@@ -1579,6 +1579,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashlink"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2417,7 +2426,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha3",
- "sqlx-core",
+ "sqlx-core 0.9.0",
  "sqlx-postgres",
  "thiserror",
  "time",
@@ -2443,7 +2452,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha3",
- "sqlx-core",
+ "sqlx-core 0.9.0",
  "sqlx-postgres",
  "tokio",
  "tracing",
@@ -2458,7 +2467,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "sqlx-core",
+ "sqlx-core 0.9.0",
  "sqlx-postgres",
  "tokio",
  "tower-http",
@@ -2481,7 +2490,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha3",
- "sqlx-core",
+ "sqlx-core 0.9.0",
  "sqlx-postgres",
  "tokio",
  "tracing",
@@ -2526,7 +2535,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha3",
- "sqlx-core",
+ "sqlx-core 0.9.0",
  "sqlx-postgres",
  "tokio",
  "tracing",
@@ -3267,11 +3276,44 @@ dependencies = [
  "futures-io",
  "futures-util",
  "hashbrown 0.15.5",
- "hashlink",
+ "hashlink 0.10.0",
  "indexmap",
  "log",
  "memchr",
  "once_cell",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smallvec",
+ "thiserror",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "sqlx-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05b44e85bf579a8eeb4ceaa77a3a523baf2bf0e9bac7e40f405d537b5d2d5ccb"
+dependencies = [
+ "base64",
+ "bytes",
+ "cfg-if",
+ "crc",
+ "crossbeam-queue",
+ "either",
+ "event-listener",
+ "futures-core",
+ "futures-intrusive",
+ "futures-io",
+ "futures-util",
+ "hashbrown 0.16.1",
+ "hashlink 0.11.1",
+ "indexmap",
+ "log",
+ "memchr",
  "percent-encoding",
  "rustls",
  "serde",
@@ -3283,8 +3325,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
- "uuid",
- "webpki-roots 0.26.11",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3318,7 +3359,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
- "sqlx-core",
+ "sqlx-core 0.8.6",
  "stringprep",
  "thiserror",
  "tracing",
@@ -3916,15 +3957,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.8",
 ]
 
 [[package]]
