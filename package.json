@@ -1,0 +1,31 @@
+{
+  "name": "prism-network",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Open infrastructure for metered GPU compute.",
+  "license": "Apache-2.0",
+  "homepage": "https://prismnetwork.tech",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/prismnetwork-tech/prism.git"
+  },
+  "engines": {
+    "node": ">=24.14.0 <25"
+  },
+  "packageManager": "pnpm@10.34.5",
+  "scripts": {
+    "build": "pnpm --filter @prism/web build",
+    "dev": "pnpm --filter @prism/web dev",
+    "lint": "pnpm --filter @prism/web lint",
+    "typecheck": "pnpm --filter @prism/web typecheck",
+    "test": "pnpm --filter @prism/web test",
+    "check": "./scripts/validate.sh"
+  },
+  "pnpm": {
+    "overrides": {
+      "viem": "2.55.2",
+      "postcss": "8.5.10",
+      "uuid@<11.1.1": "11.1.1"
+    }
+  }
+}

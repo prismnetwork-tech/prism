@@ -1,0 +1,30 @@
+FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS build
+WORKDIR /workspace
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_OPTIONS=--max-old-space-size=1024
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/web/package.json apps/web/package.json
+RUN corepack enable && pnpm install --frozen-lockfile
+COPY apps/web apps/web
+ARG NEXT_PUBLIC_PRISM_PRIVY_APP_ID
+ARG NEXT_PUBLIC_PRISM_SITE_URL=https://prismnetwork.tech
+ARG NEXT_PUBLIC_PRISM_RPC_URL
+ARG NEXT_PUBLIC_PRISM_ESCROW_ADDRESS
+ENV NEXT_PUBLIC_PRISM_PRIVY_APP_ID=${NEXT_PUBLIC_PRISM_PRIVY_APP_ID}
+ENV NEXT_PUBLIC_PRISM_SITE_URL=${NEXT_PUBLIC_PRISM_SITE_URL}
+ENV NEXT_PUBLIC_PRISM_RPC_URL=${NEXT_PUBLIC_PRISM_RPC_URL}
+ENV NEXT_PUBLIC_PRISM_ESCROW_ADDRESS=${NEXT_PUBLIC_PRISM_ESCROW_ADDRESS}
+RUN pnpm --filter @prism/web build
+
+FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+WORKDIR /app
+ENV NODE_ENV=production
+ENV HOSTNAME=0.0.0.0
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN groupadd --system --gid 10001 prism && useradd --system --uid 10001 --gid prism prism
+COPY --from=build --chown=prism:prism /workspace/apps/web/.next/standalone ./
+COPY --from=build --chown=prism:prism /workspace/apps/web/.next/static ./apps/web/.next/static
+COPY --from=build --chown=prism:prism /workspace/apps/web/public ./apps/web/public
+USER prism
+EXPOSE 3000
+CMD ["node", "apps/web/server.js"]

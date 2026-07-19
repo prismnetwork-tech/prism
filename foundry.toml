@@ -1,0 +1,15 @@
+[profile.default]
+src = "contracts/src"
+test = "contracts/test"
+out = "contracts/out"
+cache_path = "contracts/cache"
+solc_version = "0.8.30"
+optimizer = true
+optimizer_runs = 20_000
+evm_version = "cancun"
+ffi = false
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true

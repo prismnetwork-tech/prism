@@ -1,0 +1,21 @@
+[Unit]
+Description=Prism Network node certificate renewal
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/prismd/device.json
+
+[Service]
+Type=oneshot
+User=prismd
+Group=prismd
+EnvironmentFile=/etc/prismd/node.env
+ExecStart=/usr/local/sbin/prismd certificate \
+  --identity /var/lib/prismd/device.json \
+  --control-plane ${PRISM_CONTROL_PLANE_URL}
+ExecStartPost=+/usr/bin/systemctl try-restart prismd-tunnel.service
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/prismd/tls
+PrivateTmp=true
+UMask=0077

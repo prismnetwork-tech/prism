@@ -1,0 +1,8 @@
+* @prismnetwork-tech/prism-maintainers
+
+/.github/ @prismnetwork-tech/prism-maintainers
+/contracts/ @prismnetwork-tech/prism-maintainers
+/infra/ @prismnetwork-tech/prism-maintainers
+/node/ @prismnetwork-tech/prism-maintainers
+/services/ @prismnetwork-tech/prism-maintainers
+/workers/ @prismnetwork-tech/prism-maintainers

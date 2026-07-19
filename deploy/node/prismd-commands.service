@@ -1,0 +1,26 @@
+[Unit]
+Description=Prism Network node command supervisor
+After=network-online.target containerd.service
+Wants=network-online.target
+Requires=containerd.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/prismd/node.env
+ExecStart=/usr/local/sbin/prismd commands \
+  --identity /var/lib/prismd/device.json \
+  --control-plane ${PRISM_CONTROL_PLANE_URL} \
+  --workspace-root /var/lib/prismd/workspaces \
+  --state-root /var/lib/prismd/leases
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/prismd /run/lock/prismd
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

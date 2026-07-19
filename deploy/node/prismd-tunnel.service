@@ -1,0 +1,31 @@
+[Unit]
+Description=Prism Network outbound access tunnel
+After=network-online.target prismd-commands.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/prismd/tls/ca.crt
+ConditionPathExists=/var/lib/prismd/tls/node.crt
+ConditionPathExists=/var/lib/prismd/tls/node.key
+
+[Service]
+Type=simple
+User=prismd
+Group=prismd
+EnvironmentFile=/etc/prismd/node.env
+ExecStart=/usr/local/sbin/prismd tunnel \
+  --identity /var/lib/prismd/device.json \
+  --gateway ${PRISM_GATEWAY_ADDRESS} \
+  --server-name ${PRISM_GATEWAY_SERVER_NAME} \
+  --ca-certificate /var/lib/prismd/tls/ca.crt \
+  --client-certificate /var/lib/prismd/tls/node.crt \
+  --client-key /var/lib/prismd/tls/node.key \
+  --connection-id ${PRISM_CONNECTION_ID}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

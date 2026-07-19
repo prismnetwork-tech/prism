@@ -1,0 +1,28 @@
+projects:
+  - name: Prism Network
+    environments:
+      - name: Production
+        services:
+          - type: web
+            name: prism-network-web
+            runtime: docker
+            plan: free
+            region: frankfurt
+            repo: https://github.com/prismnetwork-tech/prism
+            branch: main
+            autoDeployTrigger: checksPass
+            dockerfilePath: ./deploy/Dockerfile.web
+            dockerContext: .
+            healthCheckPath: /api/healthz
+            domains:
+              - prismnetwork.tech
+            envVars:
+              - key: NODE_ENV
+                value: production
+              - key: NEXT_TELEMETRY_DISABLED
+                value: "1"
+              - key: NEXT_PUBLIC_PRISM_SITE_URL
+                value: https://prismnetwork.tech
+
+previews:
+  generation: off

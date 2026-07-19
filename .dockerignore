@@ -1,0 +1,13 @@
+.git
+.github
+.next
+**/.next
+node_modules
+**/node_modules
+target
+contracts/cache
+contracts/out
+output
+.env
+.env.*
+*.log

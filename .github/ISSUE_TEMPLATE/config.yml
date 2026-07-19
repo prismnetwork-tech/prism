@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/prismnetwork-tech/prism/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.
+  - name: Support and deployment questions
+    url: https://github.com/prismnetwork-tech/prism/discussions
+    about: Ask for community help in Discussions.

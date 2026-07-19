@@ -1,0 +1,48 @@
+{
+  "name": "@prism/web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Prism Network web application.",
+  "license": "Apache-2.0",
+  "homepage": "https://prismnetwork.tech",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/prismnetwork-tech/prism.git",
+    "directory": "apps/web"
+  },
+  "engines": {
+    "node": ">=24.14.0 <25"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@alchemy/common": "5.0.6",
+    "@alchemy/wallet-apis": "5.0.6",
+    "@privy-io/react-auth": "3.35.1",
+    "@tanstack/react-query": "5.101.2",
+    "jose": "6.2.0",
+    "next": "16.2.10",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "redis": "6.1.0",
+    "viem": "2.55.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.0",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  },
+  "overrides": {
+    "viem": "2.55.2",
+    "@privy-io/react-auth": {
+      "viem": "2.55.2"
+    }
+  }
+}

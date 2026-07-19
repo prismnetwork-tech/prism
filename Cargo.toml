@@ -1,0 +1,59 @@
+[workspace]
+members = [
+  "crates/chain",
+  "crates/protocol",
+  "services/control-plane",
+  "services/access-gateway",
+  "services/operations-monitor",
+  "node/prismd",
+  "workers/lifecycle-worker",
+  "workers/proof-worker",
+  "workers/settlement-worker",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+homepage = "https://prismnetwork.tech"
+license = "Apache-2.0"
+repository = "https://github.com/prismnetwork-tech/prism"
+rust-version = "1.94.1"
+version = "0.1.0"
+
+[workspace.dependencies]
+aes-gcm = "0.10.3"
+anyhow = "1.0.98"
+aws-config = { version = "1.9.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-kms = { version = "1.112.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.138.1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-smithy-http-client-reqwest = "0.1.0"
+axum = "0.8.4"
+base64 = "0.22.1"
+chrono = { version = "0.4.41", features = ["serde"] }
+clap = { version = "4.5.41", features = ["derive"] }
+ed25519-dalek = { version = "2.1.1", features = ["rand_core", "serde"] }
+futures = "0.3.31"
+hex = "0.4.3"
+hmac = "0.12.1"
+k256 = { version = "0.13.4", features = ["ecdsa", "pkcs8"] }
+rand = "0.8.5"
+rcgen = { version = "0.14.8", features = ["pem", "x509-parser"] }
+redis = { version = "1.4.1", default-features = false, features = ["script", "tokio-rustls-comp"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+rlp = "0.6.1"
+rustls = "0.23.31"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+sha3 = "0.10.8"
+sqlx-core = { version = "=0.8.6", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json", "migrate"] }
+sqlx-postgres = { version = "=0.8.6", features = ["chrono", "json", "migrate", "uuid"] }
+thiserror = "2.0.12"
+time = "0.3.53"
+tokio = { version = "1.46.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = "0.26.2"
+tower-http = { version = "0.6.6", features = ["cors", "trace", "request-id"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+url = "2.5.4"
+uuid = { version = "1.17.0", features = ["serde", "v7"] }

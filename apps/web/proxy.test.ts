@@ -1,0 +1,18 @@
+import { describe, expect, it } from "vitest";
+import { contentSecurityPolicy } from "./proxy";
+
+describe("content security policy", () => {
+  it("uses a nonce without allowing inline production scripts", () => {
+    const policy = contentSecurityPolicy("abc123", false);
+
+    expect(policy).toContain("script-src 'self' 'nonce-abc123' 'strict-dynamic'");
+    expect(policy).not.toContain("'unsafe-eval'");
+    expect(policy).not.toContain("script-src 'unsafe-inline'");
+    expect(policy).toContain("frame-ancestors 'none'");
+    expect(policy).toContain("object-src 'none'");
+  });
+
+  it("allows eval only for the development runtime", () => {
+    expect(contentSecurityPolicy("abc123", true)).toContain("'unsafe-eval'");
+  });
+});

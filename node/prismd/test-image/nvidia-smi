@@ -1,0 +1,2 @@
+#!/bin/sh
+printf '%s\n' 'GPU 0: Prism test device (UUID: GPU-00000000-0000-0000-0000-000000000000)'

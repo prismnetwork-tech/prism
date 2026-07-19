@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew the Prism Network node certificate daily
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=24h
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
