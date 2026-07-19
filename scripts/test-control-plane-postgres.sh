@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 for command in cast curl docker; do
   command -v "$command" >/dev/null
@@ -26,6 +26,20 @@ cleanup() {
   docker rm -f "$container" >/dev/null 2>&1 || true
   rm -rf "$root"
 }
+
+report_failure() {
+  local exit_code=$?
+  local line=$1
+
+  printf 'control-plane PostgreSQL integration failed at line %s\n' "$line" >&2
+  if [[ -f "$root/control-plane.log" ]]; then
+    tail -200 "$root/control-plane.log" >&2
+  fi
+  docker logs --tail 200 "$container" >&2 2>/dev/null || true
+  exit "$exit_code"
+}
+
+trap 'report_failure "$LINENO"' ERR
 trap cleanup EXIT
 
 ./scripts/generate-lightsail-tls.sh tunnel.integration.invalid "$root/tls" >/dev/null 2>&1
