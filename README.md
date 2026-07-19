@@ -64,6 +64,7 @@ Required toolchains:
 - Rust 1.94.1
 - Foundry 1.5
 - Docker with Compose
+- ripgrep
 
 Install and run the fast validation path:
 
