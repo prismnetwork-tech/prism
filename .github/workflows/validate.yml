@@ -32,6 +32,10 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: cargo install cargo-audit --locked --version 0.22.1
       - run: ./scripts/validate.sh
