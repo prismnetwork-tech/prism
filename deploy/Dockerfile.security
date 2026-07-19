@@ -1,0 +1,7 @@
+FROM ghcr.io/foundry-rs/foundry:v1.3.1@sha256:2dbf3d0fc58593ad9d01ef57677f93f83f4987acd295d17f303448d82e3a3ae7 AS foundry
+
+FROM ghcr.io/crytic/slither:0.11.3@sha256:bd39e6a2fdbfa0237c9eeac16ad52de1ddd310e185091dd8272a962d2a53b0b5
+USER root
+COPY --from=foundry /usr/local/bin/forge /usr/local/bin/forge
+USER slither
+ENTRYPOINT ["slither"]

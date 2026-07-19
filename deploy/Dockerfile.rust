@@ -1,0 +1,24 @@
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS build
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY services ./services
+COPY workers ./workers
+COPY node ./node
+ARG BINARY
+RUN test -n "${BINARY}"
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/workspace/target \
+    cargo build --locked --release --bin "${BINARY}" --jobs 1 \
+    && cp "/workspace/target/release/${BINARY}" /workspace/prism-service
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+RUN useradd --system --create-home --uid 10001 prism \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+ARG BINARY
+RUN test -n "${BINARY}"
+COPY --from=build /workspace/prism-service /usr/local/bin/prism-service
+USER prism
+ENTRYPOINT ["/usr/local/bin/prism-service"]

@@ -1,0 +1,58 @@
+groups:
+  - name: prism-network
+    rules:
+      - alert: PrismOperationsMonitorDown
+        expr: up{job="prism-operations"} != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Prism operations monitor is unavailable
+          description: Check the monitor container and PostgreSQL connectivity before trusting any other alert state.
+      - alert: PrismNetworkLeaseCapExceeded
+        expr: prism_active_leases > 25
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Active leases exceed the V1 network cap
+          description: Pause new matching and inspect control-plane concurrency enforcement.
+      - alert: PrismQueueFailure
+        expr: prism_queue_jobs{status="failed"} > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A durable worker queue contains failed jobs
+          description: Inspect the named queue, last_error fields and worker logs; settlement must not be bypassed.
+      - alert: PrismQueueBacklog
+        expr: prism_queue_oldest_age_seconds{status=~"queued|processing|submitted"} > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A Prism worker queue is delayed
+          description: Inspect worker health, RPC availability, database locks and retry counts for the named queue.
+      - alert: PrismStaleNodeTunnel
+        expr: prism_stale_node_tunnels > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: One or more node tunnels are stale
+          description: Confirm gateway observations, certificate state and node connectivity. Stale nodes are not schedulable.
+      - alert: PrismNodeCertificateExpiring
+        expr: prism_node_certificates_expiring_24h > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A node certificate expires within 24 hours
+          description: Renew the device-signed certificate before its outbound tunnels are rejected.
+      - alert: PrismPrivilegedActivity
+        expr: increase(prism_operator_actions_24h[30m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: Privileged operator activity was recorded
+          description: Review the append-only operator audit for actor, target, reason and before/after state.

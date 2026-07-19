@@ -1,0 +1,314 @@
+name: prism-network
+
+services:
+  web:
+    image: ${PRISM_WEB_IMAGE:?set PRISM_WEB_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    environment:
+      NODE_ENV: production
+      PRISM_API_BASE_URL: http://control-plane:8080
+      PRISM_CONTROL_PLANE_AUTH_KEY: ${PRISM_CONTROL_PLANE_AUTH_KEY:?set PRISM_CONTROL_PLANE_AUTH_KEY}
+      PRISM_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_PROOF_INDEX_URL: ${PRISM_PROOF_INDEX_URL:?set PRISM_PROOF_INDEX_URL}
+      PRISM_PRIVY_APP_ID: ${PRISM_PRIVY_APP_ID:?set PRISM_PRIVY_APP_ID}
+      PRISM_PRIVY_VERIFICATION_KEY: ${PRISM_PRIVY_VERIFICATION_KEY:?set PRISM_PRIVY_VERIFICATION_KEY}
+      PRISM_ALCHEMY_API_KEY: ${PRISM_ALCHEMY_API_KEY:?set PRISM_ALCHEMY_API_KEY}
+      PRISM_ALCHEMY_POLICY_ID: ${PRISM_ALCHEMY_POLICY_ID:?set PRISM_ALCHEMY_POLICY_ID}
+      PRISM_WALLET_AUTH_KEY: ${PRISM_WALLET_AUTH_KEY:?set PRISM_WALLET_AUTH_KEY}
+      PRISM_REDIS_URL: rediss://:${PRISM_REDIS_PASSWORD:?set PRISM_REDIS_PASSWORD}@cache:6379/0
+      PRISM_REDIS_CA_FILE: /run/prism-tls/ca.crt
+    volumes:
+      - runtime_tls:/run/prism-tls:ro
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      tls-init:
+        condition: service_completed_successfully
+
+  control-plane:
+    image: ${PRISM_CONTROL_PLANE_IMAGE:?set PRISM_CONTROL_PLANE_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    environment:
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_CONTROL_PLANE_ADDR: 0.0.0.0:8080
+      PRISM_CONTROL_PLANE_AUTH_KEY: ${PRISM_CONTROL_PLANE_AUTH_KEY:?set PRISM_CONTROL_PLANE_AUTH_KEY}
+      PRISM_GATEWAY_OBSERVER_TOKEN: ${PRISM_GATEWAY_OBSERVER_TOKEN:?set PRISM_GATEWAY_OBSERVER_TOKEN}
+      PRISM_ACCESS_CREDENTIAL_KEY: ${PRISM_ACCESS_CREDENTIAL_KEY:?set PRISM_ACCESS_CREDENTIAL_KEY}
+      PRISM_PUBLIC_GATEWAY_HOST: ${PRISM_DOMAIN:?set PRISM_DOMAIN}
+      PRISM_PUBLIC_RELAY_PORT: "7444"
+      PRISM_NODE_CA_CERTIFICATE: /run/prism-ca/ca.crt
+      PRISM_NODE_CA_KEY: /run/prism-ca/ca.key
+      PRISM_OPERATOR_SUBJECTS: ${PRISM_OPERATOR_SUBJECTS:?set PRISM_OPERATOR_SUBJECTS}
+      PRISM_NODE_REGISTRY_ADDRESS: ${PRISM_NODE_REGISTRY_ADDRESS:?set PRISM_NODE_REGISTRY_ADDRESS}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_FUNDING_CONFIRMATIONS: ${PRISM_FUNDING_CONFIRMATIONS:-12}
+    volumes:
+      - control_plane_ca:/run/prism-ca:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tls-init:
+        condition: service_completed_successfully
+
+  access-gateway:
+    image: ${PRISM_ACCESS_GATEWAY_IMAGE:?set PRISM_ACCESS_GATEWAY_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    ports:
+      - "7443:7443"
+      - "7444:7444"
+    environment:
+      PRISM_GATEWAY_ADDR: 0.0.0.0:8081
+      PRISM_GATEWAY_CONTROL_TOKEN: ${PRISM_GATEWAY_CONTROL_TOKEN:?set PRISM_GATEWAY_CONTROL_TOKEN}
+      PRISM_GATEWAY_HMAC_KEY: ${PRISM_GATEWAY_HMAC_KEY:?set PRISM_GATEWAY_HMAC_KEY}
+      PRISM_REDIS_URL: rediss://:${PRISM_REDIS_PASSWORD:?set PRISM_REDIS_PASSWORD}@cache:6379/0
+      PRISM_REDIS_CA_FILE: /run/prism-tls/ca.crt
+      PRISM_ENABLE_TUNNEL: "1"
+      PRISM_TUNNEL_ADDR: 0.0.0.0:7443
+      PRISM_RELAY_ADDR: 0.0.0.0:7444
+      PRISM_TUNNEL_SERVER_CERTIFICATE: /run/prism-tls/server.crt
+      PRISM_TUNNEL_SERVER_KEY: /run/prism-tls/server.key
+      PRISM_TUNNEL_CLIENT_CA: /run/prism-tls/ca.crt
+      PRISM_CONTROL_PLANE_URL: http://control-plane:8080
+      PRISM_ALLOW_PRIVATE_CONTROL_PLANE_HTTP: "1"
+      PRISM_GATEWAY_OBSERVER_TOKEN: ${PRISM_GATEWAY_OBSERVER_TOKEN:?set PRISM_GATEWAY_OBSERVER_TOKEN}
+    volumes:
+      - runtime_tls:/run/prism-tls:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      cache:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+      tls-init:
+        condition: service_completed_successfully
+
+  edge:
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PRISM_DOMAIN: ${PRISM_DOMAIN:?set PRISM_DOMAIN}
+      PRISM_ACME_EMAIL: ${PRISM_ACME_EMAIL:?set PRISM_ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - proof_data:/srv/proof:ro
+    depends_on:
+      - web
+
+  postgres:
+    image: postgres:17-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: prism
+      POSTGRES_USER: prism
+      POSTGRES_PASSWORD: ${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prism -d prism"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  cache:
+    image: valkey/valkey:8-bookworm@sha256:fea8b3e67b15729d4bb70589eb03367bab9ad1ee89c876f54327fc7c6e618571
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /run/prism-tls/cache.crt
+      - --tls-key-file
+      - /run/prism-tls/cache.key
+      - --tls-ca-cert-file
+      - /run/prism-tls/ca.crt
+      - --tls-auth-clients
+      - "no"
+      - --requirepass
+      - ${PRISM_REDIS_PASSWORD:?set PRISM_REDIS_PASSWORD}
+    volumes:
+      - cache_data:/data
+      - runtime_tls:/run/prism-tls:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - valkey-cli --tls --cacert /run/prism-tls/ca.crt -h cache -a "$$PRISM_REDIS_PASSWORD" ping | grep PONG
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      PRISM_REDIS_PASSWORD: ${PRISM_REDIS_PASSWORD:?set PRISM_REDIS_PASSWORD}
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+
+  tls-init:
+    image: valkey/valkey:8-bookworm@sha256:fea8b3e67b15729d4bb70589eb03367bab9ad1ee89c876f54327fc7c6e618571
+    restart: "no"
+    user: "0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    command:
+      - sh
+      - -ec
+      - |
+        install -m 0444 /source/ca.crt /runtime/ca.crt
+        install -m 0444 -o 10001 -g 10001 /source/ca.crt /control-plane-ca/ca.crt
+        install -m 0400 -o 10001 -g 10001 /source/ca.key /control-plane-ca/ca.key
+        install -m 0444 -o 10001 -g 10001 /source/server.crt /runtime/server.crt
+        install -m 0400 -o 10001 -g 10001 /source/server.key /runtime/server.key
+        install -m 0444 -o 999 -g 999 /source/cache.crt /runtime/cache.crt
+        install -m 0400 -o 999 -g 999 /source/cache.key /runtime/cache.key
+    volumes:
+      - ./secrets/tls:/source:ro
+      - runtime_tls:/runtime
+      - control_plane_ca:/control-plane-ca
+
+  operations-monitor:
+    profiles: [observability]
+    image: ${PRISM_OPERATIONS_MONITOR_IMAGE:?set PRISM_OPERATIONS_MONITOR_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    environment:
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_OPERATIONS_MONITOR_ADDR: 0.0.0.0:9091
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9091/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    restart: unless-stopped
+    read_only: true
+    user: "65534:65534"
+    cap_drop: [ALL]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle=false
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prism-alerts.yml:/etc/prometheus/prism-alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      operations-monitor:
+        condition: service_healthy
+
+  settlement-worker:
+    profiles: [workers]
+    image: ${PRISM_SETTLEMENT_WORKER_IMAGE:?set PRISM_SETTLEMENT_WORKER_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      AWS_REGION: ${AWS_REGION:-eu-central-1}
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_ATTESTOR_KMS_KEY_ID: ${PRISM_ATTESTOR_KMS_KEY_ID:?set PRISM_ATTESTOR_KMS_KEY_ID}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_SETTLEMENT_CONFIRMATIONS: ${PRISM_SETTLEMENT_CONFIRMATIONS:-12}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  lifecycle-worker:
+    profiles: [workers]
+    image: ${PRISM_LIFECYCLE_WORKER_IMAGE:?set PRISM_LIFECYCLE_WORKER_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      AWS_REGION: ${AWS_REGION:-eu-central-1}
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_ACCESS_CREDENTIAL_KEY: ${PRISM_ACCESS_CREDENTIAL_KEY:?set PRISM_ACCESS_CREDENTIAL_KEY}
+      PRISM_GATEWAY_CONTROL_TOKEN: ${PRISM_GATEWAY_CONTROL_TOKEN:?set PRISM_GATEWAY_CONTROL_TOKEN}
+      PRISM_GATEWAY_CONTROL_URL: http://access-gateway:8081
+      PRISM_ALLOW_PRIVATE_GATEWAY_HTTP: "1"
+      PRISM_GATEWAY_KMS_KEY_ID: ${PRISM_GATEWAY_KMS_KEY_ID:?set PRISM_GATEWAY_KMS_KEY_ID}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_LIFECYCLE_CONFIRMATIONS: ${PRISM_LIFECYCLE_CONFIRMATIONS:-12}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+    depends_on:
+      access-gateway:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  proof-worker:
+    profiles: [workers]
+    image: ${PRISM_PROOF_WORKER_IMAGE:?set PRISM_PROOF_WORKER_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_ALLOW_LOCAL_PROOF_ARTIFACTS: "1"
+      PRISM_PROOF_ARTIFACT_DIR: /var/lib/prism-proof/public
+      PRISM_PUBLIC_PROOF_URL: ${PRISM_PUBLIC_PROOF_URL:?set PRISM_PUBLIC_PROOF_URL}
+      PRISM_X_USER_ACCESS_TOKEN: ${PRISM_X_USER_ACCESS_TOKEN:?set PRISM_X_USER_ACCESS_TOKEN}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_PROOF_CONFIRMATIONS: ${PRISM_PROOF_CONFIRMATIONS:-12}
+    volumes:
+      - proof_data:/var/lib/prism-proof
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  cache_data:
+  caddy_config:
+  caddy_data:
+  control_plane_ca:
+  postgres_data:
+  proof_data:
+  prometheus_data:
+  runtime_tls:

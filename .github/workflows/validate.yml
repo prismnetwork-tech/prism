@@ -1,0 +1,64 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: clippy,rustfmt
+      - uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: cargo install cargo-audit --locked --version 0.22.1
+      - run: ./scripts/validate.sh
+        env:
+          PRISM_ALLOWED_GIT_EMAIL: opensource@prismnetwork.tech
+          PRISM_ALLOWED_GIT_NAME: Prism Network
+      - name: Validate Terraform
+        run: |
+          docker run --rm -v "$PWD/infra/terraform:/workspace" -w /workspace hashicorp/terraform:1.10@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28 init -backend=false -input=false
+          docker run --rm -v "$PWD/infra/terraform:/workspace" -w /workspace hashicorp/terraform:1.10@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28 validate
+      - name: Validate Lightsail deployment
+        run: docker compose --env-file deploy/lightsail/.env.example -f deploy/lightsail/compose.yml config --quiet
+      - name: Build service images
+        run: |
+          docker build -f deploy/Dockerfile.web -t prism-web:test \
+            --build-arg NEXT_PUBLIC_PRISM_PRIVY_APP_ID= \
+            --build-arg NEXT_PUBLIC_PRISM_RPC_URL=https://rpc.mainnet.chain.robinhood.com \
+            --build-arg NEXT_PUBLIC_PRISM_ESCROW_ADDRESS= .
+          docker build -f deploy/Dockerfile.rust -t prism-control-plane:test \
+            --build-arg BINARY=prism-control-plane .
+          docker build -f deploy/Dockerfile.rust -t prism-access-gateway:test \
+            --build-arg BINARY=prism-access-gateway .
+          docker build -f deploy/Dockerfile.rust -t prism-lifecycle-worker:test \
+            --build-arg BINARY=prism-lifecycle-worker .
+          docker build -f deploy/Dockerfile.rust -t prism-proof-worker:test \
+            --build-arg BINARY=prism-proof-worker .
+          docker build -f deploy/Dockerfile.rust -t prism-settlement-worker:test \
+            --build-arg BINARY=prism-settlement-worker .
+          docker build -f deploy/Dockerfile.rust -t prism-operations-monitor:test \
+            --build-arg BINARY=prism-operations-monitor .
