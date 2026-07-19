@@ -18,8 +18,12 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Verify commit signoffs
         env:
+          ACTOR: ${{ github.actor }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          if [[ "$ACTOR" == "dependabot[bot]" ]]; then
+            exit 0
+          fi
           failed=0
           while read -r commit; do
             author="$(git show -s --format='%an <%ae>' "$commit")"
