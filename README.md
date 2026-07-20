@@ -70,11 +70,7 @@ Install and run the fast validation path:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm typecheck
-pnpm test
-pnpm build
-cargo test --workspace
-forge test
+pnpm check
 ```
 
 The full release gate additionally requires PostgreSQL, Valkey, Anvil, Docker
@@ -82,7 +78,8 @@ and the security scanners documented in
 [security scanning](docs/security-scanning.md):
 
 ```sh
-./scripts/validate.sh
+pnpm check:full
+gh workflow run full-validate.yml --ref <branch>
 ```
 
 Copy only the example environment files needed for your target. Never commit
