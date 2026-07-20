@@ -204,8 +204,8 @@ function paintIncomingSignal(
     ? { x: width * 0.08, y: center.y - radius * 1.08 }
     : { x: center.x - radius * 1.5, y: center.y - radius * 1.18 };
   const impact = {
-    x: center.x - radius * 0.18,
-    y: center.y - radius * 0.22,
+    x: center.x - radius * 0.06,
+    y: center.y - radius * 0.08,
   };
 
   context.save();
