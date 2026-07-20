@@ -141,7 +141,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .empty-state h2 { margin: 14px 0 6px; }
 .empty-state p { max-width: 420px; color: var(--muted); line-height: 1.65; font-size: 14px; }
 .empty-icon { width: 46px; height: 46px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); border-radius: 13px; font-size: 25px; }
-.proof-disclosure { display: grid; gap: 5px; border-left: 3px solid var(--accent); }
+.proof-disclosure { display: grid; gap: 5px; }
 .proof-disclosure p { margin: 0; color: var(--muted); line-height: 1.6; font-size: 13px; }
 .proof-list { display: grid; gap: 10px; }
 .receipt { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 28px; }

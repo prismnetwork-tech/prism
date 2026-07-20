@@ -6,7 +6,12 @@ const maxResponseBytes = 1_000_000;
 
 export async function GET() {
   const source = process.env.PRISM_PROOF_INDEX_URL;
-  if (!source) return NextResponse.json({ error: "proof_feed_unavailable" }, { status: 503 });
+  if (!source) {
+    return NextResponse.json(
+      { generated_at: new Date().toISOString(), receipts: [] },
+      { headers: { "Cache-Control": "public, max-age=30" } },
+    );
+  }
 
   let url: URL;
   try {
