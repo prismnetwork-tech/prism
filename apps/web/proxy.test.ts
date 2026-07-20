@@ -10,6 +10,9 @@ describe("content security policy", () => {
     expect(policy).not.toContain("script-src 'unsafe-inline'");
     expect(policy).toContain("frame-ancestors 'none'");
     expect(policy).toContain("object-src 'none'");
+    expect(policy).toContain(
+      "img-src 'self' data: blob: https://explorer-api.walletconnect.com",
+    );
   });
 
   it("allows eval only for the development runtime", () => {
