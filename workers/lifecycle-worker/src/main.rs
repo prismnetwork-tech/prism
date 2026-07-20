@@ -24,6 +24,18 @@ mod vast;
 use vast::VastBroker;
 
 const SIGNER_LOCK: i64 = 4_663_001;
+const CLOUD_CAPACITY_UPSERT: &str = "
+    INSERT INTO cloud_capacity
+        (node_id, provider, available, provider_offer_id, hourly_cost_micros, observed_at)
+    VALUES ($1, 'vast', $2, $3, $4, NOW())
+    ON CONFLICT (node_id) DO UPDATE SET
+        provider = 'vast',
+        available = EXCLUDED.available,
+        provider_offer_id = EXCLUDED.provider_offer_id,
+        hourly_cost_micros = EXCLUDED.hourly_cost_micros,
+        observed_at = NOW(),
+        updated_at = NOW()
+";
 
 struct Worker {
     pool: PgPool,
@@ -283,22 +295,13 @@ impl Worker {
             .transpose()?
             .map(i64::try_from)
             .transpose()?;
-        query(
-            "INSERT INTO cloud_capacity \
-                 (node_id, available, provider_offer_id, hourly_cost_micros, observed_at) \
-             VALUES ($1, $2, $3, $4, NOW()) \
-             ON CONFLICT (node_id) DO UPDATE SET \
-                 available = EXCLUDED.available, \
-                 provider_offer_id = EXCLUDED.provider_offer_id, \
-                 hourly_cost_micros = EXCLUDED.hourly_cost_micros, \
-                 observed_at = NOW(), updated_at = NOW()",
-        )
-        .bind(&vast.node_id)
-        .bind(offer.is_some())
-        .bind(provider_offer_id)
-        .bind(hourly_micros)
-        .execute(&self.pool)
-        .await?;
+        query(CLOUD_CAPACITY_UPSERT)
+            .bind(&vast.node_id)
+            .bind(offer.is_some())
+            .bind(provider_offer_id)
+            .bind(hourly_micros)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1375,5 +1378,11 @@ mod tests {
         assert!(private_gateway_host("fd00::2"));
         assert!(!private_gateway_host("gateway.example.com"));
         assert!(!private_gateway_host("203.0.113.6"));
+    }
+
+    #[test]
+    fn cloud_capacity_upsert_records_the_provider() {
+        assert!(CLOUD_CAPACITY_UPSERT.contains("(node_id, provider, available"));
+        assert!(CLOUD_CAPACITY_UPSERT.contains("VALUES ($1, 'vast'"));
     }
 }
