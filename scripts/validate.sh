@@ -26,6 +26,7 @@ cargo build --workspace
 ./scripts/test-lightsail-compose.sh
 ./scripts/test-observability.sh
 forge fmt --check
+forge build
 forge test
 ./scripts/check-secrets.sh
 ./scripts/verify-isolation.sh
