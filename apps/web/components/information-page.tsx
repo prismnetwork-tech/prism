@@ -2,47 +2,44 @@ import Link from "next/link";
 import { PublicFooter } from "@/components/public-footer";
 import { docsUrl } from "@/lib/site";
 
-export function LegalPage({
+export function InformationPage({
+  eyebrow,
   title,
   description,
-  effective,
   children,
 }: {
+  eyebrow: string;
   title: string;
   description: string;
-  effective: string;
   children: React.ReactNode;
 }) {
   return (
-    <div className="legal-page">
-      <header className="legal-header">
+    <div className="information-page">
+      <header className="information-header">
         <Link className="landing-brand" href="/" aria-label="prism. home">
           <img src="/brand/prism-logo.svg" alt="" width="32" height="32" />
           <span>prism.</span>
         </Link>
-        <nav aria-label="Legal page navigation">
-          <Link href="/">Home</Link>
+        <nav aria-label="Public page navigation">
+          <Link href="/pricing">Pricing</Link>
           <Link href={docsUrl.href}>Docs</Link>
-          <Link className="legal-console-link" href="/compute">Open console ↗</Link>
+          <Link className="information-console-link" href="/compute">Open console ↗</Link>
         </nav>
       </header>
-      <main className="legal-main" id="main-content" tabIndex={-1}>
-        <header className="legal-hero">
-          <p>Prism Network / Legal</p>
+      <main id="main-content" tabIndex={-1}>
+        <header className="information-hero">
+          <p>{eyebrow}</p>
           <h1>{title}</h1>
-          <div>
-            <p>{description}</p>
-            <span>Effective {effective}</span>
-          </div>
+          <p>{description}</p>
         </header>
-        <article className="legal-document">{children}</article>
+        <div className="information-content">{children}</div>
       </main>
       <PublicFooter />
     </div>
   );
 }
 
-export function LegalSection({
+export function InformationSection({
   index,
   title,
   children,
@@ -52,7 +49,7 @@ export function LegalSection({
   children: React.ReactNode;
 }) {
   return (
-    <section>
+    <section className="information-section">
       <header><span>{index}</span><h2>{title}</h2></header>
       <div>{children}</div>
     </section>

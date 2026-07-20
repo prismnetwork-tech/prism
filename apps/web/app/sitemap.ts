@@ -38,5 +38,25 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "yearly",
       priority: 0.3,
     },
+    {
+      url: new URL("/about", siteUrl).href,
+      changeFrequency: "monthly",
+      priority: 0.5,
+    },
+    {
+      url: new URL("/pricing", siteUrl).href,
+      changeFrequency: "weekly",
+      priority: 0.7,
+    },
+    {
+      url: new URL("/security", siteUrl).href,
+      changeFrequency: "monthly",
+      priority: 0.5,
+    },
+    {
+      url: new URL("/contact", siteUrl).href,
+      changeFrequency: "monthly",
+      priority: 0.4,
+    },
   ];
 }
