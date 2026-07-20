@@ -7,11 +7,19 @@ export function proxy(request: NextRequest) {
   requestHeaders.set("Content-Security-Policy", policy);
   requestHeaders.set("x-nonce", nonce);
 
-  const response = NextResponse.next({
-    request: { headers: requestHeaders },
-  });
+  const hostname = request.headers.get("host")?.split(":", 1)[0] || request.nextUrl.hostname;
+  const rewrite = publicPageRewrite(hostname, request.nextUrl.pathname);
+  const response = rewrite
+    ? NextResponse.rewrite(new URL(rewrite, request.url), { request: { headers: requestHeaders } })
+    : NextResponse.next({ request: { headers: requestHeaders } });
   response.headers.set("Content-Security-Policy", policy);
   return response;
+}
+
+export function publicPageRewrite(hostname: string, pathname: string) {
+  return hostname.toLowerCase() === "docs.prismnetwork.tech" && pathname === "/"
+    ? "/docs"
+    : null;
 }
 
 export function contentSecurityPolicy(nonce: string, development: boolean) {

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 import { usePrismAuth } from "@/components/providers";
+import { docsUrl } from "@/lib/site";
 
 const navigation = [
   ["Compute", "/compute"],
@@ -12,6 +13,7 @@ const navigation = [
   ["Earnings", "/earnings"],
   ["Wallets", "/wallets"],
   ["Proof", "/proof"],
+  ["Docs", docsUrl.href],
   ["Settings", "/settings"],
 ] as const;
 
@@ -19,7 +21,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [menuOpen, setMenuOpen] = useState(false);
 
-  if (pathname === "/") return <>{children}</>;
+  if (
+    pathname === "/"
+    || pathname.startsWith("/docs")
+    || pathname === "/privacy"
+    || pathname === "/terms"
+  ) return <>{children}</>;
 
   return (
     <div className="app-shell">
