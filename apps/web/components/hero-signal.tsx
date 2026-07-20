@@ -129,7 +129,7 @@ function paintPrism({ context, width, height, time }: Frame) {
   const apex = { x: center.x, y: center.y - scale * 0.23 };
   const left = { x: center.x - scale * 0.2, y: center.y + scale * 0.17 };
   const right = { x: center.x + scale * 0.21, y: center.y + scale * 0.17 };
-  const lower = { x: center.x, y: center.y + scale * 0.27 };
+  const core = { x: center.x, y: center.y + scale * 0.04 };
 
   context.save();
   context.shadowColor = "rgba(204, 255, 0, 0.4)";
@@ -137,17 +137,18 @@ function paintPrism({ context, width, height, time }: Frame) {
   context.lineWidth = 1.4;
   context.strokeStyle = "rgba(204, 255, 0, 0.9)";
   context.fillStyle = "rgba(204, 255, 0, 0.035)";
-  polygon(context, [apex, left, lower, right]);
+  polygon(context, [apex, left, right]);
   context.fill();
   context.stroke();
   context.shadowBlur = 0;
   context.strokeStyle = "rgba(204, 255, 0, 0.35)";
-  line(context, apex, lower);
-  line(context, left, right);
+  line(context, apex, core);
+  line(context, left, core);
+  line(context, right, core);
   context.restore();
 
   const origin = { x: width * (wide ? 0.38 : compact ? 0.04 : 0.18), y: center.y };
-  const beamEnd = { x: center.x - scale * 0.05, y: center.y };
+  const beamEnd = { x: center.x - scale * 0.05, y: center.y - scale * 0.06 };
   const incoming = pointBetween(origin, beamEnd, loop(time, 4400));
 
   context.save();
@@ -158,11 +159,10 @@ function paintPrism({ context, width, height, time }: Frame) {
   context.restore();
   label(context, "LEASE REQUEST", origin.x, origin.y - 18, "left");
 
-  const lanePositions = compact ? [0.63, 0.77, 0.91] : [0.28, 0.5, 0.72];
   const lanes = [
-    { name: "ESCROW", y: height * lanePositions[0], offset: 0 },
-    { name: "COMPUTE", y: height * lanePositions[1], offset: 0.34 },
-    { name: "SETTLE", y: height * lanePositions[2], offset: 0.68 },
+    { name: "ESCROW", offset: 0 },
+    { name: "COMPUTE", offset: 0.34 },
+    { name: "SETTLE", offset: 0.68 },
   ] as const;
   const receipt = {
     x: width * (compact ? 0.75 : wide ? 0.87 : 0.82),
@@ -173,30 +173,22 @@ function paintPrism({ context, width, height, time }: Frame) {
 
   lanes.forEach((lane) => {
     const start = { x: center.x + scale * 0.07, y: center.y };
-    const checkpoint = {
-      x: width * (compact ? 0.63 : wide ? 0.78 : 0.7),
-      y: lane.y,
-    };
     const end = {
       x: receipt.x,
       y: receipt.y + receipt.height * (lane.name === "ESCROW" ? 0.25 : lane.name === "COMPUTE" ? 0.5 : 0.75),
     };
+    const checkpointX = width * (compact ? 0.63 : wide ? 0.78 : 0.7);
+    const checkpoint = pointBetween(start, end, (checkpointX - start.x) / (end.x - start.x));
 
     context.save();
     context.strokeStyle = "rgba(204, 255, 0, 0.32)";
     context.lineWidth = lane.name === "COMPUTE" ? 1.4 : 1;
-    context.beginPath();
-    context.moveTo(start.x, start.y);
-    context.lineTo(checkpoint.x, checkpoint.y);
-    context.lineTo(end.x, end.y);
-    context.stroke();
+    line(context, start, end);
     diamond(context, checkpoint.x, checkpoint.y, 7);
     label(context, lane.name, checkpoint.x + 13, checkpoint.y - 9, "left");
 
     const progress = loop(time + lane.offset * 4400, 4400);
-    const point = progress < 0.66
-      ? pointBetween(start, checkpoint, progress / 0.66)
-      : pointBetween(checkpoint, end, (progress - 0.66) / 0.34);
+    const point = pointBetween(start, end, progress);
     glowPoint(context, point.x, point.y, lane.name === "COMPUTE" ? 3.5 : 2.5, 15);
     context.restore();
   });
