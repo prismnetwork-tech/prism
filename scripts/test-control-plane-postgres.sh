@@ -439,7 +439,11 @@ curl --fail --silent \
 counts=$(docker exec -e PGPASSWORD=integration-secret "$container" \
   psql -U prism -d prism -Atc \
   "SELECT (SELECT count(*) FROM node_offers), (SELECT count(*) FROM node_telemetry), (SELECT count(*) FROM node_tunnels), (SELECT count(*) FROM lease_quotes), (SELECT count(*) FROM leases), (SELECT count(*) FROM node_commands), (SELECT count(*) FROM lease_secrets), (SELECT count(*) FROM lifecycle_outbox), (SELECT count(*) FROM account_wallets WHERE verified_at IS NOT NULL), (SELECT count(*) FROM account_sessions WHERE revoked_at IS NOT NULL), (SELECT count(*) FROM node_certificates), (SELECT count(*) FROM operator_audit_events);")
-[[ $counts == "1|1|1|1|1|1|1|1|1|1|2|5" ]]
+expected_counts="1|1|1|1|1|1|1|1|2|1|2|5"
+if [[ $counts != "$expected_counts" ]]; then
+  echo "unexpected integration row counts: got $counts; expected $expected_counts" >&2
+  exit 1
+fi
 
 kill "$control_pid"
 wait "$control_pid" 2>/dev/null || true
