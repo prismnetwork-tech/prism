@@ -276,6 +276,12 @@ services:
       PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
       PRISM_LIFECYCLE_CONFIRMATIONS: ${PRISM_LIFECYCLE_CONFIRMATIONS:-12}
       PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_VAST_API_KEY_FILE: /run/secrets/vast_api_key
+      PRISM_VAST_DISK_GB: ${PRISM_VAST_DISK_GB:-16}
+      PRISM_VAST_MAX_HOURLY_MICROS: ${PRISM_VAST_MAX_HOURLY_MICROS:-640000}
+      PRISM_VAST_NODE_ID: ${PRISM_VAST_NODE_ID:-}
+    secrets:
+      - vast_api_key
     depends_on:
       access-gateway:
         condition: service_healthy
@@ -312,3 +318,7 @@ volumes:
   proof_data:
   prometheus_data:
   runtime_tls:
+
+secrets:
+  vast_api_key:
+    file: ./secrets/vast-api-key

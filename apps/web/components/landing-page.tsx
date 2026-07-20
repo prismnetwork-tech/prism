@@ -3,9 +3,9 @@ import { HeroSignal } from "@/components/hero-signal";
 
 const executionSteps = [
   ["01", "Fund", "Maximum lease cost is locked in USDG escrow before provisioning."],
-  ["02", "Match", "Compatible independent nodes are ranked by price, performance and reliability."],
-  ["03", "Launch", "The GPU enters an isolated Kata VM-backed workspace with temporary access."],
-  ["04", "Meter", "Billing begins only after CUDA and interactive access are confirmed ready."],
+  ["02", "Match", "Prism selects verified L40S capacity only while the upstream cost stays below its operating ceiling."],
+  ["03", "Launch", "A fresh container-isolated workspace starts with temporary direct SSH access."],
+  ["04", "Meter", "Billing begins only after GPU, cost and access endpoint admission checks pass."],
   ["05", "Settle", "Confirmed runtime becomes an onchain proposal, refund and public receipt."],
 ] as const;
 
@@ -36,11 +36,11 @@ export function LandingPage() {
         <section className="landing-hero">
           <div className="hero-grid">
             <div className="landing-hero-copy">
-              <p className="landing-kicker"><span /> Independent GPU infrastructure</p>
+              <p className="landing-kicker"><span /> L40S cloud beta</p>
               <h1>GPU compute,<br />settled by the second.</h1>
               <p>
-                Prism connects renters to independent NVIDIA capacity through isolated workspaces,
-                metered USDG escrow and a public settlement trail.
+                On-demand NVIDIA L40S workspaces at $0.80 per GPU hour, with metered USDG
+                escrow, temporary access and a public settlement trail.
               </p>
               <div className="landing-actions">
                 <Link className="landing-button primary" href="/compute">Find compute <span>↗</span></Link>
@@ -50,8 +50,8 @@ export function LandingPage() {
             <HeroSignal />
           </div>
           <div className="hero-status" role="status">
-            <span><i /> Private beta</span>
-            <span>Hardware validation in progress</span>
+            <span><i /> L40S canary passed</span>
+            <span>$0.80 / GPU hour</span>
             <span>Robinhood Chain · USDG</span>
           </div>
         </section>
@@ -59,19 +59,19 @@ export function LandingPage() {
         <section className="landing-section network-section" id="network">
           <div className="section-intro">
             <p className="section-index">01 / Network</p>
-            <h2>Direct access.<br />No black-box meter.</h2>
+            <h2>One clear product.<br />One honest boundary.</h2>
             <p>
-              Raw GPU workspaces come first. Batch containers and managed inference build on the
-              same node identity, access and settlement lifecycle.
+              The launch tier brokers verified cloud capacity. Permissionless hardware remains a
+              separate supplier track until its stronger isolation path is ready.
             </p>
           </div>
           <div className="network-panels">
             <article className="network-panel renter-panel">
               <span className="panel-number">R / 01</span>
               <div>
-                <p className="panel-label">Rent compute</p>
-                <h3>Launch an isolated NVIDIA workspace.</h3>
-                <p>Choose a compatible public OCI image, fund the maximum lease and connect through temporary SSH or Jupyter credentials.</p>
+                <p className="panel-label">L40S cloud beta</p>
+                <h3>46 GB of GPU memory at $0.80/hour.</h3>
+                <p>Launch an ephemeral container workspace with temporary direct SSH access. Capacity is offered only while a qualifying host is available.</p>
               </div>
               <Link href="/compute">Explore compute <span>↗</span></Link>
             </article>
@@ -106,28 +106,28 @@ export function LandingPage() {
         <section className="landing-section security-section" id="security">
           <div className="security-visual" aria-hidden="true">
             <div className="security-frame outer-frame">
-              <span>HOST</span>
+              <span>CLOUD HOST</span>
               <div className="security-frame middle-frame">
-                <span>KATA VM</span>
+                <span>CONTAINER</span>
                 <div className="security-frame inner-frame">
                   <span>GPU</span>
-                  <strong>VFIO</strong>
+                  <strong>L40S</strong>
                 </div>
               </div>
             </div>
-            <div className="tunnel-line"><i /><span>OUTBOUND mTLS</span></div>
+            <div className="tunnel-line"><i /><span>TEMPORARY ACCESS</span></div>
           </div>
           <div className="security-copy">
             <p className="section-index">03 / Isolation</p>
-            <h2>Built around a hostile boundary.</h2>
+            <h2>A clean workspace, not confidential compute.</h2>
             <p>
-              Each lease receives exclusive GPU passthrough into a VM-backed container. Supplier
-              addresses stay private, workspace keys are temporary and host egress policy blocks
-              private networks and metadata endpoints.
+              Each cloud lease starts in a fresh container with temporary credentials. Workspace
+              storage is destroyed when the instance closes, but the upstream host remains inside
+              the trust boundary.
             </p>
             <div className="security-disclosure">
               <span>Important boundary</span>
-              <p>Permissionless suppliers are not trusted computing environments. Prism rejects confidential and sensitive workloads until independently attestable confidential-GPU nodes exist.</p>
+              <p>Do not place private keys, production credentials or confidential data in a beta workspace. Container isolation is not hardware-backed confidential computing.</p>
             </div>
           </div>
         </section>
@@ -173,7 +173,7 @@ export function LandingPage() {
           <img src="/brand/prism-logo.svg" alt="" width="30" height="30" />
           <span>prism.</span>
         </Link>
-        <p>Independent GPU infrastructure with metered USDG settlement.</p>
+        <p>On-demand L40S compute with metered USDG settlement.</p>
         <div className="landing-footer-links">
           <Link href="/proof">Proof</Link>
           <Link href="/settings">Settings</Link>
@@ -201,7 +201,7 @@ function SocialLinks() {
       </a>
       <a
         className="landing-social-link"
-        href="https://github.com/prismnetwork-tech/prism"
+        href="https://github.com/prismnetwork-tech"
         target="_blank"
         rel="noopener noreferrer"
         aria-label="Prism on GitHub"

@@ -226,10 +226,17 @@ struct MemoryLifecycle {
     grant_expires_at: Option<chrono::DateTime<Utc>>,
 }
 
-struct StoredLeaseAccess {
-    token: EncryptedSecret,
-    jupyter_token: EncryptedSecret,
-    expires_at: chrono::DateTime<Utc>,
+enum StoredLeaseAccess {
+    Gateway {
+        token: EncryptedSecret,
+        jupyter_token: EncryptedSecret,
+        expires_at: chrono::DateTime<Utc>,
+    },
+    DirectSsh {
+        host: String,
+        port: u16,
+        expires_at: chrono::DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -274,6 +281,8 @@ enum StoreError {
     OperatorTargetNotFound,
     #[error("operator action is invalid for its target")]
     InvalidOperatorAction,
+    #[error("stored state is invalid: {0}")]
+    InvalidStoredState(String),
     #[error("storage failure")]
     Storage(#[source] SqlError),
 }
@@ -2255,9 +2264,16 @@ impl MarketplaceStore {
                            SELECT 1 FROM node_controls c \
                            WHERE c.node_id = o.node_id AND c.suspended \
                        ) \
-                       AND EXISTS ( \
+                       AND (EXISTS ( \
                            SELECT 1 FROM node_tunnels t \
                            WHERE t.node_id = o.node_id AND t.observed_at >= $1 \
+                       ) OR EXISTS ( \
+                           SELECT 1 FROM cloud_capacity cc \
+                           WHERE cc.node_id = o.node_id \
+                             AND cc.provider = 'vast' \
+                             AND cc.available \
+                             AND cc.observed_at >= $1 \
+                       ) \
                        ) \
                      ORDER BY (o.document->>'rate_per_second')::bigint ASC, o.updated_at DESC",
                 )
@@ -2649,7 +2665,7 @@ impl MarketplaceStore {
             encrypted_jupyter_token,
         } = confirmation;
         let now = Utc::now();
-        let lease = LeaseRecord {
+        let mut lease = LeaseRecord {
             lease_id: funding.lease_id,
             quote_id: quote.quote_id,
             node_id: quote.node_id.clone(),
@@ -2762,10 +2778,24 @@ impl MarketplaceStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
+                let cloud_backed = query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM cloud_capacity \
+                         WHERE node_id = $1 AND provider = 'vast' \
+                     )",
+                )
+                .bind(&lease.node_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if cloud_backed {
+                    lease.state = LeaseState::Provisioning;
+                    lease.updated_at = Utc::now();
+                }
                 query(
                     "INSERT INTO leases \
                          (lease_id, quote_id, subject, renter_wallet, funding_transaction_hash, document, state) \
-                     VALUES ($1, $2, $3, $4, $5, $6, 'funded')",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
                 .bind(lease.lease_id as i64)
                 .bind(quote.quote_id)
@@ -2773,6 +2803,7 @@ impl MarketplaceStore {
                 .bind(&lease.renter_wallet)
                 .bind(&lease.funding_transaction_hash)
                 .bind(SqlJson(lease.clone()))
+                .bind(lease_state_name(&lease.state))
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
@@ -2784,7 +2815,7 @@ impl MarketplaceStore {
                     .map_err(StoreError::Storage)?;
                 query(
                     "INSERT INTO lease_lifecycle (lease_id, connection_id) \
-                     SELECT $1, connection_id FROM node_tunnels WHERE node_id = $2 \
+                     VALUES ($1, (SELECT connection_id FROM node_tunnels WHERE node_id = $2)) \
                      ON CONFLICT (lease_id) DO NOTHING",
                 )
                 .bind(lease.lease_id as i64)
@@ -2792,19 +2823,42 @@ impl MarketplaceStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
-                let command = launch_command(&lease, ssh_authorized_key, jupyter_token);
-                query(
-                    "INSERT INTO node_commands \
-                         (command_id, node_id, lease_id, document, status) \
-                     VALUES ($1, $2, $3, $4, 'queued')",
-                )
-                .bind(command.command_id)
-                .bind(&command.node_id)
-                .bind(command.lease_id as i64)
-                .bind(SqlJson(command.clone()))
-                .execute(&mut *transaction)
-                .await
-                .map_err(StoreError::Storage)?;
+                if cloud_backed {
+                    query(
+                        "INSERT INTO cloud_instances (lease_id, ssh_authorized_key) \
+                         VALUES ($1, $2)",
+                    )
+                    .bind(lease.lease_id as i64)
+                    .bind(ssh_authorized_key)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                    query(
+                        "INSERT INTO lifecycle_outbox \
+                             (action_id, lease_id, kind, available_at) \
+                         VALUES ($1, $2, 'start_access', NOW()) \
+                         ON CONFLICT (lease_id, kind) DO NOTHING",
+                    )
+                    .bind(Uuid::now_v7())
+                    .bind(lease.lease_id as i64)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                } else {
+                    let command = launch_command(&lease, ssh_authorized_key, jupyter_token);
+                    query(
+                        "INSERT INTO node_commands \
+                             (command_id, node_id, lease_id, document, status) \
+                         VALUES ($1, $2, $3, $4, 'queued')",
+                    )
+                    .bind(command.command_id)
+                    .bind(&command.node_id)
+                    .bind(command.lease_id as i64)
+                    .bind(SqlJson(command.clone()))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                }
                 transaction.commit().await.map_err(StoreError::Storage)?;
                 Ok(lease)
             }
@@ -3031,13 +3085,39 @@ impl MarketplaceStore {
                 ) else {
                     return Ok(None);
                 };
-                Ok(Some(StoredLeaseAccess {
+                Ok(Some(StoredLeaseAccess::Gateway {
                     token,
                     jupyter_token,
                     expires_at,
                 }))
             }
             Self::Postgres(pool) => {
+                let direct = query_as::<_, (String, i32, chrono::DateTime<Utc>)>(
+                    "SELECT ci.ssh_host, ci.ssh_port, \
+                            lc.access_started_at + make_interval(secs => (l.document->>'duration_seconds')::integer) \
+                     FROM leases l \
+                     JOIN lease_lifecycle lc ON lc.lease_id = l.lease_id \
+                     JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
+                     WHERE l.lease_id = $1 AND l.subject = $2 AND l.state = 'active' \
+                       AND ci.status = 'running' \
+                       AND ci.ssh_host IS NOT NULL AND ci.ssh_port IS NOT NULL \
+                       AND lc.access_started_at IS NOT NULL \
+                       AND lc.access_started_at + make_interval(secs => (l.document->>'duration_seconds')::integer) > NOW()",
+                )
+                .bind(lease_id as i64)
+                .bind(subject)
+                .fetch_optional(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                if let Some((host, port, expires_at)) = direct {
+                    return Ok(Some(StoredLeaseAccess::DirectSsh {
+                        host,
+                        port: u16::try_from(port).map_err(|_| {
+                            StoreError::InvalidStoredState("invalid SSH port".into())
+                        })?,
+                        expires_at,
+                    }));
+                }
                 let stored = query_as::<
                     _,
                     (
@@ -3061,7 +3141,7 @@ impl MarketplaceStore {
                 .map_err(StoreError::Storage)?;
                 Ok(
                     stored.map(|(SqlJson(token), SqlJson(jupyter_token), expires_at)| {
-                        StoredLeaseAccess {
+                        StoredLeaseAccess::Gateway {
                             token,
                             jupyter_token,
                             expires_at,
@@ -3862,27 +3942,42 @@ async fn get_lease_access(
         .ok_or_else(|| {
             not_found(
                 "access_not_ready",
-                "lease access is unavailable until gateway readiness and onchain start are final",
+                "lease access is unavailable until provider readiness and onchain start are final",
             )
         })?;
-    let token = state
-        .credential_cipher
-        .decrypt(&stored.token)
-        .map_err(|_| credential_error())?;
-    let jupyter_token = state
-        .credential_cipher
-        .decrypt(&stored.jupyter_token)
-        .map_err(|_| credential_error())?;
-    Ok(Json(LeaseAccess {
-        lease_id,
-        token,
-        gateway_host: state.public_gateway_host.as_ref().clone(),
-        relay_port: state.public_relay_port,
-        ssh_user: "workspace".to_owned(),
-        jupyter_path: "/lab".to_owned(),
-        jupyter_token,
-        expires_at: stored.expires_at,
-    }))
+    match stored {
+        StoredLeaseAccess::Gateway {
+            token,
+            jupyter_token,
+            expires_at,
+        } => Ok(Json(LeaseAccess::Gateway {
+            lease_id,
+            token: state
+                .credential_cipher
+                .decrypt(&token)
+                .map_err(|_| credential_error())?,
+            gateway_host: state.public_gateway_host.as_ref().clone(),
+            relay_port: state.public_relay_port,
+            ssh_user: "workspace".to_owned(),
+            jupyter_path: "/lab".to_owned(),
+            jupyter_token: state
+                .credential_cipher
+                .decrypt(&jupyter_token)
+                .map_err(|_| credential_error())?,
+            expires_at,
+        })),
+        StoredLeaseAccess::DirectSsh {
+            host,
+            port,
+            expires_at,
+        } => Ok(Json(LeaseAccess::DirectSsh {
+            lease_id,
+            ssh_host: host,
+            ssh_port: port,
+            ssh_user: "root".to_owned(),
+            expires_at,
+        })),
+    }
 }
 
 async fn confirm_lease(
@@ -4002,6 +4097,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("operational controls"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0006_operations.sql")),
+                false,
+            ),
+            Migration::new(
+                7,
+                Cow::Borrowed("cloud broker"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0007_cloud_broker.sql")),
                 false,
             ),
         ]),
@@ -4335,6 +4437,10 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
             "invalid_operator_action",
             "operator action is invalid for the requested target state",
         ),
+        StoreError::InvalidStoredState(message) => {
+            tracing::error!(%message, "invalid stored marketplace state");
+            internal_error(StoreError::InvalidStoredState(message))
+        }
         StoreError::Storage(error) => internal_error(StoreError::Storage(error)),
     }
 }

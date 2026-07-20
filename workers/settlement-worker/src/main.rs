@@ -9,8 +9,8 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use prism_chain::EthereumSigner;
 use prism_protocol::{
-    PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, SettlementEvidence, node_id, receipt_hash,
-    verifying_key,
+    ExecutionEvidence, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, SettlementEvidence,
+    node_id, receipt_hash, verifying_key,
 };
 use rlp::RlpStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -462,7 +462,7 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
     {
         anyhow::bail!("lease {} has an invalid metering window", evidence.lease_id);
     }
-    validate_telemetry(evidence, start, end)?;
+    validate_execution_evidence(evidence, start, end)?;
     let maximum_by_deposit = evidence.deposit_base_units / evidence.rate_per_second;
     let usage_seconds = end
         .saturating_sub(start)
@@ -507,16 +507,41 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
     })
 }
 
-fn validate_telemetry(evidence: &SettlementEvidence, start: u64, end: u64) -> anyhow::Result<()> {
+fn validate_execution_evidence(
+    evidence: &SettlementEvidence,
+    start: u64,
+    end: u64,
+) -> anyhow::Result<()> {
+    let key = verifying_key(&evidence.device_public_key)?;
+    if node_id(&key) != evidence.node_id {
+        anyhow::bail!("lease {} node identity does not match", evidence.lease_id);
+    }
+    if let ExecutionEvidence::Vast {
+        instance_id,
+        hourly_cost_micros,
+    } = &evidence.execution
+    {
+        let retail_hourly = evidence
+            .rate_per_second
+            .checked_mul(3_600)
+            .context("cloud retail rate overflow")?;
+        if *instance_id == 0
+            || *hourly_cost_micros == 0
+            || *hourly_cost_micros >= retail_hourly
+            || !evidence.node_telemetry.is_empty()
+        {
+            anyhow::bail!(
+                "lease {} has invalid Vast execution evidence",
+                evidence.lease_id
+            );
+        }
+        return Ok(());
+    }
     if evidence.node_telemetry.is_empty() || evidence.node_telemetry.len() > 10_000 {
         anyhow::bail!(
             "lease {} has no bounded telemetry evidence",
             evidence.lease_id
         );
-    }
-    let key = verifying_key(&evidence.device_public_key)?;
-    if node_id(&key) != evidence.node_id {
-        anyhow::bail!("lease {} node identity does not match", evidence.lease_id);
     }
     let lease_id = evidence.lease_id.to_string();
     let mut previous_sequence = None;
@@ -967,6 +992,7 @@ mod tests {
             cuda_ready_at: 10,
             interactive_access_ready_at: 20,
             gateway_closed_at: 100,
+            execution: ExecutionEvidence::Physical,
             node_telemetry: telemetry,
         }
     }
@@ -977,6 +1003,23 @@ mod tests {
         assert_eq!(proposal.usage_seconds, 80);
         assert_eq!(proposal.lease_id, 1);
         assert!(bytes32(&proposal.receipt_hash).is_ok());
+    }
+
+    #[test]
+    fn cloud_reconciliation_uses_explicit_profitable_provider_evidence() {
+        let mut evidence = evidence();
+        evidence.execution = ExecutionEvidence::Vast {
+            instance_id: 42,
+            hourly_cost_micros: 600_000,
+        };
+        evidence.node_telemetry.clear();
+        assert_eq!(reconcile(&evidence).unwrap().usage_seconds, 80);
+
+        evidence.execution = ExecutionEvidence::Vast {
+            instance_id: 42,
+            hourly_cost_micros: 3_600_000,
+        };
+        assert!(reconcile(&evidence).is_err());
     }
 
     #[test]
