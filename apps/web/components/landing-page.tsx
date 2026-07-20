@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { HeroSignal } from "@/components/hero-signal";
+import { docsUrl } from "@/lib/site";
 
 const executionSteps = [
   ["01", "Fund", "Maximum lease cost is locked in USDG escrow before provisioning."],
@@ -22,6 +23,7 @@ export function LandingPage() {
           <a href="#security">Security</a>
           <a href="#settlement">Settlement</a>
           <Link href="/proof">Proof</Link>
+          <Link href={docsUrl}>Docs</Link>
         </nav>
         <div className="landing-header-actions">
           <SocialLinks />
@@ -50,7 +52,7 @@ export function LandingPage() {
             <HeroSignal />
           </div>
           <div className="hero-status" role="status">
-            <span><i /> L40S canary passed</span>
+            <span><i /> Mainnet canary pending</span>
             <span>$0.80 / GPU hour</span>
             <span>Robinhood Chain · USDG</span>
           </div>
@@ -176,6 +178,9 @@ export function LandingPage() {
         <p>On-demand L40S compute with metered USDG settlement.</p>
         <div className="landing-footer-links">
           <Link href="/proof">Proof</Link>
+          <Link href={docsUrl}>Docs</Link>
+          <Link href="/privacy">Privacy</Link>
+          <Link href="/terms">Terms</Link>
           <Link href="/settings">Settings</Link>
           <span>Private beta</span>
           <SocialLinks />

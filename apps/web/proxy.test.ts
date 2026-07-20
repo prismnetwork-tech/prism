@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { contentSecurityPolicy } from "./proxy";
+import { contentSecurityPolicy, publicPageRewrite } from "./proxy";
 
 describe("content security policy", () => {
   it("uses a nonce without allowing inline production scripts", () => {
@@ -17,5 +17,11 @@ describe("content security policy", () => {
 
   it("allows eval only for the development runtime", () => {
     expect(contentSecurityPolicy("abc123", true)).toContain("'unsafe-eval'");
+  });
+
+  it("serves documentation at the docs subdomain root", () => {
+    expect(publicPageRewrite("docs.prismnetwork.tech", "/")).toBe("/docs");
+    expect(publicPageRewrite("docs.prismnetwork.tech", "/api/healthz")).toBeNull();
+    expect(publicPageRewrite("prismnetwork.tech", "/")).toBeNull();
   });
 });

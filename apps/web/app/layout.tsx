@@ -4,6 +4,8 @@ import { Providers } from "@/components/providers";
 import { siteUrl } from "@/lib/site";
 import "./globals.css";
 import "./landing.css";
+import "./docs.css";
+import "./legal.css";
 
 export const dynamic = "force-dynamic";
 
