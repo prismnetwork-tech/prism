@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { createWalletClient, custom, encodeFunctionData, keccak256, toBytes, type EIP1193Provider, type Hex } from "viem";
+import { encodeFunctionData, keccak256, toBytes, type Address, type Hex } from "viem";
 import { usePrismAuth, useSmartWallet } from "@/components/providers";
 import { escrowAbi, escrowAddress, robinhoodChain, usdgAbi, usdgAddress } from "@/lib/chain";
 
@@ -29,6 +29,7 @@ export function ComputeWorkspace() {
   const [sshKey, setSshKey] = useState("");
   const [offers, setOffers] = useState<MarketplaceOffer[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [fundingAddress, setFundingAddress] = useState<Address | null>(null);
   const [loadingOffers, setLoadingOffers] = useState(true);
   const [offerError, setOfferError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -57,6 +58,18 @@ export function ComputeWorkspace() {
       .finally(() => setLoadingOffers(false));
     return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    if (!auth.authenticated) {
+      setFundingAddress(null);
+      return;
+    }
+    setFundingAddress((current) => (
+      auth.accounts.some((account) => account.address === current)
+        ? current
+        : auth.embeddedAddress ?? auth.accounts[0]?.address ?? null
+    ));
+  }, [auth.accounts, auth.authenticated, auth.embeddedAddress]);
 
   async function fundEscrow() {
     if (!auth.authenticated) {
@@ -107,26 +120,13 @@ export function ComputeWorkspace() {
           }),
         },
       ] as const;
-      if (auth.authenticated && auth.embeddedAddress) {
-        const result = await smartWallet.executeCalls([...calls]);
-        await confirmLease(lease.quote_id, result.transactionHash, sshKey.trim());
-        setNotice(`Lease funded and indexed: ${result.transactionHash.slice(0, 10)}…`);
+      if (!fundingAddress) {
+        setNotice("Connect a funding wallet before launching compute.");
         return;
       }
-      const ethereum = window.ethereum as EIP1193Provider | undefined;
-      if (!ethereum) {
-        setNotice("Sign in with Prism or connect an EVM wallet to fund this lease.");
-        return;
-      }
-      const accounts = (await ethereum.request({ method: "eth_requestAccounts" })) as `0x${string}`[];
-      const account = accounts[0];
-      if (!account) throw new Error("No wallet account was returned.");
-      await ensureChain(ethereum);
-      const client = createWalletClient({ account, chain: robinhoodChain, transport: custom(ethereum) });
-      await client.sendTransaction({ to: calls[0].to, data: calls[0].data });
-      const transactionHash = await client.sendTransaction({ to: calls[1].to, data: calls[1].data });
-      await confirmLease(lease.quote_id, transactionHash, sshKey.trim());
-      setNotice(`Lease funded and indexed: ${transactionHash.slice(0, 10)}…`);
+      const result = await smartWallet.executeCalls([...calls], fundingAddress);
+      await confirmLease(lease.quote_id, result.transactionHash, sshKey.trim());
+      setNotice(`Lease funded and indexed: ${result.transactionHash.slice(0, 10)}…`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Wallet transaction was not completed.");
     }
@@ -192,11 +192,34 @@ export function ComputeWorkspace() {
               </select>
             </label>
           )}
+          {auth.authenticated && (
+            <label>
+              Funding wallet
+              <select
+                value={fundingAddress ?? ""}
+                onChange={(event) => setFundingAddress(event.target.value as Address)}
+                disabled={!auth.accounts.length || smartWallet.pending}
+              >
+                {!auth.accounts.length && <option value="">No connected wallet</option>}
+                {auth.accounts.map((account) => (
+                  <option value={account.address} key={account.address}>
+                    {account.label} · {account.address.slice(0, 6)}…{account.address.slice(-4)}
+                  </option>
+                ))}
+              </select>
+              <small>The selected wallet must hold enough USDG for escrow and ETH for Robinhood Chain gas.</small>
+            </label>
+          )}
           <div className="safety-note">
             <strong>Workspace boundary</strong>
             <span>Node providers are independent. Do not use this service for confidential data or credentials.</span>
           </div>
-          <button className="button primary full" type="submit" disabled={!offer || !auth.configured || loadingOffers || smartWallet.pending}>
+          <button
+            className="button primary full"
+            type={auth.authenticated ? "submit" : "button"}
+            disabled={!offer || !auth.configured || loadingOffers || smartWallet.pending}
+            onClick={!auth.authenticated && auth.configured ? auth.login : undefined}
+          >
             {launchLabel}
           </button>
           {offerError && <p className="form-notice" role="status">{offerError}</p>}
@@ -236,8 +259,13 @@ async function requestMatch(
     body: JSON.stringify({ request: { image, duration_seconds, min_vram_mib, preferred_node_id } }),
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { error?: unknown } | null;
-    throw new Error(typeof payload?.error === "string" ? payload.error.replaceAll("_", " ") : "No compatible GPU is available.");
+    const payload = await response.json().catch(() => null) as { error?: unknown; message?: unknown } | null;
+    const message = typeof payload?.message === "string"
+      ? payload.message
+      : typeof payload?.error === "string"
+        ? payload.error.replaceAll("_", " ")
+        : "No compatible GPU is available.";
+    throw new Error(message);
   }
   const payload: unknown = await response.json();
   if (!isLeaseQuote(payload)) throw new Error("The match response was invalid.");
@@ -321,24 +349,4 @@ function formatVram(vramMib: number) {
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
-async function ensureChain(provider: EIP1193Provider) {
-  const chainId = `0x${robinhoodChain.id.toString(16)}`;
-  try {
-    await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
-  } catch (error) {
-    const code = typeof error === "object" && error && "code" in error ? Number(error.code) : null;
-    if (code !== 4902) throw error;
-    await provider.request({
-      method: "wallet_addEthereumChain",
-      params: [{
-        chainId,
-        chainName: robinhoodChain.name,
-        nativeCurrency: robinhoodChain.nativeCurrency,
-        rpcUrls: robinhoodChain.rpcUrls.default.http,
-        blockExplorerUrls: [robinhoodChain.blockExplorers.default.url],
-      }],
-    });
-  }
 }
