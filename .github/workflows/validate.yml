@@ -41,8 +41,14 @@ jobs:
       - run: cargo install cargo-audit --locked --version 0.22.1
       - run: ./scripts/validate.sh
         env:
-          PRISM_ALLOWED_GIT_EMAIL: opensource@prismnetwork.tech
-          PRISM_ALLOWED_GIT_NAME: Prism Network
+          PRISM_ALLOWED_GIT_EMAILS: |-
+            opensource@prismnetwork.tech
+            dev@prismnetwork.tech
+            noreply@github.com
+          PRISM_ALLOWED_GIT_NAMES: |-
+            Prism Network
+            useprismnetwork
+            GitHub
       - name: Validate Terraform
         run: |
           docker run --rm -v "$PWD/infra/terraform:/workspace" -w /workspace hashicorp/terraform:1.10@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28 init -backend=false -input=false
