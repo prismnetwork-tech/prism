@@ -11,9 +11,9 @@
 - The scheduler accepts only bounded, digest-pinned public-image requests.
 - Access grants expire after at most one hour and can be revoked in the grant
   store.
-- The lifecycle and settlement workers use non-exportable secp256k1 KMS keys
-  for gateway transactions, EIP-712 metering attestations and settlement
-  transactions.
+- The production worker configuration requires non-exportable secp256k1 KMS
+  keys for gateway transactions, EIP-712 metering attestations and settlement
+  transactions. Live KMS signing remains a release gate.
 
 ## Release-gated controls
 
@@ -43,9 +43,11 @@ hosts. Kata reduces the renter-to-host attack surface; it does not provide a
 confidential-computing guarantee. Do not run secrets, regulated data, private
 datasets or valuable model weights on the initial network.
 
-The contracts are not deployed or independently audited. A production
-deployment must verify the checked-in source and constructor inputs against the
-deployed bytecode. Emergency pause is available to the administration Safe.
+The contracts are deployed and paused on Robinhood Chain. They are not
+source-verified on the explorer or independently audited. Before unpausing,
+operators must verify the checked-in source, constructor inputs and runtime
+bytecode against the deployment. Emergency pause is available to the
+administration Safe.
 
 ## Required operational controls
 
@@ -56,4 +58,5 @@ deployed bytecode. Emergency pause is available to the administration Safe.
 - Ordinary availability incidents affect reputation, not automatic slashing.
 - Proof and X publication must remain separate from settlement so an X API
   failure cannot delay settlement or refunds. Durable database outboxes enforce
-  this separation, but the production services are not deployed yet.
+  this separation, but a production proof receipt and X digest have not been
+  published yet.
