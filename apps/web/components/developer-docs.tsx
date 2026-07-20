@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { siteUrl } from "@/lib/site";
 
 const sections = [
   ["overview", "Overview"],
@@ -97,14 +98,14 @@ export function DeveloperDocs() {
   return (
     <div className="docs-page">
       <header className="docs-header">
-        <Link className="landing-brand" href="/" aria-label="prism. home">
+        <Link className="landing-brand" href={siteUrl} aria-label="prism. home">
           <img src="/brand/prism-logo.svg" alt="" width="32" height="32" />
           <span>prism.</span>
         </Link>
         <nav aria-label="Documentation header">
           <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
-          <Link href="/proof">Proof</Link>
-          <Link className="docs-console-link" href="/compute">Open console ↗</Link>
+          <Link href={new URL("/proof", siteUrl)}>Proof</Link>
+          <Link className="docs-console-link" href={new URL("/compute", siteUrl)}>Open console ↗</Link>
         </nav>
       </header>
 
@@ -427,9 +428,9 @@ export function DeveloperDocs() {
               <p>Source-aligned reference for the current beta protocol.</p>
             </div>
             <nav aria-label="Documentation footer">
-              <Link href="/">Home</Link>
-              <Link href="/compute">Console</Link>
-              <Link href="/proof">Proof</Link>
+              <Link href={siteUrl}>Home</Link>
+              <Link href={new URL("/compute", siteUrl)}>Console</Link>
+              <Link href={new URL("/proof", siteUrl)}>Proof</Link>
               <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">Source ↗</a>
             </nav>
           </footer>
