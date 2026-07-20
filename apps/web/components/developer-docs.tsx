@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { PublicFooter } from "@/components/public-footer";
 import { siteUrl } from "@/lib/site";
 
 const sections = [
@@ -98,14 +99,14 @@ export function DeveloperDocs() {
   return (
     <div className="docs-page">
       <header className="docs-header">
-        <Link className="landing-brand" href={siteUrl} aria-label="prism. home">
+        <Link className="landing-brand" href={siteUrl.href} aria-label="prism. home">
           <img src="/brand/prism-logo.svg" alt="" width="32" height="32" />
           <span>prism.</span>
         </Link>
         <nav aria-label="Documentation header">
           <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
-          <Link href={new URL("/proof", siteUrl)}>Proof</Link>
-          <Link className="docs-console-link" href={new URL("/compute", siteUrl)}>Open console ↗</Link>
+          <Link href={new URL("/proof", siteUrl).href}>Proof</Link>
+          <Link className="docs-console-link" href={new URL("/compute", siteUrl).href}>Open console ↗</Link>
         </nav>
       </header>
 
@@ -422,20 +423,9 @@ export function DeveloperDocs() {
             </ul>
           </DocsSection>
 
-          <footer className="docs-footer">
-            <div>
-              <strong>Prism Network developer documentation</strong>
-              <p>Source-aligned reference for the current beta protocol.</p>
-            </div>
-            <nav aria-label="Documentation footer">
-              <Link href={siteUrl}>Home</Link>
-              <Link href={new URL("/compute", siteUrl)}>Console</Link>
-              <Link href={new URL("/proof", siteUrl)}>Proof</Link>
-              <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">Source ↗</a>
-            </nav>
-          </footer>
         </main>
       </div>
+      <PublicFooter />
     </div>
   );
 }
