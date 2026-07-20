@@ -28,15 +28,15 @@ const contracts = [
 
 const states = [
   ["funded", "Escrow event confirmed and associated with a five-minute quote."],
-  ["provisioning", "Provider allocation or signed physical-node launch is in progress."],
+  ["provisioning", "Capacity assignment and workspace provisioning are in progress."],
   ["ready", "GPU and access admission checks passed; access start is pending finality."],
   ["active", "Billable access is available to the authenticated renter."],
   ["closing", "Credentials are revoked and the runtime is being destroyed."],
   ["settlement_pending", "Usage evidence has produced an onchain settlement proposal."],
   ["disputed", "Finalization is blocked pending Safe-controlled resolution."],
-  ["finalized", "Provider payment, platform fee, and renter refund are terminal."],
+  ["finalized", "Provider payment, platform fee, and renter refund are complete."],
   ["refunded", "The lease ended without a provider charge."],
-  ["failed", "Provisioning failed before a terminal onchain transition was indexed."],
+  ["failed", "Provisioning failed before a final onchain transition was recorded."],
 ] as const;
 
 const errors = [
@@ -48,7 +48,7 @@ const errors = [
   ["413", "request_too_large", "The application API body exceeds 256 KiB."],
   ["415", "unsupported_media_type", "A mutation was not submitted as application/json."],
   ["429", "rate_limited", "The same-origin API budget was exceeded; honor Retry-After."],
-  ["503", "service_unavailable", "An identity, rate-limit, control-plane, or upstream dependency is unavailable."],
+  ["503", "service_unavailable", "A required identity, rate-limit, orchestration, or provider service is unavailable."],
 ] as const;
 
 const quoteExample = `{
@@ -150,8 +150,8 @@ export function DeveloperDocs() {
             <p>
               The public web application is the identity boundary. It verifies Privy access
               tokens, establishes an HTTP-only same-origin session, rate-limits requests, and
-              signs internal control-plane identity assertions. Browsers never receive the
-              control-plane HMAC key, settlement keys, device keys, or Vast credentials.
+              signs service-to-service identity assertions. Browsers never receive orchestration
+              signing keys, settlement keys, device keys, or provider credentials.
             </p>
             <div className="architecture-flow" aria-label="Prism request architecture">
               <FlowNode label="Browser" detail="Privy + wallet" />
@@ -159,21 +159,21 @@ export function DeveloperDocs() {
               <FlowNode label="Web boundary" detail="Session + rate limit" />
               <FlowArrow label="Signed identity" />
               <FlowNode label="Control plane" detail="Quote + lifecycle state" />
-              <FlowArrow label="Durable jobs" />
+              <FlowArrow label="Asynchronous processing" />
               <FlowNode label="Workers" detail="Provider + chain" />
             </div>
             <div className="docs-grid two">
               <InfoCard title="Data plane">
-                <p>Cloud beta leases receive a direct Vast SSH endpoint. Physical-node leases use revocable gateway grants over outbound mTLS tunnels.</p>
+                <p>Managed cloud leases receive a temporary direct SSH endpoint. Operator-owned infrastructure uses revocable gateway grants over outbound mTLS tunnels.</p>
               </InfoCard>
               <InfoCard title="Control plane">
-                <p>PostgreSQL is authoritative for accounts, quotes, provider instances, transaction outboxes, lease transitions, and proof publication jobs.</p>
+                <p>PostgreSQL is the system of record for accounts, quotes, provider instances, lease transitions, settlement transactions, and proof publication.</p>
               </InfoCard>
               <InfoCard title="Settlement plane">
                 <p>Robinhood Chain contracts enforce escrow limits, active-lease bounds, dispute timing, provider payment, platform fees, and refunds.</p>
               </InfoCard>
               <InfoCard title="Governance plane">
-                <p>A two-owner Safe controls routine changes through a 48-hour timelock. Emergency pause and dispute resolution remain immediate Safe actions.</p>
+                <p>The Governance Safe routes routine configuration changes through a 48-hour timelock. Emergency pause and dispute resolution remain immediate Safe actions.</p>
               </InfoCard>
             </div>
           </DocsSection>
@@ -186,7 +186,7 @@ export function DeveloperDocs() {
               <li><span>04</span><div><h3>Quote and fund</h3><p>Request a five-minute quote, approve the exact maximum USDG amount, and call <code>createLease</code> with the quote-derived reference.</p></div></li>
               <li><span>05</span><div><h3>Confirm and connect</h3><p>Confirm the finalized funding transaction, poll the lease until active, retrieve access, verify the host key, and connect over SSH.</p></div></li>
             </ol>
-            <Callout kind="warning" title="Beta workload boundary">
+            <Callout kind="warning" title="Data classification">
               Do not place private keys, production credentials, regulated data, confidential
               datasets, or valuable model weights inside a beta workspace. Provider operators
               remain within the trust boundary.
@@ -210,17 +210,17 @@ export function DeveloperDocs() {
                 </ul>
               </InfoCard>
               <InfoCard title="Server-to-server clients">
-                <p>A public API-key product is not currently issued. Do not automate by copying browser cookies or reproducing internal identity headers. Dedicated service credentials require a separate supported integration.</p>
+                <p>Programmatic access is available through managed integrations. Browser cookies and browser identity assertions are not supported as service credentials.</p>
               </InfoCard>
             </div>
-            <Callout kind="note" title="Internal headers are not an API">
+            <Callout kind="note" title="Service authentication">
               <code>X-Prism-Subject</code>, <code>X-Prism-Session-Id</code>, timestamp, and
-              signature headers are generated only by the web identity boundary. Treat them as
-              private protocol internals.
+              signature headers are generated by Prism&apos;s web identity service. They are
+              service-to-service credentials, not a supported integration interface.
             </Callout>
           </DocsSection>
 
-          <DocsSection id="api" index="04" eyebrow="Same-origin application API" title="HTTP API">
+          <DocsSection id="api" index="04" eyebrow="Web application API" title="HTTP API">
             <p>
               Browser integrations use <code>https://prismnetwork.tech/api/app</code>. Responses
               are JSON, never cached, and include <code>X-Request-Id</code>. Mutation bodies must
@@ -263,11 +263,11 @@ export function DeveloperDocs() {
             <CodeBlock label="POST /api/app/leases/confirm" code={confirmExample} />
             <Callout kind="note" title="Approval policy">
               Approve only the quoted maximum. Prism does not require an unlimited USDG allowance.
-              Unused escrow is returned during terminal settlement or refund.
+              Unused escrow is returned during final settlement or refund.
             </Callout>
           </DocsSection>
 
-          <DocsSection id="lifecycle" index="06" eyebrow="Durable state machine" title="Lease lifecycle">
+          <DocsSection id="lifecycle" index="06" eyebrow="State model" title="Lease lifecycle">
             <div className="state-list">
               {states.map(([state, description]) => (
                 <div key={state}><code>{state}</code><p>{description}</p></div>
@@ -276,20 +276,20 @@ export function DeveloperDocs() {
             <p>
               Transitions are idempotent and persisted before external side effects. Provider
               instance IDs, chain transaction bytes, nonces, hashes, confirmation blocks, and
-              terminal evidence survive worker restarts. A ten-minute provision timeout is the
+              final-state evidence survive worker restarts. A ten-minute provision timeout is the
               refund boundary for leases that never reach billable access.
             </p>
           </DocsSection>
 
           <DocsSection id="runtime" index="07" eyebrow="Execution environments" title="Runtime modes">
             <div className="runtime-table">
-              <div className="runtime-head"><span>Property</span><span>Cloud beta</span><span>Physical supplier track</span></div>
-              <RuntimeRow label="Capacity" cloud="Verified Vast L40S below cost ceiling" physical="Bonded operator-owned NVIDIA host" />
+              <div className="runtime-head"><span>Property</span><span>Managed L40S</span><span>Operator-owned infrastructure</span></div>
+              <RuntimeRow label="Capacity" cloud="Managed NVIDIA L40S capacity" physical="Bonded operator-owned NVIDIA host" />
               <RuntimeRow label="Isolation" cloud="Disposable provider container" physical="Kata sandbox with VFIO GPU assignment" />
               <RuntimeRow label="Access" cloud="Temporary direct root SSH" physical="Revocable SSH/Jupyter grant via mTLS gateway" />
               <RuntimeRow label="Readiness" cloud="Provider state, GPU, VRAM, cost, SSH endpoint" physical="Signed telemetry plus independent active gateway probes" />
               <RuntimeRow label="Evidence" cloud="Provider instance and hourly cost" physical="Device-signed telemetry and gateway timing" />
-              <RuntimeRow label="Launch status" cloud="Initial L40S product path" physical="Release-gated pending hardware matrix" />
+              <RuntimeRow label="Availability" cloud="Limited beta" physical="Planned; not available for production leases" />
             </div>
             <h3 className="docs-subheading">Container requirements</h3>
             <ul className="docs-list">
@@ -330,8 +330,8 @@ export function DeveloperDocs() {
 
           <DocsSection id="settlement" index="09" eyebrow="Usage accounting" title="Settlement and proof">
             <p>
-              Billing begins only after the configured gateway authority confirms runtime and
-              access readiness onchain. Closing revokes access first, destroys the execution
+              Billing begins only after Prism confirms runtime and access readiness onchain.
+              Closing revokes access first, destroys the execution
               environment, and then assembles bounded usage evidence.
             </p>
             <ol className="docs-steps compact">
@@ -339,12 +339,12 @@ export function DeveloperDocs() {
               <li><span>02</span><div><h3>Propose</h3><p>Submit an EIP-712 settlement carrying usage seconds, receipt hash, nonce, and deadline.</p></div></li>
               <li><span>03</span><div><h3>Dispute</h3><p>Hold finalization for 24 hours. A renter can dispute; the governance Safe resolves disputed outcomes.</p></div></li>
               <li><span>04</span><div><h3>Finalize</h3><p>Pay 90% of the charge to the provider, route the 10% platform fee, and refund unused escrow.</p></div></li>
-              <li><span>05</span><div><h3>Publish</h3><p>Verify the terminal chain event and expose a sanitized, canonical receipt in the public proof feed.</p></div></li>
+              <li><span>05</span><div><h3>Publish</h3><p>Verify the final chain event and expose a sanitized, canonical receipt in the public proof feed.</p></div></li>
             </ol>
             <p>
               Public receipts omit renter/provider wallet addresses, precise geography, image
               digests, terminal output, files, and private telemetry. Proof establishes a
-              platform-attested usage record paired with an onchain terminal event; it does not
+              platform-attested usage record paired with a final onchain event; it does not
               prove faithful workload execution or confidential computing.
             </p>
           </DocsSection>
@@ -359,15 +359,15 @@ export function DeveloperDocs() {
                   <li>50 USDG and six-hour contract limits.</li>
                   <li>Device signature, freshness, and replay checks.</li>
                   <li>Encrypted stored access credentials.</li>
-                  <li>Durable chain outboxes with reorg-aware confirmation.</li>
+                  <li>Replay-safe chain submissions with reorg-aware confirmation.</li>
                 </ul>
               </InfoCard>
-              <InfoCard title="Not guaranteed">
+              <InfoCard title="Excluded protections">
                 <ul>
                   <li>Host confidentiality or trusted execution.</li>
                   <li>Protection from a malicious provider operator.</li>
                   <li>Durable workspace storage.</li>
-                  <li>Uninterrupted upstream provider availability.</li>
+                  <li>Uninterrupted infrastructure-provider availability.</li>
                   <li>Independent smart-contract assurance.</li>
                   <li>Faithful execution of arbitrary renter workloads.</li>
                 </ul>
@@ -386,28 +386,28 @@ export function DeveloperDocs() {
           <DocsSection id="operations" index="11" eyebrow="Production behavior" title="Operations">
             <div className="docs-grid two">
               <InfoCard title="Idempotency and recovery">
-                <p>Provider launches reconcile by a unique lease label. Chain submissions persist signed bytes before broadcast. Workers retry from durable state and refuse conflicting terminal transitions.</p>
+                <p>Provider launches reconcile by a unique lease label. Chain submissions persist signed bytes before broadcast. Workers retry from persisted state and reject conflicting final-state transitions.</p>
               </InfoCard>
               <InfoCard title="Capacity admission">
-                <p>The cloud broker advertises one concurrent L40S only while a verified, rentable offer satisfies model, VRAM, reliability, and upstream hourly-cost bounds.</p>
+                <p>Prism publishes an L40S offer only when available capacity satisfies model, VRAM, reliability, and pricing requirements.</p>
               </InfoCard>
               <InfoCard title="Failure containment">
-                <p>Provision failures close or refund rather than starting billing. Destruction is retried before terminal settlement. Emergency pause blocks new leases without blocking existing refunds.</p>
+                <p>Provision failures close or refund rather than starting billing. Destruction is retried before final settlement. Emergency pause blocks new leases without blocking existing refunds.</p>
               </InfoCard>
               <InfoCard title="Observability">
                 <p>Use the response request ID to correlate web, control-plane, provider, and chain records. Public proof publication remains decoupled from financial settlement.</p>
               </InfoCard>
             </div>
-            <h3 className="docs-subheading">Launch gate</h3>
+            <h3 className="docs-subheading">Production availability</h3>
             <p>
-              Public capacity remains gated until a funded mainnet canary completes quote,
-              funding, provisioning, GPU/access admission, teardown, settlement, refund/payment,
-              and proof verification. A failed stage must preserve evidence and return escrow to
-              a paused state before another public attempt.
+              Prism expands public capacity after end-to-end production validation covers quoting,
+              funding, provisioning, readiness, teardown, settlement, refunds, provider payment,
+              and proof publication. Failed validations preserve diagnostic evidence and pause new
+              lease funding until the affected service is restored.
             </p>
           </DocsSection>
 
-          <DocsSection id="errors" index="12" eyebrow="Failure contract" title="Errors and retries">
+          <DocsSection id="errors" index="12" eyebrow="Response handling" title="Errors and retries">
             <div className="error-table">
               <div className="error-head"><span>HTTP</span><span>Code</span><span>Meaning</span></div>
               {errors.map(([status, code, meaning]) => (
@@ -416,10 +416,10 @@ export function DeveloperDocs() {
             </div>
             <ul className="docs-list">
               <li>Retry <code>429</code> only after <code>Retry-After</code>.</li>
-              <li>Retry transient <code>503</code> responses with bounded exponential backoff and the same business intent.</li>
-              <li>Do not blindly replay funding transactions; first query the wallet receipt and account leases.</li>
+              <li>Retry transient <code>503</code> responses with exponential backoff and a maximum delay, without changing the request.</li>
+              <li>Before resubmitting a funding transaction, verify the wallet receipt and account lease history.</li>
               <li><code>funding_not_final</code> is expected before the required confirmation threshold and can be polled safely.</li>
-              <li>Treat other <code>4xx</code> responses as terminal until the request or account state changes.</li>
+              <li>Treat other <code>4xx</code> responses as non-retryable until the request or account state changes.</li>
             </ul>
           </DocsSection>
 

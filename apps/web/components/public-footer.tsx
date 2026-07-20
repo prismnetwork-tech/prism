@@ -88,7 +88,7 @@ export function PublicFooter() {
             <span>View on Blockscout ↗</span>
           </a>
         </div>
-        <p>© 2026 Prism Network. Open infrastructure, verifiable settlement.</p>
+        <p>© 2026 Prism Network. All rights reserved.</p>
       </div>
     </footer>
   );

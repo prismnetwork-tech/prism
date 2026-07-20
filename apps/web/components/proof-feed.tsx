@@ -31,10 +31,10 @@ export function ProofFeed() {
         <div><p className="eyebrow">Public verification</p><h1>Proof feed</h1></div>
         <span className="chip">{statusLabel(status, proof)}</span>
       </div>
-      <article className="panel proof-disclosure"><strong>What this proves</strong><p>Published entries link a platform-attested usage receipt to an onchain settlement event. They do not independently verify hardware execution or contract correctness.</p></article>
+      <article className="panel proof-disclosure"><strong>Verification scope</strong><p>Published records associate a platform-attested usage receipt with an onchain settlement event. They do not independently verify hardware execution or contract correctness.</p></article>
       {status === "loading" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Loading proof feed</h2></article>}
       {status === "unavailable" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Proof feed is temporarily unavailable</h2><p>No receipt data is being shown while the publication endpoint is unavailable.</p></article>}
-      {status === "ready" && proof?.receipts.length === 0 && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>No receipts published yet</h2><p>The first receipt will appear after a funded lease reaches finalized settlement and its artifact passes chain verification.</p></article>}
+      {status === "ready" && proof?.receipts.length === 0 && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>No settlement receipts published</h2><p>Receipts are published after a funded lease reaches final settlement and passes chain verification.</p></article>}
       {status === "ready" && proof && proof.receipts.length > 0 && <article className="panel proof-list">{proof.receipts.map((receipt) => <Receipt key={receipt.receipt_id} receipt={receipt} />)}</article>}
     </section>
   );

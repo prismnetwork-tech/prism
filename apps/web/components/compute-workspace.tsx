@@ -40,7 +40,7 @@ export function ComputeWorkspace() {
   );
   let launchLabel = mode === "auto" ? "Match and fund escrow" : "Approve USDG and fund escrow";
   if (!auth.authenticated) launchLabel = "Sign in to launch";
-  if (!auth.configured) launchLabel = "Authentication unavailable";
+  if (!auth.configured) launchLabel = "Account access unavailable";
   if (!offer) launchLabel = "No GPUs available";
   if (loadingOffers) launchLabel = "Loading live offers…";
 
@@ -53,7 +53,7 @@ export function ComputeWorkspace() {
       })
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === "AbortError") return;
-        setOfferError("Live GPU offers are temporarily unavailable.");
+        setOfferError("GPU availability could not be loaded. Try again shortly.");
       })
       .finally(() => setLoadingOffers(false));
     return () => controller.abort();
@@ -77,15 +77,15 @@ export function ComputeWorkspace() {
         auth.login();
         return;
       }
-      setNotice("Authentication is not configured in this environment.");
+      setNotice("Account access is temporarily unavailable.");
       return;
     }
     if (!escrowAddress) {
-      setNotice("Escrow deployment address has not been configured.");
+      setNotice("Lease funding is temporarily unavailable.");
       return;
     }
     if (!offer) {
-      setNotice("No bonded GPU offers are available.");
+      setNotice("No compatible GPU offers are currently available.");
       return;
     }
     if (!image.includes("@sha256:")) {
@@ -126,7 +126,7 @@ export function ComputeWorkspace() {
       }
       const result = await smartWallet.executeCalls([...calls], fundingAddress);
       await confirmLease(lease.quote_id, result.transactionHash, sshKey.trim());
-      setNotice(`Lease funded and indexed: ${result.transactionHash.slice(0, 10)}…`);
+      setNotice(`Funding confirmed: ${result.transactionHash.slice(0, 10)}…`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Wallet transaction was not completed.");
     }
@@ -136,10 +136,10 @@ export function ComputeWorkspace() {
     <section className="page-stack">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">Interactive workspace</p>
+          <p className="eyebrow">GPU compute</p>
           <h1>Launch GPU compute</h1>
         </div>
-        <span className="chip">Public OCI only</span>
+        <span className="chip">Digest-pinned images</span>
       </div>
 
       <div className="compute-layout">
@@ -211,8 +211,8 @@ export function ComputeWorkspace() {
             </label>
           )}
           <div className="safety-note">
-            <strong>Workspace boundary</strong>
-            <span>Node providers are independent. Do not use this service for confidential data or credentials.</span>
+            <strong>Data handling notice</strong>
+            <span>Infrastructure providers are independent. Do not process confidential data or credentials in beta workspaces.</span>
           </div>
           <button
             className="button primary full"
@@ -233,7 +233,7 @@ export function ComputeWorkspace() {
           <div className="quote-line"><span>Reliability</span><strong>{offer ? `${(offer.reliability_bps / 100).toFixed(1)}%` : "—"}</strong></div>
           <div className="quote-line"><span>Rate</span><strong>{offer ? `${formatRate(offer.rate_per_second)} USDG/sec` : "—"}</strong></div>
           <div className="quote-total"><span>Maximum escrow</span><strong>{maximum} <small>USDG</small></strong></div>
-          <p className="muted">Billing starts after CUDA and access readiness are confirmed. Unused funds refund at settlement.</p>
+          <p className="muted">Charges begin after GPU and access readiness are confirmed. Unused escrow is returned after settlement.</p>
         </aside>
       </div>
     </section>
@@ -326,7 +326,7 @@ async function confirmLease(quoteId: string, transactionHash: Hex, sshAuthorized
     }
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }
-  throw new Error("Funding confirmation timed out. The transaction is safe; check Leases shortly.");
+  throw new Error("Funding confirmation timed out. Check the Leases page for the latest transaction status.");
 }
 
 function isBytes32(value: unknown): value is `0x${string}` {

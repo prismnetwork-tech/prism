@@ -74,7 +74,7 @@ function AccountControl() {
   const auth = usePrismAuth();
 
   if (!auth.configured) {
-    return <span className="account-status" title="Configure Privy before opening beta accounts.">Authentication unavailable</span>;
+    return <span className="account-status" title="Account access is temporarily unavailable.">Account access unavailable</span>;
   }
 
   if (!auth.ready) {

@@ -17,16 +17,16 @@ export function NodeFleet() {
   return (
     <section className="page-stack">
       <div className="page-heading">
-        <div><p className="eyebrow">Supply</p><h1>GPU nodes</h1></div>
-        <span className="chip">Independent operators</span>
+        <div><p className="eyebrow">Provider infrastructure</p><h1>GPU nodes</h1></div>
+        <span className="chip">Provider portal</span>
       </div>
 
       {!auth.authenticated ? (
-        <Empty title="Sign in to manage nodes" message="Node inventory is scoped to wallets whose ownership your Prism account has verified." action={auth.configured ? <button className="button primary" type="button" onClick={auth.login}>Sign in</button> : null} />
+        <Empty title="Sign in to manage nodes" message="Node inventory is available to accounts with a verified operator or payout wallet." action={auth.configured ? <button className="button primary" type="button" onClick={auth.login}>Sign in</button> : null} />
       ) : isPending ? (
         <Empty title="Loading node inventory" />
       ) : isError ? (
-        <Empty title="Node inventory is unavailable" message="The supplier index could not be loaded." action={<button className="button secondary" type="button" onClick={() => void refetch()}>Retry</button>} />
+        <Empty title="Node inventory is unavailable" message="Provider records could not be loaded. Try again shortly." action={<button className="button secondary" type="button" onClick={() => void refetch()}>Retry</button>} />
       ) : data.nodes.length ? (
         <>
           <div className="metric-grid">
@@ -56,17 +56,17 @@ export function NodeFleet() {
           </article>
         </>
       ) : (
-        <Empty title="No nodes linked to this account" message="Verify the operator or payout wallet used during enrollment, then run the host enrollment sequence." />
+        <Empty title="No registered nodes" message="Verify the operator or payout wallet used during enrollment, then complete the host registration process." />
       )}
 
       <div className="dashboard-grid">
         <article className="panel checklist">
-          <p className="eyebrow">Host baseline</p><h2>Preflight requirements</h2>
+          <p className="eyebrow">Host requirements</p><h2>Infrastructure baseline</h2>
           <ul>{checks.map((item) => <li key={item}><span>✓</span>{item}</li>)}</ul>
         </article>
         <article className="panel code-panel">
-          <p className="eyebrow">Enrollment sequence</p>
-          <h2>Identity, enrollment and certificate</h2>
+          <p className="eyebrow">Provider onboarding</p>
+          <h2>Node registration</h2>
           <code>prismd preflight</code>
           <code>prismd create-identity --path /var/lib/prismd/device.json</code>
           <code>prismd enroll --identity /var/lib/prismd/device.json …</code>

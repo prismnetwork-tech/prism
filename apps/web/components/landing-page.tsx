@@ -4,11 +4,11 @@ import { PublicFooter } from "@/components/public-footer";
 import { docsUrl } from "@/lib/site";
 
 const executionSteps = [
-  ["01", "Fund", "Maximum lease cost is locked in USDG escrow before provisioning."],
-  ["02", "Match", "Prism selects verified L40S capacity only while the upstream cost stays below its operating ceiling."],
-  ["03", "Launch", "A fresh container-isolated workspace starts with temporary direct SSH access."],
-  ["04", "Meter", "Billing begins only after GPU, cost and access endpoint admission checks pass."],
-  ["05", "Settle", "Confirmed runtime becomes an onchain proposal, refund and public receipt."],
+  ["01", "Quote", "Review the per-second rate, funded duration, and maximum USDG commitment."],
+  ["02", "Fund", "Approve the quoted amount and deposit it into the lease escrow contract."],
+  ["03", "Provision", "Prism assigns available L40S capacity and prepares an ephemeral workspace."],
+  ["04", "Meter", "Charges begin after GPU and access-readiness checks complete."],
+  ["05", "Settle", "Confirmed usage is settled onchain and unused escrow is returned."],
 ] as const;
 
 export function LandingPage() {
@@ -39,21 +39,21 @@ export function LandingPage() {
         <section className="landing-hero">
           <div className="hero-grid">
             <div className="landing-hero-copy">
-              <p className="landing-kicker"><span /> L40S cloud beta</p>
-              <h1>GPU compute,<br />settled by the second.</h1>
+              <p className="landing-kicker"><span /> NVIDIA L40S compute</p>
+              <h1>On-demand GPU compute,<br />billed by the second.</h1>
               <p>
-                On-demand NVIDIA L40S workspaces at $0.80 per GPU hour, with metered USDG
-                escrow, temporary access and a public settlement trail.
+                Launch NVIDIA L40S workspaces with per-second USDG billing, upfront cost
+                controls, and verifiable onchain settlement records.
               </p>
               <div className="landing-actions">
                 <Link className="landing-button primary" href="/compute">Find compute <span>↗</span></Link>
-                <Link className="landing-button secondary" href="/nodes">Supply a node <span>＋</span></Link>
+                <Link className="landing-button secondary" href="/nodes">Become a provider <span>＋</span></Link>
               </div>
             </div>
             <HeroSignal />
           </div>
           <div className="hero-status" role="status">
-            <span><i /> Mainnet canary pending</span>
+            <span><i /> Private beta</span>
             <span>$0.80 / GPU hour</span>
             <span>Robinhood Chain · USDG</span>
           </div>
@@ -62,28 +62,28 @@ export function LandingPage() {
         <section className="landing-section network-section" id="network">
           <div className="section-intro">
             <p className="section-index">01 / Network</p>
-            <h2>One clear product.<br />One honest boundary.</h2>
+            <h2>Compute and settlement<br />in one service.</h2>
             <p>
-              The launch tier brokers verified cloud capacity. Permissionless hardware remains a
-              separate supplier track until its stronger isolation path is ready.
+              Managed L40S capacity is available in private beta. Operator-owned infrastructure
+              is in technical onboarding and is not yet available for production leases.
             </p>
           </div>
           <div className="network-panels">
             <article className="network-panel renter-panel">
               <span className="panel-number">R / 01</span>
               <div>
-                <p className="panel-label">L40S cloud beta</p>
-                <h3>46 GB of GPU memory at $0.80/hour.</h3>
-                <p>Launch an ephemeral container workspace with temporary direct SSH access. Capacity is offered only while a qualifying host is available.</p>
+                <p className="panel-label">L40S compute</p>
+                <h3>46 GB of GPU memory from $0.80 per hour.</h3>
+                <p>Run digest-pinned OCI images in ephemeral workspaces with temporary SSH access. Offers reflect real-time capacity.</p>
               </div>
               <Link href="/compute">Explore compute <span>↗</span></Link>
             </article>
             <article className="network-panel supplier-panel">
               <span className="panel-number">S / 02</span>
               <div>
-                <p className="panel-label">Supply capacity</p>
-                <h3>Put independent hardware on the network.</h3>
-                <p>Enroll an NVIDIA host, publish a signed offer and receive 90% of confirmed usage after settlement.</p>
+                <p className="panel-label">Provider program</p>
+                <h3>Operate GPU capacity and earn from settled usage.</h3>
+                <p>Review the requirements for operator-owned NVIDIA infrastructure. Approved providers receive 90% of confirmed usage charges.</p>
               </div>
               <Link href="/nodes">Review requirements <span>↗</span></Link>
             </article>
@@ -93,7 +93,7 @@ export function LandingPage() {
         <section className="landing-section settlement-section" id="settlement">
           <div className="section-intro compact">
             <p className="section-index">02 / Settlement</p>
-            <h2>One measurable<br />execution path.</h2>
+            <h2>A controlled<br />lease lifecycle.</h2>
           </div>
           <div className="execution-list">
             {executionSteps.map(([number, title, description]) => (
@@ -122,14 +122,14 @@ export function LandingPage() {
           </div>
           <div className="security-copy">
             <p className="section-index">03 / Isolation</p>
-            <h2>A clean workspace, not confidential compute.</h2>
+            <h2>Ephemeral workspaces with a defined security boundary.</h2>
             <p>
               Each cloud lease starts in a fresh container with temporary credentials. Workspace
-              storage is destroyed when the instance closes, but the upstream host remains inside
+              storage is destroyed when the instance closes, but the infrastructure provider remains inside
               the trust boundary.
             </p>
             <div className="security-disclosure">
-              <span>Important boundary</span>
+              <span>Security scope</span>
               <p>Do not place private keys, production credentials or confidential data in a beta workspace. Container isolation is not hardware-backed confidential computing.</p>
             </div>
           </div>
@@ -138,7 +138,7 @@ export function LandingPage() {
         <section className="landing-section proof-section">
           <div className="proof-copy">
             <p className="section-index">04 / Proof</p>
-            <h2>Settlement leaves<br />a public trace.</h2>
+            <h2>Verifiable<br />settlement records.</h2>
             <p>
               Finalized receipts connect platform-attested usage records to Robinhood Chain
               settlement events without exposing terminal contents, notebooks or files.
@@ -148,7 +148,7 @@ export function LandingPage() {
           <div className="receipt-terminal">
             <div className="terminal-bar">
               <span>SETTLEMENT RECEIPT</span>
-              <span>AWAITING MAINNET CANARY</span>
+              <span>AWAITING FIRST FINALIZED LEASE</span>
             </div>
             <dl>
               <div><dt>STATUS</dt><dd>NO FINALIZED RECEIPTS</dd></div>
@@ -157,16 +157,16 @@ export function LandingPage() {
               <div><dt>USDG SETTLED</dt><dd>—</dd></div>
               <div><dt>TRANSACTION</dt><dd>—</dd></div>
             </dl>
-            <div className="terminal-cursor"><span /> Waiting for verified network activity</div>
+            <div className="terminal-cursor"><span /> Awaiting the first verified settlement</div>
           </div>
         </section>
 
         <section className="landing-cta">
-          <p>GPU infrastructure should account for every second.</p>
-          <h2>Enter the network.</h2>
+          <p>Deploy GPU capacity with transparent usage-based billing.</p>
+          <h2>Launch a workspace.</h2>
           <div>
             <Link className="landing-button primary" href="/compute">Find compute <span>↗</span></Link>
-            <Link className="landing-button secondary" href="/nodes">Supply a node <span>＋</span></Link>
+            <Link className="landing-button secondary" href="/nodes">Become a provider <span>＋</span></Link>
           </div>
         </section>
       </main>

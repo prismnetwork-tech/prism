@@ -11,8 +11,8 @@ export default function SecurityPage() {
   return (
     <InformationPage
       eyebrow="Trust / Security"
-      title="Know exactly what the beta protects."
-      description="Prism secures funding, lifecycle state, access credentials, and settlement evidence. It does not claim the upstream GPU host is confidential."
+      title="Security controls and service boundaries."
+      description="Prism protects funding, lease state, access credentials, and settlement evidence. Infrastructure providers remain within the workload trust boundary."
     >
       <InformationSection index="01" title="Enforced controls">
         <ul>
@@ -21,7 +21,7 @@ export default function SecurityPage() {
           <li>Bounded request bodies, rate limits, concurrency limits, and risk holds.</li>
           <li>GPU, provider-cost, and access-endpoint admission before billable time starts.</li>
           <li>Encrypted temporary access credentials with revocation at lease close.</li>
-          <li>Durable lifecycle and settlement jobs designed for safe retry after failure.</li>
+          <li>Idempotent lease and settlement processing with recovery after interruption.</li>
           <li>Maximum escrow, maximum duration, dispute window, and emergency pause enforced onchain.</li>
         </ul>
       </InformationSection>
@@ -29,7 +29,7 @@ export default function SecurityPage() {
       <InformationSection index="02" title="Trust boundaries">
         <p>
           Cloud workspaces run in fresh containers with temporary direct access. This limits
-          accidental persistence between leases, but the upstream provider controls the physical
+          accidental persistence between leases, but the infrastructure provider controls the physical
           host and may be able to observe workload data.
         </p>
         <p>
@@ -48,7 +48,7 @@ export default function SecurityPage() {
         </p>
         <p>
           Contract addresses, roles, state transitions, settlement calculations, and operational
-          release gates are published in the{" "}
+          parameters are published in the{" "}
           <a href="https://docs.prismnetwork.tech/#contracts">developer documentation</a>.
         </p>
       </InformationSection>

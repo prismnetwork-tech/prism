@@ -8,3 +8,4 @@ pnpm build
 ./scripts/check-secrets.sh
 ./scripts/verify-isolation.sh
 ./scripts/check-ui-patterns.sh
+./scripts/check-public-copy.sh
