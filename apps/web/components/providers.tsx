@@ -1,15 +1,14 @@
 "use client";
 
 import {
+  type EIP1193Provider,
   PrivyProvider,
-  toViemAccount,
   usePrivy,
   useWallets,
 } from "@privy-io/react-auth";
-import { alchemyWalletTransport, createSmartWalletClient } from "@alchemy/wallet-apis";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { stringToHex, type Address, type Hex } from "viem";
+import { createPublicClient, createWalletClient, custom, http, stringToHex, type Address, type Hex } from "viem";
 import { robinhoodChain } from "@/lib/chain";
 import { ThemeProvider } from "@/components/theme-provider";
 
@@ -122,25 +121,31 @@ function LiveSession({ children }: { children: React.ReactNode }) {
   const executeCalls = useCallback(async (calls: TransactionCall[], signerAddress?: Address, onSubmitted?: (id: Hex) => void) => {
     const wallet = signerAddress
       ? wallets.find((candidate) => candidate.address.toLowerCase() === signerAddress.toLowerCase())
-      : embedded;
+      : embedded ?? wallets[0];
     if (!wallet) throw new Error("The selected wallet is not connected in this browser.");
     setPending(true);
     try {
-      const signer = await toViemAccount({ wallet });
-      const client = createSmartWalletClient({
-        signer,
+      const provider = await wallet.getEthereumProvider();
+      await ensureWalletChain(provider);
+      const client = createWalletClient({
+        account: wallet.address as Address,
         chain: robinhoodChain,
-        transport: alchemyWalletTransport({ url: "/api/wallet" }),
+        transport: custom(provider),
       });
-      const result = await client.sendCalls({
-        calls: calls.map((call) => ({ to: call.to, data: call.data, value: call.value ?? 0n })),
-      });
-      onSubmitted?.(result.id);
-      const status = await client.waitForCallsStatus({ id: result.id });
-      if (status.status !== "success") throw new Error("The onchain operation did not complete.");
-      const transactionHash = status.receipts?.at(-1)?.transactionHash;
-      if (!transactionHash) throw new Error("The wallet provider returned no funding transaction receipt.");
-      return { id: result.id, transactionHash };
+      const publicClient = createPublicClient({ chain: robinhoodChain, transport: http() });
+      let transactionHash: Hex | undefined;
+      for (const call of calls) {
+        transactionHash = await client.sendTransaction({
+          to: call.to,
+          data: call.data,
+          value: call.value ?? 0n,
+        });
+        onSubmitted?.(transactionHash);
+        const receipt = await publicClient.waitForTransactionReceipt({ hash: transactionHash });
+        if (receipt.status !== "success") throw new Error("The onchain operation reverted.");
+      }
+      if (!transactionHash) throw new Error("No wallet transactions were submitted.");
+      return { id: transactionHash, transactionHash };
     } finally {
       setPending(false);
     }
@@ -239,4 +244,24 @@ export function useSmartWallet() {
   const context = useContext(SmartWalletContext);
   if (!context) throw new Error("useSmartWallet must be used inside Providers.");
   return context;
+}
+
+async function ensureWalletChain(provider: EIP1193Provider) {
+  const chainId = `0x${robinhoodChain.id.toString(16)}`;
+  try {
+    await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
+  } catch (error) {
+    const code = typeof error === "object" && error && "code" in error ? Number(error.code) : null;
+    if (code !== 4902) throw error;
+    await provider.request({
+      method: "wallet_addEthereumChain",
+      params: [{
+        chainId,
+        chainName: robinhoodChain.name,
+        nativeCurrency: robinhoodChain.nativeCurrency,
+        rpcUrls: robinhoodChain.rpcUrls.default.http,
+        blockExplorerUrls: [robinhoodChain.blockExplorers.default.url],
+      }],
+    });
+  }
 }

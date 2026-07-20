@@ -21,8 +21,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@alchemy/common": "5.0.6",
-    "@alchemy/wallet-apis": "5.0.6",
     "@privy-io/react-auth": "3.35.1",
     "@tanstack/react-query": "5.101.2",
     "jose": "6.2.0",
