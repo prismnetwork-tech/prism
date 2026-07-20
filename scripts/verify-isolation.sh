@@ -27,16 +27,28 @@ if [[ -n "$denylist" ]]; then
   fi
 fi
 
-if [[ -n "${PRISM_ALLOWED_GIT_EMAIL:-}" ]] && git rev-parse --verify HEAD >/dev/null 2>&1; then
-  if git log --format='%ae%n%ce' | rg -v --fixed-strings "$PRISM_ALLOWED_GIT_EMAIL" | rg -q '.'; then
-    printf '%s\n' "Commit history contains an unapproved author email."
-    exit 1
-  fi
-fi
+check_commit_identities() {
+  local label="$1"
+  local format="$2"
+  local allowed="$3"
 
-if [[ -n "${PRISM_ALLOWED_GIT_NAME:-}" ]] && git rev-parse --verify HEAD >/dev/null 2>&1; then
-  if git log --format='%an%n%cn' | rg -v --fixed-strings "$PRISM_ALLOWED_GIT_NAME" | rg -q '.'; then
-    printf '%s\n' "Commit history contains an unapproved author name."
-    exit 1
-  fi
+  [[ -z "$allowed" ]] && return
+
+  while IFS= read -r identity; do
+    if ! grep -Fqx -- "$identity" <<<"$allowed"; then
+      printf '%s\n' "Commit history contains an unapproved $label."
+      exit 1
+    fi
+  done < <(git log --format="$format")
+}
+
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  check_commit_identities \
+    "author email" \
+    '%ae%n%ce' \
+    "${PRISM_ALLOWED_GIT_EMAILS:-${PRISM_ALLOWED_GIT_EMAIL:-}}"
+  check_commit_identities \
+    "author name" \
+    '%an%n%cn' \
+    "${PRISM_ALLOWED_GIT_NAMES:-${PRISM_ALLOWED_GIT_NAME:-}}"
 fi
