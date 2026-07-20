@@ -31,6 +31,10 @@ docker compose --env-file deploy/lightsail/.env \
   -f deploy/lightsail/compose.yml config --quiet
 ```
 
+The worker profile expects `secrets/vast-api-key` for the launch-day cloud
+broker. Complete [`docs/vast-launch.md`](../../docs/vast-launch.md) before
+starting the stack.
+
 Start the full persistent stack, including all three workers and private
 Prometheus alert evaluation:
 

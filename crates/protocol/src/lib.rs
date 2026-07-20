@@ -536,7 +536,20 @@ pub struct SettlementEvidence {
     pub cuda_ready_at: u64,
     pub interactive_access_ready_at: u64,
     pub gateway_closed_at: u64,
+    #[serde(default)]
+    pub execution: ExecutionEvidence,
     pub node_telemetry: Vec<NodeTelemetry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ExecutionEvidence {
+    #[default]
+    Physical,
+    Vast {
+        instance_id: u64,
+        hourly_cost_micros: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -574,15 +587,25 @@ pub struct AccessGrant {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LeaseAccess {
-    pub lease_id: u64,
-    pub token: String,
-    pub gateway_host: String,
-    pub relay_port: u16,
-    pub ssh_user: String,
-    pub jupyter_path: String,
-    pub jupyter_token: String,
-    pub expires_at: DateTime<Utc>,
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum LeaseAccess {
+    Gateway {
+        lease_id: u64,
+        token: String,
+        gateway_host: String,
+        relay_port: u16,
+        ssh_user: String,
+        jupyter_path: String,
+        jupyter_token: String,
+        expires_at: DateTime<Utc>,
+    },
+    DirectSsh {
+        lease_id: u64,
+        ssh_host: String,
+        ssh_port: u16,
+        ssh_user: String,
+        expires_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

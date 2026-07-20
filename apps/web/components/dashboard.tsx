@@ -1,10 +1,10 @@
 import Link from "next/link";
 
 const metrics = [
-  ["Available GPUs", "0", "Awaiting verified node enrollment"],
-  ["Live capacity", "—", "No bonded nodes online"],
+  ["Cloud canary", "Passed", "L40S · 46 GB VRAM"],
+  ["Beta price", "$0.80/h", "Per L40S GPU"],
+  ["Available GPUs", "0", "Production deployment pending"],
   ["Escrowed today", "—", "Contract deployment pending"],
-  ["Network success", "—", "No finalized leases yet"],
 ] as const;
 
 export function Dashboard() {
@@ -15,7 +15,8 @@ export function Dashboard() {
           <p className="eyebrow">GPU infrastructure</p>
           <h1>Compute with a clear settlement trail.</h1>
           <p className="hero-copy">
-            Prism is being built for isolated GPU workspaces with metered USDG escrow. Availability and proof records appear only after verified nodes and onchain settlements exist.
+            The L40S supply canary is verified. The direct-SSH broker lifecycle is wired, but Prism
+            will not advertise live capacity until the production lease path passes.
           </p>
         </div>
         <div className="hero-actions">
@@ -39,12 +40,12 @@ export function Dashboard() {
           <div className="panel-heading">
             <div>
               <p className="eyebrow">Network signal</p>
-              <h2>Capacity will appear after enrollment</h2>
+              <h2>L40S supply verified</h2>
             </div>
-            <span className="chip">No live offers</span>
+            <span className="chip">Deployment pending</span>
           </div>
-          <p className="muted">The beta will admit NVIDIA hosts only after preflight, sufficient USDG bonding and independent gateway connectivity checks are operational.</p>
-          <Link className="text-link" href="/nodes">Review node requirements →</Link>
+          <p className="muted">A live L40S instance reached CUDA-ready infrastructure with SSH access and was destroyed cleanly. Customer access remains gated until production deployment passes.</p>
+          <Link className="text-link" href="/compute">Open compute console →</Link>
         </article>
 
         <article className="panel proof-preview">

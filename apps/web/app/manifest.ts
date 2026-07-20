@@ -4,7 +4,7 @@ export default function manifest(): MetadataRoute.Manifest {
   return {
     name: "Prism Network",
     short_name: "Prism",
-    description: "Independent GPU infrastructure with metered USDG settlement.",
+    description: "On-demand L40S compute with metered USDG settlement.",
     start_url: "/",
     display: "standalone",
     background_color: "#000000",

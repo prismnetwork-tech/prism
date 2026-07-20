@@ -8,6 +8,11 @@ Prism Network is open infrastructure for metered GPU compute. It connects
 renters to independent NVIDIA capacity through isolated Kata workspaces,
 short-lived SSH or Jupyter access, and USDG settlement on Robinhood Chain.
 
+The launch configuration can also broker disposable Vast L40S instances over
+direct SSH. That path uses provider-reported readiness and settlement evidence;
+it does not claim the hardware-rooted isolation or attestation of a physical
+Kata/VFIO node.
+
 ## Project status
 
 Prism is pre-production software. The local software lifecycle is implemented
