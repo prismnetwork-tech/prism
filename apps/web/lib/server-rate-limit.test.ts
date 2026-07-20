@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { consumeOneTime, registerOneTime, requestSubject, takeRateLimit } from "./server-rate-limit";
+import { consumeOneTime, isAllowedRedisUrl, registerOneTime, requestSubject, takeRateLimit } from "./server-rate-limit";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -40,5 +40,13 @@ describe("server rate limiting", () => {
   it("rejects arbitrary client IP header names", () => {
     vi.stubEnv("PRISM_CLIENT_IP_HEADER", "x-client-ip");
     expect(requestSubject(new Headers({ "x-client-ip": "203.0.113.30" }))).toBe("unattributed");
+  });
+
+  it("allows TLS and Render private Redis connections only", () => {
+    expect(isAllowedRedisUrl("rediss://user:secret@cache.example:6380")).toBe(true);
+    expect(isAllowedRedisUrl("redis://red-d9f3t3gs116c738816l0:6379")).toBe(true);
+    expect(isAllowedRedisUrl("redis://cache.internal:6379")).toBe(false);
+    expect(isAllowedRedisUrl("redis://user:secret@red-d9f3t3gs116c738816l0:6379")).toBe(false);
+    expect(isAllowedRedisUrl("redis://red-d9f3t3gs116c738816l0:6380")).toBe(false);
   });
 });
