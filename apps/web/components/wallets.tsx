@@ -43,7 +43,7 @@ export function Wallets() {
       });
       if (!response.ok) throw new Error("The ownership proof was rejected.");
       await queryClient.invalidateQueries({ queryKey: ["supplier-summary", auth.userId] });
-      setNotice("Wallet ownership verified for supplier inventory and payouts.");
+      setNotice("Wallet ownership verified for provider inventory and payouts.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Wallet ownership could not be verified.");
     } finally {
@@ -53,8 +53,8 @@ export function Wallets() {
 
   return (
     <section className="page-stack">
-      <div className="page-heading"><div><p className="eyebrow">Account instruments</p><h1>Wallets</h1></div>{action}</div>
-      {!auth.configured && <p className="form-notice" role="status">Authentication is not configured in this environment, so accounts and wallet linking are unavailable.</p>}
+      <div className="page-heading"><div><p className="eyebrow">Account and billing</p><h1>Wallets</h1></div>{action}</div>
+      {!auth.configured && <p className="form-notice" role="status">Account access and wallet linking are temporarily unavailable.</p>}
       {notice && <p className="form-notice" role="status">{notice}</p>}
       {auth.accounts.length ? (
         <article className="panel settings-list">
@@ -64,7 +64,7 @@ export function Wallets() {
               <div key={account.address}>
                 <div><h2>{account.embedded ? "Embedded wallet" : account.label}</h2><p className="mono">{account.address}</p></div>
                 <div className="setting-actions">
-                  <span className={`chip ${isVerified ? "success" : ""}`}>{isVerified ? "Ownership verified" : "Connected only"}</span>
+                  <span className={`chip ${isVerified ? "success" : ""}`}>{isVerified ? "Ownership verified" : "Verification required"}</span>
                   {!isVerified && auth.authenticated && (
                     <button className="button secondary" type="button" disabled={pending !== null} onClick={() => void verify(account.address)}>
                       {pending === account.address ? "Check wallet…" : "Verify ownership"}
@@ -76,9 +76,9 @@ export function Wallets() {
           })}
         </article>
       ) : (
-        <article className="panel empty-state"><span className="empty-icon">◇</span><h2>No wallet connected</h2><p>Connect an EVM wallet or create an embedded wallet through your Prism account. A signature proof is required before a wallet can expose supplier nodes or earnings.</p>{auth.configured && !auth.authenticated && <button className="button secondary" type="button" onClick={auth.login}>Sign in to continue</button>}</article>
+        <article className="panel empty-state"><span className="empty-icon">◇</span><h2>No wallet connected</h2><p>Connect an EVM wallet or create an embedded wallet through your Prism account. Signature verification is required before a wallet can access provider nodes or earnings.</p>{auth.configured && !auth.authenticated && <button className="button secondary" type="button" onClick={auth.login}>Sign in to continue</button>}</article>
       )}
-      <article className="panel proof-disclosure"><p className="eyebrow">Ownership boundary</p><h2>Connection is not verification</h2><p>Prism links a wallet to the durable account only after a short-lived, single-use message is signed by that wallet. The signature cannot authorize a transaction or transfer funds.</p></article>
+      <article className="panel proof-disclosure"><p className="eyebrow">Wallet security</p><h2>Signature-based verification</h2><p>Prism verifies wallet ownership through a short-lived, single-use message signed by that wallet. The signature cannot authorize a transaction or transfer funds.</p></article>
     </section>
   );
 }

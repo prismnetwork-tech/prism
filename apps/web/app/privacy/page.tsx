@@ -43,16 +43,16 @@ export default function PrivacyPage() {
         <h3>Compute and usage data</h3>
         <p>
           We process quote parameters, selected image reference, requested GPU capacity,
-          duration, provider/node identifiers, runtime state, access-readiness timestamps,
-          metered seconds, provider-cost evidence, failure classifications, and settlement
+          duration, provider and node identifiers, runtime state, workspace-readiness timestamps,
+          metered seconds, provider pricing records, service failure categories, and settlement
           outcomes. Public proof records are intentionally pseudonymous and omit wallet
           addresses, precise location, image digest, files, terminal output, and private
           telemetry.
         </p>
         <h3>Technical and security data</h3>
         <p>
-          We process request IDs, timestamps, network address or trusted edge identifier,
-          browser and device metadata, rate-limit state, service logs, security events, and
+          We process request IDs, timestamps, network address or edge-provided client identifier,
+          browser and device metadata, abuse-prevention signals, service logs, security events, and
           diagnostic records required to prevent abuse, investigate failures, and maintain
           availability.
         </p>
@@ -70,9 +70,9 @@ export default function PrivacyPage() {
           <li>Match workloads to capacity and operate the lease lifecycle.</li>
           <li>Verify escrow funding, meter admitted runtime, settle usage, and issue refunds.</li>
           <li>Provide temporary workspace access and revoke it at lease close.</li>
-          <li>Publish sanitized proof artifacts after terminal chain verification.</li>
+          <li>Publish sanitized proof artifacts after final chain confirmation.</li>
           <li>Enforce rate, concurrency, fraud, risk, and platform-abuse controls.</li>
-          <li>Debug incidents, recover durable jobs, and secure Prism infrastructure.</li>
+          <li>Investigate incidents, restore interrupted operations, and secure Prism infrastructure.</li>
           <li>Meet accounting, compliance, dispute, and legal obligations.</li>
         </ul>
       </LegalSection>
@@ -119,8 +119,8 @@ export default function PrivacyPage() {
         <p>
           Prism uses secure same-site HTTP-only sessions, same-origin mutation checks,
           least-privilege service credentials, encrypted stored access credentials,
-          non-exportable production signing keys, replay protection, request limits, durable
-          transaction records, and governance-controlled emergency pause. No system is
+          non-exportable production signing keys, replay protection, request limits,
+          persistent transaction records, and governance-controlled emergency pause. No system is
           completely secure. The beta does not provide confidential computing and the deployed
           contracts are unaudited.
         </p>

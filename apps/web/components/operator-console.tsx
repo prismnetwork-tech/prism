@@ -83,7 +83,7 @@ export function OperatorConsole() {
       setAudit((current) => [payload, ...current.filter((item) => item.event_id !== payload.event_id)]);
       setReason("");
       setEvidence("");
-      setNotice("Control applied and recorded in the append-only audit log.");
+      setNotice("Control applied and recorded in the immutable audit log.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Operator control could not be applied.");
     } finally {
@@ -92,17 +92,17 @@ export function OperatorConsole() {
   }
 
   if (!auth.authenticated) {
-    return <Shell><Empty title="Operator authentication required" message="Sign in with an explicitly allowlisted operator account." action={auth.configured ? <button className="button primary" type="button" onClick={auth.login}>Sign in</button> : null} /></Shell>;
+    return <Shell><Empty title="Administrator sign-in required" message="Sign in with an authorized administrator account." action={auth.configured ? <button className="button primary" type="button" onClick={auth.login}>Sign in</button> : null} /></Shell>;
   }
   if (status === "loading" || status === "idle") return <Shell><Empty title="Loading operator authorization" /></Shell>;
-  if (status === "forbidden") return <Shell><Empty title="Operator access denied" message="This account is not present in the server-side operator allowlist." /></Shell>;
+  if (status === "forbidden") return <Shell><Empty title="Administrator access denied" message="This account does not have permission to use administrative controls." /></Shell>;
   if (status === "unavailable") return <Shell><Empty title="Operator controls are unavailable" action={<button className="button secondary" type="button" onClick={() => void loadOperatorData()}>Retry</button>} /></Shell>;
 
   return (
     <Shell>
       <div className="operator-layout">
         <form className="panel launch-form" onSubmit={(event) => void submit(event)}>
-          <div><p className="eyebrow">Privileged mutation</p><h2>Apply control</h2></div>
+          <div><p className="eyebrow">Administrative action</p><h2>Apply control</h2></div>
           <label>Action<select value={action} onChange={(event) => setAction(event.target.value as OperatorAction)}>{operatorActions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
           <label>Target<input value={target} onChange={(event) => setTarget(event.target.value)} maxLength={255} required spellCheck="false" placeholder={action.startsWith("node_") || action === "slash_evidence_record" ? "0x… node ID" : "Privy account subject"} /></label>
           <label>Reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} minLength={8} maxLength={512} required /></label>
@@ -110,11 +110,11 @@ export function OperatorConsole() {
           <button className="button primary full" type="submit" disabled={submitting}>{submitting ? "Applying…" : "Apply and audit"}</button>
           {notice && <p className="form-notice" role="status">{notice}</p>}
         </form>
-        <article className="panel proof-disclosure"><p className="eyebrow">Control boundary</p><h2>Every mutation is attributable</h2><p>Account and node controls require a server-authorized operator subject. Action IDs are idempotent, session suspension revokes active sessions, and audit rows cannot be updated or deleted.</p></article>
+        <article className="panel proof-disclosure"><p className="eyebrow">Administrative security</p><h2>Audited administrative controls</h2><p>Account and node controls require an authorized administrator account. Action IDs are idempotent, session suspension revokes active sessions, and audit records are immutable.</p></article>
       </div>
       <article className="panel dispute-queue">
         <div className="panel-heading">
-          <div><p className="eyebrow">Safe resolution queue</p><h2>Disputed settlements</h2></div>
+          <div><p className="eyebrow">Settlement review</p><h2>Disputed settlements</h2></div>
           <span className="chip">{disputes.length} open</span>
         </div>
         <p className="muted">Evidence is reduced to metering boundaries and hashes. Copying calldata does not submit a transaction; Safe owners must independently review and approve it.</p>
@@ -147,7 +147,7 @@ export function OperatorConsole() {
                   <button className="button secondary compact" type="button" onClick={() => void copyCalldata(dispute.accept_proposal_transaction!.data, setCopyNotice)}>Copy Safe calldata</button>
                 </div>
               ) : (
-                <p className="form-notice">No acceptance calldata is available. Verify the evidence hash and deployment configuration before resolving.</p>
+                <p className="form-notice">Settlement transaction data is unavailable. Verify the evidence record and contract addresses before proceeding.</p>
               )}
             </article>
           ))}
@@ -179,7 +179,7 @@ export function OperatorConsole() {
 }
 
 function Shell({ children }: { children: React.ReactNode }) {
-  return <section className="page-stack"><div className="page-heading"><div><p className="eyebrow">Restricted operations</p><h1>Operator controls</h1></div><span className="chip">Allowlist required</span></div>{children}</section>;
+  return <section className="page-stack"><div className="page-heading"><div><p className="eyebrow">Administration</p><h1>Operator controls</h1></div><span className="chip">Restricted access</span></div>{children}</section>;
 }
 
 function Empty({ title, message, action }: { title: string; message?: string; action?: React.ReactNode }) {

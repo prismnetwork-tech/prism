@@ -11,8 +11,8 @@ export default function ContactPage() {
   return (
     <InformationPage
       eyebrow="Company / Contact"
-      title="Use the channel built for the issue."
-      description="Public technical work stays public. Sensitive security reports stay private."
+      title="Contact Prism Network."
+      description="Select the appropriate channel for product questions, technical support, security reports, and conduct concerns."
     >
       <InformationSection index="01" title="Product and network">
         <p>

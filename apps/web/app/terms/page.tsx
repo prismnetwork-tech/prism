@@ -26,7 +26,7 @@ export default function TermsPage() {
       <LegalSection index="02" title="The beta service">
         <p>
           Prism is an unaudited beta marketplace for metered GPU compute. It matches renter
-          requests with independent or upstream capacity, coordinates temporary access, and
+          requests with independent or third-party capacity, coordinates temporary access, and
           uses USDG escrow on Robinhood Chain for funding and settlement. Features, limits,
           pricing, providers, supported chains, and availability may change or be suspended.
         </p>
@@ -89,14 +89,14 @@ export default function TermsPage() {
         <p>
           A quote states the rate per second, funded duration, and maximum USDG escrow. Quotes
           expire and do not reserve capacity. A lease begins only after the required approval,
-          escrow transaction, chain finality, quote verification, provisioning, and access
-          admission.
+          escrow transaction, chain finality, quote verification, provisioning, and workspace
+          readiness.
         </p>
         <ul>
-          <li>Billing starts only after the configured authority confirms admitted access.</li>
+          <li>Billing starts only after the service confirms GPU and access readiness.</li>
           <li>Usage is capped by funded duration and contract limits.</li>
           <li>Finalized charges allocate 90% to the provider and a 10% platform fee.</li>
-          <li>Unused escrow is refunded when terminal settlement succeeds.</li>
+          <li>Unused escrow is refunded when settlement is finalized.</li>
           <li>A 24-hour dispute window applies before ordinary settlement finalization.</li>
           <li>Network gas, wallet, or third-party fees may be separate and non-refundable.</li>
         </ul>
@@ -111,7 +111,7 @@ export default function TermsPage() {
           pending.
         </p>
         <p>
-          Objective settlement disputes may be reviewed through the protocol dispute process.
+          Settlement disputes may be reviewed through the protocol dispute process.
           Preserve transaction hashes, request IDs, timestamps, and relevant non-secret evidence.
           Governance decisions remain constrained by the deployed contracts and available
           evidence.

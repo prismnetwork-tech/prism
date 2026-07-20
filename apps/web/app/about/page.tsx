@@ -3,7 +3,7 @@ import { InformationPage, InformationSection } from "@/components/information-pa
 
 export const metadata: Metadata = {
   title: "About",
-  description: "Why Prism Network is building accountable, metered GPU infrastructure.",
+  description: "Prism Network provides metered GPU infrastructure with verifiable onchain settlement.",
   alternates: { canonical: "/about" },
 };
 
@@ -11,38 +11,38 @@ export default function AboutPage() {
   return (
     <InformationPage
       eyebrow="Company / About"
-      title="Compute should account for itself."
-      description="Prism is building a GPU marketplace where access, usage, payment, and refunds share one verifiable lifecycle."
+      title="Metered GPU infrastructure with verifiable settlement."
+      description="Prism provides on-demand GPU capacity with per-second billing, upfront escrow limits, and public settlement records."
     >
-      <InformationSection index="01" title="What we are building">
+      <InformationSection index="01" title="Platform">
         <p>
-          Prism connects renters to GPU capacity, admits a workspace only after infrastructure
-          checks pass, meters usable runtime by the second, and settles the result through USDG
-          escrow on Robinhood Chain.
+          Prism connects customers to GPU capacity, begins billing after workspace-readiness
+          checks pass, measures runtime by the second, and settles usage through USDG escrow on
+          Robinhood Chain.
         </p>
         <p>
-          The current launch product is an L40S cloud beta. Independently operated hardware is a
-          separate supplier track and remains release-gated until its stronger isolation and
-          network path is production-ready.
+          The current service provides managed NVIDIA L40S capacity in private beta. A provider
+          program for operator-owned infrastructure is in technical onboarding and is not yet
+          available for production leases.
         </p>
       </InformationSection>
 
       <InformationSection index="02" title="Operating principles">
-        <h3>Meter after readiness</h3>
-        <p>Billing begins only after GPU, cost, and access-endpoint admission checks pass.</p>
-        <h3>Settle exact usage</h3>
+        <h3>Readiness-based billing</h3>
+        <p>Billing begins only after GPU, pricing, and access-readiness checks pass.</p>
+        <h3>Usage-based settlement</h3>
         <p>Maximum cost is escrowed up front. Confirmed runtime is charged and unused escrow is returned.</p>
-        <h3>Expose proof, not workloads</h3>
+        <h3>Privacy-preserving records</h3>
         <p>Public receipts prove settlement state without publishing wallet identity, terminal contents, notebooks, or files.</p>
-        <h3>State the trust boundary</h3>
-        <p>The beta uses fresh container workspaces, not confidential computing. The upstream host remains inside the trust boundary.</p>
+        <h3>Defined security scope</h3>
+        <p>The beta uses fresh container workspaces, not confidential computing. The infrastructure provider remains inside the trust boundary.</p>
       </InformationSection>
 
-      <InformationSection index="03" title="Built in public">
+      <InformationSection index="03" title="Open-source infrastructure">
         <p>
-          The protocol, control plane, workers, contracts, deployment configuration, and web
-          application are developed in the open. Architecture and operational contracts are
-          documented alongside the source so claims can be checked against implementation.
+          Prism&apos;s protocol, smart contracts, service architecture, and application code are
+          developed in the open. Architecture and operational contracts are
+          documented alongside the source for independent technical review.
         </p>
         <p>
           Review the{" "}
