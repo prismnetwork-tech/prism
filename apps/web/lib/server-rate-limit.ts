@@ -24,9 +24,6 @@ export async function takeRateLimit(
     }
     return takeMemoryRateLimit(key, limit, windowMs, now);
   }
-  if (!url.startsWith("rediss://")) {
-    return { allowed: false, available: false, retryAfter: 1 };
-  }
   try {
     const client = await redisClient(url);
     const result = await client.eval(
@@ -95,6 +92,7 @@ export async function consumeOneTime(scope: string, value: string) {
 }
 
 function redisClient(url: string) {
+  if (!isAllowedRedisUrl(url)) throw new Error("insecure Redis connection");
   clientPromise ??= (async () => {
     const caPath = process.env.PRISM_REDIS_CA_FILE;
     const client = createClient({
@@ -106,6 +104,20 @@ function redisClient(url: string) {
     return client;
   })();
   return clientPromise;
+}
+
+export function isAllowedRedisUrl(value: string) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "rediss:") return true;
+    return url.protocol === "redis:"
+      && /^red-[a-z0-9]+$/.test(url.hostname)
+      && url.port === "6379"
+      && !url.username
+      && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 function takeMemoryRateLimit(key: string, limit: number, windowMs: number, now: number): RateLimit {
