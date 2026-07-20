@@ -7,46 +7,46 @@ const columns = [
   {
     title: "Product",
     links: [
-      ["Compute", new URL("/compute", siteUrl).href],
-      ["Pricing", new URL("/pricing", siteUrl).href],
-      ["Leases", new URL("/leases", siteUrl).href],
-      ["Proof", new URL("/proof", siteUrl).href],
+      ["Compute", new URL("/compute", siteUrl).href, false],
+      ["Pricing", new URL("/pricing", siteUrl).href, false],
+      ["Leases", new URL("/leases", siteUrl).href, false],
+      ["Proof", new URL("/proof", siteUrl).href, false],
     ],
   },
   {
     title: "Providers",
     links: [
-      ["Supply capacity", new URL("/nodes", siteUrl).href],
-      ["Node fleet", new URL("/nodes", siteUrl).href],
-      ["Earnings", new URL("/earnings", siteUrl).href],
-      ["Runtime requirements", new URL("/#runtime", docsUrl).href],
+      ["Supply capacity", new URL("/nodes", siteUrl).href, false],
+      ["Node fleet", new URL("/nodes", siteUrl).href, false],
+      ["Earnings", new URL("/earnings", siteUrl).href, false],
+      ["Runtime requirements", new URL("/#runtime", docsUrl).href, false],
     ],
   },
   {
     title: "Developers",
     links: [
-      ["Documentation", docsUrl.href],
-      ["API reference", new URL("/#api", docsUrl).href],
-      ["Architecture", new URL("/#architecture", docsUrl).href],
-      ["Security model", new URL("/#security", docsUrl).href],
-      ["Source", "https://github.com/prismnetwork-tech/prism"],
+      ["Documentation", docsUrl.href, false],
+      ["API reference", new URL("/#api", docsUrl).href, false],
+      ["Architecture", new URL("/#architecture", docsUrl).href, false],
+      ["Security model", new URL("/#security", docsUrl).href, false],
+      ["Source", "https://github.com/prismnetwork-tech/prism", true],
     ],
   },
   {
     title: "Legal",
     links: [
-      ["Terms", new URL("/terms", siteUrl).href],
-      ["Privacy", new URL("/privacy", siteUrl).href],
-      ["Security", new URL("/security", siteUrl).href],
+      ["Terms", new URL("/terms", siteUrl).href, false],
+      ["Privacy", new URL("/privacy", siteUrl).href, false],
+      ["Security", new URL("/security", siteUrl).href, false],
     ],
   },
   {
     title: "Company",
     links: [
-      ["About", new URL("/about", siteUrl).href],
-      ["Contact", new URL("/contact", siteUrl).href],
-      ["Follow on X", "https://x.com/useprismnetwork"],
-      ["GitHub", "https://github.com/prismnetwork-tech"],
+      ["About", new URL("/about", siteUrl).href, false],
+      ["Contact", new URL("/contact", siteUrl).href, false],
+      ["Follow on X", "https://x.com/useprismnetwork", true],
+      ["GitHub", "https://github.com/prismnetwork-tech", true],
     ],
   },
 ] as const;
@@ -69,8 +69,7 @@ export function PublicFooter() {
         {columns.map((column) => (
           <nav key={column.title} aria-label={`${column.title} footer links`}>
             <h2>{column.title}</h2>
-            {column.links.map(([label, href]) => {
-              const external = href.startsWith("https://github.com") || href.startsWith("https://x.com");
+            {column.links.map(([label, href, external]) => {
               return external ? (
                 <a href={href} key={label} target="_blank" rel="noopener noreferrer">{label}</a>
               ) : (
