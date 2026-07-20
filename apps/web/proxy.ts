@@ -30,7 +30,7 @@ export function contentSecurityPolicy(nonce: string, development: boolean) {
     "form-action 'self'",
     `script-src ${script}`,
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob:",
+    "img-src 'self' data: blob: https://explorer-api.walletconnect.com",
     "font-src 'self'",
     "worker-src 'self' blob:",
     "frame-src https://auth.privy.io https://*.privy.io",
