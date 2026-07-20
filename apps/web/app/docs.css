@@ -398,12 +398,12 @@
 
 .docs-callout {
   padding: 20px 22px;
-  border-left: 2px solid #ccff00;
+  border: 1px solid rgba(204, 255, 0, .2);
   background: rgba(204, 255, 0, .055);
 }
 
 .docs-callout.warning {
-  border-color: #ffcc00;
+  border-color: rgba(255, 204, 0, .25);
   background: rgba(255, 204, 0, .055);
 }
 
