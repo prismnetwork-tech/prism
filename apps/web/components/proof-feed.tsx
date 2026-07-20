@@ -29,15 +29,21 @@ export function ProofFeed() {
     <section className="page-stack">
       <div className="page-heading">
         <div><p className="eyebrow">Public verification</p><h1>Proof feed</h1></div>
-        <span className="chip">{status === "ready" ? "Live artifacts" : "Publication pending"}</span>
+        <span className="chip">{statusLabel(status, proof)}</span>
       </div>
       <article className="panel proof-disclosure"><strong>What this proves</strong><p>Published entries link a platform-attested usage receipt to an onchain settlement event. They do not independently verify hardware execution or contract correctness.</p></article>
       {status === "loading" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Loading proof feed</h2></article>}
-      {status === "unavailable" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Proof feed is unavailable</h2><p>Public proof artifacts have not been configured in this environment.</p></article>}
-      {status === "ready" && proof?.receipts.length === 0 && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>No receipts published</h2><p>Receipts appear after finalized settlement artifacts are published.</p></article>}
+      {status === "unavailable" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Proof feed is temporarily unavailable</h2><p>No receipt data is being shown while the publication endpoint is unavailable.</p></article>}
+      {status === "ready" && proof?.receipts.length === 0 && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>No receipts published yet</h2><p>The first receipt will appear after a funded lease reaches finalized settlement and its artifact passes chain verification.</p></article>}
       {status === "ready" && proof && proof.receipts.length > 0 && <article className="panel proof-list">{proof.receipts.map((receipt) => <Receipt key={receipt.receipt_id} receipt={receipt} />)}</article>}
     </section>
   );
+}
+
+function statusLabel(status: "loading" | "unavailable" | "ready", proof: PublicProofIndex | null) {
+  if (status === "loading") return "Loading";
+  if (status === "unavailable") return "Feed unavailable";
+  return proof?.receipts.length ? "Live artifacts" : "Awaiting first receipt";
 }
 
 function Receipt({ receipt }: { receipt: PublicProofReceipt }) {
