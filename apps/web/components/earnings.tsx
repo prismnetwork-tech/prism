@@ -12,13 +12,13 @@ export function Earnings() {
 
   return (
     <section className="page-stack">
-      <div className="page-heading"><div><p className="eyebrow">Supply revenue</p><h1>Earnings</h1></div><span className="chip">90% provider share</span></div>
+      <div className="page-heading"><div><p className="eyebrow">Provider revenue</p><h1>Earnings</h1></div><span className="chip">90% provider share</span></div>
       {!auth.authenticated ? (
-        <Empty title="Sign in to view supplier earnings" message="Settlement totals are scoped to your verified operator and payout wallets." />
+        <Empty title="Sign in to view provider earnings" message="Settlement totals are available for verified operator and payout wallets." />
       ) : isPending ? (
         <Empty title="Loading settlement history" />
       ) : isError || !data ? (
-        <Empty title="Earnings are unavailable" message="The supplier settlement index could not be loaded." action={<button className="button secondary" type="button" onClick={() => void refetch()}>Retry</button>} />
+        <Empty title="Earnings are unavailable" message="Settlement records could not be loaded. Try again shortly." action={<button className="button secondary" type="button" onClick={() => void refetch()}>Retry</button>} />
       ) : (
         <>
           <div className="metric-grid">
@@ -41,14 +41,14 @@ export function Earnings() {
                       <td className="mono">{short(node.offer.payout_wallet)}</td>
                     </tr>
                   ))}
-                  {!data.nodes.length && <tr><td colSpan={5}>No supplier nodes are linked to a verified wallet.</td></tr>}
+                  {!data.nodes.length && <tr><td colSpan={5}>No provider nodes are linked to a verified wallet.</td></tr>}
                 </tbody>
               </table>
             </div>
           </article>
         </>
       )}
-      <article className="panel proof-disclosure"><p className="eyebrow">Settlement policy</p><h2>Receipt-backed totals</h2><p>Only finalized proof receipts count toward provider-paid totals. Pending settlement, escrow deposits and USDG bonds are excluded.</p></article>
+      <article className="panel proof-disclosure"><p className="eyebrow">Settlement policy</p><h2>Settled earnings</h2><p>Provider earnings include finalized settlement receipts only. Pending settlements, escrow deposits, and USDG bonds are excluded.</p></article>
     </section>
   );
 }

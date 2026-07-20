@@ -220,12 +220,12 @@ function UnconfiguredSession({ children }: { children: React.ReactNode }) {
     linkWallet: () => undefined,
     linkEmail: () => undefined,
     linkPasskey: () => undefined,
-    signWalletMessage: async () => { throw new Error("Prism authentication is not configured."); },
+    signWalletMessage: async () => { throw new Error("Prism account access is unavailable."); },
     getAccessToken: async () => null,
   }), []);
   const smartWallet = useMemo<SmartWalletContextValue>(() => ({
     pending: false,
-    executeCalls: async () => { throw new Error("Prism authentication is not configured."); },
+    executeCalls: async () => { throw new Error("Prism account access is unavailable."); },
   }), []);
   return <SessionContexts auth={auth} smartWallet={smartWallet}>{children}</SessionContexts>;
 }

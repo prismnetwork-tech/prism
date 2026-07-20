@@ -77,10 +77,10 @@ export function LeaseTable() {
     return <Empty title="Loading lease history" />;
   }
   if (status === "unavailable") {
-    return <Empty title="Lease history is unavailable" message="The control plane could not load your indexed escrow leases." />;
+    return <Empty title="Lease history is unavailable" message="The lease service could not load your records. Try again shortly." />;
   }
   if (!leases.length) {
-    return <Empty title="No leases yet" message="A lease appears here after its quote-bound escrow transaction reaches finality." />;
+    return <Empty title="No leases" message="Funded leases appear here after the escrow transaction is confirmed onchain." />;
   }
 
   return (
@@ -127,7 +127,7 @@ function AccessPanel({ access, onClose }: { access: LeaseAccess; onClose: () => 
     return (
       <section className="access-panel" aria-label={`Access for lease ${access.lease_id}`}>
         <div className="section-heading">
-          <div><p className="eyebrow">Lease #{access.lease_id}</p><h2>Direct cloud access</h2></div>
+          <div><p className="eyebrow">Lease #{access.lease_id}</p><h2>Workspace access</h2></div>
           <button className="button secondary compact" type="button" onClick={onClose}>Close</button>
         </div>
         <p className="muted">Instance access ends {new Date(access.expires_at).toLocaleString()}. The endpoint and instance are removed when the lease closes.</p>
@@ -140,7 +140,7 @@ function AccessPanel({ access, onClose }: { access: LeaseAccess; onClose: () => 
   return (
     <section className="access-panel" aria-label={`Access for lease ${access.lease_id}`}>
       <div className="section-heading">
-        <div><p className="eyebrow">Lease #{access.lease_id}</p><h2>Private gateway access</h2></div>
+        <div><p className="eyebrow">Lease #{access.lease_id}</p><h2>Secure gateway access</h2></div>
         <button className="button secondary compact" type="button" onClick={onClose}>Close</button>
       </div>
       <p className="muted">Grant expires {new Date(access.expires_at).toLocaleString()}. Fetch a fresh grant here before it expires.</p>
