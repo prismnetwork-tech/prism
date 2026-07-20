@@ -168,7 +168,7 @@ export function LandingPage() {
       <footer className="landing-footer">
         <Link className="landing-brand" href="/">
           <img src="/brand/prism-logo.svg" alt="" width="30" height="30" />
-          <span>Prism Network</span>
+          <span>prism.</span>
         </Link>
         <p>Independent GPU infrastructure with metered USDG settlement.</p>
         <div>
