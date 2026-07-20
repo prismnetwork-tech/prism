@@ -39,7 +39,8 @@ export async function takeRateLimit(
       available: true,
       retryAfter: Math.max(1, Math.ceil(ttl / 1_000)),
     };
-  } catch {
+  } catch (error) {
+    logRedisError(error);
     return { allowed: false, available: false, retryAfter: 1 };
   }
 }
@@ -63,7 +64,8 @@ export async function registerOneTime(scope: string, value: string, ttlMs: numbe
     const client = await redisClient(url);
     const result = await client.set(key, "1", { NX: true, PX: ttlMs });
     return { available: true, stored: result === "OK" };
-  } catch {
+  } catch (error) {
+    logRedisError(error);
     return { available: false, stored: false };
   }
 }
@@ -86,12 +88,13 @@ export async function consumeOneTime(scope: string, value: string) {
       { keys: [key], arguments: [] },
     );
     return { available: true, consumed: Number(result) === 1 };
-  } catch {
+  } catch (error) {
+    logRedisError(error);
     return { available: false, consumed: false };
   }
 }
 
-function redisClient(url: string) {
+async function redisClient(url: string) {
   if (!isAllowedRedisUrl(url)) throw new Error("insecure Redis connection");
   clientPromise ??= (async () => {
     const caPath = process.env.PRISM_REDIS_CA_FILE;
@@ -103,7 +106,12 @@ function redisClient(url: string) {
     await client.connect();
     return client;
   })();
-  return clientPromise;
+  try {
+    return await clientPromise;
+  } catch (error) {
+    clientPromise = undefined;
+    throw error;
+  }
 }
 
 export function isAllowedRedisUrl(value: string) {
@@ -118,6 +126,13 @@ export function isAllowedRedisUrl(value: string) {
   } catch {
     return false;
   }
+}
+
+function logRedisError(error: unknown) {
+  const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+    ? error.code.slice(0, 64)
+    : "unknown";
+  console.error(JSON.stringify({ event: "redis_unavailable", code }));
 }
 
 function takeMemoryRateLimit(key: string, limit: number, windowMs: number, now: number): RateLimit {
