@@ -184,7 +184,7 @@ function getGeometry(width: number, height: number): Geometry {
 
   return {
     center: {
-      x: width * (compact ? 0.52 : wide ? 0.74 : 0.66),
+      x: width * (compact ? 0.52 : wide ? 0.71 : 0.64),
       y: height * (compact ? 0.73 : 0.5),
     },
     radius: scale * (compact ? 0.25 : wide ? 0.205 : 0.22),
@@ -201,11 +201,11 @@ function paintIncomingSignal(
   compact: boolean,
 ) {
   const source = compact
-    ? { x: width * 0.05, y: center.y + radius * 0.18 }
-    : { x: width * 0.56, y: center.y + radius * 0.08 };
+    ? { x: width * 0.08, y: center.y - radius * 1.08 }
+    : { x: center.x - radius * 1.5, y: center.y - radius * 1.18 };
   const impact = {
-    x: center.x - radius * 0.12,
-    y: center.y - radius * 0.16,
+    x: center.x - radius * 0.18,
+    y: center.y - radius * 0.22,
   };
 
   context.save();
@@ -300,8 +300,10 @@ function paintMeshes(
   { center, radius }: Geometry,
   time: number,
 ) {
+  const coreRadius = radius * 0.19 * 1.15;
+
   paintTesseract(context, center, radius * 0.62, time);
-  paintCorePyramid(context, center, radius * 0.19, time);
+  paintCorePyramid(context, center, coreRadius, time);
 }
 
 function paintTesseract(
