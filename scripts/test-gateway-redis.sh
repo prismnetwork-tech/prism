@@ -6,6 +6,7 @@ command -v curl >/dev/null
 
 mkdir -p output
 root=$(mktemp -d "$PWD/output/gateway-redis.XXXXXX")
+chmod 0755 "$root"
 container="prism-valkey-test-$$"
 gateway_pid=
 port=
