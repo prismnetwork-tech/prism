@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { HeroSignal } from "@/components/hero-signal";
+import { PublicFooter } from "@/components/public-footer";
 import { docsUrl } from "@/lib/site";
 
 const executionSteps = [
@@ -23,7 +24,7 @@ export function LandingPage() {
           <a href="#security">Security</a>
           <a href="#settlement">Settlement</a>
           <Link href="/proof">Proof</Link>
-          <Link href={docsUrl}>Docs</Link>
+          <Link href={docsUrl.href}>Docs</Link>
         </nav>
         <div className="landing-header-actions">
           <SocialLinks />
@@ -170,22 +171,7 @@ export function LandingPage() {
         </section>
       </main>
 
-      <footer className="landing-footer">
-        <Link className="landing-brand" href="/">
-          <img src="/brand/prism-logo.svg" alt="" width="30" height="30" />
-          <span>prism.</span>
-        </Link>
-        <p>On-demand L40S compute with metered USDG settlement.</p>
-        <div className="landing-footer-links">
-          <Link href="/proof">Proof</Link>
-          <Link href={docsUrl}>Docs</Link>
-          <Link href="/privacy">Privacy</Link>
-          <Link href="/terms">Terms</Link>
-          <Link href="/settings">Settings</Link>
-          <span>Private beta</span>
-          <SocialLinks />
-        </div>
-      </footer>
+      <PublicFooter />
     </div>
   );
 }

@@ -6,6 +6,8 @@ import "./globals.css";
 import "./landing.css";
 import "./docs.css";
 import "./legal.css";
+import "./information.css";
+import "./public-footer.css";
 
 export const dynamic = "force-dynamic";
 

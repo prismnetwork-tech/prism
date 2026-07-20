@@ -26,6 +26,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     || pathname.startsWith("/docs")
     || pathname === "/privacy"
     || pathname === "/terms"
+    || pathname === "/about"
+    || pathname === "/pricing"
+    || pathname === "/security"
+    || pathname === "/contact"
   ) return <>{children}</>;
 
   return (
