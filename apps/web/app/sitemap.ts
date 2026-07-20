@@ -1,5 +1,5 @@
 import type { MetadataRoute } from "next";
-import { siteUrl } from "@/lib/site";
+import { docsUrl, siteUrl } from "@/lib/site";
 
 export default function sitemap(): MetadataRoute.Sitemap {
   return [
@@ -22,6 +22,21 @@ export default function sitemap(): MetadataRoute.Sitemap {
       url: new URL("/nodes", siteUrl).href,
       changeFrequency: "weekly",
       priority: 0.7,
+    },
+    {
+      url: docsUrl.href,
+      changeFrequency: "weekly",
+      priority: 0.8,
+    },
+    {
+      url: new URL("/privacy", siteUrl).href,
+      changeFrequency: "yearly",
+      priority: 0.3,
+    },
+    {
+      url: new URL("/terms", siteUrl).href,
+      changeFrequency: "yearly",
+      priority: 0.3,
     },
   ];
 }

@@ -16,6 +16,7 @@ projects:
             healthCheckPath: /api/healthz
             domains:
               - prismnetwork.tech
+              - docs.prismnetwork.tech
             envVars:
               - key: NODE_ENV
                 value: production
@@ -23,6 +24,8 @@ projects:
                 value: "1"
               - key: NEXT_PUBLIC_PRISM_SITE_URL
                 value: https://prismnetwork.tech
+              - key: NEXT_PUBLIC_PRISM_DOCS_URL
+                value: https://docs.prismnetwork.tech
 
 previews:
   generation: off
