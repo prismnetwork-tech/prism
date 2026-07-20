@@ -222,7 +222,7 @@ function paintIncomingSignal(
     context,
     "LEASE SIGNAL",
     source.x + (compact ? 12 : 0),
-    source.y - 14,
+    source.y - (compact ? 2 : 14),
     compact ? "left" : "center",
     LIME,
   );
