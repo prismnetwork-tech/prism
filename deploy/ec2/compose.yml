@@ -1,0 +1,123 @@
+name: prism-network
+
+services:
+  edge:
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PRISM_DOMAIN: ${PRISM_DOMAIN:?set PRISM_DOMAIN}
+      PRISM_ACME_EMAIL: ${PRISM_ACME_EMAIL:?set PRISM_ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+  control-plane:
+    image: ${PRISM_CONTROL_PLANE_IMAGE:?set PRISM_CONTROL_PLANE_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    environment:
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_CONTROL_PLANE_ADDR: 0.0.0.0:8080
+      PRISM_CONTROL_PLANE_AUTH_KEY: ${PRISM_CONTROL_PLANE_AUTH_KEY:?set PRISM_CONTROL_PLANE_AUTH_KEY}
+      PRISM_GATEWAY_OBSERVER_TOKEN: ${PRISM_GATEWAY_OBSERVER_TOKEN:?set PRISM_GATEWAY_OBSERVER_TOKEN}
+      PRISM_ACCESS_CREDENTIAL_KEY: ${PRISM_ACCESS_CREDENTIAL_KEY:?set PRISM_ACCESS_CREDENTIAL_KEY}
+      PRISM_PUBLIC_GATEWAY_HOST: ${PRISM_DOMAIN:?set PRISM_DOMAIN}
+      PRISM_PUBLIC_RELAY_PORT: "7444"
+      PRISM_NODE_CA_CERTIFICATE: /run/prism-ca/ca.crt
+      PRISM_NODE_CA_KEY: /run/prism-ca/ca.key
+      PRISM_OPERATOR_SUBJECTS: ${PRISM_OPERATOR_SUBJECTS:?set PRISM_OPERATOR_SUBJECTS}
+      PRISM_NODE_REGISTRY_ADDRESS: ${PRISM_NODE_REGISTRY_ADDRESS:?set PRISM_NODE_REGISTRY_ADDRESS}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_FUNDING_CONFIRMATIONS: ${PRISM_FUNDING_CONFIRMATIONS:-12}
+    volumes:
+      - ./secrets/tls:/run/prism-ca:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+    restart: unless-stopped
+    shm_size: 128mb
+    environment:
+      POSTGRES_DB: prism
+      POSTGRES_USER: prism
+      POSTGRES_PASSWORD: ${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prism -d prism"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  lifecycle-worker:
+    image: ${PRISM_LIFECYCLE_WORKER_IMAGE:?set PRISM_LIFECYCLE_WORKER_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      AWS_REGION: ${AWS_REGION:-eu-central-1}
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_ACCESS_CREDENTIAL_KEY: ${PRISM_ACCESS_CREDENTIAL_KEY:?set PRISM_ACCESS_CREDENTIAL_KEY}
+      PRISM_GATEWAY_CONTROL_TOKEN: ${PRISM_GATEWAY_CONTROL_TOKEN:?set PRISM_GATEWAY_CONTROL_TOKEN}
+      PRISM_GATEWAY_CONTROL_URL: http://127.0.0.1:9
+      PRISM_ALLOW_PRIVATE_GATEWAY_HTTP: "1"
+      PRISM_GATEWAY_KMS_KEY_ID: ${PRISM_GATEWAY_KMS_KEY_ID:?set PRISM_GATEWAY_KMS_KEY_ID}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_LIFECYCLE_CONFIRMATIONS: ${PRISM_LIFECYCLE_CONFIRMATIONS:-12}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_VAST_API_KEY_FILE: /run/secrets/vast_api_key
+      PRISM_VAST_DISK_GB: ${PRISM_VAST_DISK_GB:-16}
+      PRISM_VAST_MAX_HOURLY_MICROS: ${PRISM_VAST_MAX_HOURLY_MICROS:-640000}
+      PRISM_VAST_NODE_ID: ${PRISM_VAST_NODE_ID:?set PRISM_VAST_NODE_ID}
+    secrets:
+      - vast_api_key
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+  settlement-worker:
+    image: ${PRISM_SETTLEMENT_WORKER_IMAGE:?set PRISM_SETTLEMENT_WORKER_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      AWS_REGION: ${AWS_REGION:-eu-central-1}
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_ATTESTOR_KMS_KEY_ID: ${PRISM_ATTESTOR_KMS_KEY_ID:?set PRISM_ATTESTOR_KMS_KEY_ID}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_SETTLEMENT_CONFIRMATIONS: ${PRISM_SETTLEMENT_CONFIRMATIONS:-12}
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+volumes:
+  caddy_config:
+  caddy_data:
+  postgres_data:
+
+secrets:
+  vast_api_key:
+    file: ./secrets/vast-api-key

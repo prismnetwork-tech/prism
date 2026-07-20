@@ -6,7 +6,6 @@ use aws_sdk_kms::{
     primitives::Blob,
     types::{MessageType, SigningAlgorithmSpec},
 };
-use aws_smithy_http_client_reqwest::ReqwestHttpClient;
 use k256::{
     PublicKey,
     ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey, signature::hazmat::PrehashSigner},
@@ -279,13 +278,7 @@ impl EthereumSigner {
             return Ok(Self::Local(LocalSigner::new(&encoded)?));
         }
         let key_id = env::var(key_id_env).with_context(|| format!("{key_id_env} is required"))?;
-        let kms_http = reqwest::Client::builder()
-            .https_only(true)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("build KMS HTTPS client")?;
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .http_client(ReqwestHttpClient::new(kms_http))
             .load()
             .await;
         Ok(Self::Kms(

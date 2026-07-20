@@ -24,3 +24,5 @@ terraform.tfstate.*
 .terraform/
 crash-reports/
 deploy/lightsail/secrets/
+deploy/ec2/.env
+deploy/ec2/secrets/

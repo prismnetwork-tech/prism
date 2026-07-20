@@ -6,8 +6,8 @@ use prism_chain::{
     EthereumSigner, Finality, PreparedTransaction, RpcClient, address, selector, word_u128,
 };
 use prism_protocol::{
-    CredentialCipher, LeaseRecord, LeaseState, NodeOffer, NodeTelemetry, PublicReceipt,
-    ROBINHOOD_CHAIN_ID, ReceiptOutcome, SettlementEvidence, receipt_hash,
+    CredentialCipher, ExecutionEvidence, LeaseRecord, LeaseState, NodeOffer, NodeTelemetry,
+    PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, SettlementEvidence, receipt_hash,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -19,7 +19,23 @@ use sqlx_postgres::{PgPool, PgPoolOptions};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod vast;
+
+use vast::VastBroker;
+
 const SIGNER_LOCK: i64 = 4_663_001;
+const CLOUD_CAPACITY_UPSERT: &str = "
+    INSERT INTO cloud_capacity
+        (node_id, provider, available, provider_offer_id, hourly_cost_micros, observed_at)
+    VALUES ($1, 'vast', $2, $3, $4, NOW())
+    ON CONFLICT (node_id) DO UPDATE SET
+        provider = 'vast',
+        available = EXCLUDED.available,
+        provider_offer_id = EXCLUDED.provider_offer_id,
+        hourly_cost_micros = EXCLUDED.hourly_cost_micros,
+        observed_at = NOW(),
+        updated_at = NOW()
+";
 
 struct Worker {
     pool: PgPool,
@@ -29,6 +45,7 @@ struct Worker {
     confirmations: u64,
     gateway: GatewayClient,
     cipher: CredentialCipher,
+    vast: Option<VastBroker>,
 }
 
 #[derive(Debug)]
@@ -142,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         gateway: GatewayClient::from_environment()?,
         cipher: CredentialCipher::from_hex(&required_env("PRISM_ACCESS_CREDENTIAL_KEY")?)
             .context("PRISM_ACCESS_CREDENTIAL_KEY must be 32 bytes of hex")?,
+        vast: VastBroker::from_environment()?,
     };
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
     loop {
@@ -166,6 +184,9 @@ async fn main() -> anyhow::Result<()> {
 
 impl Worker {
     async fn scan(&self) -> anyhow::Result<()> {
+        if let Err(error) = self.refresh_cloud_capacity().await {
+            tracing::error!(%error, "cloud capacity refresh failed");
+        }
         query(
             "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
              SELECT md5(lease_id::text || ':expire_provision')::uuid, lease_id, 'expire_provision', \
@@ -184,13 +205,16 @@ impl Worker {
              JOIN lease_lifecycle lc ON lc.lease_id = l.lease_id \
              LEFT JOIN node_telemetry nt ON nt.node_id = l.document->>'node_id' \
              LEFT JOIN node_tunnels t ON t.node_id = l.document->>'node_id' \
+             LEFT JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
              WHERE l.state = 'active' \
                AND (lc.access_started_at + \
                     make_interval(secs => (l.document->>'duration_seconds')::int) <= NOW() \
-                    OR nt.observed_at IS NULL \
-                    OR nt.observed_at < NOW() - INTERVAL '90 seconds' \
-                    OR t.observed_at IS NULL \
-                    OR t.observed_at < NOW() - INTERVAL '90 seconds') \
+                    OR (ci.lease_id IS NULL AND ( \
+                        nt.observed_at IS NULL \
+                        OR nt.observed_at < NOW() - INTERVAL '90 seconds' \
+                        OR t.observed_at IS NULL \
+                        OR t.observed_at < NOW() - INTERVAL '90 seconds')) \
+                    OR (ci.lease_id IS NOT NULL AND ci.status NOT IN ('running', 'destroying'))) \
              ON CONFLICT (lease_id, kind) DO NOTHING",
         )
         .execute(&self.pool)
@@ -211,6 +235,73 @@ impl Worker {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn refresh_cloud_capacity(&self) -> anyhow::Result<()> {
+        let Some(vast) = &self.vast else {
+            return Ok(());
+        };
+        let refreshed_at: Option<DateTime<Utc>> =
+            query_scalar("SELECT updated_at FROM cloud_capacity WHERE node_id = $1")
+                .bind(&vast.node_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if refreshed_at.is_some_and(|value| value >= Utc::now() - chrono::Duration::seconds(30)) {
+            return Ok(());
+        }
+        let offer_document = query_scalar::<_, SqlJson<NodeOffer>>(
+            "SELECT document FROM node_offers WHERE node_id = $1",
+        )
+        .bind(&vast.node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(SqlJson(mut node_offer)) = offer_document else {
+            tracing::warn!(
+                node_id = %vast.node_id,
+                "Vast broker node is not enrolled; cloud capacity is disabled"
+            );
+            return Ok(());
+        };
+        let provider_offer = match vast.cheapest_l40s().await {
+            Ok(offer) => offer,
+            Err(error) => {
+                self.record_cloud_capacity(vast, None).await?;
+                return Err(error);
+            }
+        };
+        self.record_cloud_capacity(vast, provider_offer.as_ref())
+            .await?;
+        if provider_offer.is_some() {
+            node_offer.online = true;
+            node_offer.updated_at = Utc::now();
+            query("UPDATE node_offers SET document = $2, updated_at = NOW() WHERE node_id = $1")
+                .bind(&vast.node_id)
+                .bind(SqlJson(node_offer))
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn record_cloud_capacity(
+        &self,
+        vast: &VastBroker,
+        offer: Option<&vast::Offer>,
+    ) -> anyhow::Result<()> {
+        let provider_offer_id = offer.map(|offer| i64::try_from(offer.id)).transpose()?;
+        let hourly_micros = offer
+            .map(|offer| vast::hourly_micros(offer.dph_total))
+            .transpose()?
+            .map(i64::try_from)
+            .transpose()?;
+        query(CLOUD_CAPACITY_UPSERT)
+            .bind(&vast.node_id)
+            .bind(offer.is_some())
+            .bind(provider_offer_id)
+            .bind(hourly_micros)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -279,6 +370,9 @@ impl Worker {
         if action.kind == ActionKind::CloseAccess && action.transaction.is_none() {
             self.revoke_access(action.lease_id).await?;
         }
+        if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
+            self.destroy_cloud_instance(action.lease_id).await?;
+        }
         if action.kind == ActionKind::Finalize && action.transaction.is_none() {
             match self.lease_status(action.lease_id).await? {
                 4 => {
@@ -321,6 +415,9 @@ impl Worker {
     }
 
     async fn probe(&self, action: &Action) -> anyhow::Result<()> {
+        if self.ensure_cloud_ready(action.lease_id).await? {
+            return Ok(());
+        }
         let context = self.lease_context(action.lease_id).await?;
         if context.lease.state != LeaseState::Ready {
             anyhow::bail!("lease is not ready for an access probe");
@@ -345,6 +442,158 @@ impl Worker {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn ensure_cloud_ready(&self, lease_id: u64) -> anyhow::Result<bool> {
+        let row = query_as::<
+            _,
+            (
+                Option<i64>,
+                Option<i64>,
+                String,
+                Option<DateTime<Utc>>,
+                String,
+            ),
+        >(
+            "SELECT provider_instance_id, provider_offer_id, ssh_authorized_key, \
+                    ssh_key_attached_at, status \
+             FROM cloud_instances WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((stored_instance_id, _, ssh_key, ssh_key_attached_at, status)) = row else {
+            return Ok(false);
+        };
+        let vast = self
+            .vast
+            .as_ref()
+            .context("Vast is not configured for this cloud lease")?;
+        let context = self.lease_context(lease_id).await?;
+        if context.lease.node_id != vast.node_id {
+            anyhow::bail!("cloud lease node does not match the configured Vast broker");
+        }
+        if matches!(status.as_str(), "destroying" | "destroyed" | "failed") {
+            anyhow::bail!("cloud instance is in terminal state {status}");
+        }
+
+        let label = format!("prism-lease-{lease_id}");
+        let (instance_id, selected_offer) = match stored_instance_id {
+            Some(instance_id) => (u64::try_from(instance_id)?, None),
+            None => {
+                if let Some(instance_id) = vast.find_by_label(&label).await? {
+                    (instance_id, None)
+                } else {
+                    let offer = vast
+                        .cheapest_l40s()
+                        .await?
+                        .context("no verified L40S is available under the cost ceiling")?;
+                    let instance_id = vast
+                        .create(offer.id, &context.lease.image, lease_id)
+                        .await?;
+                    (instance_id, Some(offer))
+                }
+            }
+        };
+        query(
+            "UPDATE cloud_instances SET provider_instance_id = $2, \
+                 provider_offer_id = COALESCE($3, provider_offer_id), \
+                 hourly_cost_micros = COALESCE($4, hourly_cost_micros), \
+                 status = 'provisioning', last_error = NULL, updated_at = NOW() \
+             WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .bind(i64::try_from(instance_id)?)
+        .bind(
+            selected_offer
+                .as_ref()
+                .map(|offer| i64::try_from(offer.id))
+                .transpose()?,
+        )
+        .bind(
+            selected_offer
+                .as_ref()
+                .map(|offer| vast::hourly_micros(offer.dph_total))
+                .transpose()?
+                .map(i64::try_from)
+                .transpose()?,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        if ssh_key_attached_at.is_none() {
+            vast.attach_ssh_key(instance_id, &ssh_key).await?;
+            query(
+                "UPDATE cloud_instances SET ssh_key_attached_at = NOW(), updated_at = NOW() \
+                 WHERE lease_id = $1",
+            )
+            .bind(lease_id as i64)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        let instance = vast.instance(instance_id).await?;
+        if instance.status != "running" {
+            if matches!(
+                instance.status.as_str(),
+                "exited" | "destroyed" | "failed" | "offline"
+            ) {
+                query(
+                    "UPDATE cloud_instances SET status = 'failed', last_error = $2, \
+                         updated_at = NOW() WHERE lease_id = $1",
+                )
+                .bind(lease_id as i64)
+                .bind(format!("Vast instance entered {}", instance.status))
+                .execute(&self.pool)
+                .await?;
+                anyhow::bail!("Vast instance entered terminal state {}", instance.status);
+            }
+            anyhow::bail!("Vast instance is not ready");
+        }
+        if !instance.gpu_name.eq_ignore_ascii_case("L40S")
+            || instance.gpu_ram < 45_000
+            || !instance.verification.eq_ignore_ascii_case("verified")
+            || instance.hourly_micros > vast.max_hourly_micros
+        {
+            vast.destroy(instance_id).await?;
+            query(
+                "UPDATE cloud_instances SET status = 'failed', destroyed_at = NOW(), \
+                     last_error = 'provider instance failed admission checks', updated_at = NOW() \
+                 WHERE lease_id = $1",
+            )
+            .bind(lease_id as i64)
+            .execute(&self.pool)
+            .await?;
+            anyhow::bail!("Vast instance failed GPU, verification or cost admission checks");
+        }
+        let host = instance.ssh_host.context("Vast instance has no SSH host")?;
+        let port = instance.ssh_port.context("Vast instance has no SSH port")?;
+        let ready_at = Utc::now();
+        let mut transaction = self.pool.begin().await?;
+        query(
+            "UPDATE cloud_instances SET hourly_cost_micros = $2, ssh_host = $3, ssh_port = $4, \
+                 status = 'running', started_at = COALESCE(started_at, $5), \
+                 last_error = NULL, updated_at = NOW() WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .bind(i64::try_from(instance.hourly_micros)?)
+        .bind(host)
+        .bind(i32::from(port))
+        .bind(ready_at)
+        .execute(&mut *transaction)
+        .await?;
+        query(
+            "UPDATE lease_lifecycle SET connection_id = $2, cuda_ready_at = $3, \
+                 gateway_ready_at = $3, updated_at = NOW() WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .bind(format!("vast:{instance_id}"))
+        .bind(ready_at)
+        .execute(&mut *transaction)
+        .await?;
+        set_lease_state_in(&mut transaction, lease_id, LeaseState::Ready).await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     async fn prepare(&self, action: &Action) -> anyhow::Result<PreparedTransaction> {
@@ -447,7 +696,9 @@ impl Worker {
         )
         .execute(&self.pool)
         .await?;
-        self.issue_grant(action.lease_id, false).await?;
+        if !self.is_cloud_lease(action.lease_id).await? {
+            self.issue_grant(action.lease_id, false).await?;
+        }
         self.set_lease_state(action.lease_id, LeaseState::Active)
             .await
     }
@@ -640,6 +891,17 @@ impl Worker {
     }
 
     async fn revoke_access(&self, lease_id: u64) -> anyhow::Result<()> {
+        if self.destroy_cloud_instance(lease_id).await? {
+            query(
+                "UPDATE lease_lifecycle SET gateway_closed_at = COALESCE(gateway_closed_at, NOW()), \
+                     grant_token = NULL, grant_expires_at = NULL, updated_at = NOW() \
+                 WHERE lease_id = $1",
+            )
+            .bind(lease_id as i64)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
         let context = self.lease_context(lease_id).await?;
         if let Some(token_id) = context.grant_token_id {
             self.gateway.revoke(token_id).await?;
@@ -655,8 +917,76 @@ impl Worker {
         Ok(())
     }
 
+    async fn is_cloud_lease(&self, lease_id: u64) -> anyhow::Result<bool> {
+        query_scalar("SELECT EXISTS (SELECT 1 FROM cloud_instances WHERE lease_id = $1)")
+            .bind(lease_id as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn destroy_cloud_instance(&self, lease_id: u64) -> anyhow::Result<bool> {
+        let row = query_as::<_, (Option<i64>, String)>(
+            "SELECT provider_instance_id, status FROM cloud_instances WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((instance_id, status)) = row else {
+            return Ok(false);
+        };
+        if status == "destroyed" {
+            return Ok(true);
+        }
+        query(
+            "UPDATE cloud_instances SET status = 'destroying', updated_at = NOW() \
+             WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .execute(&self.pool)
+        .await?;
+        if let Some(instance_id) = instance_id {
+            self.vast
+                .as_ref()
+                .context("Vast is not configured for this cloud lease")?
+                .destroy(u64::try_from(instance_id)?)
+                .await?;
+        }
+        query(
+            "UPDATE cloud_instances SET status = 'destroyed', destroyed_at = COALESCE(destroyed_at, NOW()), \
+                 ssh_host = NULL, ssh_port = NULL, last_error = NULL, updated_at = NOW() \
+             WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
     async fn settlement_evidence(&self, lease_id: u64) -> anyhow::Result<SettlementEvidence> {
         let context = self.lease_context(lease_id).await?;
+        let cloud = query_as::<_, (i64, i64, String)>(
+            "SELECT provider_instance_id, hourly_cost_micros, status \
+             FROM cloud_instances \
+             WHERE lease_id = $1 \
+               AND provider_instance_id IS NOT NULL \
+               AND hourly_cost_micros IS NOT NULL",
+        )
+        .bind(lease_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        let execution = match cloud {
+            Some((instance_id, hourly_cost_micros, status)) => {
+                if status != "destroyed" {
+                    anyhow::bail!("cloud instance was not destroyed before settlement");
+                }
+                ExecutionEvidence::Vast {
+                    instance_id: u64::try_from(instance_id)?,
+                    hourly_cost_micros: u64::try_from(hourly_cost_micros)?,
+                }
+            }
+            None => ExecutionEvidence::Physical,
+        };
         let telemetry = query_scalar::<_, SqlJson<NodeTelemetry>>(
             "SELECT document FROM lease_telemetry WHERE lease_id = $1 ORDER BY sequence",
         )
@@ -694,6 +1024,7 @@ impl Worker {
                 "interactive readiness",
             )?,
             gateway_closed_at: timestamp(context.gateway_closed_at, "gateway close")?,
+            execution,
             node_telemetry: telemetry,
         })
     }
@@ -1047,5 +1378,11 @@ mod tests {
         assert!(private_gateway_host("fd00::2"));
         assert!(!private_gateway_host("gateway.example.com"));
         assert!(!private_gateway_host("203.0.113.6"));
+    }
+
+    #[test]
+    fn cloud_capacity_upsert_records_the_provider() {
+        assert!(CLOUD_CAPACITY_UPSERT.contains("(node_id, provider, available"));
+        assert!(CLOUD_CAPACITY_UPSERT.contains("VALUES ($1, 'vast'"));
     }
 }

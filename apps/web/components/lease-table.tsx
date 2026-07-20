@@ -14,7 +14,8 @@ type Lease = {
   created_at: string;
 };
 
-type LeaseAccess = {
+type GatewayAccess = {
+  mode: "gateway";
   lease_id: number;
   token: string;
   gateway_host: string;
@@ -24,6 +25,17 @@ type LeaseAccess = {
   jupyter_token: string;
   expires_at: string;
 };
+
+type DirectSshAccess = {
+  mode: "direct_ssh";
+  lease_id: number;
+  ssh_host: string;
+  ssh_port: number;
+  ssh_user: string;
+  expires_at: string;
+};
+
+type LeaseAccess = GatewayAccess | DirectSshAccess;
 
 export function LeaseTable() {
   const auth = usePrismAuth();
@@ -111,6 +123,19 @@ export function LeaseTable() {
 }
 
 function AccessPanel({ access, onClose }: { access: LeaseAccess; onClose: () => void }) {
+  if (access.mode === "direct_ssh") {
+    return (
+      <section className="access-panel" aria-label={`Access for lease ${access.lease_id}`}>
+        <div className="section-heading">
+          <div><p className="eyebrow">Lease #{access.lease_id}</p><h2>Direct cloud access</h2></div>
+          <button className="button secondary compact" type="button" onClick={onClose}>Close</button>
+        </div>
+        <p className="muted">Instance access ends {new Date(access.expires_at).toLocaleString()}. The endpoint and instance are removed when the lease closes.</p>
+        <label>SSH</label>
+        <code>{`ssh -p ${access.ssh_port} ${access.ssh_user}@${access.ssh_host}`}</code>
+      </section>
+    );
+  }
   const relay = `prismd relay --gateway ${access.gateway_host}:${access.relay_port} --server-name ${access.gateway_host} --ca-certificate prism-ca.crt --token '${access.token}'`;
   return (
     <section className="access-panel" aria-label={`Access for lease ${access.lease_id}`}>
@@ -169,16 +194,24 @@ function isLease(value: unknown): value is Lease {
 
 function isLeaseAccess(value: unknown): value is LeaseAccess {
   if (!value || typeof value !== "object") return false;
-  const access = value as Partial<LeaseAccess>;
-  return Number.isSafeInteger(access.lease_id)
-    && typeof access.token === "string"
+  const access = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(access.lease_id)
+    || typeof access.ssh_user !== "string"
+    || typeof access.expires_at !== "string") return false;
+  if (access.mode === "direct_ssh") {
+    return typeof access.ssh_host === "string"
+      && typeof access.ssh_port === "number"
+      && Number.isSafeInteger(access.ssh_port)
+      && access.ssh_port > 0
+      && access.ssh_port <= 65_535;
+  }
+  if (access.mode !== "gateway") return false;
+  return typeof access.token === "string"
     && access.token.length > 32
     && typeof access.gateway_host === "string"
     && typeof access.relay_port === "number"
-    && typeof access.ssh_user === "string"
     && typeof access.jupyter_path === "string"
-    && typeof access.jupyter_token === "string"
-    && typeof access.expires_at === "string";
+    && typeof access.jupyter_token === "string";
 }
 
 function short(value: string) {

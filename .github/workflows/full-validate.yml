@@ -50,8 +50,10 @@ jobs:
         run: |
           docker run --rm -v "$PWD/infra/terraform:/workspace" -w /workspace hashicorp/terraform:1.10@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28 init -backend=false -input=false
           docker run --rm -v "$PWD/infra/terraform:/workspace" -w /workspace hashicorp/terraform:1.10@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28 validate
-      - name: Validate Lightsail deployment
-        run: docker compose --env-file deploy/lightsail/.env.example -f deploy/lightsail/compose.yml config --quiet
+      - name: Validate deployment manifests
+        run: |
+          docker compose --env-file deploy/lightsail/.env.example -f deploy/lightsail/compose.yml config --quiet
+          docker compose --env-file deploy/lightsail/.env.example -f deploy/ec2/compose.yml config --quiet
       - name: Build service images
         run: |
           docker build -f deploy/Dockerfile.web -t prism-web:test \

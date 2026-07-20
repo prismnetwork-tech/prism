@@ -13,18 +13,18 @@ export const metadata: Metadata = {
     default: "Prism Network",
     template: "%s · Prism Network",
   },
-  description: "Independent GPU infrastructure with metered USDG settlement.",
+  description: "On-demand L40S compute with metered USDG settlement.",
   applicationName: "Prism Network",
   openGraph: {
     type: "website",
     siteName: "Prism Network",
     title: "Prism Network",
-    description: "Independent GPU infrastructure with metered USDG settlement.",
+    description: "On-demand L40S compute with metered USDG settlement.",
   },
   twitter: {
     card: "summary",
     title: "Prism Network",
-    description: "Independent GPU infrastructure with metered USDG settlement.",
+    description: "On-demand L40S compute with metered USDG settlement.",
   },
   manifest: "/manifest.webmanifest",
   icons: {
