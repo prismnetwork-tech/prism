@@ -19,7 +19,8 @@
     "lint": "pnpm --filter @prism/web lint",
     "typecheck": "pnpm --filter @prism/web typecheck",
     "test": "pnpm --filter @prism/web test",
-    "check": "./scripts/validate.sh"
+    "check": "./scripts/validate-fast.sh",
+    "check:full": "./scripts/validate.sh"
   },
   "pnpm": {
     "overrides": {
