@@ -7,6 +7,14 @@ type Point = {
   y: number;
 };
 
+type Point3 = Point & {
+  z: number;
+};
+
+type Point4 = Point3 & {
+  w: number;
+};
+
 type Frame = {
   context: CanvasRenderingContext2D;
   width: number;
@@ -14,13 +22,46 @@ type Frame = {
   time: number;
 };
 
+type Geometry = {
+  center: Point;
+  radius: number;
+  compact: boolean;
+};
+
+const LIME = "#cf0";
+const TAU = Math.PI * 2;
+
+const streams = [
+  { label: "ESCROW", detail: "FUNDS LOCKED", offset: 0 },
+  { label: "CUDA", detail: "WORKSPACE LIVE", offset: 0.28 },
+  { label: "PROOF", detail: "RECEIPT FINAL", offset: 0.56 },
+] as const;
+
+const tesseractVertices = Array.from({ length: 16 }, (_, index): Point4 => ({
+  x: index & 1 ? 1 : -1,
+  y: index & 2 ? 1 : -1,
+  z: index & 4 ? 1 : -1,
+  w: index & 8 ? 1 : -1,
+}));
+
+const tesseractEdges: Array<[number, number]> = [];
+
+for (let vertex = 0; vertex < tesseractVertices.length; vertex += 1) {
+  for (const axis of [1, 2, 4, 8]) {
+    if ((vertex & axis) === 0) tesseractEdges.push([vertex, vertex | axis]);
+  }
+}
+
 export function HeroSignal() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const backgroundRef = useRef<HTMLCanvasElement>(null);
+  const coreRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) return;
+    const background = backgroundRef.current;
+    const core = coreRef.current;
+    const backgroundContext = background?.getContext("2d");
+    const coreContext = core?.getContext("2d");
+    if (!background || !core || !backgroundContext || !coreContext) return;
 
     const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
     let frame = 0;
@@ -29,13 +70,16 @@ export function HeroSignal() {
     let width = 0;
 
     const render = (time: number) => {
-      context.clearRect(0, 0, width, height);
-      paintPrism({
-        context,
+      backgroundContext.clearRect(0, 0, width, height);
+      coreContext.clearRect(0, 0, width, height);
+      const geometry = getGeometry(width, height);
+      paintLightfield({
+        context: backgroundContext,
         width,
         height,
-        time: motion.matches ? 2800 : time,
+        time: motion.matches ? 3600 : time,
       });
+      paintMeshes(coreContext, geometry, motion.matches ? 3600 : time);
     };
 
     const draw = (time: number) => {
@@ -48,21 +92,28 @@ export function HeroSignal() {
     const start = () => {
       if (!visible || frame) return;
       if (motion.matches) {
-        render(2800);
+        render(3600);
         return;
       }
       frame = window.requestAnimationFrame(draw);
     };
 
     const resize = () => {
-      const bounds = canvas.getBoundingClientRect();
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.75);
+      const bounds = background.getBoundingClientRect();
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.6);
       width = bounds.width;
       height = bounds.height;
-      canvas.width = Math.round(width * pixelRatio);
-      canvas.height = Math.round(height * pixelRatio);
-      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-      if (motion.matches) render(2800);
+
+      for (const layer of [background, core]) {
+        layer.width = Math.round(width * pixelRatio);
+        layer.height = Math.round(height * pixelRatio);
+      }
+
+      for (const context of [backgroundContext, coreContext]) {
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      }
+
+      render(motion.matches ? 3600 : performance.now());
     };
 
     const intersectionObserver = new IntersectionObserver(([entry]) => {
@@ -81,8 +132,8 @@ export function HeroSignal() {
       start();
     };
 
-    intersectionObserver.observe(canvas);
-    resizeObserver.observe(canvas);
+    intersectionObserver.observe(background);
+    resizeObserver.observe(background);
     motion.addEventListener("change", handleMotionChange);
     resize();
     start();
@@ -97,7 +148,17 @@ export function HeroSignal() {
 
   return (
     <div className="signal-visual">
-      <canvas ref={canvasRef} aria-label="GPU lease refracting into escrow, compute and settlement paths" role="img" />
+      <canvas
+        className="signal-layer signal-layer-background"
+        ref={backgroundRef}
+        aria-label="A rotating four-dimensional wireframe prism refracting a GPU lease signal into escrow, compute and proof streams"
+        role="img"
+      />
+      <canvas
+        className="signal-layer signal-layer-core"
+        ref={coreRef}
+        aria-hidden="true"
+      />
       <div className="signal-corner signal-corner-top" aria-hidden="true" />
       <div className="signal-corner signal-corner-bottom" aria-hidden="true" />
       <div className="signal-hud" aria-hidden="true">
@@ -108,175 +169,252 @@ export function HeroSignal() {
   );
 }
 
-function paintPrism({ context, width, height, time }: Frame) {
-  const compact = width < 520;
+function paintLightfield({ context, width, height, time }: Frame) {
+  if (!width || !height) return;
+
+  const { center, radius, compact } = getGeometry(width, height);
+  paintIncomingSignal(context, width, center, radius, time, compact);
+  paintStreams(context, width, height, center, radius, time, compact);
+}
+
+function getGeometry(width: number, height: number): Geometry {
+  const compact = width < 600;
   const wide = width >= 960;
-
-  paintBackdrop(context, width, height);
-  paintPerspectiveGrid(
-    context,
-    width,
-    height,
-    width * (wide ? 0.64 : 0.5),
-    height * (compact ? 0.58 : 0.36),
-  );
-
   const scale = Math.min(width, height);
-  const center = {
-    x: width * (compact ? 0.46 : wide ? 0.64 : 0.58),
-    y: height * (compact ? 0.79 : 0.52),
+
+  return {
+    center: {
+      x: width * (compact ? 0.52 : wide ? 0.74 : 0.66),
+      y: height * (compact ? 0.73 : 0.5),
+    },
+    radius: scale * (compact ? 0.25 : wide ? 0.205 : 0.22),
+    compact,
   };
-  const apex = { x: center.x, y: center.y - scale * 0.23 };
-  const left = { x: center.x - scale * 0.2, y: center.y + scale * 0.17 };
-  const right = { x: center.x + scale * 0.21, y: center.y + scale * 0.17 };
-  const core = { x: center.x, y: center.y + scale * 0.04 };
-
-  context.save();
-  context.shadowColor = "rgba(204, 255, 0, 0.4)";
-  context.shadowBlur = 26;
-  context.lineWidth = 1.4;
-  context.strokeStyle = "rgba(204, 255, 0, 0.9)";
-  context.fillStyle = "rgba(204, 255, 0, 0.035)";
-  polygon(context, [apex, left, right]);
-  context.fill();
-  context.stroke();
-  context.shadowBlur = 0;
-  context.strokeStyle = "rgba(204, 255, 0, 0.35)";
-  line(context, apex, core);
-  line(context, left, core);
-  line(context, right, core);
-  context.restore();
-
-  const origin = { x: width * (wide ? 0.38 : compact ? 0.04 : 0.18), y: center.y };
-  const beamEnd = { x: center.x - scale * 0.05, y: center.y - scale * 0.06 };
-  const incoming = pointBetween(origin, beamEnd, loop(time, 4400));
-
-  context.save();
-  context.strokeStyle = "rgba(204, 255, 0, 0.3)";
-  context.lineWidth = 1;
-  line(context, origin, beamEnd);
-  glowPoint(context, incoming.x, incoming.y, 3.5, 18);
-  context.restore();
-  label(context, "LEASE REQUEST", origin.x, origin.y - 18, "left");
-
-  const lanes = [
-    { name: "ESCROW", offset: 0 },
-    { name: "COMPUTE", offset: 0.34 },
-    { name: "SETTLE", offset: 0.68 },
-  ] as const;
-  const receipt = {
-    x: width * (compact ? 0.75 : wide ? 0.87 : 0.82),
-    y: height * (compact ? 0.66 : 0.39),
-    width: width * (compact ? 0.21 : wide ? 0.105 : 0.14),
-    height: height * (compact ? 0.17 : 0.22),
-  };
-
-  lanes.forEach((lane) => {
-    const start = { x: center.x + scale * 0.07, y: center.y };
-    const end = {
-      x: receipt.x,
-      y: receipt.y + receipt.height * (lane.name === "ESCROW" ? 0.25 : lane.name === "COMPUTE" ? 0.5 : 0.75),
-    };
-    const checkpointX = width * (compact ? 0.63 : wide ? 0.78 : 0.7);
-    const checkpoint = pointBetween(start, end, (checkpointX - start.x) / (end.x - start.x));
-
-    context.save();
-    context.strokeStyle = "rgba(204, 255, 0, 0.32)";
-    context.lineWidth = lane.name === "COMPUTE" ? 1.4 : 1;
-    line(context, start, end);
-    diamond(context, checkpoint.x, checkpoint.y, 7);
-    label(context, lane.name, checkpoint.x + 13, checkpoint.y - 9, "left");
-
-    const progress = loop(time + lane.offset * 4400, 4400);
-    const point = pointBetween(start, end, progress);
-    glowPoint(context, point.x, point.y, lane.name === "COMPUTE" ? 3.5 : 2.5, 15);
-    context.restore();
-  });
-
-  context.save();
-  context.fillStyle = "rgba(3, 5, 1, 0.92)";
-  context.strokeStyle = "rgba(204, 255, 0, 0.7)";
-  context.lineWidth = 1;
-  context.fillRect(receipt.x, receipt.y, receipt.width, receipt.height);
-  context.strokeRect(receipt.x, receipt.y, receipt.width, receipt.height);
-  context.fillStyle = "#ccff00";
-  context.fillRect(receipt.x, receipt.y, receipt.width, 2);
-  label(context, "RECEIPT", receipt.x + 10, receipt.y + 22, "left", "#ccff00");
-  label(context, "RUNTIME", receipt.x + 10, receipt.y + 48, "left");
-  label(
-    context,
-    `${String(Math.floor((time / 1000) % 60)).padStart(2, "0")}.00 SEC`,
-    receipt.x + 10,
-    receipt.y + 65,
-    "left",
-    "#f4f7ef",
-  );
-  label(
-    context,
-    compact ? "FINAL" : "FINALIZED",
-    receipt.x + 10,
-    receipt.y + receipt.height - 15,
-    "left",
-    "#ccff00",
-  );
-  context.restore();
 }
 
-function paintBackdrop(context: CanvasRenderingContext2D, width: number, height: number) {
-  const compact = width < 520;
-  const wide = width >= 960;
-  const focusX = wide ? 0.7 : compact ? 0.5 : 0.58;
-  const focusY = compact ? 0.68 : 0.42;
+function paintIncomingSignal(
+  context: CanvasRenderingContext2D,
+  width: number,
+  center: Point,
+  radius: number,
+  time: number,
+  compact: boolean,
+) {
+  const source = compact
+    ? { x: width * 0.05, y: center.y + radius * 0.18 }
+    : { x: width * 0.56, y: center.y + radius * 0.08 };
+  const impact = {
+    x: center.x - radius * 0.12,
+    y: center.y - radius * 0.16,
+  };
 
-  context.fillStyle = "#010200";
-  context.fillRect(0, 0, width, height);
-  const glow = context.createRadialGradient(
-    width * focusX,
-    height * focusY,
-    0,
-    width * focusX,
-    height * focusY,
-    Math.max(width, height) * 0.68,
+  context.save();
+  context.strokeStyle = LIME;
+  context.lineWidth = 1;
+  line(context, source, impact);
+
+  const progress = loop(time, 3600);
+  const point = pointBetween(source, impact, easeInOut(progress));
+  paintPoint(context, point.x, point.y, 1.2 + progress);
+  context.restore();
+
+  label(
+    context,
+    "LEASE SIGNAL",
+    source.x + (compact ? 12 : 0),
+    source.y - 14,
+    compact ? "left" : "center",
+    LIME,
   );
-  glow.addColorStop(0, "rgba(204, 255, 0, 0.1)");
-  glow.addColorStop(0.42, "rgba(204, 255, 0, 0.025)");
-  glow.addColorStop(1, "rgba(204, 255, 0, 0)");
-  context.fillStyle = glow;
-  context.fillRect(0, 0, width, height);
 }
 
-function paintPerspectiveGrid(
+function paintStreams(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
-  vanishingX: number,
-  horizon: number,
+  center: Point,
+  radius: number,
+  time: number,
+  compact: boolean,
+) {
+  const start = { x: center.x + radius * 0.12, y: center.y };
+
+  streams.forEach((stream, index) => {
+    const spread = index - 1;
+    const end = compact
+      ? {
+          x: width * (0.17 + index * 0.33),
+          y: height * (0.92 + Math.abs(spread) * 0.018),
+        }
+      : {
+          x: width * 0.975,
+          y: center.y + spread * radius * 0.96,
+        };
+
+    context.save();
+    context.strokeStyle = LIME;
+    context.lineWidth = 1;
+    line(context, start, end);
+
+    for (let particle = 0; particle < 2; particle += 1) {
+      const progress = loop(time + stream.offset * 4800 + particle * 2240, 4800);
+      const point = pointBetween(start, end, easeInOut(progress));
+      paintPoint(context, point.x, point.y, index === 1 ? 1.8 : 1.3);
+    }
+    context.restore();
+
+    paintStreamNode(context, end, stream.label, stream.detail, compact);
+  });
+}
+
+function paintStreamNode(
+  context: CanvasRenderingContext2D,
+  point: Point,
+  title: string,
+  detail: string,
+  compact: boolean,
 ) {
   context.save();
-  context.strokeStyle = "rgba(204, 255, 0, 0.055)";
+  context.translate(point.x, point.y);
+  context.strokeStyle = LIME;
+  context.fillStyle = "#020300";
   context.lineWidth = 1;
-  for (let column = -3; column <= 11; column += 1) {
-    line(
-      context,
-      { x: vanishingX, y: horizon },
-      { x: (column / 8) * width, y: height * 1.05 },
-    );
-  }
-  for (let row = 0; row < 8; row += 1) {
-    const depth = row / 7;
-    const y = horizon + Math.pow(depth, 2.1) * (height - horizon);
-    line(context, { x: 0, y }, { x: width, y });
+  context.beginPath();
+  context.moveTo(0, -6);
+  context.lineTo(6, 0);
+  context.lineTo(0, 6);
+  context.lineTo(-6, 0);
+  context.closePath();
+  context.fill();
+  context.stroke();
+  context.restore();
+
+  const x = compact ? point.x : point.x - 14;
+  const align = compact ? "center" : "right";
+  label(context, title, x, point.y - 17, align, LIME);
+  if (!compact) label(context, detail, x, point.y + 21, align, "#f4f7ef");
+}
+
+function paintMeshes(
+  context: CanvasRenderingContext2D,
+  { center, radius }: Geometry,
+  time: number,
+) {
+  paintTesseract(context, center, radius * 0.62, time);
+  paintCorePyramid(context, center, radius * 0.19, time);
+}
+
+function paintTesseract(
+  context: CanvasRenderingContext2D,
+  center: Point,
+  radius: number,
+  time: number,
+) {
+  const projected = tesseractVertices.map((vertex) => {
+    const rotated = rotate4D(vertex, time);
+    return project(project4D(rotated), center, radius);
+  });
+
+  context.save();
+  context.strokeStyle = LIME;
+  context.lineWidth = 1;
+  for (const [from, to] of tesseractEdges) {
+    line(context, projected[from], projected[to]);
   }
   context.restore();
 }
 
-function polygon(context: CanvasRenderingContext2D, points: ReadonlyArray<Point>) {
-  context.beginPath();
-  points.forEach((point, index) => {
-    if (index === 0) context.moveTo(point.x, point.y);
-    else context.lineTo(point.x, point.y);
-  });
-  context.closePath();
+function paintCorePyramid(
+  context: CanvasRenderingContext2D,
+  center: Point,
+  radius: number,
+  time: number,
+) {
+  const vertices: Point3[] = [
+    { x: 0, y: -1.05, z: 0 },
+    { x: -0.76, y: 0.68, z: -0.76 },
+    { x: 0.76, y: 0.68, z: -0.76 },
+    { x: 0.76, y: 0.68, z: 0.76 },
+    { x: -0.76, y: 0.68, z: 0.76 },
+  ];
+  const rotation = {
+    x: time * 0.00042,
+    y: -time * 0.00058,
+    z: time * 0.00012,
+  };
+  const projected = vertices.map((vertex) =>
+    project(rotate(vertex, rotation), center, radius),
+  );
+  const edges = [
+    [0, 1], [0, 2], [0, 3], [0, 4],
+    [1, 2], [2, 3], [3, 4], [4, 1],
+  ];
+
+  context.save();
+  context.strokeStyle = "#f4f7ef";
+  context.lineWidth = 0.75;
+  for (const [from, to] of edges) {
+    line(context, projected[from], projected[to]);
+  }
+  context.restore();
+}
+
+function rotate4D(point: Point4, time: number): Point4 {
+  let { x, y, z, w } = point;
+
+  [x, w] = rotatePair(x, w, time * 0.00021);
+  [y, z] = rotatePair(y, z, -time * 0.00016);
+  [x, y] = rotatePair(x, y, time * 0.00011);
+  [z, w] = rotatePair(z, w, time * 0.00014);
+
+  return { x, y, z, w };
+}
+
+function project4D(point: Point4): Point3 {
+  const perspective = 4.2 / (4.2 - point.w);
+  return {
+    x: point.x * perspective,
+    y: point.y * perspective,
+    z: point.z * perspective,
+  };
+}
+
+function rotatePair(first: number, second: number, angle: number): [number, number] {
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  return [
+    first * cosine - second * sine,
+    first * sine + second * cosine,
+  ];
+}
+
+function rotate(point: Point3, rotation: Point3): Point3 {
+  const cosX = Math.cos(rotation.x);
+  const sinX = Math.sin(rotation.x);
+  const cosY = Math.cos(rotation.y);
+  const sinY = Math.sin(rotation.y);
+  const cosZ = Math.cos(rotation.z);
+  const sinZ = Math.sin(rotation.z);
+
+  const x1 = point.x * cosY - point.z * sinY;
+  const z1 = point.x * sinY + point.z * cosY;
+  const y1 = point.y * cosX - z1 * sinX;
+  const z2 = point.y * sinX + z1 * cosX;
+
+  return {
+    x: x1 * cosZ - y1 * sinZ,
+    y: x1 * sinZ + y1 * cosZ,
+    z: z2,
+  };
+}
+
+function project(point: Point3, center: Point, radius: number): Point {
+  const depth = point.z * radius;
+  const perspective = radius * 5.5 / (radius * 5.5 - depth);
+  return {
+    x: center.x + point.x * radius * perspective,
+    y: center.y + point.y * radius * perspective,
+  };
 }
 
 function line(context: CanvasRenderingContext2D, start: Point, end: Point) {
@@ -286,31 +424,16 @@ function line(context: CanvasRenderingContext2D, start: Point, end: Point) {
   context.stroke();
 }
 
-function diamond(context: CanvasRenderingContext2D, x: number, y: number, size: number) {
-  context.save();
-  context.translate(x, y);
-  context.rotate(Math.PI / 4);
-  context.fillStyle = "rgba(2, 4, 0, 0.9)";
-  context.strokeStyle = "#ccff00";
-  context.lineWidth = 1.2;
-  context.fillRect(-size / 2, -size / 2, size, size);
-  context.strokeRect(-size / 2, -size / 2, size, size);
-  context.restore();
-}
-
-function glowPoint(
+function paintPoint(
   context: CanvasRenderingContext2D,
   x: number,
   y: number,
   radius: number,
-  blur: number,
 ) {
   context.save();
-  context.shadowColor = "#ccff00";
-  context.shadowBlur = blur;
-  context.fillStyle = "#ccff00";
+  context.fillStyle = "#f4f7ef";
   context.beginPath();
-  context.arc(x, y, radius, 0, Math.PI * 2);
+  context.arc(x, y, radius, 0, TAU);
   context.fill();
   context.restore();
 }
@@ -321,12 +444,12 @@ function label(
   x: number,
   y: number,
   align: CanvasTextAlign,
-  color = "rgba(226, 233, 220, 0.5)",
+  color = "#f4f7ef",
 ) {
   context.save();
   context.fillStyle = color;
-  context.font = "9px ui-monospace, SFMono-Regular, Menlo, monospace";
-  context.letterSpacing = "1px";
+  context.font = "8px ui-monospace, SFMono-Regular, Menlo, monospace";
+  context.letterSpacing = "1.2px";
   context.textAlign = align;
   context.fillText(text, x, y);
   context.restore();
@@ -337,6 +460,12 @@ function pointBetween(start: Point, end: Point, progress: number): Point {
     x: start.x + (end.x - start.x) * progress,
     y: start.y + (end.y - start.y) * progress,
   };
+}
+
+function easeInOut(value: number) {
+  return value < 0.5
+    ? 2 * value * value
+    : 1 - Math.pow(-2 * value + 2, 2) / 2;
 }
 
 function loop(time: number, duration: number) {

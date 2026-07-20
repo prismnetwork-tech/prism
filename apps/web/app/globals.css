@@ -1,5 +1,5 @@
 :root {
-  --font-display: Arial, "Helvetica Neue", Helvetica, sans-serif;
+  --font-display: "Arial MT Pro", Arial, "Helvetica Neue", Helvetica, sans-serif;
   --canvas: #000000;
   --surface: #080a07;
   --surface-strong: #11140d;
