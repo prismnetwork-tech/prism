@@ -23,10 +23,13 @@ export function LandingPage() {
           <a href="#settlement">Settlement</a>
           <Link href="/proof">Proof</Link>
         </nav>
-        <Link className="landing-console-link" href="/compute">
-          Open console
-          <span aria-hidden="true">↗</span>
-        </Link>
+        <div className="landing-header-actions">
+          <SocialLinks />
+          <Link className="landing-console-link" href="/compute" aria-label="Open console">
+            <span className="landing-console-label">Open console</span>
+            <span aria-hidden="true">↗</span>
+          </Link>
+        </div>
       </header>
 
       <main id="main-content" tabIndex={-1}>
@@ -171,12 +174,46 @@ export function LandingPage() {
           <span>prism.</span>
         </Link>
         <p>Independent GPU infrastructure with metered USDG settlement.</p>
-        <div>
+        <div className="landing-footer-links">
           <Link href="/proof">Proof</Link>
           <Link href="/settings">Settings</Link>
           <span>Private beta</span>
+          <SocialLinks />
         </div>
       </footer>
     </div>
+  );
+}
+
+function SocialLinks() {
+  return (
+    <nav className="landing-social-links" aria-label="Social links">
+      <a
+        className="landing-social-link"
+        href="https://x.com/useprismnetwork"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="Prism on X"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817-5.966 6.817H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231 5.45-6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117L17.083 19.77Z" />
+        </svg>
+      </a>
+      <a
+        className="landing-social-link"
+        href="https://github.com/prismnetwork-tech/prism"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="Prism on GitHub"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path
+            fillRule="evenodd"
+            clipRule="evenodd"
+            d="M12 .7a11.3 11.3 0 0 0-3.57 22.03c.57.1.77-.25.77-.55v-2.16c-3.15.68-3.81-1.34-3.81-1.34-.52-1.34-1.28-1.7-1.28-1.7-1.04-.72.08-.7.08-.7 1.15.08 1.75 1.18 1.75 1.18 1.03 1.75 2.69 1.25 3.34.96.1-.74.4-1.25.73-1.54-2.51-.29-5.16-1.26-5.16-5.59 0-1.23.44-2.24 1.17-3.03-.12-.29-.51-1.44.11-2.99 0 0 .96-.31 3.11 1.16a10.8 10.8 0 0 1 5.67 0c2.16-1.47 3.11-1.16 3.11-1.16.62 1.55.23 2.7.11 2.99.73.79 1.17 1.8 1.17 3.03 0 4.34-2.65 5.29-5.17 5.58.41.35.77 1.04.77 2.1v3.11c0 .3.21.66.78.55A11.3 11.3 0 0 0 12 .7Z"
+          />
+        </svg>
+      </a>
+    </nav>
   );
 }
