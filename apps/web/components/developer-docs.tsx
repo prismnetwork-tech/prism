@@ -20,10 +20,9 @@ const sections = [
 
 const contracts = [
   ["USDG", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "6 decimals"],
-  ["NodeRegistryV1", "0xBf83714Ff5d524FA5CD9bdF24495540e979426d7", "Supplier bonds and offers"],
-  ["LeaseEscrowV1", "0x4e599D47bA62c2Bb733D41625BF98d6cBbf2dF0f", "Lease funding and settlement"],
-  ["AdminTimelockV1", "0x22e2868dCe0E28fb266C5C5BC018Da3145307BBD", "48-hour configuration delay"],
-  ["Governance Safe", "0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a", "Emergency and dispute authority"],
+  ["NodeRegistryV1", "0xcbB8B6CF5908a98073a6d81fF4F3471Ff84fAc24", "Supplier bonds and offers"],
+  ["LeaseEscrowV1", "0x2A3eaf3394D70180db761b593BC1183CCb83743e", "Lease funding and settlement"],
+  ["Governance Safe", "0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a", "Administration, emergency and dispute authority"],
 ] as const;
 
 const states = [
