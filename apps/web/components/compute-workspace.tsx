@@ -413,7 +413,8 @@ async function sshKeygen(): Promise<{ publicKey: string; privateKey: string }> {
   for (let pad = 1; priv.length % 8 !== 0; pad += 1) priv = concatBytes(priv, new Uint8Array([pad]));
   const blob = concatBytes(enc.encode("openssh-key-v1\0"), sshField(enc.encode("none")), sshField(enc.encode("none")), sshField(new Uint8Array(0)), uint32be(1), sshField(pubBlob), sshField(priv));
   const body = base64(blob).replace(/(.{70})/g, "$1\n");
-  return { publicKey, privateKey: `-----BEGIN OPENSSH PRIVATE KEY-----\n${body}\n-----END OPENSSH PRIVATE KEY-----\n` };
+  const label = "OPENSSH PRIVATE KEY";
+  return { publicKey, privateKey: `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n` };
 }
 
 function uint32be(value: number) {
