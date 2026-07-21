@@ -1,59 +1,112 @@
 # Lightsail deployment
 
-This topology runs the web application, control plane, access gateway,
-PostgreSQL and Valkey on one Lightsail instance. It reduces first-month cost,
-but it is not highly available. Database, cache and proof volumes must be
-included in encrypted snapshots and tested restores.
+This is the full single-host reference topology. It runs the web application,
+control plane, physical-node access gateway, PostgreSQL, TLS-only Valkey,
+lifecycle, settlement and proof workers, and optional local observability on
+one Ubuntu host.
 
-## Host preparation
+The configuration, certificate bootstrap and Compose topology pass the
+repository test suite. This topology has not been release-qualified on a live
+Lightsail instance. It is not highly available and should not be treated as a
+production deployment without tested backup, restore and host-replacement
+procedures.
+
+## Included services
+
+- Caddy HTTPS edge
+- Next.js web application
+- Rust control plane and access gateway
+- PostgreSQL and TLS-only Valkey
+- Lifecycle, settlement and proof workers
+- Optional operations monitor and Prometheus
+
+The proof worker writes public artifacts to the `proof_data` volume. Caddy
+serves the index and immutable artifacts below `/proof-artifacts/`.
+
+## Prepare the host
 
 Install Docker Engine with the Compose plugin on a current Ubuntu LTS host.
-Point the application DNS record at the instance before starting Caddy.
+Allow public TCP 80 and 443, plus 7443 and 7444 only when physical nodes and
+renter relay access are enabled. Do not expose PostgreSQL, Valkey, Prometheus,
+the control plane or the internal gateway HTTP port.
+
+Point the deployment hostname at the instance before starting Caddy.
 
 Create the private gateway and cache CA material:
 
 ```sh
-./scripts/generate-lightsail-tls.sh tunnel.example.invalid
+./scripts/generate-lightsail-tls.sh gateway.example.com
 ```
 
-The generated directory is ignored by Git. The one-shot `tls-init` service
-copies only runtime certificates into a named volume and assigns the gateway
-and Valkey keys to their non-root runtime users. Keep `ca.key` offline after
-issuing node certificates. The bootstrap node certificate is for a controlled
-canary; production enrollment must issue a separate certificate for each
-device and record its revocation status.
+The generated `deploy/lightsail/secrets/tls` directory is ignored by Git. The
+one-shot `tls-init` service copies only the required runtime files into named
+volumes and applies non-root ownership where needed.
 
-Copy `.env.example` to an untracked `.env`, replace every example value and
-validate the resolved configuration:
+This reduced topology keeps the CA private key online so the control plane can
+issue and renew node certificates. Restrict host access, encrypt snapshots and
+rotate the CA if the host is compromised. The generated bootstrap node
+certificate is only for a controlled canary; each supplier device needs its
+own certificate and revocation record.
+
+Create the untracked environment file and replace every example value:
 
 ```sh
+cp deploy/lightsail/.env.example deploy/lightsail/.env
 docker compose --env-file deploy/lightsail/.env \
   -f deploy/lightsail/compose.yml config --quiet
 ```
 
-The worker profile expects `secrets/vast-api-key` for the launch-day cloud
-broker. Complete [`docs/vast-launch.md`](../../docs/vast-launch.md) before
-starting the stack.
+The worker profile also expects an untracked Vast credential:
 
-Start the full persistent stack, including all three workers and private
-Prometheus alert evaluation:
+```text
+deploy/lightsail/secrets/vast-api-key
+```
+
+Complete the [Vast launch runbook](../../docs/vast-launch.md) before enabling
+the cloud broker. An empty `PRISM_VAST_NODE_ID` disables Vast provisioning
+while retaining the physical-node lifecycle.
+
+## Start the stack
+
+Start the core web, API, gateway, database and cache:
 
 ```sh
 docker compose --env-file deploy/lightsail/.env \
-  -f deploy/lightsail/compose.yml --profile workers --profile observability up -d
+  -f deploy/lightsail/compose.yml up -d
 ```
 
-The lifecycle, settlement and proof workers are long-running database-outbox
-consumers. Run exactly one instance of each on this topology. The proof worker
-writes public artifacts to the `proof_data` volume; Caddy serves them below
-`/proof-artifacts/`.
+Add the three workers and local alert evaluation:
 
-The operations monitor exposes database-derived metrics only to the private
-Compose network. Prometheus retains 15 days locally and evaluates the rules in
-`deploy/observability/prism-alerts.yml`. Connect an external notification
-receiver before public beta; alert delivery credentials are deployment inputs,
-not repository defaults.
+```sh
+docker compose --env-file deploy/lightsail/.env \
+  -f deploy/lightsail/compose.yml \
+  --profile workers --profile observability up -d
+```
 
-Do not expose PostgreSQL, Valkey or the control-plane port publicly. Ports 7443
-and 7444 are the mTLS node tunnel and renter relay endpoints. The application
-HTTPS endpoint is served by Caddy on port 443.
+Inspect health and logs:
+
+```sh
+docker compose --env-file deploy/lightsail/.env \
+  -f deploy/lightsail/compose.yml ps
+docker compose --env-file deploy/lightsail/.env \
+  -f deploy/lightsail/compose.yml logs --tail 200
+```
+
+Run exactly one lifecycle, settlement and proof worker on this topology. Their
+database outboxes provide retry and idempotency; multiple unsupervised copies
+are outside the tested operating model.
+
+Prometheus retains 15 days locally and evaluates
+`deploy/observability/prism-alerts.yml`. It has no default external
+notification receiver. Configure off-host alert delivery before any funded
+beta.
+
+## Readiness limits
+
+- The escrow remains paused and this topology has not completed a funded
+  mainnet lease.
+- Physical NVIDIA/Kata/VFIO/CUDA execution still requires hardware validation.
+- Database, cache, proof and Prometheus data share one failure domain.
+- Backup restore, host replacement and certificate-revocation drills remain
+  operator responsibilities.
+- The contracts and infrastructure have not received an independent audit.

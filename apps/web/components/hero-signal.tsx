@@ -303,7 +303,7 @@ function paintMeshes(
   const coreRadius = radius * 0.19 * 1.15;
 
   paintTesseract(context, center, radius * 0.62, time);
-  paintCorePyramid(context, center, coreRadius, time);
+  paintCorePyramids(context, center, coreRadius, time);
 }
 
 function paintTesseract(
@@ -326,7 +326,7 @@ function paintTesseract(
   context.restore();
 }
 
-function paintCorePyramid(
+function paintCorePyramids(
   context: CanvasRenderingContext2D,
   center: Point,
   radius: number,
@@ -339,25 +339,40 @@ function paintCorePyramid(
     { x: 0.76, y: 0.68, z: 0.76 },
     { x: -0.76, y: 0.68, z: 0.76 },
   ];
-  const rotation = {
-    x: time * 0.00042,
-    y: -time * 0.00058,
-    z: time * 0.00012,
-  };
-  const projected = vertices.map((vertex) =>
-    project(rotate(vertex, rotation), center, radius),
-  );
   const edges = [
     [0, 1], [0, 2], [0, 3], [0, 4],
     [1, 2], [2, 3], [3, 4], [4, 1],
   ];
+  const outerRotation = {
+    x: time * 0.00042,
+    y: -time * 0.00058,
+    z: time * 0.00012,
+  };
+  const innerRotation = {
+    x: -time * 0.00031,
+    y: time * 0.00043,
+    z: -time * 0.00018,
+  };
+  const outer = vertices.map((vertex) =>
+    project(rotate(vertex, outerRotation), center, radius),
+  );
+  const inner = vertices.map((vertex) =>
+    project(rotate(vertex, innerRotation), center, radius * 0.52),
+  );
 
   context.save();
   context.strokeStyle = "#f4f7ef";
   context.lineWidth = 0.75;
   for (const [from, to] of edges) {
-    line(context, projected[from], projected[to]);
+    line(context, outer[from], outer[to]);
   }
+
+  context.globalAlpha = 0.68;
+  context.lineWidth = 0.6;
+  for (const [from, to] of edges) {
+    line(context, inner[from], inner[to]);
+  }
+
   context.restore();
 }
 
