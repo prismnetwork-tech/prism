@@ -2584,7 +2584,11 @@ impl MarketplaceStore {
                 .map_err(StoreError::Storage)?;
                 let online: BTreeSet<String> = query_scalar(
                     "SELECT node_id FROM node_tunnels \
-                     WHERE observed_at >= NOW() - INTERVAL '90 seconds'",
+                     WHERE observed_at >= NOW() - INTERVAL '90 seconds' \
+                     UNION \
+                     SELECT node_id FROM cloud_capacity \
+                     WHERE provider = 'vast' AND available \
+                       AND observed_at >= NOW() - INTERVAL '90 seconds'",
                 )
                 .fetch_all(&mut *transaction)
                 .await
