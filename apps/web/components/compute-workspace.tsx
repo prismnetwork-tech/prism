@@ -20,13 +20,23 @@ type LeaseQuote = {
   rate_per_second: number;
 };
 
+const apps = [
+  { id: "ollama", name: "Ollama", blurb: "Run open LLMs like Llama and Mistral", image: "docker.io/ollama/ollama@sha256:a61a8fd395dbb931cc8cb1b5da7a2510746575c87113fdc45b647ee59ef7f808" },
+  { id: "pytorch", name: "PyTorch", blurb: "Notebooks, training and fine-tuning", image: "docker.io/pytorch/pytorch@sha256:c8268a92a69bd500f8be0e665b2630ee006dadaf7bfbc24249141b15ff622755" },
+  { id: "tensorflow", name: "TensorFlow", blurb: "GPU machine learning", image: "docker.io/tensorflow/tensorflow@sha256:61fe1ce25bd26b0a38e310463a5588d4067d2d01b6bdb058a3ca4f5cf2e18f15" },
+  { id: "cuda", name: "CUDA workspace", blurb: "A clean CUDA box to build on", image: "docker.io/nvidia/cuda@sha256:cff3a0d82d2c2b47bab252d67fa9b34a20ef4c50781d98501b5c7367ea9afd10" },
+] as const;
+
 export function ComputeWorkspace() {
   const auth = usePrismAuth();
   const smartWallet = useSmartWallet();
   const [duration, setDuration] = useState(3_600);
   const [mode, setMode] = useState<"auto" | "manual">("auto");
-  const [image, setImage] = useState("");
+  const [appId, setAppId] = useState<string>(apps[0].id);
+  const [advanced, setAdvanced] = useState(false);
+  const [customImage, setCustomImage] = useState("");
   const [sshKey, setSshKey] = useState("");
+  const image = (advanced ? customImage.trim() : apps.find((app) => app.id === appId)?.image) ?? "";
   const [offers, setOffers] = useState<MarketplaceOffer[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [fundingAddress, setFundingAddress] = useState<Address | null>(null);
@@ -144,18 +154,44 @@ export function ComputeWorkspace() {
 
       <div className="compute-layout">
         <form className="panel launch-form" onSubmit={(event) => { event.preventDefault(); void fundEscrow(); }}>
-          <label>
-            Container image
-            <input
-              value={image}
-              onChange={(event) => setImage(event.target.value)}
-              placeholder={`registry.example/runtime@sha256:${"a".repeat(64)}`}
-              maxLength={512}
-              required
-              spellCheck="false"
-            />
-            <small>Images must be public, immutable and compatible with the workspace probe.</small>
-          </label>
+          <fieldset className="form-fieldset">
+            <legend>What do you want to run?</legend>
+            <div className="app-picker">
+              {apps.map((app) => (
+                <button
+                  type="button"
+                  key={app.id}
+                  className={!advanced && appId === app.id ? "app-tile active" : "app-tile"}
+                  onClick={() => { setAdvanced(false); setAppId(app.id); }}
+                >
+                  <strong>{app.name}</strong>
+                  <span>{app.blurb}</span>
+                </button>
+              ))}
+              <button
+                type="button"
+                className={advanced ? "app-tile active" : "app-tile"}
+                onClick={() => setAdvanced(true)}
+              >
+                <strong>Custom image</strong>
+                <span>Advanced · bring your own pinned image</span>
+              </button>
+            </div>
+            {advanced && (
+              <label className="app-custom">
+                Container image
+                <input
+                  value={customImage}
+                  onChange={(event) => setCustomImage(event.target.value)}
+                  placeholder={`registry.example/runtime@sha256:${"a".repeat(64)}`}
+                  maxLength={512}
+                  required
+                  spellCheck="false"
+                />
+                <small>Public, immutable, sha256-pinned and CUDA-compatible.</small>
+              </label>
+            )}
+          </fieldset>
           <label>
             SSH public key
             <input
