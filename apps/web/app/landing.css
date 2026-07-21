@@ -806,12 +806,12 @@
   }
 
   .hero-grid {
-    min-height: 820px;
+    min-height: 700px;
     align-items: flex-start;
   }
 
   .landing-hero-copy {
-    padding: 50px var(--landing-gutter) 330px;
+    padding: 46px var(--landing-gutter) 268px;
   }
 
   .signal-hud {
@@ -820,7 +820,8 @@
 
   .landing-hero h1 {
     margin-top: 21px;
-    font-size: clamp(52px, 16vw, 76px);
+    font-size: clamp(40px, 12vw, 62px);
+    overflow-wrap: break-word;
   }
 
   .landing-hero-copy > p:not(.landing-kicker) {
