@@ -2,6 +2,10 @@
 
 Date: 2026-07-19
 
+> Historical audit snapshot. Deployment and repository-control statements
+> below describe the state on the audit date; see the root README for current
+> readiness.
+
 ## Executive summary
 
 The raw-GPU software P0 is implemented and exercised end to end on a local
