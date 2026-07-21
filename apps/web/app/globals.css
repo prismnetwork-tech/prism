@@ -108,6 +108,9 @@ a { color: inherit; text-decoration: none; }
 .app-tile.active { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 .app-tile.active strong { color: var(--accent); }
 .app-custom { margin-top: 12px; }
+.keygen-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.keygen-row button { padding: 0 14px; min-height: 42px; color: var(--text); border: 1px solid var(--border); background: var(--surface); border-radius: 8px; font-size: 12px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.keygen-row button:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); color: var(--accent); }
 .duration-picker, .segmented { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
 .duration, .segmented button { min-height: 38px; color: var(--text); border: 1px solid var(--border); background: var(--surface); border-radius: 0; font-size: 11px; font-weight: 400; letter-spacing: .08em; text-transform: uppercase; }
 .duration.active, .segmented button.active { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); color: var(--accent); }
