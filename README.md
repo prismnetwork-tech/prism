@@ -29,7 +29,7 @@ Verified on 2026-07-20:
 | Area | Status |
 | --- | --- |
 | Public web and API | Live at [prismnetwork.tech](https://prismnetwork.tech), with one Vast-backed L40S offer visible |
-| Robinhood Chain contracts | Deployed on mainnet; the lease escrow is paused and has no leases |
+| Robinhood Chain contracts | Deployed on mainnet; the lease escrow is live |
 | Vast execution | Implemented and locally lifecycle-tested; a funded mainnet canary has not been completed |
 | Independent Kata nodes | Daemon, gateway, certificates, commands, tunnel and workspace lifecycle are implemented and integration-tested without physical GPU hardware |
 | Settlement and proof | Workers and local end-to-end flows are implemented; no public mainnet settlement receipt exists yet |
@@ -42,19 +42,19 @@ environment, and Kata isolation is not confidential-computing attestation.
 
 ## Mainnet contracts
 
-The V1 contracts are non-upgradeable. `LeaseEscrowV1` is currently paused.
-Their source has not been verified on the explorer and they have not received
-an independent audit.
+The V1 contracts are non-upgradeable and `LeaseEscrowV1` is live. Their source
+has not been verified on the explorer and they have not received an independent
+audit.
 
 | Contract | Address |
 | --- | --- |
 | Canonical USDG | [`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`](https://robinhoodchain.blockscout.com/address/0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168) |
-| `NodeRegistryV1` | [`0xBf83714Ff5d524FA5CD9bdF24495540e979426d7`](https://robinhoodchain.blockscout.com/address/0xBf83714Ff5d524FA5CD9bdF24495540e979426d7) |
-| `LeaseEscrowV1` | [`0x4e599D47bA62c2Bb733D41625BF98d6cBbf2dF0f`](https://robinhoodchain.blockscout.com/address/0x4e599D47bA62c2Bb733D41625BF98d6cBbf2dF0f) |
-| `AdminTimelock` | [`0x22e2868dCe0E28fb266C5C5BC018Da3145307BBD`](https://robinhoodchain.blockscout.com/address/0x22e2868dCe0E28fb266C5C5BC018Da3145307BBD) |
+| `NodeRegistryV1` | [`0xcbB8B6CF5908a98073a6d81fF4F3471Ff84fAc24`](https://robinhoodchain.blockscout.com/address/0xcbB8B6CF5908a98073a6d81fF4F3471Ff84fAc24) |
+| `LeaseEscrowV1` | [`0x2A3eaf3394D70180db761b593BC1183CCb83743e`](https://robinhoodchain.blockscout.com/address/0x2A3eaf3394D70180db761b593BC1183CCb83743e) |
+| Governance Safe | [`0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a`](https://robinhoodchain.blockscout.com/address/0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a) |
 
-The timelock delay is 48 hours. Emergency pause and dispute resolution remain
-under the configured Safe. Network settings and the USDG address should always
+Administration, emergency pause and dispute resolution are held by a 2-of-2
+governance Safe. Network settings and the USDG address should always
 be checked against the
 [official Robinhood Chain documentation](https://docs.robinhood.com/chain/connecting/)
 and [contract registry](https://docs.robinhood.com/chain/contracts/).
