@@ -36,6 +36,7 @@ export function ComputeWorkspace() {
   const [advanced, setAdvanced] = useState(false);
   const [customImage, setCustomImage] = useState("");
   const [sshKey, setSshKey] = useState("");
+  const [generatedKey, setGeneratedKey] = useState(false);
   const image = (advanced ? customImage.trim() : apps.find((app) => app.id === appId)?.image) ?? "";
   const [offers, setOffers] = useState<MarketplaceOffer[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -45,7 +46,7 @@ export function ComputeWorkspace() {
   const [notice, setNotice] = useState<string | null>(null);
   const offer = offers.find((item) => item.node_id === selected) ?? offers[0];
   const maximum = useMemo(
-    () => offer ? formatUsdg(BigInt(offer.rate_per_second) * BigInt(duration)) : "—",
+    () => offer ? formatUsd(BigInt(offer.rate_per_second) * BigInt(duration)) : "—",
     [duration, offer],
   );
   let launchLabel = mode === "auto" ? "Match and fund escrow" : "Approve USDG and fund escrow";
@@ -142,6 +143,18 @@ export function ComputeWorkspace() {
     }
   }
 
+  async function generateKey() {
+    try {
+      const key = await sshKeygen();
+      setSshKey(key.publicKey);
+      setGeneratedKey(true);
+      downloadText("prism_key", key.privateKey);
+      setNotice("Created an SSH key. Your private key downloaded as \"prism_key\" — keep it to connect.");
+    } catch {
+      setNotice("This browser can't generate a key. Paste an existing SSH public key instead.");
+    }
+  }
+
   return (
     <section className="page-stack">
       <div className="page-heading">
@@ -192,19 +205,26 @@ export function ComputeWorkspace() {
               </label>
             )}
           </fieldset>
-          <label>
-            SSH public key
-            <input
-              value={sshKey}
-              onChange={(event) => setSshKey(event.target.value)}
-              placeholder="ssh-ed25519 AAAA…"
-              maxLength={16_384}
-              required
-              spellCheck="false"
-              autoComplete="off"
-            />
-            <small>Only the public key is sent to the assigned workspace. Keep the private key on your machine.</small>
-          </label>
+          <fieldset className="form-fieldset">
+            <legend>Workspace access</legend>
+            <div className="keygen-row">
+              <input
+                value={sshKey}
+                onChange={(event) => { setSshKey(event.target.value); setGeneratedKey(false); }}
+                placeholder="ssh-ed25519 AAAA…"
+                maxLength={16_384}
+                spellCheck="false"
+                autoComplete="off"
+                aria-label="SSH public key"
+              />
+              <button type="button" onClick={() => void generateKey()}>Generate for me</button>
+            </div>
+            <small>
+              {generatedKey
+                ? "Key created and public key filled. Your private key downloaded as \"prism_key\" — keep it to connect."
+                : "No SSH key? Let us make one. Only the public key ever reaches the workspace."}
+            </small>
+          </fieldset>
           <fieldset className="form-fieldset">
             <legend>Runtime</legend>
             <div className="duration-picker">
@@ -224,7 +244,7 @@ export function ComputeWorkspace() {
               GPU offer
               <select value={selected ?? ""} onChange={(event) => setSelected(event.target.value)} disabled={!offers.length}>
                 {!offers.length && <option value="">No schedulable offers</option>}
-                {offers.map((item) => <option value={item.node_id} key={item.node_id}>{item.gpu.model} · {formatVram(item.gpu.vram_mib)} · {formatRate(item.rate_per_second)} USDG/sec</option>)}
+                {offers.map((item) => <option value={item.node_id} key={item.node_id}>{item.gpu.model} · {formatVram(item.gpu.vram_mib)} · {formatUsdPerHour(item.rate_per_second)}</option>)}
               </select>
             </label>
           )}
@@ -267,8 +287,8 @@ export function ComputeWorkspace() {
           <h2>{offer ? mode === "auto" ? "Best available match" : offer.gpu.model : "No schedulable GPUs"}</h2>
           <div className="quote-line"><span>GPU memory</span><strong>{offer ? formatVram(offer.gpu.vram_mib) : "—"}</strong></div>
           <div className="quote-line"><span>Reliability</span><strong>{offer ? `${(offer.reliability_bps / 100).toFixed(1)}%` : "—"}</strong></div>
-          <div className="quote-line"><span>Rate</span><strong>{offer ? `${formatRate(offer.rate_per_second)} USDG/sec` : "—"}</strong></div>
-          <div className="quote-total"><span>Maximum escrow</span><strong>{maximum} <small>USDG</small></strong></div>
+          <div className="quote-line"><span>Rate</span><strong>{offer ? formatUsdPerHour(offer.rate_per_second) : "—"}</strong></div>
+          <div className="quote-total"><span>Max escrow · USDG</span><strong>{maximum}</strong></div>
           <p className="muted">Charges begin after GPU and access readiness are confirmed. Unused escrow is returned after settlement.</p>
         </aside>
       </div>
@@ -369,14 +389,68 @@ function isBytes32(value: unknown): value is `0x${string}` {
   return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value);
 }
 
-function formatUsdg(value: bigint) {
-  const whole = value / 1_000_000n;
-  const fraction = (value % 1_000_000n).toString().padStart(6, "0").replace(/0+$/, "");
-  return fraction ? `${whole}.${fraction}` : whole.toString();
+function formatUsd(baseUnits: bigint) {
+  const cents = (baseUnits + 5_000n) / 10_000n;
+  return `$${cents / 100n}.${(cents % 100n).toString().padStart(2, "0")}`;
 }
 
-function formatRate(ratePerSecond: number) {
-  return formatUsdg(BigInt(ratePerSecond));
+function formatUsdPerHour(ratePerSecond: number) {
+  return `${formatUsd(BigInt(ratePerSecond) * 3_600n)} / hour`;
+}
+
+async function sshKeygen(): Promise<{ publicKey: string; privateKey: string }> {
+  const comment = "prism";
+  const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
+  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+  const seed = pkcs8.slice(pkcs8.length - 32);
+  const enc = new TextEncoder();
+  const keytype = enc.encode("ssh-ed25519");
+  const pubBlob = concatBytes(sshField(keytype), sshField(pub));
+  const publicKey = `ssh-ed25519 ${base64(pubBlob)} ${comment}`;
+  const check = crypto.getRandomValues(new Uint8Array(4));
+  let priv = concatBytes(check, check, sshField(keytype), sshField(pub), sshField(concatBytes(seed, pub)), sshField(enc.encode(comment)));
+  for (let pad = 1; priv.length % 8 !== 0; pad += 1) priv = concatBytes(priv, new Uint8Array([pad]));
+  const blob = concatBytes(enc.encode("openssh-key-v1\0"), sshField(enc.encode("none")), sshField(enc.encode("none")), sshField(new Uint8Array(0)), uint32be(1), sshField(pubBlob), sshField(priv));
+  const body = base64(blob).replace(/(.{70})/g, "$1\n");
+  const label = "OPENSSH PRIVATE KEY";
+  return { publicKey, privateKey: `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n` };
+}
+
+function uint32be(value: number) {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value, false);
+  return bytes;
+}
+
+function sshField(bytes: Uint8Array) {
+  return concatBytes(uint32be(bytes.length), bytes);
+}
+
+function concatBytes(...parts: Uint8Array[]) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function base64(bytes: Uint8Array) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function downloadText(name: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: "application/octet-stream" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 function formatVram(vramMib: number) {
