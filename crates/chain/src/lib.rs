@@ -158,7 +158,10 @@ impl RpcClient {
                 serde_json::json!([from, "pending"]),
             )
             .await?;
-        let gas_price = self.quantity("eth_gasPrice", serde_json::json!([])).await?;
+        let gas_price = self
+            .quantity("eth_gasPrice", serde_json::json!([]))
+            .await?
+            .saturating_mul(2);
         let gas_limit = self
             .quantity(
                 "eth_estimateGas",
