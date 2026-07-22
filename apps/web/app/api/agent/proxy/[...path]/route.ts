@@ -9,8 +9,12 @@ export const dynamic = "force-dynamic";
 type RouteContext = { params: Promise<{ path: string[] }> };
 const maxRequestBytes = 256 * 1_024;
 
+// This boundary vouches for any wallet, so it may only reach the renter surface.
+// Operator, node, gateway, and supplier routes are off limits here.
+const renterRoutes = new Set(["offers", "leases"]);
+
 async function proxy(request: NextRequest, context: RouteContext) {
-  const requestId = request.headers.get("x-request-id") ?? randomUUID();
+  const requestId = randomUUID();
   const bearer = request.headers.get("authorization");
   const token = bearer?.toLowerCase().startsWith("bearer ") ? bearer.slice(7).trim() : null;
   if (!token) return error(401, "identity_required", requestId);
@@ -32,6 +36,7 @@ async function proxy(request: NextRequest, context: RouteContext) {
   if (!base) return error(503, "service_unavailable", requestId);
   const { path } = await context.params;
   if (path.some((part) => !/^[a-zA-Z0-9_-]+$/.test(part))) return error(400, "invalid_request", requestId);
+  if (!renterRoutes.has(path[0])) return error(403, "forbidden_route", requestId);
   const target = controlPlaneUrl(base, path);
   if (!target) return error(503, "service_unavailable", requestId);
   target.search = request.nextUrl.search;

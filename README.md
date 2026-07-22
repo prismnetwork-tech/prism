@@ -90,6 +90,9 @@ The repository contains:
 - `workers`: lifecycle, settlement and proof workers.
 - `node/prismd`: independent-node runtime and workspace supervisor.
 - `contracts`: USDG bond, escrow and administration contracts.
+- `sdk`: headless agent SDK for wallet-signature USDG leasing.
+- `mcp`: Model Context Protocol server exposing leasing to MCP clients.
+- `x402`: pay-per-job GPU execution over HTTP 402.
 - `deploy/ec2`: lean Vast launch topology with the web application on Render.
 - `deploy/lightsail`: full single-host reference topology.
 - `deploy/node`: Ubuntu node service units and configuration.
@@ -98,6 +101,23 @@ The repository contains:
 
 See [architecture](docs/ARCHITECTURE.md), [security model](docs/SECURITY_MODEL.md)
 and [release gates](docs/RELEASE_GATES.md) before operating the system.
+
+## Agent access
+
+Autonomous agents integrate without a browser. An agent proves control of its
+funding wallet by signing a short-lived challenge, exchanges it for a bearer
+session, and drives the same renter surface — offer discovery and the lease
+lifecycle — over the `/api/agent` endpoints. Escrow, readiness, metering and
+settlement are identical to the browser path, and the agent boundary reaches
+only renter routes.
+
+- [`sdk`](sdk/README.md) — `@prism-network/agent-sdk`, headless USDG-funded leasing for Node.
+- [`mcp`](mcp/README.md) — `@prism-network/mcp`, the same leasing exposed as Model Context Protocol tools.
+- [`x402`](x402/README.md) — `@prism-network/x402`, pay-per-job GPU execution over HTTP 402.
+
+These packages are not yet published to npm; install them from this repository.
+The beta data-classification limits above apply unchanged — an agent workspace
+is a disposable environment, not confidential computing.
 
 ## Verification
 

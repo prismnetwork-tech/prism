@@ -1,14 +1,12 @@
 #!/usr/bin/env node
-// Prism Network MCP server — lets an MCP client (Claude, agents) lease and run on
+// Prism Network MCP server: lets an MCP client (Claude, agents) lease and run on
 // real GPUs. Configure with a wallet: PRISM_AGENT_KEY, PRISM_ESCROW.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { PrismAgent } from "@prism-network/agent-sdk";
+import { DEFAULT_IMAGE, PrismAgent } from "@prism-network/agent-sdk";
 
-const DEFAULT_IMAGE =
-  process.env.PRISM_DEFAULT_IMAGE ??
-  "docker.io/ollama/ollama@sha256:a61a8fd395dbb931cc8cb1b5da7a2510746575c87113fdc45b647ee59ef7f808";
+const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -16,15 +14,38 @@ function requireEnv(name) {
   return value;
 }
 
-const agent = new PrismAgent({
-  privateKey: requireEnv("PRISM_AGENT_KEY"),
-  escrow: requireEnv("PRISM_ESCROW"),
-  apiBase: process.env.PRISM_API_BASE ?? "https://prismnetwork.tech",
-  rpcUrl: process.env.PRISM_RPC_URL,
-});
+let agent;
+try {
+  agent = new PrismAgent({
+    privateKey: requireEnv("PRISM_AGENT_KEY"),
+    escrow: requireEnv("PRISM_ESCROW"),
+    apiBase: process.env.PRISM_API_BASE ?? "https://prismnetwork.tech",
+    rpcUrl: process.env.PRISM_RPC_URL,
+  });
+} catch (err) {
+  console.error(`prism mcp config error: ${err.message}. Set PRISM_AGENT_KEY and PRISM_ESCROW in the server env.`);
+  process.exit(1);
+}
 
 const leases = new Map();
 const usdg = (micros) => `${(Number(micros) / 1e6).toFixed(6)} USDG`;
+
+function sweepExpiredLeases() {
+  const now = Date.now();
+  for (const [id, lease] of leases) {
+    const expiry = Date.parse(lease.access?.expires_at ?? "");
+    if (Number.isFinite(expiry) && expiry < now) {
+      agent.endLease(lease);
+      leases.delete(id);
+    }
+  }
+}
+
+function leaseId(value) {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("lease_id must be a positive integer");
+  return id;
+}
 
 const TOOLS = [
   {
@@ -39,7 +60,7 @@ const TOOLS = [
   },
   {
     name: "prism_lease_and_run",
-    description: "Lease a GPU, run one shell command on it, and return the output. The lease stays alive (use prism_run for more commands, prism_end_lease to release). This is the fastest way to run a one-off GPU job.",
+    description: "Lease a GPU, run one shell command on it, and return the output. The lease stays alive (use prism_run for more commands, prism_end_lease to release). Prefer this for a single command; use prism_lease when you'll run several.",
     inputSchema: {
       type: "object",
       properties: {
@@ -104,9 +125,11 @@ async function handle(name, args) {
     };
   }
   if (name === "prism_lease_and_run" || name === "prism_lease") {
+    if (name === "prism_lease_and_run" && !args.command) throw new Error("command is required");
     await ensureAuth();
+    sweepExpiredLeases();
     const lease = await agent.lease({
-      image: DEFAULT_IMAGE,
+      image: IMAGE,
       durationSeconds: args.duration_seconds ?? 900,
       minVramMib: args.min_vram_mib ?? 16000,
     });
@@ -121,30 +144,34 @@ async function handle(name, args) {
     return { ...summary, command: args.command, exit_code: out.code, stdout: out.stdout, stderr: out.stderr };
   }
   if (name === "prism_run") {
-    const lease = leases.get(args.lease_id);
-    if (!lease) throw new Error(`no active lease ${args.lease_id} in this session`);
+    if (!args.command) throw new Error("command is required");
+    const id = leaseId(args.lease_id);
+    const lease = leases.get(id);
+    if (!lease) throw new Error(`no active lease ${id} in this session`);
     const out = await agent.run(lease, args.command, {
       timeoutMs: (args.timeout_seconds ?? 120) * 1000,
     });
-    return { lease_id: args.lease_id, exit_code: out.code, stdout: out.stdout, stderr: out.stderr };
+    return { lease_id: id, exit_code: out.code, stdout: out.stdout, stderr: out.stderr };
   }
   if (name === "prism_end_lease") {
-    const lease = leases.get(args.lease_id);
+    const id = leaseId(args.lease_id);
+    const lease = leases.get(id);
     if (lease) {
       agent.endLease(lease);
-      leases.delete(args.lease_id);
+      leases.delete(id);
     }
-    return { lease_id: args.lease_id, released: Boolean(lease) };
+    return { lease_id: id, released: Boolean(lease) };
   }
   throw new Error(`unknown tool ${name}`);
 }
 
-let authed = false;
-async function ensureAuth() {
-  if (!authed) {
-    await agent.authenticate();
-    authed = true;
-  }
+let authPromise = null;
+function ensureAuth() {
+  authPromise ??= agent.authenticate().catch((err) => {
+    authPromise = null;
+    throw err;
+  });
+  return authPromise;
 }
 
 const server = new Server({ name: "prism", version: "0.1.0" }, { capabilities: { tools: {} } });

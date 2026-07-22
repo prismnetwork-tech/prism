@@ -16,6 +16,7 @@ const sections = [
   ["security", "Security model"],
   ["operations", "Operations"],
   ["errors", "Errors"],
+  ["agent", "Agent access"],
 ] as const;
 
 const contracts = [
@@ -93,6 +94,19 @@ const confirmExample = `{
   "transaction_hash": "0x<funding transaction hash>",
   "ssh_authorized_key": "ssh-ed25519 AAAA... workstation"
 }`;
+
+const agentExample = `import { PrismAgent, DEFAULT_IMAGE } from "@prism-network/agent-sdk";
+
+const agent = new PrismAgent({
+  privateKey: process.env.AGENT_KEY,
+  escrow: "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD",
+});
+
+await agent.authenticate();
+const lease = await agent.lease({ image: DEFAULT_IMAGE, durationSeconds: 900, minVramMib: 16000 });
+const out = await agent.run(lease, "nvidia-smi");
+console.log(out.stdout);
+agent.endLease(lease);`;
 
 export function DeveloperDocs() {
   return (
@@ -208,8 +222,8 @@ export function DeveloperDocs() {
                   <li>Session revocation on logout and server-side identity rejection.</li>
                 </ul>
               </InfoCard>
-              <InfoCard title="Server-to-server clients">
-                <p>Programmatic access is available through managed integrations. Browser cookies and browser identity assertions are not supported as service credentials.</p>
+              <InfoCard title="Agent and service clients">
+                <p>Autonomous agents authenticate with a wallet signature instead of a browser session; see <a className="docs-inline-link" href="#agent">Agent access</a>. Browser cookies and browser identity assertions are not accepted as service credentials.</p>
               </InfoCard>
             </div>
             <Callout kind="note" title="Service authentication">
@@ -420,6 +434,41 @@ export function DeveloperDocs() {
               <li><code>funding_not_final</code> is expected before the required confirmation threshold and can be polled safely.</li>
               <li>Treat other <code>4xx</code> responses as non-retryable until the request or account state changes.</li>
             </ul>
+          </DocsSection>
+
+          <DocsSection id="agent" index="13" eyebrow="Autonomous integration" title="Agent access">
+            <p>
+              Autonomous agents integrate without a browser or Privy. An agent proves control of
+              its funding wallet by signing a short-lived challenge, exchanges the signature for a
+              bearer session, and drives the same renter surface — offer discovery and the lease
+              lifecycle — over the <code>/api/agent</code> endpoints. Escrow, readiness, metering,
+              and settlement are identical to the browser path.
+            </p>
+            <div className="endpoint-list">
+              <Endpoint method="GET" path="/api/agent/challenge" auth="Public" description="Issue a single-use, five-minute challenge for a wallet address." />
+              <Endpoint method="POST" path="/api/agent/session" auth="Signature" description="Exchange a wallet-signed challenge for a one-hour bearer session." />
+              <Endpoint method="ANY" path="/api/agent/proxy/{path}" auth="Bearer" description="Authenticated passthrough to the renter API. Only offer and lease routes are reachable." />
+            </div>
+            <CodeBlock label="@prism-network/agent-sdk" code={agentExample} />
+            <div className="docs-grid two">
+              <InfoCard title="Agent SDK">
+                <p>Headless leasing for Node. Authenticate, lease a digest-pinned image, run commands over SSH, and release — funded in USDG with native gas on Robinhood Chain.</p>
+              </InfoCard>
+              <InfoCard title="MCP server">
+                <p>The same leasing exposed as Model Context Protocol tools, so an MCP client can list GPUs, lease and run a command, and release the lease.</p>
+              </InfoCard>
+              <InfoCard title="x402 one-shot compute">
+                <p>Pay-per-job GPU execution over HTTP 402. Submit a command, pay USDG, and poll for the output; the service leases, runs, and releases on your behalf, refunding a failed job.</p>
+              </InfoCard>
+              <InfoCard title="Wallet as identity">
+                <p>The signing wallet is the subject of every request. The agent boundary reaches only renter routes; operator, node, and gateway surfaces are rejected.</p>
+              </InfoCard>
+            </div>
+            <Callout kind="warning" title="Beta and packaging">
+              The agent packages are not yet published to npm; install them from the repository.
+              The data-classification limits above apply unchanged — an agent workspace is a
+              disposable beta environment, not confidential computing.
+            </Callout>
           </DocsSection>
 
         </main>
