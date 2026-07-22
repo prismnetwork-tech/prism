@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { encodeFunctionData, keccak256, toBytes, type Address, type Hex } from "viem";
 import { usePrismAuth, useSmartWallet } from "@/components/providers";
 import { escrowAbi, escrowAddress, robinhoodChain, usdgAbi, usdgAddress } from "@/lib/chain";
@@ -30,6 +31,7 @@ const apps = [
 export function ComputeWorkspace() {
   const auth = usePrismAuth();
   const smartWallet = useSmartWallet();
+  const router = useRouter();
   const [duration, setDuration] = useState(3_600);
   const [mode, setMode] = useState<"auto" | "manual">("auto");
   const [appId, setAppId] = useState<string>(apps[0].id);
@@ -37,6 +39,7 @@ export function ComputeWorkspace() {
   const [customImage, setCustomImage] = useState("");
   const [sshKey, setSshKey] = useState("");
   const [generatedKey, setGeneratedKey] = useState(false);
+  const [confirmed, setConfirmed] = useState<{ model: string; vram: number; escrow: string; hash: string } | null>(null);
   const image = (advanced ? customImage.trim() : apps.find((app) => app.id === appId)?.image) ?? "";
   const [offers, setOffers] = useState<MarketplaceOffer[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -137,7 +140,8 @@ export function ComputeWorkspace() {
       }
       const result = await smartWallet.executeCalls([...calls], fundingAddress);
       await confirmLease(lease.quote_id, result.transactionHash, sshKey.trim());
-      setNotice(`Funding confirmed: ${result.transactionHash.slice(0, 10)}…`);
+      setNotice(null);
+      setConfirmed({ model: offer.gpu.model, vram: offer.gpu.vram_mib, escrow: maximum, hash: result.transactionHash });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Wallet transaction was not completed.");
     }
@@ -165,6 +169,21 @@ export function ComputeWorkspace() {
         <span className="chip">Digest-pinned images</span>
       </div>
 
+      {confirmed ? (
+        <div className="panel lease-confirmed" role="status">
+          <span className="lease-confirmed-check" aria-hidden="true">✓</span>
+          <h2>Lease confirmed</h2>
+          <p>Your {confirmed.model} workspace is provisioning. It will be ready to connect in about a minute.</p>
+          <dl className="lease-confirmed-facts">
+            <div><dt>GPU</dt><dd>{confirmed.model} · {formatVram(confirmed.vram)}</dd></div>
+            <div><dt>Escrow held</dt><dd>{confirmed.escrow}</dd></div>
+            <div><dt>Funding tx</dt><dd>{confirmed.hash.slice(0, 10)}…{confirmed.hash.slice(-6)}</dd></div>
+          </dl>
+          <button type="button" className="button primary full" onClick={() => router.push("/leases")}>
+            View your leases
+          </button>
+        </div>
+      ) : (
       <div className="compute-layout">
         <form className="panel launch-form" onSubmit={(event) => { event.preventDefault(); void fundEscrow(); }}>
           <fieldset className="form-fieldset">
@@ -292,6 +311,7 @@ export function ComputeWorkspace() {
           <p className="muted">Charges begin after GPU and access readiness are confirmed. Unused escrow is returned after settlement.</p>
         </aside>
       </div>
+      )}
     </section>
   );
 }

@@ -20,8 +20,8 @@ const sections = [
 
 const contracts = [
   ["USDG", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "6 decimals"],
-  ["NodeRegistryV1", "0xcbB8B6CF5908a98073a6d81fF4F3471Ff84fAc24", "Supplier bonds and offers"],
-  ["LeaseEscrowV1", "0x2A3eaf3394D70180db761b593BC1183CCb83743e", "Lease funding and settlement"],
+  ["NodeRegistryV1", "0xe3b7eF730637763ed46542d41a6C3f83AfC78f01", "Supplier bonds and offers"],
+  ["LeaseEscrowV1", "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD", "Lease funding and settlement"],
   ["Governance Safe", "0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a", "Administration, emergency and dispute authority"],
 ] as const;
 
