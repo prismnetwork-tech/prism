@@ -1,0 +1,14 @@
+{
+  "name": "@prism-network/x402",
+  "version": "0.1.0",
+  "description": "Pay-per-job GPU compute on Prism Network over HTTP 402.",
+  "type": "module",
+  "bin": { "prism-x402": "server.mjs" },
+  "files": ["server.mjs", "README.md"],
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@prism-network/agent-sdk": "file:../sdk",
+    "viem": "^2"
+  },
+  "license": "Apache-2.0"
+}
