@@ -45,6 +45,8 @@ jobs:
           PRISM_ALLOWED_GIT_NAMES: |-
             Prism Network
             useprismnetwork
+            winterstacks
+            ianklemm
             GitHub
       - name: Validate Terraform
         run: |
