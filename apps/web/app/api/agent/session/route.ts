@@ -1,22 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { AgentAuthConfigError, AgentAuthError, issueSession } from "@/lib/agent-auth";
-import { takeRateLimit } from "@/lib/server-rate-limit";
+import { requestSubject, takeRateLimit } from "@/lib/server-rate-limit";
 
 export const dynamic = "force-dynamic";
 const maxRequestBytes = 16 * 1_024;
 
 export async function POST(request: NextRequest) {
-  const requestId = request.headers.get("x-request-id") ?? randomUUID();
+  const requestId = randomUUID();
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     return error(415, "unsupported_media_type", requestId);
   }
-  if (Number(request.headers.get("content-length") ?? "0") > maxRequestBytes) {
-    return error(413, "request_too_large", requestId);
-  }
+  const ipLimit = await takeRateLimit("agent-session-ip", requestSubject(request.headers), 60, 60_000);
+  if (!ipLimit.available) return error(503, "rate_limit_unavailable", requestId);
+  if (!ipLimit.allowed) return error(429, "rate_limited", requestId, ipLimit.retryAfter);
+  const raw = await request.arrayBuffer();
+  if (raw.byteLength > maxRequestBytes) return error(413, "request_too_large", requestId);
   let payload: { challenge?: unknown; address?: unknown; signature?: unknown };
   try {
-    payload = await request.json();
+    payload = JSON.parse(Buffer.from(raw).toString("utf8") || "{}");
   } catch {
     return error(400, "invalid_json", requestId);
   }
