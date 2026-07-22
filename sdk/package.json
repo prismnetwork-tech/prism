@@ -1,0 +1,12 @@
+{
+  "name": "@prism-network/agent-sdk",
+  "version": "0.1.0",
+  "description": "Headless GPU leasing on Prism Network for wallet-holding agents.",
+  "type": "module",
+  "main": "prism.mjs",
+  "exports": { ".": "./prism.mjs" },
+  "files": ["prism.mjs", "README.md"],
+  "engines": { "node": ">=20" },
+  "peerDependencies": { "viem": "^2" },
+  "license": "Apache-2.0"
+}
