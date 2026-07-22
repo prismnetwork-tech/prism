@@ -26,3 +26,7 @@ crash-reports/
 deploy/lightsail/secrets/
 deploy/ec2/.env
 deploy/ec2/secrets/
+
+mcp/package-lock.json
+x402/package-lock.json
+sdk/package-lock.json

@@ -1,10 +1,13 @@
 // Prism Network agent SDK — headless GPU leasing for wallet-holding agents.
 // No browser, no Privy. Authenticate with a wallet signature, pay on-chain, run.
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createPublicClient,
   createWalletClient,
   defineChain,
-  encodeFunctionData,
   http,
   keccak256,
   parseAbi,
@@ -61,6 +64,14 @@ export class PrismAgent {
 
   async offers() {
     return this.#proxy("GET", ["offers"]);
+  }
+
+  async balances() {
+    const [usdg, eth] = await Promise.all([
+      this.publicClient.readContract({ address: USDG, abi: erc20Abi, functionName: "balanceOf", args: [this.address] }),
+      this.publicClient.getBalance({ address: this.address }),
+    ]);
+    return { address: this.address, usdg: usdg.toString(), eth: eth.toString() };
   }
 
   async quote({ image, durationSeconds, minVramMib, preferredNodeId = null }) {
@@ -129,6 +140,97 @@ export class PrismAgent {
       await sleep(intervalMs);
     }
     throw new PrismError(408, "access_timeout");
+  }
+
+  // One call: quote -> generate an SSH key -> fund on-chain -> confirm -> wait for access.
+  // Returns a lease handle usable with run() and endLease().
+  async lease({ image, durationSeconds, minVramMib, preferredNodeId = null } = {}) {
+    if (!this.session) await this.authenticate();
+    const quote = await this.quote({ image, durationSeconds, minVramMib, preferredNodeId });
+    const key = this.#generateSshKey();
+    const funded = await this.fund(quote);
+    const record = await this.confirm({
+      quoteId: quote.quote_id,
+      transactionHash: funded.hash,
+      sshAuthorizedKey: key.publicKey,
+    });
+    const access = await this.waitForAccess(record.lease_id);
+    return {
+      leaseId: record.lease_id,
+      access,
+      keyPath: key.keyPath,
+      keyDir: key.dir,
+      publicKey: key.publicKey,
+      fundingHash: funded.hash,
+      quote,
+    };
+  }
+
+  // Run a shell command on a leased GPU over SSH. Retries through Vast sshd warmup.
+  async run(lease, command, { timeoutMs = 120_000, connectRetries = 24, connectDelayMs = 10_000 } = {}) {
+    if (!lease?.access || !lease?.keyPath) throw new PrismError(400, "invalid_lease_handle");
+    const target = {
+      host: lease.access.ssh_host,
+      port: lease.access.ssh_port,
+      user: lease.access.ssh_user ?? "root",
+      keyPath: lease.keyPath,
+    };
+    let last;
+    for (let attempt = 0; attempt <= connectRetries; attempt++) {
+      const res = await this.#ssh(target, command, timeoutMs);
+      const warming = res.code === 255 && /Connection refused|Permission denied|Connection timed out|Connection closed|Operation timed out/.test(res.stderr);
+      if (!warming) return res;
+      last = res;
+      if (attempt < connectRetries) await sleep(connectDelayMs);
+    }
+    return last;
+  }
+
+  // Releases local key material. The on-chain lease settles at the end of its duration.
+  endLease(lease) {
+    if (lease?.keyDir) {
+      try {
+        rmSync(lease.keyDir, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+
+  #generateSshKey() {
+    const dir = mkdtempSync(join(tmpdir(), "prism-ssh-"));
+    const keyPath = join(dir, "id_ed25519");
+    execFileSync("ssh-keygen", ["-t", "ed25519", "-N", "", "-q", "-f", keyPath, "-C", "prism-agent"]);
+    return { dir, keyPath, publicKey: readFileSync(`${keyPath}.pub`, "utf8").trim() };
+  }
+
+  #ssh(target, command, timeoutMs) {
+    const args = [
+      "-i", target.keyPath,
+      "-p", String(target.port),
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "UserKnownHostsFile=/dev/null",
+      "-o", "BatchMode=yes",
+      "-o", "ConnectTimeout=15",
+      `${target.user}@${target.host}`,
+      command,
+    ];
+    return new Promise((resolve) => {
+      const child = spawn("ssh", args);
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code: code ?? -1, stdout: stdout.trim(), stderr: stderr.trim() });
+      });
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        resolve({ code: 255, stdout: "", stderr: String(err) });
+      });
+    });
   }
 
   async #proxy(method, segments, body = null, raw = false) {
