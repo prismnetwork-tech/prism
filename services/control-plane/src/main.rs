@@ -820,11 +820,7 @@ impl RegistryVerifier {
                         .as_deref()
                         .ok_or(RegistryError::InvalidResponse)?,
                 )?;
-                let required_bond = node
-                    .rate_per_second
-                    .checked_mul(86_400)
-                    .ok_or(RegistryError::InvalidResponse)?
-                    .max(100_000_000);
+                let required_bond: u128 = 1_000_000;
                 Ok(node.status == 1
                     && node.active_lease_id == 0
                     && node.bond >= required_bond
@@ -2259,7 +2255,13 @@ impl MarketplaceStore {
                     "SELECT o.document FROM node_offers o \
                      WHERE (o.document->>'bonded')::boolean = true \
                        AND (document->>'public_image_only')::boolean = true \
-                       AND o.updated_at >= $1 \
+                       AND (o.updated_at >= $1 OR EXISTS ( \
+                           SELECT 1 FROM cloud_capacity cc0 \
+                           WHERE cc0.node_id = o.node_id \
+                             AND cc0.provider = 'vast' \
+                             AND cc0.available \
+                             AND cc0.observed_at >= $1 \
+                       )) \
                        AND NOT EXISTS ( \
                            SELECT 1 FROM node_controls c \
                            WHERE c.node_id = o.node_id AND c.suspended \
