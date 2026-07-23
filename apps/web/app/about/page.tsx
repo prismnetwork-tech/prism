@@ -21,6 +21,11 @@ export default function AboutPage() {
           Robinhood Chain.
         </p>
         <p>
+          Access is built for autonomous agents as well as people. An agent authenticates with
+          its wallet, leases a GPU, and pays in USDG without a console or an API key, through an
+          open SDK, an MCP server, and pay-per-job settlement over x402.
+        </p>
+        <p>
           The current service provides managed NVIDIA L40S capacity in private beta. A provider
           program for operator-owned infrastructure is in technical onboarding and is not yet
           available for production leases.

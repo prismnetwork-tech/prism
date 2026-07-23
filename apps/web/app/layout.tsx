@@ -17,18 +17,18 @@ export const metadata: Metadata = {
     default: "Prism Network",
     template: "%s · Prism Network",
   },
-  description: "On-demand L40S compute with metered USDG settlement.",
+  description: "GPU compute autonomous agents can rent with a wallet. Lease NVIDIA L40S capacity, pay per second in USDG, settle every lease onchain.",
   applicationName: "Prism Network",
   openGraph: {
     type: "website",
     siteName: "Prism Network",
     title: "Prism Network",
-    description: "On-demand L40S compute with metered USDG settlement.",
+    description: "GPU compute autonomous agents can rent with a wallet. Lease NVIDIA L40S capacity, pay per second in USDG, settle every lease onchain.",
   },
   twitter: {
     card: "summary",
     title: "Prism Network",
-    description: "On-demand L40S compute with metered USDG settlement.",
+    description: "GPU compute autonomous agents can rent with a wallet. Lease NVIDIA L40S capacity, pay per second in USDG, settle every lease onchain.",
   },
   manifest: "/manifest.webmanifest",
   icons: {
