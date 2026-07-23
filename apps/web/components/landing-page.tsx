@@ -3,6 +3,12 @@ import { HeroSignal } from "@/components/hero-signal";
 import { PublicFooter } from "@/components/public-footer";
 import { docsUrl } from "@/lib/site";
 
+const agentSteps = [
+  ["01", "Wallet identity", "An agent signs a challenge with its wallet to authenticate. No browser login, no API keys to provision or rotate."],
+  ["02", "SDK and MCP", "Lease a GPU and run a command in a few lines with the SDK, or connect the MCP server and an agent leases compute as a native tool."],
+  ["03", "Pay per job", "Fund a lease in USDG onchain, or settle a single job over x402. An agent pays for exactly the compute it uses."],
+] as const;
+
 const executionSteps = [
   ["01", "Quote", "Review the per-second rate, funded duration, and maximum USDG commitment."],
   ["02", "Fund", "Approve the quoted amount and deposit it into the lease escrow contract."],
@@ -21,8 +27,9 @@ export function LandingPage() {
         </Link>
         <nav className="landing-nav" aria-label="Landing navigation">
           <a href="#network">Network</a>
-          <a href="#security">Security</a>
+          <a href="#agents">Agents</a>
           <a href="#settlement">Settlement</a>
+          <a href="#security">Security</a>
           <Link href="/proof">Proof</Link>
           <Link href={docsUrl.href}>Docs</Link>
         </nav>
@@ -39,15 +46,16 @@ export function LandingPage() {
         <section className="landing-hero">
           <div className="hero-grid">
             <div className="landing-hero-copy">
-              <p className="landing-kicker"><span /> NVIDIA L40S compute</p>
-              <h1>On-demand GPU compute,<br />billed by the second.</h1>
+              <p className="landing-kicker"><span /> Agent-native GPU compute</p>
+              <h1>GPU compute your agents<br />can rent themselves.</h1>
               <p>
-                Launch NVIDIA L40S workspaces with per-second USDG billing, upfront cost
-                controls, and verifiable onchain settlement records.
+                An agent authenticates with its wallet, leases an NVIDIA L40S, and pays per
+                second in USDG. No console, no API keys. Every lease is metered and settled
+                onchain.
               </p>
               <div className="landing-actions">
                 <Link className="landing-button primary" href="/compute">Find compute <span>↗</span></Link>
-                <Link className="landing-button secondary" href="/nodes">Become a provider <span>＋</span></Link>
+                <Link className="landing-button secondary" href={docsUrl.href}>Read the docs <span>↗</span></Link>
               </div>
             </div>
             <HeroSignal />
@@ -90,9 +98,30 @@ export function LandingPage() {
           </div>
         </section>
 
+        <section className="landing-section agents-section" id="agents">
+          <div className="section-intro">
+            <p className="section-index">02 / Agents</p>
+            <h2>Built for autonomous<br />agents, not dashboards.</h2>
+            <p>
+              An agent needs three things to use a GPU: an identity, a way to pay, and a way
+              to run code. On Prism the wallet is the identity, USDG is the payment, and an
+              open SDK and MCP server are the interface.
+            </p>
+          </div>
+          <div className="execution-list">
+            {agentSteps.map(([number, title, description]) => (
+              <article className="execution-step" key={number}>
+                <span>{number}</span>
+                <h3>{title}</h3>
+                <p>{description}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+
         <section className="landing-section settlement-section" id="settlement">
           <div className="section-intro compact">
-            <p className="section-index">02 / Settlement</p>
+            <p className="section-index">03 / Settlement</p>
             <h2>A controlled<br />lease lifecycle.</h2>
           </div>
           <div className="execution-list">
@@ -121,7 +150,7 @@ export function LandingPage() {
             <div className="tunnel-line"><i /><span>TEMPORARY ACCESS</span></div>
           </div>
           <div className="security-copy">
-            <p className="section-index">03 / Isolation</p>
+            <p className="section-index">04 / Isolation</p>
             <h2>Ephemeral workspaces with a defined security boundary.</h2>
             <p>
               Each cloud lease starts in a fresh container with temporary credentials. Workspace
@@ -137,32 +166,33 @@ export function LandingPage() {
 
         <section className="landing-section proof-section">
           <div className="proof-copy">
-            <p className="section-index">04 / Proof</p>
+            <p className="section-index">05 / Proof</p>
             <h2>Verifiable<br />settlement records.</h2>
             <p>
-              Finalized receipts connect platform-attested usage records to Robinhood Chain
-              settlement events without exposing terminal contents, notebooks or files.
+              Every settled lease publishes a receipt that ties a platform-attested usage
+              record to a Robinhood Chain settlement event, without exposing terminal
+              contents, notebooks, or files. The first receipt is live.
             </p>
             <Link className="landing-button secondary" href="/proof">Open proof feed <span>↗</span></Link>
           </div>
           <div className="receipt-terminal">
             <div className="terminal-bar">
               <span>SETTLEMENT RECEIPT</span>
-              <span>AWAITING FIRST FINALIZED LEASE</span>
+              <span>PUBLISHED ONCHAIN</span>
             </div>
             <dl>
-              <div><dt>STATUS</dt><dd>NO FINALIZED RECEIPTS</dd></div>
-              <div><dt>GPU MODEL</dt><dd>—</dd></div>
-              <div><dt>RUNTIME</dt><dd>—</dd></div>
-              <div><dt>USDG SETTLED</dt><dd>—</dd></div>
-              <div><dt>TRANSACTION</dt><dd>—</dd></div>
+              <div><dt>STATUS</dt><dd>VERIFIED ONCHAIN</dd></div>
+              <div><dt>GPU MODEL</dt><dd>NVIDIA L40S</dd></div>
+              <div><dt>BILLING</dt><dd>PER SECOND, USDG</dd></div>
+              <div><dt>NETWORK</dt><dd>ROBINHOOD CHAIN</dd></div>
+              <div><dt>FEED</dt><dd>/PROOF</dd></div>
             </dl>
-            <div className="terminal-cursor"><span /> Awaiting the first verified settlement</div>
+            <div className="terminal-cursor"><span /> First verified receipt is live</div>
           </div>
         </section>
 
         <section className="landing-cta">
-          <p>Deploy GPU capacity with transparent usage-based billing.</p>
+          <p>Give your agents a wallet and a GPU.</p>
           <h2>Launch a workspace.</h2>
           <div>
             <Link className="landing-button primary" href="/compute">Find compute <span>↗</span></Link>
