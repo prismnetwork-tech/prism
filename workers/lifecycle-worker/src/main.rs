@@ -484,13 +484,36 @@ impl Worker {
                 if let Some(instance_id) = vast.find_by_label(&label).await? {
                     (instance_id, None)
                 } else {
-                    let offer = vast
-                        .cheapest_l40s()
-                        .await?
-                        .context("no verified L40S is available under the cost ceiling")?;
-                    let instance_id = vast
-                        .create(offer.id, &context.lease.image, lease_id)
-                        .await?;
+                    let candidates = vast.ranked_l40s(8).await?;
+                    if candidates.is_empty() {
+                        anyhow::bail!("no verified L40S is available under the cost ceiling");
+                    }
+                    // Vast can reject a create even when the offer showed rentable (another
+                    // renter took the machine). Fall through the ranked list instead of
+                    // hammering the cheapest one until the provision window expires.
+                    let mut launched = None;
+                    let mut last_error = None;
+                    for offer in candidates {
+                        match vast.create(offer.id, &context.lease.image, lease_id).await {
+                            Ok(instance_id) => {
+                                launched = Some((instance_id, offer));
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    lease_id,
+                                    offer_id = offer.id,
+                                    %error,
+                                    "Vast offer unavailable, trying next candidate"
+                                );
+                                last_error = Some(error);
+                            }
+                        }
+                    }
+                    let (instance_id, offer) = launched.ok_or_else(|| {
+                        last_error
+                            .unwrap_or_else(|| anyhow::anyhow!("all candidate Vast offers failed"))
+                    })?;
                     (instance_id, Some(offer))
                 }
             }

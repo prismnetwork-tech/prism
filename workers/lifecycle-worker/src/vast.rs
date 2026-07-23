@@ -117,7 +117,7 @@ impl VastBroker {
         }))
     }
 
-    pub(crate) async fn cheapest_l40s(&self) -> anyhow::Result<Option<Offer>> {
+    async fn search_offers(&self) -> anyhow::Result<Vec<Offer>> {
         let response = self
             .client
             .post(self.base_url.join("bundles/")?)
@@ -140,7 +140,15 @@ impl VastBroker {
             .json::<OfferResponse>()
             .await
             .context("decode Vast offer search")?;
-        Ok(select_offer(response.offers, self.max_hourly_micros))
+        Ok(response.offers)
+    }
+
+    pub(crate) async fn cheapest_l40s(&self) -> anyhow::Result<Option<Offer>> {
+        Ok(select_offer(self.search_offers().await?, self.max_hourly_micros))
+    }
+
+    pub(crate) async fn ranked_l40s(&self, limit: usize) -> anyhow::Result<Vec<Offer>> {
+        Ok(rank_offers(self.search_offers().await?, self.max_hourly_micros, limit))
     }
 
     pub(crate) async fn create(
@@ -274,15 +282,22 @@ impl VastBroker {
     }
 }
 
-fn select_offer(offers: Vec<Offer>, max_hourly_micros: u64) -> Option<Offer> {
-    offers
+fn rank_offers(offers: Vec<Offer>, max_hourly_micros: u64, limit: usize) -> Vec<Offer> {
+    let mut eligible: Vec<Offer> = offers
         .into_iter()
         .filter(|offer| {
             offer.gpu_name.eq_ignore_ascii_case("L40S")
                 && offer.gpu_ram >= 45_000
                 && hourly_micros(offer.dph_total).is_ok_and(|cost| cost <= max_hourly_micros)
         })
-        .min_by_key(|offer| hourly_micros(offer.dph_total).unwrap_or(u64::MAX))
+        .collect();
+    eligible.sort_by_key(|offer| hourly_micros(offer.dph_total).unwrap_or(u64::MAX));
+    eligible.truncate(limit);
+    eligible
+}
+
+fn select_offer(offers: Vec<Offer>, max_hourly_micros: u64) -> Option<Offer> {
+    rank_offers(offers, max_hourly_micros, 1).into_iter().next()
 }
 
 pub(crate) fn hourly_micros(value: f64) -> anyhow::Result<u64> {
