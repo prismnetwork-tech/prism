@@ -3,6 +3,9 @@
 [![Validate](https://github.com/prismnetwork-tech/prism/actions/workflows/validate.yml/badge.svg)](https://github.com/prismnetwork-tech/prism/actions/workflows/validate.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/prismnetwork-tech/prism/badge)](https://securityscorecards.dev/viewer/?uri=github.com/prismnetwork-tech/prism)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ccff00)](LICENSE)
+[![Headless agent SDK](https://img.shields.io/badge/agents-headless%20SDK-ccff00)](sdk/README.md)
+[![MCP + x402](https://img.shields.io/badge/agents-MCP%20%2B%20x402-ccff00)](mcp/README.md)
+[![Wallet-signature auth](https://img.shields.io/badge/agents-wallet%20auth-ccff00)](examples/agent-quickstart/README.md)
 
 Prism Network is open infrastructure for metered GPU compute. The current
 system implements account and wallet onboarding, GPU offer discovery, USDG
