@@ -2472,6 +2472,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-reconciliation-monitor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "hex",
+ "prism-chain",
+ "prism-protocol",
+ "serde",
+ "serde_json",
+ "sha3",
+ "sqlx-core",
+ "sqlx-postgres",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "prism-settlement-worker"
 version = "0.1.0"
 dependencies = [
