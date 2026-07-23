@@ -222,6 +222,31 @@ services:
       postgres:
         condition: service_healthy
 
+  reconciliation-monitor:
+    profiles: [observability]
+    image: ${PRISM_RECONCILIATION_MONITOR_IMAGE:?set PRISM_RECONCILIATION_MONITOR_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    environment:
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_RECONCILIATION_MONITOR_ADDR: 0.0.0.0:9092
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9092/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
   prometheus:
     profiles: [observability]
     image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
@@ -240,6 +265,8 @@ services:
       - prometheus_data:/prometheus
     depends_on:
       operations-monitor:
+        condition: service_healthy
+      reconciliation-monitor:
         condition: service_healthy
 
   settlement-worker:
