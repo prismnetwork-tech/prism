@@ -9,3 +9,6 @@ scrape_configs:
   - job_name: prism-operations
     static_configs:
       - targets: ["operations-monitor:9091"]
+  - job_name: prism-reconciliation
+    static_configs:
+      - targets: ["reconciliation-monitor:9092"]

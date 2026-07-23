@@ -5,6 +5,7 @@ members = [
   "services/control-plane",
   "services/access-gateway",
   "services/operations-monitor",
+  "services/reconciliation-monitor",
   "node/prismd",
   "workers/lifecycle-worker",
   "workers/proof-worker",
