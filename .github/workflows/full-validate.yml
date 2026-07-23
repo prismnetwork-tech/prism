@@ -46,6 +46,7 @@ jobs:
             Prism Network
             useprismnetwork
             winterstacks
+            Mika Winter
             ianklemm
             GitHub
       - name: Validate Terraform
