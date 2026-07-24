@@ -3,6 +3,7 @@ set -euo pipefail
 
 search_args=(
   --hidden
+  --glob '!.git'
   --glob '!.git/**'
   --glob '!pnpm-lock.yaml'
   --glob '!Cargo.lock'
