@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import { ProofFeed } from "@/components/proof-feed";
 
 export const metadata: Metadata = {
-  title: "Settlement proof",
-  description: "Verify published GPU usage receipts against finalized Robinhood Chain settlement events.",
+  title: "Receipts",
+  description: "Onchain settlement receipts for GPU leases on Prism Network.",
   alternates: { canonical: "/proof" },
 };
 

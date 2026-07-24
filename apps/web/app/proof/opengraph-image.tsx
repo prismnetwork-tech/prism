@@ -2,12 +2,12 @@ import { ogContentType, ogSize, renderOgImage } from "@/lib/og-image";
 
 export const size = ogSize;
 export const contentType = ogContentType;
-export const alt = "Prism Network settlement proof";
+export const alt = "Prism Network settlement receipts";
 
 export default function Image() {
   return renderOgImage({
-    eyebrow: "Public verification",
-    title: "Verifiable settlement records.",
+    eyebrow: "Settlement receipts",
+    title: "Every lease leaves a receipt.",
     tag: "Robinhood Chain · USDG",
   });
 }

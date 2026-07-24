@@ -30,7 +30,7 @@ export function LandingPage() {
           <a href="#agents">Agents</a>
           <a href="#settlement">Settlement</a>
           <a href="#security">Security</a>
-          <Link href="/proof">Proof</Link>
+          <Link href="/proof">Receipts</Link>
           <Link href={docsUrl.href}>Docs</Link>
         </nav>
         <div className="landing-header-actions">
@@ -166,28 +166,28 @@ export function LandingPage() {
 
         <section className="landing-section proof-section">
           <div className="proof-copy">
-            <p className="section-index">05 / Proof</p>
-            <h2>Verifiable<br />settlement records.</h2>
+            <p className="section-index">05 / Receipts</p>
+            <h2>Every lease<br />leaves a receipt.</h2>
             <p>
-              Every settled lease publishes a receipt that ties a platform-attested usage
-              record to a Robinhood Chain settlement event, without exposing terminal
-              contents, notebooks, or files. The first receipt is live.
+              When a lease settles, Prism publishes a receipt for it onchain: the GPU, the
+              runtime, and the USDG charged, without exposing terminal contents, notebooks,
+              or files. Handy for accounting, and anyone can check it.
             </p>
-            <Link className="landing-button secondary" href="/proof">Open proof feed <span>↗</span></Link>
+            <Link className="landing-button secondary" href="/proof">See the receipts <span>↗</span></Link>
           </div>
           <div className="receipt-terminal">
             <div className="terminal-bar">
               <span>SETTLEMENT RECEIPT</span>
-              <span>PUBLISHED ONCHAIN</span>
+              <span>ONCHAIN</span>
             </div>
             <dl>
-              <div><dt>STATUS</dt><dd>VERIFIED ONCHAIN</dd></div>
+              <div><dt>STATUS</dt><dd>SETTLED ONCHAIN</dd></div>
               <div><dt>GPU MODEL</dt><dd>NVIDIA L40S</dd></div>
               <div><dt>BILLING</dt><dd>PER SECOND, USDG</dd></div>
               <div><dt>NETWORK</dt><dd>ROBINHOOD CHAIN</dd></div>
               <div><dt>FEED</dt><dd>/PROOF</dd></div>
             </dl>
-            <div className="terminal-cursor"><span /> First verified receipt is live</div>
+            <div className="terminal-cursor"><span /> Receipts are live</div>
           </div>
         </section>
 
