@@ -26,7 +26,7 @@ export const metadata: Metadata = {
     description: "GPU compute autonomous agents can rent with a wallet. Lease NVIDIA L40S capacity, pay per second in USDG, settle every lease onchain.",
   },
   twitter: {
-    card: "summary",
+    card: "summary_large_image",
     title: "Prism Network",
     description: "GPU compute autonomous agents can rent with a wallet. Lease NVIDIA L40S capacity, pay per second in USDG, settle every lease onchain.",
   },
