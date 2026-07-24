@@ -3,7 +3,7 @@ import { InformationPage, InformationSection } from "@/components/information-pa
 
 export const metadata: Metadata = {
   title: "About",
-  description: "Prism Network provides metered GPU infrastructure with verifiable onchain settlement.",
+  description: "Prism Network provides metered GPU infrastructure autonomous agents can rent with a wallet.",
   alternates: { canonical: "/about" },
 };
 
@@ -11,8 +11,8 @@ export default function AboutPage() {
   return (
     <InformationPage
       eyebrow="Company / About"
-      title="Metered GPU infrastructure with verifiable settlement."
-      description="Prism provides on-demand GPU capacity with per-second billing, upfront escrow limits, and public settlement records."
+      title="Metered GPU infrastructure, built for agents."
+      description="Prism provides on-demand GPU capacity an agent can rent with its wallet, with per-second billing and upfront escrow limits."
     >
       <InformationSection index="01" title="Platform">
         <p>

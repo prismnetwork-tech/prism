@@ -10,7 +10,7 @@ const columns = [
       ["Compute", new URL("/compute", siteUrl).href, false],
       ["Pricing", new URL("/pricing", siteUrl).href, false],
       ["Leases", new URL("/leases", siteUrl).href, false],
-      ["Proof", new URL("/proof", siteUrl).href, false],
+      ["Receipts", new URL("/proof", siteUrl).href, false],
     ],
   },
   {
@@ -62,7 +62,7 @@ export function PublicFooter() {
             <img src="/brand/prism-logo.svg" alt="" width="32" height="32" />
             <span>prism.</span>
           </Link>
-          <p>Metered GPU compute with USDG escrow and public settlement proof.</p>
+          <p>Metered GPU compute autonomous agents can rent with a wallet.</p>
           <span>Live · Robinhood Chain · L40S</span>
         </div>
 

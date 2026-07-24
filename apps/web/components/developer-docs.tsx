@@ -118,7 +118,7 @@ export function DeveloperDocs() {
         </Link>
         <nav aria-label="Documentation header">
           <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
-          <Link href={new URL("/proof", siteUrl).href}>Proof</Link>
+          <Link href={new URL("/proof", siteUrl).href}>Receipts</Link>
           <Link className="docs-console-link" href={new URL("/compute", siteUrl).href}>Open console ↗</Link>
         </nav>
       </header>
