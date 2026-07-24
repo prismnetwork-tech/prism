@@ -1,11 +1,21 @@
 .public-footer {
   --footer-gutter: clamp(22px, 4vw, 72px);
+  position: relative;
   width: min(1920px, 100%);
   margin: 0 auto;
   padding: clamp(64px, 8vw, 120px) var(--footer-gutter) 28px;
-  border-top: 1px solid rgba(230, 237, 220, .14);
   background: #020305;
   color: #f4f7ef;
+}
+
+.public-footer::before {
+  content: "";
+  position: absolute;
+  left: var(--footer-gutter);
+  right: var(--footer-gutter);
+  top: 0;
+  height: 1px;
+  background: rgba(230, 237, 220, .14);
 }
 
 .public-footer-grid {

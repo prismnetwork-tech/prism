@@ -23,8 +23,17 @@
   align-items: center;
   justify-content: space-between;
   gap: 30px;
-  border-bottom: 1px solid rgba(230, 237, 220, .14);
   background: #000;
+}
+
+.docs-header::after {
+  content: "";
+  position: absolute;
+  left: var(--docs-gutter);
+  right: var(--docs-gutter);
+  bottom: 0;
+  height: 1px;
+  background: rgba(230, 237, 220, .14);
 }
 
 .docs-header nav {
