@@ -1,4 +1,4 @@
-# @prism-network/x402
+# @prismnetwork/x402
 
 Pay-per-job GPU compute on [Prism Network](https://prismnetwork.tech) over HTTP 402. An agent submits a command, pays USDG on Robinhood Chain, and gets the output. No lease management, no wallet-signature session.
 

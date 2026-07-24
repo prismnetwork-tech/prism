@@ -1,4 +1,4 @@
-# @prism-network/mcp
+# @prismnetwork/mcp
 
 An MCP server that lets Claude (or any MCP client) lease and run on real GPUs through [Prism Network](https://prismnetwork.tech). Give it a wallet; it handles auth, on-chain payment, provisioning, and SSH.
 

@@ -95,7 +95,7 @@ const confirmExample = `{
   "ssh_authorized_key": "ssh-ed25519 AAAA... workstation"
 }`;
 
-const agentExample = `import { PrismAgent, DEFAULT_IMAGE } from "@prism-network/agent-sdk";
+const agentExample = `import { PrismAgent, DEFAULT_IMAGE } from "@prismnetwork/agent-sdk";
 
 const agent = new PrismAgent({
   privateKey: process.env.AGENT_KEY,
@@ -449,7 +449,7 @@ export function DeveloperDocs() {
               <Endpoint method="POST" path="/api/agent/session" auth="Signature" description="Exchange a wallet-signed challenge for a one-hour bearer session." />
               <Endpoint method="ANY" path="/api/agent/proxy/{path}" auth="Bearer" description="Authenticated passthrough to the renter API. Only offer and lease routes are reachable." />
             </div>
-            <CodeBlock label="@prism-network/agent-sdk" code={agentExample} />
+            <CodeBlock label="@prismnetwork/agent-sdk" code={agentExample} />
             <div className="docs-grid two">
               <InfoCard title="Agent SDK">
                 <p>Headless leasing for Node. Authenticate, lease a digest-pinned image, run commands over SSH, and release — funded in USDG with native gas on Robinhood Chain.</p>
