@@ -134,7 +134,7 @@ export function DeveloperDocs() {
           <div className="docs-version">
             <span>API</span><strong>v1</strong>
             <span>Chain</span><strong>4663</strong>
-            <span>Stage</span><strong>Beta</strong>
+            <span>Stage</span><strong>Live</strong>
           </div>
         </aside>
 
@@ -152,7 +152,7 @@ export function DeveloperDocs() {
               <a className="landing-button secondary" href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">Read source <span>↗</span></a>
             </div>
             <dl className="docs-facts">
-              <div><dt>Execution</dt><dd>L40S cloud beta</dd></div>
+              <div><dt>Execution</dt><dd>L40S cloud</dd></div>
               <div><dt>Settlement</dt><dd>Robinhood Chain + USDG</dd></div>
               <div><dt>Access</dt><dd>Temporary, key-only SSH</dd></div>
               <div><dt>Billing unit</dt><dd>Confirmed runtime second</dd></div>
@@ -201,7 +201,7 @@ export function DeveloperDocs() {
             </ol>
             <Callout kind="warning" title="Data classification">
               Do not place private keys, production credentials, regulated data, confidential
-              datasets, or valuable model weights inside a beta workspace. Provider operators
+              datasets, or valuable model weights inside a workspace. Provider operators
               remain within the trust boundary.
             </Callout>
           </DocsSection>
@@ -302,7 +302,7 @@ export function DeveloperDocs() {
               <RuntimeRow label="Access" cloud="Temporary direct root SSH" physical="Revocable SSH/Jupyter grant via mTLS gateway" />
               <RuntimeRow label="Readiness" cloud="Provider state, GPU, VRAM, cost, SSH endpoint" physical="Signed telemetry plus independent active gateway probes" />
               <RuntimeRow label="Evidence" cloud="Provider instance and hourly cost" physical="Device-signed telemetry and gateway timing" />
-              <RuntimeRow label="Availability" cloud="Limited beta" physical="Planned; not available for production leases" />
+              <RuntimeRow label="Availability" cloud="Live" physical="Planned; not available for production leases" />
             </div>
             <h3 className="docs-subheading">Container requirements</h3>
             <ul className="docs-list">
@@ -334,8 +334,8 @@ export function DeveloperDocs() {
               <div><dt>Platform fee</dt><dd>10%</dd></div>
               <div><dt>Network concurrency</dt><dd>25 active leases</dd></div>
             </dl>
-            <Callout kind="warning" title="Unaudited beta">
-              The deployed contracts are operational beta software and have not completed an
+            <Callout kind="warning" title="Unaudited contracts">
+              The deployed contracts are operational software and have not completed an
               independent production audit. Verify contract addresses, bytecode, constructor
               inputs, and current pause state directly before building a financial dependency.
             </Callout>
@@ -464,10 +464,10 @@ export function DeveloperDocs() {
                 <p>The signing wallet is the subject of every request. The agent boundary reaches only renter routes; operator, node, and gateway surfaces are rejected.</p>
               </InfoCard>
             </div>
-            <Callout kind="warning" title="Beta and packaging">
+            <Callout kind="warning" title="Packaging">
               The agent packages are not yet published to npm; install them from the repository.
-              The data-classification limits above apply unchanged — an agent workspace is a
-              disposable beta environment, not confidential computing.
+              The data-classification limits above apply unchanged. An agent workspace is a
+              disposable environment, not confidential computing.
             </Callout>
           </DocsSection>
 

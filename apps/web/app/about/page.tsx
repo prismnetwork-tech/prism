@@ -26,7 +26,7 @@ export default function AboutPage() {
           open SDK, an MCP server, and pay-per-job settlement over x402.
         </p>
         <p>
-          The current service provides managed NVIDIA L40S capacity in private beta. A provider
+          The current service provides live, managed NVIDIA L40S capacity. A provider
           program for operator-owned infrastructure is in technical onboarding and is not yet
           available for production leases.
         </p>
@@ -40,7 +40,7 @@ export default function AboutPage() {
         <h3>Privacy-preserving records</h3>
         <p>Public receipts prove settlement state without publishing wallet identity, terminal contents, notebooks, or files.</p>
         <h3>Defined security scope</h3>
-        <p>The beta uses fresh container workspaces, not confidential computing. The infrastructure provider remains inside the trust boundary.</p>
+        <p>The service uses fresh container workspaces, not confidential computing. The infrastructure provider remains inside the trust boundary.</p>
       </InformationSection>
 
       <InformationSection index="03" title="Open-source infrastructure">

@@ -63,7 +63,7 @@ export function PublicFooter() {
             <span>prism.</span>
           </Link>
           <p>Metered GPU compute with USDG escrow and public settlement proof.</p>
-          <span>Robinhood Chain · L40S beta</span>
+          <span>Live · Robinhood Chain · L40S</span>
         </div>
 
         {columns.map((column) => (
