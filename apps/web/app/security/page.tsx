@@ -34,7 +34,7 @@ export default function SecurityPage() {
         </p>
         <p>
           Do not place private keys, production credentials, regulated data, proprietary model
-          weights, or other confidential material in a beta workspace. Prism does not currently
+          weights, or other confidential material in a workspace. Prism does not currently
           provide a hardware-backed trusted execution environment, confidential GPU memory,
           durable storage, or a service-level agreement.
         </p>
@@ -44,7 +44,7 @@ export default function SecurityPage() {
         <p>
           Lease funding and settlement execute through deployed Robinhood Chain contracts.
           Configuration changes pass through a 48-hour timelock, while the governance Safe holds
-          emergency and dispute authority. The initial contracts are unaudited beta software.
+          emergency and dispute authority. The initial contracts are unaudited software.
         </p>
         <p>
           Contract addresses, roles, state transitions, settlement calculations, and operational

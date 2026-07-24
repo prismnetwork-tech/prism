@@ -119,7 +119,7 @@ only renter routes.
 - [`x402`](x402/README.md) — `@prism-network/x402`, pay-per-job GPU execution over HTTP 402.
 
 These packages are not yet published to npm; install them from this repository.
-The beta data-classification limits above apply unchanged — an agent workspace
+The data-classification limits above apply unchanged. An agent workspace
 is a disposable environment, not confidential computing.
 
 ## Verification

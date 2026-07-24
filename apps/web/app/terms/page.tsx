@@ -3,7 +3,7 @@ import { LegalPage, LegalSection } from "@/components/legal-page";
 
 export const metadata: Metadata = {
   title: "Terms of service",
-  description: "Terms governing access to the Prism Network beta website, console, marketplace, and contracts.",
+  description: "Terms governing access to the Prism Network website, console, marketplace, and contracts.",
   alternates: { canonical: "/terms" },
 };
 
@@ -11,7 +11,7 @@ export default function TermsPage() {
   return (
     <LegalPage
       title="Terms of service"
-      description="Terms governing access to the Prism beta website, console, compute marketplace, and associated smart contracts."
+      description="Terms governing access to the Prism website, console, compute marketplace, and associated smart contracts."
       effective="July 20, 2026"
     >
       <LegalSection index="01" title="Acceptance and eligibility">
@@ -23,9 +23,9 @@ export default function TermsPage() {
         </p>
       </LegalSection>
 
-      <LegalSection index="02" title="The beta service">
+      <LegalSection index="02" title="The service">
         <p>
-          Prism is an unaudited beta marketplace for metered GPU compute. It matches renter
+          Prism is an unaudited marketplace for metered GPU compute. It matches renter
           requests with independent or third-party capacity, coordinates temporary access, and
           uses USDG escrow on Robinhood Chain for funding and settlement. Features, limits,
           pricing, providers, supported chains, and availability may change or be suspended.
@@ -59,7 +59,7 @@ export default function TermsPage() {
           <li>Deploy malware, phishing, credential theft, denial-of-service, botnet, or unauthorized mining workloads.</li>
           <li>Probe, exploit, disrupt, or bypass Prism, providers, other renters, rate limits, or security controls.</li>
           <li>Access data or systems without authorization, or process unlawful or harmful content.</li>
-          <li>Place secrets, regulated data, or confidential material into a beta workspace.</li>
+          <li>Place secrets, regulated data, or confidential material into a workspace.</li>
           <li>Misrepresent usage, manipulate metering, replay identities, or interfere with settlement evidence.</li>
           <li>Resell access without written authorization or use capacity for sanctioned end users or destinations.</li>
         </ul>
@@ -136,7 +136,7 @@ export default function TermsPage() {
         <p>
           Prism may impose capacity, duration, escrow, geographic, wallet, risk, or concurrency
           limits; modify or discontinue features; rotate providers; deploy security fixes; or
-          pause the service. Beta availability is not guaranteed. Planned governance changes may
+          pause the service. Availability is not guaranteed. Planned governance changes may
           be timelocked, while emergency pause and security containment may be immediate.
         </p>
       </LegalSection>
@@ -170,7 +170,7 @@ export default function TermsPage() {
           disclaimers, liability limits, and dispute records—continue after termination.
         </p>
         <p>
-          These terms and referenced policies form the agreement for the beta service unless a
+          These terms and referenced policies form the agreement for the service unless a
           separate written agreement applies. Mandatory local consumer rights remain unaffected.
           If a provision is unenforceable, the remainder continues. Failure to enforce a provision
           is not a waiver. Material updates will be identified by a revised effective date.

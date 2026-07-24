@@ -61,7 +61,7 @@ export function LandingPage() {
             <HeroSignal />
           </div>
           <div className="hero-status" role="status">
-            <span><i /> Private beta</span>
+            <span><i /> Live</span>
             <span>$0.80 / GPU hour</span>
             <span>Robinhood Chain · USDG</span>
           </div>
@@ -72,8 +72,8 @@ export function LandingPage() {
             <p className="section-index">01 / Network</p>
             <h2>Compute and settlement<br />in one service.</h2>
             <p>
-              Managed L40S capacity is available in private beta. Operator-owned infrastructure
-              is in technical onboarding and is not yet available for production leases.
+              Managed L40S capacity is live. Operator-owned infrastructure is in technical
+              onboarding and is not yet available for production leases.
             </p>
           </div>
           <div className="network-panels">
@@ -159,7 +159,7 @@ export function LandingPage() {
             </p>
             <div className="security-disclosure">
               <span>Security scope</span>
-              <p>Do not place private keys, production credentials or confidential data in a beta workspace. Container isolation is not hardware-backed confidential computing.</p>
+              <p>Do not place private keys, production credentials or confidential data in a workspace. Container isolation is not hardware-backed confidential computing.</p>
             </div>
           </div>
         </section>

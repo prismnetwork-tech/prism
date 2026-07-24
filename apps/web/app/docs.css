@@ -715,7 +715,7 @@
   .runtime-head { display: none; }
   .runtime-table > div { grid-template-columns: 1fr; gap: 8px; }
   .runtime-table > div span::before { display: block; margin-bottom: 4px; color: #687064; font-size: 8px; text-transform: uppercase; }
-  .runtime-table > div span:nth-child(2)::before { content: "Cloud beta"; }
+  .runtime-table > div span:nth-child(2)::before { content: "Cloud"; }
   .runtime-table > div span:nth-child(3)::before { content: "Physical track"; }
   .parameter-grid { grid-template-columns: 1fr; }
   .parameter-grid div { border-right: 0; border-bottom: 1px solid rgba(230, 237, 220, .1) !important; }

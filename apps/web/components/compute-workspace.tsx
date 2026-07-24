@@ -287,7 +287,7 @@ export function ComputeWorkspace() {
           )}
           <div className="safety-note">
             <strong>Data handling notice</strong>
-            <span>Infrastructure providers are independent. Do not process confidential data or credentials in beta workspaces.</span>
+            <span>Infrastructure providers are independent. Do not process confidential data or credentials in workspaces.</span>
           </div>
           <button
             className="button primary full"

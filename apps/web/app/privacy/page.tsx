@@ -100,7 +100,7 @@ export default function PrivacyPage() {
           Data may also be disclosed when required by law, to investigate security incidents
           or abuse, to protect users or infrastructure, in connection with a corporate
           transaction, or at your direction. Independent GPU operators may observe or control
-          data processed on their hosts; do not use beta workspaces for confidential data.
+          data processed on their hosts; do not use workspaces for confidential data.
         </p>
       </LegalSection>
 
@@ -121,7 +121,7 @@ export default function PrivacyPage() {
           least-privilege service credentials, encrypted stored access credentials,
           non-exportable production signing keys, replay protection, request limits,
           persistent transaction records, and governance-controlled emergency pause. No system is
-          completely secure. The beta does not provide confidential computing and the deployed
+          completely secure. The service does not provide confidential computing and the deployed
           contracts are unaudited.
         </p>
       </LegalSection>
