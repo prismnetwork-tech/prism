@@ -464,9 +464,9 @@ export function DeveloperDocs() {
                 <p>The signing wallet is the subject of every request. The agent boundary reaches only renter routes; operator, node, and gateway surfaces are rejected.</p>
               </InfoCard>
             </div>
-            <Callout kind="warning" title="Packaging">
-              The agent packages are not yet published to npm; install them from the repository.
-              The data-classification limits above apply unchanged. An agent workspace is a
+            <Callout kind="warning" title="Workspace data">
+              The agent packages are on npm under the @prismnetwork scope. The
+              data-classification limits above apply unchanged. An agent workspace is a
               disposable environment, not confidential computing.
             </Callout>
           </DocsSection>

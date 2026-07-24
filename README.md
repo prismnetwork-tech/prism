@@ -118,8 +118,8 @@ only renter routes.
 - [`mcp`](mcp/README.md) — `@prismnetwork/mcp`, the same leasing exposed as Model Context Protocol tools.
 - [`x402`](x402/README.md) — `@prismnetwork/x402`, pay-per-job GPU execution over HTTP 402.
 
-These packages are not yet published to npm; install them from this repository.
-The data-classification limits above apply unchanged. An agent workspace
+All three are published on npm under the `@prismnetwork` scope. The
+data-classification limits above apply unchanged. An agent workspace
 is a disposable environment, not confidential computing.
 
 ## Verification

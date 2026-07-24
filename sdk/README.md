@@ -4,11 +4,11 @@ Headless GPU leasing on [Prism Network](https://prismnetwork.tech) for autonomou
 
 ## Install
 
-Not yet published to npm. Until it is, install it from the repo alongside its `viem` peer dependency:
+```
+npm install @prismnetwork/agent-sdk viem
+```
 
-```
-npm install /path/to/prism-public/sdk viem
-```
+`viem` is a peer dependency.
 
 ## Use
 
