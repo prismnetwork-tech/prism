@@ -62,7 +62,7 @@ export function PublicFooter() {
             <img src="/brand/prism-logo.svg" alt="" width="32" height="32" />
             <span>prism.</span>
           </Link>
-          <p>Metered GPU compute autonomous agents can rent with a wallet.</p>
+          <p>Metered GPU compute for autonomous agents, rented with a wallet.</p>
           <span>Live · Robinhood Chain · L40S</span>
         </div>
 
