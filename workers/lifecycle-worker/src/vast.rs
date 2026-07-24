@@ -144,11 +144,18 @@ impl VastBroker {
     }
 
     pub(crate) async fn cheapest_l40s(&self) -> anyhow::Result<Option<Offer>> {
-        Ok(select_offer(self.search_offers().await?, self.max_hourly_micros))
+        Ok(select_offer(
+            self.search_offers().await?,
+            self.max_hourly_micros,
+        ))
     }
 
     pub(crate) async fn ranked_l40s(&self, limit: usize) -> anyhow::Result<Vec<Offer>> {
-        Ok(rank_offers(self.search_offers().await?, self.max_hourly_micros, limit))
+        Ok(rank_offers(
+            self.search_offers().await?,
+            self.max_hourly_micros,
+            limit,
+        ))
     }
 
     pub(crate) async fn create(
