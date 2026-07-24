@@ -8,7 +8,7 @@
 // The wallet needs USDG and native Robinhood-Chain gas. Set PRISM_RUN_LEASE=1 to
 // actually lease and run (spends funds); otherwise this stops after listing GPUs.
 // Prism is pre-production and unaudited — do not use funds or data you cannot lose.
-import { DEFAULT_IMAGE, PrismAgent } from "@prism-network/agent-sdk";
+import { DEFAULT_IMAGE, PrismAgent } from "@prismnetwork/agent-sdk";
 
 const agent = new PrismAgent({
   privateKey: requireEnv("PRISM_AGENT_KEY"),

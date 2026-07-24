@@ -32,6 +32,15 @@ Point your MCP client (Claude Desktop / Code) at the published server:
 
 The wallet needs USDG (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`) and Robinhood-Chain ETH for gas. See the SDK's Funding section for how to fund a fresh wallet.
 
+Or add it to Claude Code in one line:
+
+```sh
+claude mcp add prism \
+  --env PRISM_ESCROW=0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD \
+  --env PRISM_AGENT_KEY=0x<agent wallet private key> \
+  -- npx -y @prismnetwork/mcp
+```
+
 ## Timing
 
 `prism_lease` and `prism_lease_and_run` block while a GPU provisions (usually one to four minutes, occasionally longer on a slow host). Configure your MCP client to allow long tool calls.

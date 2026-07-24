@@ -9,7 +9,7 @@
     "start": "node quickstart.mjs"
   },
   "dependencies": {
-    "@prism-network/agent-sdk": "file:../../sdk",
+    "@prismnetwork/agent-sdk": "^0.1.0",
     "viem": "^2"
   }
 }
