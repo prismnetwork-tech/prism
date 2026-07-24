@@ -31,9 +31,9 @@ export function ProofFeed() {
         <div><p className="eyebrow">Settlement receipts</p><h1>Receipts</h1></div>
         <span className="chip">{statusLabel(status, proof)}</span>
       </div>
-      <article className="panel proof-disclosure"><strong>About these receipts</strong><p>Each record ties a platform-attested usage receipt to an onchain settlement event. They do not independently attest hardware execution or contract correctness.</p></article>
+      <article className="panel proof-disclosure"><strong>About these receipts</strong><p>Each receipt links a platform-attested usage record to an onchain settlement. It does not independently attest hardware execution or contract correctness.</p></article>
       {status === "loading" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Loading receipts</h2></article>}
-      {status === "unavailable" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Receipts are temporarily unavailable</h2><p>No receipt data is being shown while the publication endpoint is unavailable.</p></article>}
+      {status === "unavailable" && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>Receipts are temporarily unavailable</h2><p>No receipts can be shown while the publication endpoint is unreachable.</p></article>}
       {status === "ready" && proof?.receipts.length === 0 && <article className="panel empty-state"><span className="empty-icon">◇</span><h2>No settlement receipts published</h2><p>Receipts are published after a funded lease reaches final settlement onchain.</p></article>}
       {status === "ready" && proof && proof.receipts.length > 0 && <article className="panel proof-list">{proof.receipts.map((receipt) => <Receipt key={receipt.receipt_id} receipt={receipt} />)}</article>}
     </section>

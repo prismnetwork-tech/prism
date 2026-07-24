@@ -169,9 +169,9 @@ export function LandingPage() {
             <p className="section-index">05 / Receipts</p>
             <h2>Every lease<br />leaves a receipt.</h2>
             <p>
-              When a lease settles, Prism publishes a receipt for it onchain: the GPU, the
-              runtime, and the USDG charged, without exposing terminal contents, notebooks,
-              or files. Handy for accounting, and anyone can check it.
+              When a lease settles, Prism writes an onchain receipt: the GPU, the runtime,
+              and the USDG charged. It records the cost, never the contents, so your spend
+              reconciles cleanly and the workspace stays private.
             </p>
             <Link className="landing-button secondary" href="/proof">See the receipts <span>↗</span></Link>
           </div>
