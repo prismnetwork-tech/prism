@@ -10,7 +10,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createPublicClient, createWalletClient, custom, http, stringToHex, type Address, type Hex } from "viem";
 import { robinhoodChain } from "@/lib/chain";
-import { ThemeProvider } from "@/components/theme-provider";
 
 export type ConnectedAccount = {
   address: Address;
@@ -72,7 +71,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     </PrivyProvider>
   ) : <UnconfiguredSession>{children}</UnconfiguredSession>;
 
-  return <QueryClientProvider client={queryClient}><ThemeProvider>{content}</ThemeProvider></QueryClientProvider>;
+  return <QueryClientProvider client={queryClient}>{content}</QueryClientProvider>;
 }
 
 function LiveSession({ children }: { children: React.ReactNode }) {
