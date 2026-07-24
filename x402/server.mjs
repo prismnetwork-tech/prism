@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createPublicClient, getAddress, http, recoverMessageAddress } from "viem";
-import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prism-network/agent-sdk";
+import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;

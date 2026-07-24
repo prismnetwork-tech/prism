@@ -1,4 +1,4 @@
-# @prism-network/x402
+# @prismnetwork/x402
 
 Pay-per-job GPU compute on [Prism Network](https://prismnetwork.tech) over HTTP 402. An agent submits a command, pays USDG on Robinhood Chain, and gets the output. No lease management, no wallet-signature session.
 
@@ -33,6 +33,6 @@ X402_PRICE_MICROS=300000    # 0.30 USDG per job
 node server.mjs
 ```
 
-Install from the repo (not yet on npm): `cd prism-public/x402 && npm install`.
+Install with `npm install @prismnetwork/x402`, or run it directly with `npx @prismnetwork/x402`.
 
 Other env: `X402_PORT` (8402), `X402_DURATION_SECONDS` (900), `X402_MIN_VRAM_MIB` (16000), `X402_PAYMENTS_FILE`, `PRISM_API_BASE`, `PRISM_RPC_URL`. The consumed-payments file makes replay protection survive a restart; a multi-instance deployment needs a shared store instead.

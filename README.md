@@ -114,12 +114,12 @@ lifecycle — over the `/api/agent` endpoints. Escrow, readiness, metering and
 settlement are identical to the browser path, and the agent boundary reaches
 only renter routes.
 
-- [`sdk`](sdk/README.md) — `@prism-network/agent-sdk`, headless USDG-funded leasing for Node.
-- [`mcp`](mcp/README.md) — `@prism-network/mcp`, the same leasing exposed as Model Context Protocol tools.
-- [`x402`](x402/README.md) — `@prism-network/x402`, pay-per-job GPU execution over HTTP 402.
+- [`sdk`](sdk/README.md) — `@prismnetwork/agent-sdk`, headless USDG-funded leasing for Node.
+- [`mcp`](mcp/README.md) — `@prismnetwork/mcp`, the same leasing exposed as Model Context Protocol tools.
+- [`x402`](x402/README.md) — `@prismnetwork/x402`, pay-per-job GPU execution over HTTP 402.
 
-These packages are not yet published to npm; install them from this repository.
-The data-classification limits above apply unchanged. An agent workspace
+All three are published on npm under the `@prismnetwork` scope. The
+data-classification limits above apply unchanged. An agent workspace
 is a disposable environment, not confidential computing.
 
 ## Verification

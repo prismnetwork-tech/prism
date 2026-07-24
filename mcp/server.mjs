@@ -4,7 +4,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { DEFAULT_IMAGE, PrismAgent } from "@prism-network/agent-sdk";
+import { DEFAULT_IMAGE, PrismAgent } from "@prismnetwork/agent-sdk";
 
 const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 

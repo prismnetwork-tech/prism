@@ -95,7 +95,7 @@ const confirmExample = `{
   "ssh_authorized_key": "ssh-ed25519 AAAA... workstation"
 }`;
 
-const agentExample = `import { PrismAgent, DEFAULT_IMAGE } from "@prism-network/agent-sdk";
+const agentExample = `import { PrismAgent, DEFAULT_IMAGE } from "@prismnetwork/agent-sdk";
 
 const agent = new PrismAgent({
   privateKey: process.env.AGENT_KEY,
@@ -449,7 +449,7 @@ export function DeveloperDocs() {
               <Endpoint method="POST" path="/api/agent/session" auth="Signature" description="Exchange a wallet-signed challenge for a one-hour bearer session." />
               <Endpoint method="ANY" path="/api/agent/proxy/{path}" auth="Bearer" description="Authenticated passthrough to the renter API. Only offer and lease routes are reachable." />
             </div>
-            <CodeBlock label="@prism-network/agent-sdk" code={agentExample} />
+            <CodeBlock label="@prismnetwork/agent-sdk" code={agentExample} />
             <div className="docs-grid two">
               <InfoCard title="Agent SDK">
                 <p>Headless leasing for Node. Authenticate, lease a digest-pinned image, run commands over SSH, and release — funded in USDG with native gas on Robinhood Chain.</p>
@@ -464,9 +464,9 @@ export function DeveloperDocs() {
                 <p>The signing wallet is the subject of every request. The agent boundary reaches only renter routes; operator, node, and gateway surfaces are rejected.</p>
               </InfoCard>
             </div>
-            <Callout kind="warning" title="Packaging">
-              The agent packages are not yet published to npm; install them from the repository.
-              The data-classification limits above apply unchanged. An agent workspace is a
+            <Callout kind="warning" title="Workspace data">
+              The agent packages are on npm under the @prismnetwork scope. The
+              data-classification limits above apply unchanged. An agent workspace is a
               disposable environment, not confidential computing.
             </Callout>
           </DocsSection>

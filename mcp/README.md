@@ -1,4 +1,4 @@
-# @prism-network/mcp
+# @prismnetwork/mcp
 
 An MCP server that lets Claude (or any MCP client) lease and run on real GPUs through [Prism Network](https://prismnetwork.tech). Give it a wallet; it handles auth, on-chain payment, provisioning, and SSH.
 
@@ -11,22 +11,16 @@ An MCP server that lets Claude (or any MCP client) lease and run on real GPUs th
 - `prism_run`: run a command on an existing lease.
 - `prism_end_lease`: release a lease.
 
-## Install
+## Configure
 
-Not yet published to npm. Until it is, install from the repo:
-
-```
-cd prism-public/mcp && npm install
-```
-
-Then point your MCP client at the local entrypoint (Claude Desktop / Code):
+Point your MCP client (Claude Desktop / Code) at the published server:
 
 ```json
 {
   "mcpServers": {
     "prism": {
-      "command": "node",
-      "args": ["/path/to/prism-public/mcp/server.mjs"],
+      "command": "npx",
+      "args": ["-y", "@prismnetwork/mcp"],
       "env": {
         "PRISM_AGENT_KEY": "0x<agent wallet private key>",
         "PRISM_ESCROW": "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD"

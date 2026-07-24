@@ -1,19 +1,19 @@
-# @prism-network/agent-sdk
+# @prismnetwork/agent-sdk
 
 Headless GPU leasing on [Prism Network](https://prismnetwork.tech) for autonomous agents. No browser, no Privy. An agent authenticates with a wallet signature, pays on-chain in USDG, and gets SSH access to a GPU.
 
 ## Install
 
-Not yet published to npm. Until it is, install it from the repo alongside its `viem` peer dependency:
+```
+npm install @prismnetwork/agent-sdk viem
+```
 
-```
-npm install /path/to/prism-public/sdk viem
-```
+`viem` is a peer dependency.
 
 ## Use
 
 ```js
-import { PrismAgent, DEFAULT_IMAGE } from "@prism-network/agent-sdk";
+import { PrismAgent, DEFAULT_IMAGE } from "@prismnetwork/agent-sdk";
 
 const agent = new PrismAgent({
   privateKey: process.env.AGENT_KEY,        // agent's wallet
