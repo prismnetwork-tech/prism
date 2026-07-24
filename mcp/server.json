@@ -1,8 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.useprismnetwork/mcp",
+  "name": "io.github.prismnetwork-tech/mcp",
   "description": "Lease and run real NVIDIA GPUs from any MCP client. Wallet auth, onchain USDG payment, and SSH.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "websiteUrl": "https://prismnetwork.tech",
   "repository": {
     "url": "https://github.com/prismnetwork-tech/prism",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@prismnetwork/mcp",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         {
