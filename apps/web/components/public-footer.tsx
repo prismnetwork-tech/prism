@@ -10,6 +10,7 @@ const columns = [
       ["Compute", new URL("/compute", siteUrl).href, false],
       ["Pricing", new URL("/pricing", siteUrl).href, false],
       ["Leases", new URL("/leases", siteUrl).href, false],
+      ["Activity", new URL("/activity", siteUrl).href, false],
       ["Receipts", new URL("/proof", siteUrl).href, false],
     ],
   },

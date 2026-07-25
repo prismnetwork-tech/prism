@@ -30,6 +30,7 @@ export function LandingPage() {
           <a href="#agents">Agents</a>
           <a href="#settlement">Settlement</a>
           <a href="#security">Security</a>
+          <Link href="/activity">Activity</Link>
           <Link href="/proof">Receipts</Link>
           <Link href={docsUrl.href}>Docs</Link>
         </nav>
