@@ -8,9 +8,9 @@ signature and paid in USDG on Robinhood Chain.
 
 | Entry point | Use it when | Docs |
 | --- | --- | --- |
-| **Agent SDK** (`@prism-network/agent-sdk`) | You want a lease you hold and run several commands on | [`sdk`](../../sdk/README.md) |
-| **MCP server** (`@prism-network/mcp`) | Your agent speaks Model Context Protocol (Claude, etc.) | [`mcp`](../../mcp/README.md) |
-| **x402** (`@prism-network/x402`) | You want a single command run for a single USDG payment | [`x402`](../../x402/README.md) |
+| **Agent SDK** (`@prismnetwork/agent-sdk`) | You want a lease you hold and run several commands on | [`sdk`](../../sdk/README.md) |
+| **MCP server** (`@prismnetwork/mcp`) | Your agent speaks Model Context Protocol (Claude, etc.) | [`mcp`](../../mcp/README.md) |
+| **x402** (`@prismnetwork/x402`) | You want a single command run for a single USDG payment | [`x402`](../../x402/README.md) |
 
 This directory is the SDK path — the smallest end-to-end script.
 
@@ -29,8 +29,8 @@ that step spends USDG and gas.
 
 **Prerequisites:** Node 20+, `ssh` and `ssh-keygen` on `PATH`, and an agent
 wallet funded with USDG and native Robinhood-Chain gas (see the SDK's
-[funding notes](../../sdk/README.md)). The packages are not yet on npm, so this
-example installs the SDK from the repository via a `file:` dependency.
+[funding notes](../../sdk/README.md)). `npm install` pulls the SDK from npm
+(`@prismnetwork/agent-sdk`).
 
 ## Before you point it at real funds
 

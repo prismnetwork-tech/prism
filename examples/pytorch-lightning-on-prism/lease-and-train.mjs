@@ -14,7 +14,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PrismAgent } from "@prism-network/agent-sdk";
+import { PrismAgent } from "@prismnetwork/agent-sdk";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const trainScript = readFileSync(join(here, "train.py")).toString("base64");

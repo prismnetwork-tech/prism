@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.prismnetwork-tech/mcp",
+  "description": "Lease and run real NVIDIA GPUs from any MCP client. Wallet auth, onchain USDG payment, and SSH.",
+  "version": "0.1.2",
+  "websiteUrl": "https://prismnetwork.tech",
+  "repository": {
+    "url": "https://github.com/prismnetwork-tech/prism",
+    "source": "github",
+    "subfolder": "mcp"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@prismnetwork/mcp",
+      "version": "0.1.2",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "PRISM_AGENT_KEY",
+          "description": "Agent wallet private key (0x...), used to authenticate and pay onchain",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "PRISM_ESCROW",
+          "description": "Prism LeaseEscrow contract address",
+          "isRequired": true,
+          "default": "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD"
+        }
+      ]
+    }
+  ]
+}
