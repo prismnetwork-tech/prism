@@ -49,7 +49,7 @@ a { color: inherit; text-decoration: none; }
 .sidebar-note { margin-top: auto; border-top: 1px solid var(--border); padding: 18px 10px 0; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .mobile-nav, .mobile-account { display: none; }
 .account-control { display: grid; gap: 8px; margin: 22px 10px 0; }
-.account-status { margin: 22px 10px 0; color: var(--muted); font-size: 11px; font-weight: 700; line-height: 1.35; }
+.account-status { margin: 22px 10px 0; color: var(--muted); font-size: 11px; font-weight: 300; line-height: 1.35; }
 .account-control .account-status { margin: 0; }
 .account-status.success { color: var(--success); }
 .account-button { width: calc(100% - 20px); margin: 22px 10px 0; border: 1px solid var(--border); border-radius: 0; min-height: 38px; padding: 8px 10px; background: var(--surface); color: var(--text); font-size: 12px; font-weight: 400; letter-spacing: .08em; text-align: center; text-transform: uppercase; }
@@ -60,7 +60,7 @@ a { color: inherit; text-decoration: none; }
 .page-heading, .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
 .page-heading h1, .dashboard-hero h1 { margin: 4px 0 0; font-family: var(--font-display), Arial, sans-serif; font-weight: 400; font-size: clamp(28px, 3.4vw, 42px); line-height: 1.05; letter-spacing: -0.05em; }
 .page-heading h1 { font-size: 30px; }
-.eyebrow { margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; font-size: 10px; font-weight: 800; }
+.eyebrow { margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; font-size: 10px; font-weight: 300; }
 .hero-copy, .muted { color: var(--muted); line-height: 1.65; }
 .dashboard-hero { min-height: 255px; padding: 42px; border: 1px solid var(--border); border-radius: 18px; background: radial-gradient(circle at 82% 14%, var(--accent-soft), transparent 30%), var(--surface); display: flex; flex-direction: column; justify-content: space-between; gap: 30px; box-shadow: var(--shadow); }
 .dashboard-hero h1 { max-width: 620px; }
@@ -80,7 +80,7 @@ a { color: inherit; text-decoration: none; }
 .dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .panel { padding: 24px; }
 .panel h2 { margin: 6px 0 0; letter-spacing: -0.035em; font-size: 19px; }
-.live-indicator, .chip { display: inline-flex; gap: 7px; align-items: center; white-space: nowrap; color: var(--muted); font-size: 12px; font-weight: 700; }
+.live-indicator, .chip { display: inline-flex; gap: 7px; align-items: center; white-space: nowrap; color: var(--muted); font-size: 12px; font-weight: 300; }
 .chip { border: 1px solid var(--border); padding: 6px 9px; border-radius: 100px; }
 .chip.success { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, var(--border)); }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent); }
@@ -149,7 +149,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .access-panel label { margin-top: 5px; font-size: 12px; font-weight: 750; }
 .access-panel code { display: block; max-width: 100%; overflow-x: auto; padding: 11px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); font-size: 11px; white-space: nowrap; }
 .mono { font-family: "SF Mono", "Roboto Mono", ui-monospace, monospace; font-size: 12px; }
-.status-badge { display: inline-flex; padding: 5px 8px; border-radius: 100px; background: var(--surface-strong); color: var(--muted); font-size: 11px; font-weight: 750; }
+.status-badge { display: inline-flex; padding: 5px 8px; border-radius: 100px; background: var(--surface-strong); color: var(--muted); font-size: 11px; font-weight: 300; }
 .status-badge.active, .status-badge.finalized { color: var(--success); background: color-mix(in srgb, var(--success) 13%, var(--surface)); }
 .checklist ul { list-style: none; padding: 0; margin: 20px 0 0; display: grid; gap: 12px; }
 .checklist li { display: flex; gap: 9px; color: var(--muted); font-size: 13px; }
