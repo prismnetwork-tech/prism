@@ -45,6 +45,7 @@ const columns = [
     title: "Company",
     links: [
       ["About", new URL("/about", siteUrl).href, false],
+      ["Roadmap", new URL("/roadmap", siteUrl).href, false],
       ["Contact", new URL("/contact", siteUrl).href, false],
       ["Follow on X", "https://x.com/useprismnetwork", true],
       ["GitHub", "https://github.com/prismnetwork-tech", true],
