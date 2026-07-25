@@ -15,6 +15,7 @@ services:
       PRISM_ACME_EMAIL: ${PRISM_ACME_EMAIL:?set PRISM_ACME_EMAIL}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./proof-artifacts:/srv/proof:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
