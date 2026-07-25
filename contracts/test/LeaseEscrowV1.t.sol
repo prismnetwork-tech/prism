@@ -80,9 +80,53 @@ contract LeaseEscrowV1Test {
         _registerNode();
     }
 
-    function testBondTracksTwentyFourHoursOfGrossRate() public view {
-        require(registry.requiredBond(1_000) == 100_000_000, "minimum bond should apply");
-        require(registry.requiredBond(2_000) == 172_800_000, "daily rate should apply");
+    function testRequiredBondIsFlatMinimum() public view {
+        require(registry.requiredBond(1_000) == 1_000_000, "flat minimum applies");
+        require(
+            registry.requiredBond(type(uint128).max) == 1_000_000, "bond does not scale with rate"
+        );
+    }
+
+    function testAdminCloseOnlyEverRefundsTheRenter() public {
+        uint256 balanceBefore = usd.balanceOf(address(this));
+        uint256 treasuryBefore = usd.balanceOf(TREASURY);
+        uint256 leaseId = _createLease(3_600);
+        VM.warp(block.timestamp + 1);
+        escrow.startAccess(leaseId);
+
+        escrow.adminClose(leaseId, keccak256("stuck lease"));
+
+        require(usd.balanceOf(address(this)) == balanceBefore, "renter was not made whole");
+        require(usd.balanceOf(TREASURY) == treasuryBefore, "admin close paid the treasury");
+        require(
+            escrow.getLease(leaseId).status == LeaseEscrowV1.LeaseStatus.Refunded,
+            "lease was not refunded"
+        );
+        require(escrow.activeLeaseCount() == 0, "lease was not released");
+        require(registry.getNode(NODE_ID).activeLeaseId == 0, "node was not released");
+    }
+
+    function testAdminCloseCannotReopenASettledLease() public {
+        uint256 leaseId = _createLease(3_600);
+        VM.warp(block.timestamp + 1);
+        escrow.startAccess(leaseId);
+        VM.warp(block.timestamp + 600);
+        escrow.closeAccess(leaseId);
+        _propose(leaseId, 600, keccak256("receipt"));
+        VM.warp(block.timestamp + 24 hours);
+        escrow.finalize(leaseId);
+
+        (bool success,) = address(escrow)
+            .call(abi.encodeCall(escrow.adminClose, (leaseId, keccak256("too late"))));
+        require(!success, "admin close reopened a finalized lease");
+    }
+
+    function testAdminCloseRejectsCallersOtherThanTheEmergencyAdmin() public {
+        uint256 leaseId = _createLease(3_600);
+        VM.prank(PROVIDER);
+        (bool success,) = address(escrow)
+            .call(abi.encodeCall(escrow.adminClose, (leaseId, keccak256("not admin"))));
+        require(!success, "a non-admin closed a lease");
     }
 
     function testEscrowReservesNodeAndStartsOnlyThroughGateway() public {
@@ -200,7 +244,7 @@ contract LeaseEscrowV1Test {
         require(!registered, "registration accepted an invalid device binding");
     }
 
-    function testNodeRegistrationRejectsBondOutsideStorageRange() public {
+    function testNodeRegistrationAcceptsExtremeRateUnderFlatBond() public {
         bytes32 nodeId = keccak256("unbounded-rate-device");
         bytes32 metadataHash = keccak256("unbounded-rate-offer");
         uint128 rate = type(uint128).max;
@@ -232,7 +276,8 @@ contract LeaseEscrowV1Test {
                     )
                 )
             );
-        require(!registered, "registration truncated required bond");
+        require(registered, "flat bond should accept any rate");
+        require(registry.getNode(nodeId).bond == 1_000_000, "bond should equal flat minimum");
     }
 
     function testRetiredNodeCanWithdrawItsEntireBond() public {

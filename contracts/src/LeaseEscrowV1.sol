@@ -13,10 +13,10 @@ contract LeaseEscrowV1 {
     uint256 public constant MAX_ESCROW = 50_000_000;
     uint32 public constant MAX_DURATION = 6 hours;
     uint32 public constant PROVISION_TIMEOUT = 10 minutes;
-    uint32 public constant DISPUTE_WINDOW = 24 hours;
+    uint32 public constant DISPUTE_WINDOW = 5 minutes;
     uint16 public constant PLATFORM_FEE_BPS = 1_000;
     uint16 public constant BPS_DENOMINATOR = 10_000;
-    uint16 public constant MAX_ACTIVE_LEASES = 25;
+    uint16 public constant MAX_ACTIVE_LEASES = 250;
 
     bytes32 public constant DOMAIN_TYPEHASH = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
@@ -346,6 +346,19 @@ contract LeaseEscrowV1 {
             revert UsageExceeded();
         }
         _settle(leaseId, lease, usageSeconds, receiptHash);
+    }
+
+    function adminClose(uint256 leaseId, bytes32 reasonHash)
+        external
+        onlyEmergencyAdmin
+        nonReentrant
+    {
+        Lease storage lease = _lease(leaseId);
+        LeaseStatus status = lease.status;
+        if (status == LeaseStatus.Finalized || status == LeaseStatus.Refunded) {
+            revert InvalidState();
+        }
+        _refund(leaseId, lease, reasonHash);
     }
 
     function pause() external onlyEmergencyAdmin {

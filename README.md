@@ -45,9 +45,21 @@ environment, and Kata isolation is not confidential-computing attestation.
 
 ## Mainnet contracts
 
-The V1 contracts are non-upgradeable and `LeaseEscrowV1` is live. Their source
-has not been verified on the explorer and they have not received an independent
-audit.
+The V1 contracts are non-upgradeable and `LeaseEscrowV1` is live. They have not
+received an independent audit. Blockscout reports `NodeRegistryV1` as fully
+source-verified and `LeaseEscrowV1` as partially source-verified. The escrow's
+executable bytecode matches this tree, while its trailing Solidity metadata
+hash differs.
+
+You do not have to take that on trust. `./scripts/verify-deployed-bytecode.sh`
+rebuilds both contracts and compares them against the code live on chain using
+only the public RPC, masking immutables and reporting the metadata blob
+separately:
+
+```
+NodeRegistryV1 0xe3b7…8f01: executable code matches, metadata differs
+LeaseEscrowV1  0x71Df…cDeD: executable code matches, metadata differs
+```
 
 | Contract | Address |
 | --- | --- |
