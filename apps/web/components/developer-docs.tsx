@@ -118,6 +118,7 @@ export function DeveloperDocs() {
         </Link>
         <nav aria-label="Documentation header">
           <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+          <Link href={new URL("/activity", siteUrl).href}>Activity</Link>
           <Link href={new URL("/proof", siteUrl).href}>Receipts</Link>
           <Link className="docs-console-link" href={new URL("/compute", siteUrl).href}>Open console ↗</Link>
         </nav>
@@ -246,6 +247,7 @@ export function DeveloperDocs() {
               <Endpoint method="GET" path="/api/app/leases" auth="Session" description="List leases owned by the authenticated account." />
               <Endpoint method="GET" path="/api/app/leases/{lease_id}/access" auth="Session" description="Return direct SSH or gateway access only after readiness and chain finality." />
               <Endpoint method="GET" path="/api/proof" auth="Public" description="Read the sanitized finalized/refunded public proof feed." />
+              <Endpoint method="GET" path="/api/activity" auth="Public" description="Read the renter-anonymous recent network activity feed." />
             </div>
             <CodeBlock label="POST /api/app/leases/match" code={quoteExample} />
             <CodeBlock label="201 quote response" code={quoteResponse} />
