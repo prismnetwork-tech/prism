@@ -9,6 +9,9 @@ export type PublicProofReceipt = {
   provider_paid_base_units: number;
   failure_class: string | null;
   outcome: "finalized" | "refunded" | "disputed";
+  // Absent on receipts minted before trust classes existed; their settled hash
+  // depends on the field staying out of the payload entirely.
+  trust_class?: "open" | "isolated" | "attested" | "confidential";
   receipt_hash: string;
   transaction_hash: string;
 };
@@ -28,6 +31,8 @@ export function isPublicProofIndex(value: unknown): value is PublicProofIndex {
     && index.receipts.every(isPublicProofReceipt);
 }
 
+const trustClasses = ["open", "isolated", "attested", "confidential"] as const;
+
 function isPublicProofReceipt(value: unknown): value is PublicProofReceipt {
   if (!value || typeof value !== "object") return false;
   const receipt = value as Partial<PublicProofReceipt>;
@@ -41,6 +46,7 @@ function isPublicProofReceipt(value: unknown): value is PublicProofReceipt {
     && isBaseUnits(receipt.provider_paid_base_units, 45_000_000)
     && (receipt.failure_class === null || isBoundedText(receipt.failure_class, 1, 64))
     && (receipt.outcome === "finalized" || receipt.outcome === "refunded" || receipt.outcome === "disputed")
+    && (receipt.trust_class === undefined || trustClasses.includes(receipt.trust_class))
     && /^[0-9a-f]{64}$/i.test(receipt.receipt_hash ?? "")
     && isHash(receipt.transaction_hash);
 }

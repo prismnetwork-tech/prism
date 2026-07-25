@@ -19,6 +19,13 @@ class LeaseAndRunArgs(BaseModel):
     min_vram_mib: int = Field(16000, description="Minimum GPU memory in MiB")
     image: str = Field(DEFAULT_IMAGE, description="Digest-pinned container image to boot")
     max_usdg: float = Field(1.0, description="Hard cap on the USDG this lease may cost")
+    min_trust_class: str = Field(
+        "open",
+        description=(
+            "Refuse suppliers below this trust class: open, isolated, attested or confidential. "
+            "On an open supplier the host operator can read anything the workload touches."
+        ),
+    )
 
 
 class RunArgs(BaseModel):
@@ -63,7 +70,10 @@ class PrismActionProvider(ActionProvider[WalletProvider]):
 
     @create_action(
         name="list_gpus",
-        description="List GPUs available to rent right now, with model, VRAM, and price per hour.",
+        description=(
+            "List GPUs available to rent right now, with model, VRAM, price per hour, and trust "
+            "class. On an 'open' supplier the host operator can read anything the workload touches."
+        ),
         schema=NoArgs,
     )
     def list_gpus(self, args: dict[str, Any]) -> str:
@@ -74,7 +84,10 @@ class PrismActionProvider(ActionProvider[WalletProvider]):
         for o in offers:
             gpu = o.get("gpu", {})
             per_hr = int(o.get("rate_per_second", 0)) * 3600 / 1_000_000
-            rows.append(f"{gpu.get('model', 'GPU')} · {gpu.get('vram_mib', '?')} MiB · ${per_hr:.2f}/hr")
+            trust = o.get("trust_class", "open")
+            rows.append(
+                f"{gpu.get('model', 'GPU')} · {gpu.get('vram_mib', '?')} MiB · ${per_hr:.2f}/hr · {trust}"
+            )
         return "\n".join(rows)
 
     @create_action(
@@ -92,6 +105,7 @@ class PrismActionProvider(ActionProvider[WalletProvider]):
             duration_seconds=p.duration_seconds,
             min_vram_mib=p.min_vram_mib,
             max_deposit=int(p.max_usdg * 1_000_000),
+            min_trust_class=p.min_trust_class,
         )
         self._leases[lease.lease_id] = lease
         res = self.agent.run(lease, p.command)

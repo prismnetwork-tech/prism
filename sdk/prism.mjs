@@ -29,6 +29,10 @@ export const USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
 export const DEFAULT_IMAGE =
   "docker.io/ollama/ollama@sha256:a61a8fd395dbb931cc8cb1b5da7a2510746575c87113fdc45b647ee59ef7f808";
 
+// Weakest to strongest. "open" means the supplier can read everything the
+// workload touches, so an agent handling anything sensitive should raise this.
+export const TRUST_CLASSES = ["open", "isolated", "attested", "confidential"];
+
 const CONFIRMATIONS = 12;
 const FETCH_TIMEOUT_MS = 30_000;
 
@@ -41,6 +45,13 @@ const erc20Abi = parseAbi([
 const escrowAbi = parseAbi([
   "function createLease(bytes32 nodeId, uint32 duration, bytes32 clientReference) returns (uint256)",
 ]);
+
+function assertTrustClass(value) {
+  if (!TRUST_CLASSES.includes(value)) {
+    throw new PrismError(400, "invalid_trust_class", { expected: TRUST_CLASSES });
+  }
+  return value;
+}
 
 function parseBaseUnits(value, field) {
   if (typeof value === "number" && Number.isInteger(value) && value >= 0) return BigInt(value);
@@ -96,8 +107,8 @@ export class PrismAgent {
     return session;
   }
 
-  async offers() {
-    return this.#proxy("GET", ["offers"]);
+  async offers({ minTrust = "open" } = {}) {
+    return this.#proxy("GET", ["offers"], { query: { min_trust: assertTrustClass(minTrust) } });
   }
 
   async balances() {
@@ -125,18 +136,21 @@ export class PrismAgent {
     }
   }
 
-  async quote({ image, durationSeconds, minVramMib = 16000, preferredNodeId = null } = {}) {
+  async quote({ image, durationSeconds, minVramMib = 16000, preferredNodeId = null, minTrustClass = "open" } = {}) {
     if (typeof image !== "string" || !/@sha256:[0-9a-f]{64}$/.test(image)) {
       throw new PrismError(400, "image_must_be_digest_pinned", { hint: "use ollama@sha256:... or DEFAULT_IMAGE" });
     }
     if (!Number.isInteger(durationSeconds) || durationSeconds <= 0) throw new PrismError(400, "invalid_duration");
     if (!Number.isInteger(minVramMib) || minVramMib <= 0) throw new PrismError(400, "invalid_min_vram_mib");
     return this.#proxy("POST", ["leases", "match"], {
-      request: {
-        image,
-        duration_seconds: durationSeconds,
-        min_vram_mib: minVramMib,
-        preferred_node_id: preferredNodeId,
+      body: {
+        request: {
+          image,
+          duration_seconds: durationSeconds,
+          min_vram_mib: minVramMib,
+          preferred_node_id: preferredNodeId,
+          min_trust_class: assertTrustClass(minTrustClass),
+        },
       },
     });
   }
@@ -185,9 +199,11 @@ export class PrismAgent {
 
   async confirm({ quoteId, transactionHash, sshAuthorizedKey }) {
     return this.#proxy("POST", ["leases", "confirm"], {
-      quote_id: quoteId,
-      transaction_hash: transactionHash,
-      ssh_authorized_key: sshAuthorizedKey,
+      body: {
+        quote_id: quoteId,
+        transaction_hash: transactionHash,
+        ssh_authorized_key: sshAuthorizedKey,
+      },
     });
   }
 
@@ -202,7 +218,7 @@ export class PrismAgent {
   async waitForAccess(leaseId, { timeoutMs = 600_000, intervalMs = 10_000 } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const res = await this.#proxy("GET", ["leases", String(leaseId), "access"], null, true);
+      const res = await this.#proxy("GET", ["leases", String(leaseId), "access"], { raw: true });
       if (res.status === 200) {
         if (!res.body?.ssh_host && res.body?.mode !== "gateway") throw new PrismError(502, "malformed_access");
         return res.body;
@@ -214,9 +230,16 @@ export class PrismAgent {
   }
 
   // quote -> ssh keygen -> fund on-chain -> confirm -> wait for access.
-  async lease({ image, durationSeconds, minVramMib, preferredNodeId = null, maxDeposit = null } = {}) {
+  async lease({
+    image,
+    durationSeconds,
+    minVramMib,
+    preferredNodeId = null,
+    maxDeposit = null,
+    minTrustClass = "open",
+  } = {}) {
     if (!this.session) await this.authenticate();
-    const quote = await this.quote({ image, durationSeconds, minVramMib, preferredNodeId });
+    const quote = await this.quote({ image, durationSeconds, minVramMib, preferredNodeId, minTrustClass });
     if (maxDeposit != null && parseBaseUnits(quote.maximum_escrow, "maximum_escrow") > BigInt(maxDeposit)) {
       throw new PrismError(402, "cost_exceeds_max", { required: quote.maximum_escrow, max: String(maxDeposit) });
     }
@@ -325,9 +348,10 @@ export class PrismAgent {
     });
   }
 
-  async #proxy(method, segments, body = null, raw = false, reauthed = false) {
+  async #proxy(method, segments, { body = null, raw = false, query = null, reauthed = false } = {}) {
     if (!this.session) await this.authenticate();
-    const res = await this.#fetch(`/api/agent/proxy/${segments.join("/")}`, {
+    const search = query ? `?${new URLSearchParams(query)}` : "";
+    const res = await this.#fetch(`/api/agent/proxy/${segments.join("/")}${search}`, {
       method,
       body,
       headers: { authorization: `Bearer ${this.session}` },
@@ -336,7 +360,7 @@ export class PrismAgent {
     if (res.status === 401 && !reauthed) {
       this.session = null;
       await this.authenticate();
-      return this.#proxy(method, segments, body, raw, true);
+      return this.#proxy(method, segments, { body, raw, query, reauthed: true });
     }
     if (raw) return { status: res.status, body: await res.json().catch(() => null) };
     return this.#unwrap(res);

@@ -791,6 +791,7 @@ impl Worker {
             provider_paid_base_units: 0,
             failure_class: Some("provisioning_timeout".to_owned()),
             outcome: ReceiptOutcome::Refunded,
+            trust_class: Some(context.lease.trust_class),
             receipt_hash: String::new(),
             transaction_hash: transaction_hash.clone(),
         };
@@ -1047,6 +1048,7 @@ impl Worker {
                 "interactive readiness",
             )?,
             gateway_closed_at: timestamp(context.gateway_closed_at, "gateway close")?,
+            trust_class: Some(context.lease.trust_class),
             execution,
             node_telemetry: telemetry,
         })

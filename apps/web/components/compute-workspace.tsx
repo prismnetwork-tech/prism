@@ -6,11 +6,35 @@ import { encodeFunctionData, keccak256, toBytes, type Address, type Hex } from "
 import { usePrismAuth, useSmartWallet } from "@/components/providers";
 import { escrowAbi, escrowAddress, robinhoodChain, usdgAbi, usdgAddress } from "@/lib/chain";
 
+type TrustClass = "open" | "isolated" | "attested" | "confidential";
+
 type MarketplaceOffer = {
   node_id: `0x${string}`;
   gpu: { model: string; vram_mib: number; cuda_major: number };
   rate_per_second: number;
   reliability_bps: number;
+  trust_class: TrustClass;
+};
+
+// What the renter can actually rely on, stated per offer rather than as one
+// blanket warning that applies equally to every supplier.
+const trustCopy: Record<TrustClass, { label: string; detail: string }> = {
+  open: {
+    label: "Open",
+    detail: "The host operator can read anything this workload touches. Keep credentials, private datasets and model weights off it.",
+  },
+  isolated: {
+    label: "Isolated",
+    detail: "Kata VM with exclusive GPU passthrough and a digest-pinned image. A privileged host can still reach the workload.",
+  },
+  attested: {
+    label: "Attested",
+    detail: "Launch measurement and GPU identity verified against vendor roots, so you can check what booted.",
+  },
+  confidential: {
+    label: "Confidential",
+    detail: "Guest memory and GPU memory are encrypted against the host.",
+  },
 };
 
 type LeaseQuote = {
@@ -263,7 +287,7 @@ export function ComputeWorkspace() {
               GPU offer
               <select value={selected ?? ""} onChange={(event) => setSelected(event.target.value)} disabled={!offers.length}>
                 {!offers.length && <option value="">No schedulable offers</option>}
-                {offers.map((item) => <option value={item.node_id} key={item.node_id}>{item.gpu.model} · {formatVram(item.gpu.vram_mib)} · {formatUsdPerHour(item.rate_per_second)}</option>)}
+                {offers.map((item) => <option value={item.node_id} key={item.node_id}>{item.gpu.model} · {formatVram(item.gpu.vram_mib)} · {formatUsdPerHour(item.rate_per_second)} · {trustCopy[item.trust_class]?.label ?? item.trust_class}</option>)}
               </select>
             </label>
           )}
@@ -286,8 +310,8 @@ export function ComputeWorkspace() {
             </label>
           )}
           <div className="safety-note">
-            <strong>Data handling notice</strong>
-            <span>Infrastructure providers are independent. Do not process confidential data or credentials in workspaces.</span>
+            <strong>Trust class · {offer ? trustCopy[offer.trust_class]?.label ?? offer.trust_class : "—"}</strong>
+            <span>{offer ? trustCopy[offer.trust_class]?.detail ?? trustCopy.open.detail : trustCopy.open.detail}</span>
           </div>
           <button
             className="button primary full"
@@ -307,6 +331,7 @@ export function ComputeWorkspace() {
           <div className="quote-line"><span>GPU memory</span><strong>{offer ? formatVram(offer.gpu.vram_mib) : "—"}</strong></div>
           <div className="quote-line"><span>Reliability</span><strong>{offer ? `${(offer.reliability_bps / 100).toFixed(1)}%` : "—"}</strong></div>
           <div className="quote-line"><span>Rate</span><strong>{offer ? formatUsdPerHour(offer.rate_per_second) : "—"}</strong></div>
+          <div className="quote-line"><span>Trust class</span><strong>{offer ? trustCopy[offer.trust_class]?.label ?? offer.trust_class : "—"}</strong></div>
           <div className="quote-total"><span>Max escrow · USDG</span><strong>{maximum}</strong></div>
           <p className="muted">Charges begin after GPU and access readiness are confirmed. Unused escrow is returned after settlement.</p>
         </aside>
@@ -320,7 +345,13 @@ async function loadOffers(signal: AbortSignal): Promise<MarketplaceOffer[]> {
   const response = await fetch("/api/app/offers", { signal, cache: "no-store" });
   if (!response.ok) throw new Error("offers unavailable");
   const payload: unknown = await response.json();
-  return Array.isArray(payload) ? payload.filter(isMarketplaceOffer) : [];
+  if (!Array.isArray(payload)) return [];
+  // An unrecognised class reads as the weakest one, so a stale API can never
+  // make a supplier look safer than it is.
+  return payload.filter(isMarketplaceOffer).map((offer) => ({
+    ...offer,
+    trust_class: offer.trust_class in trustCopy ? offer.trust_class : "open",
+  }));
 }
 
 async function requestMatch(

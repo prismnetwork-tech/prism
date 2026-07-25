@@ -38,10 +38,26 @@ Verified on 2026-07-20:
 | Settlement and proof | Workers and local end-to-end flows are implemented; no public mainnet settlement receipt exists yet |
 | Batch and inference | Planned, not implemented |
 
-This is an unaudited pre-production system. Do not deposit funds or use Prism
-for confidential workloads, regulated data, valuable model weights or
-production traffic. A permissionless supplier is not a trusted computing
-environment, and Kata isolation is not confidential-computing attestation.
+This is an unaudited pre-production system, so do not put production traffic or
+serious money on it yet.
+
+What a supplier protects is stated per offer rather than as one blanket
+warning. Every offer, quote, lease and receipt carries a trust class —
+`open`, `isolated`, `attested` or `confidential` — and renters can require a
+minimum instead of trusting prose:
+
+```bash
+curl https://api.prismnetwork.tech/v1/offers?min_trust=isolated
+```
+
+The class is derived by the control plane from evidence it can check, never
+asserted by a supplier, and it is clamped to what the network can currently
+verify. All capacity live today is `open`, which means the host operator can
+read anything the workload touches: keep secrets, regulated data and valuable
+model weights off it. Reaching `confidential` requires hardware the network
+does not have yet, not a software change. See
+[docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for what each class does and
+does not promise.
 
 ## Mainnet contracts
 
