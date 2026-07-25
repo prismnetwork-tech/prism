@@ -81,11 +81,6 @@ export default function RoadmapPage() {
         </p>
         <h3>Durable workspaces</h3>
         <p>Persistent state and storage that survive across leases, beyond today&apos;s ephemeral containers.</p>
-        <h3>Independent contract audit</h3>
-        <p>
-          Third-party review of the escrow and settlement contracts, which ship today as unaudited
-          software.
-        </p>
         <h3>Service-level commitments</h3>
         <p>Availability and performance guarantees suitable for production workloads.</p>
         <h3>Wider settlement and framework reach</h3>
