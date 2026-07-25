@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prismnetwork"
+version = "0.1.0"
+description = "Headless GPU leasing on Prism Network for autonomous agents. Wallet-signature auth, on-chain USDG payment, SSH."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+keywords = ["prism", "gpu", "agent", "web3", "usdg", "llm"]
+dependencies = [
+    "requests>=2.31",
+    "web3>=6.0",
+    "eth-account>=0.11",
+]
+
+[project.urls]
+Homepage = "https://prismnetwork.tech"
+Source = "https://github.com/prismnetwork-tech/prism"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prismnetwork"]
