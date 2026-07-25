@@ -6,7 +6,8 @@
   "description": "Capped mainnet canary: fund a short GPU lease, verify nvidia-smi, print the on-chain funding tx.",
   "license": "Apache-2.0",
   "scripts": {
-    "start": "node canary.mjs"
+    "start": "node canary.mjs",
+    "check": "node --test config.test.mjs && node canary.mjs --dry-run"
   },
   "dependencies": {
     "@prismnetwork/agent-sdk": "^0.1.0",

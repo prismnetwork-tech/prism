@@ -9,19 +9,32 @@
 // Tunables (all optional): CANARY_DURATION=600  CANARY_MAX_USDG=0.5
 //   CANARY_MIN_VRAM=16000  CANARY_NODE=0x<nodeId>
 // Spends real USDG on mainnet. Pre-production and unaudited.
-import { DEFAULT_IMAGE, PrismAgent } from "@prismnetwork/agent-sdk";
+import { readCanaryConfig } from "./config.mjs";
 
-const DURATION = int(process.env.CANARY_DURATION, 600);
-const MAX_USDG = num(process.env.CANARY_MAX_USDG, 0.5);
-const MIN_VRAM = int(process.env.CANARY_MIN_VRAM, 16000);
-const NODE = process.env.CANARY_NODE || null;
+let config;
+try {
+  config = readCanaryConfig();
+} catch (err) {
+  abort(err.message);
+}
+
+const {
+  duration: DURATION,
+  maxUsdg: MAX_USDG,
+  minVram: MIN_VRAM,
+  node: NODE,
+  capMicros,
+} = config;
 const TX = "https://robinhoodchain.blockscout.com/tx/";
 
-if (DURATION > 3600) abort("duration is capped at 1 hour");
-if (MAX_USDG > 5) abort("spend is capped at 5 USDG");
+if (process.argv.includes("--dry-run")) {
+  log(`canary configuration OK: ${MIN_VRAM} MiB for ${DURATION}s, capped at ${MAX_USDG} USDG`);
+  log("dry run complete: no wallet, network, or transaction used");
+  process.exit(0);
+}
 
+const { DEFAULT_IMAGE, PrismAgent } = await import("@prismnetwork/agent-sdk");
 const agent = new PrismAgent({ privateKey: env("PRISM_AGENT_KEY"), escrow: env("PRISM_ESCROW") });
-const capMicros = Math.round(MAX_USDG * 1e6);
 
 const { subject } = await agent.authenticate();
 log(`authenticated ${subject} (${agent.address})`);
@@ -84,12 +97,6 @@ function env(name) {
   const v = process.env[name];
   if (!v) abort(`missing ${name}`);
   return v;
-}
-function int(v, d) {
-  return v == null ? d : parseInt(v, 10);
-}
-function num(v, d) {
-  return v == null ? d : Number(v);
 }
 function log(...a) {
   console.log(...a);

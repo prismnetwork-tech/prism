@@ -28,6 +28,13 @@ CANARY_CONFIRM=1 PRISM_AGENT_KEY=0x... PRISM_ESCROW=0x71Df... npm start
 
 Optional: `CANARY_DURATION`, `CANARY_MAX_USDG`, `CANARY_MIN_VRAM`, `CANARY_NODE`.
 
+Validate the caps and configuration without loading a wallet or making a network
+request:
+
+```sh
+npm start -- --dry-run
+```
+
 ## What lands on-chain, and when
 
 - **Now:** the `createLease` funding tx (printed as the funding tx link) — the agent
