@@ -149,7 +149,7 @@
   letter-spacing: 0.16em;
   font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
   font-size: 10px;
-  font-weight: 700;
+  font-weight: 300;
 }
 
 .landing-kicker {
@@ -310,6 +310,7 @@
   letter-spacing: 0.12em;
   font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
   font-size: 9px;
+  font-weight: 300;
 }
 
 .hero-status span {
