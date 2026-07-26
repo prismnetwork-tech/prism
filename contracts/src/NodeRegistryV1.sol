@@ -7,7 +7,7 @@ import { TokenTransfers } from "./lib/TokenTransfers.sol";
 contract NodeRegistryV1 {
     using TokenTransfers for IERC20;
 
-    uint256 public constant MIN_BOND = 100_000_000;
+    uint256 public constant MIN_BOND = 1_000_000;
     uint256 public constant DAY = 24 hours;
     uint256 private constant SECP256K1N_DIV_2 =
         0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
@@ -257,9 +257,8 @@ contract NodeRegistryV1 {
             && node.bond >= requiredBond(node.ratePerSecond);
     }
 
-    function requiredBond(uint128 ratePerSecond) public pure returns (uint256) {
-        uint256 dayRate = uint256(ratePerSecond) * DAY;
-        return dayRate > MIN_BOND ? dayRate : MIN_BOND;
+    function requiredBond(uint128) public pure returns (uint256) {
+        return MIN_BOND;
     }
 
     function domainSeparator() public view returns (bytes32) {
