@@ -1,6 +1,6 @@
 [project]
 name = "prism-agentkit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Coinbase AgentKit action provider for renting real NVIDIA GPUs on Prism Network."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
@@ -10,6 +10,7 @@ dependencies = [
     "coinbase-agentkit>=0.7,<0.8",
     "prismnetwork>=0.1.0",
     "pydantic>=2",
+    "solana>=0.36.6,<0.40",
 ]
 
 [project.urls]
