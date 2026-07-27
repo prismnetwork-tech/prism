@@ -1,0 +1,50 @@
+{
+  "name": "@prismnetwork/agentkit",
+  "version": "0.1.0",
+  "description": "Prism GPU leasing as Coinbase AgentKit actions, usable from Vercel AI SDK and LangChain.",
+  "type": "module",
+  "main": "provider.mjs",
+  "exports": {
+    ".": "./provider.mjs"
+  },
+  "files": [
+    "provider.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@prismnetwork/agent-sdk": "^0.2.0"
+  },
+  "peerDependencies": {
+    "@coinbase/agentkit": ">=0.10",
+    "viem": "^2",
+    "zod": "^3 || ^4"
+  },
+  "keywords": [
+    "prism",
+    "agentkit",
+    "gpu",
+    "agent",
+    "vercel-ai",
+    "langchain",
+    "compute"
+  ],
+  "homepage": "https://prismnetwork.tech",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prismnetwork-tech/prism.git",
+    "directory": "agentkit-ts"
+  },
+  "bugs": {
+    "url": "https://github.com/prismnetwork-tech/prism/issues"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}
