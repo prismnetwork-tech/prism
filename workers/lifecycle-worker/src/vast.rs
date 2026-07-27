@@ -82,11 +82,12 @@ struct RawInstance {
     ssh_host: Option<String>,
     #[serde(default)]
     ssh_port: Option<u16>,
-    /// Vast reports -1 when the host could not reserve a forwarded port range.
+    /// Vast reports -1 when the host could not reserve a forwarded port range,
+    /// and nothing at all until it has tried.
     #[serde(default)]
-    direct_port_start: i64,
+    direct_port_start: Option<i64>,
     #[serde(default)]
-    machine_id: u64,
+    machine_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -126,7 +127,10 @@ impl VastBroker {
             anyhow::bail!("PRISM_VAST_DISK_GB must be between 16 and 2048");
         }
         Ok(Some(Self {
-            client: Client::builder().timeout(Duration::from_secs(30)).build()?,
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .build()?,
             base_url,
             token: Arc::new(token),
             node_id,
@@ -213,14 +217,16 @@ impl VastBroker {
         Ok(response.new_contract)
     }
 
-    pub(crate) async fn find_by_label(&self, label: &str) -> anyhow::Result<Option<u64>> {
+    /// Newest first, so a caller adopting one instance can destroy the rest.
+    pub(crate) async fn find_by_label(&self, label: &str) -> anyhow::Result<Vec<u64>> {
         let mut url = self.base_url.join("../v1/instances/")?;
         url.query_pairs_mut()
             .append_pair(
                 "select_filters",
                 &serde_json::json!({"label": {"eq": label}}).to_string(),
             )
-            .append_pair("select_cols", r#"["id","label"]"#);
+            .append_pair("select_cols", r#"["id","label"]"#)
+            .append_pair("limit", "100");
         let response = self
             .client
             .get(url)
@@ -233,14 +239,13 @@ impl VastBroker {
             .json::<InstancesResponse>()
             .await
             .context("decode Vast instance listing")?;
-        let mut matches = response
+        let mut found: Vec<u64> = response
             .instances
             .into_iter()
-            .filter(|instance| instance.label.as_deref() == Some(label));
-        let found = matches.next().map(|instance| instance.id);
-        if matches.next().is_some() {
-            anyhow::bail!("multiple Vast instances share the lease label");
-        }
+            .filter(|instance| instance.label.as_deref() == Some(label))
+            .map(|instance| instance.id)
+            .collect();
+        found.sort_unstable_by(|a, b| b.cmp(a));
         Ok(found)
     }
 
@@ -314,7 +319,9 @@ fn instance_from_response(body: &str) -> anyhow::Result<Instance> {
     let complete = raw.gpu_name.is_some()
         && raw.gpu_ram.is_some()
         && raw.verification.is_some()
-        && raw.dph_total.is_some();
+        && raw.dph_total.is_some()
+        && raw.direct_port_start.is_some()
+        && raw.machine_id.is_some_and(|machine_id| machine_id != 0);
     let status = match raw.actual_status {
         Some(status) if status == "running" && !complete => "loading".to_owned(),
         Some(status) => status,
@@ -328,8 +335,8 @@ fn instance_from_response(body: &str) -> anyhow::Result<Instance> {
         hourly_micros: raw.dph_total.map(hourly_micros).transpose()?.unwrap_or(0),
         ssh_host: raw.ssh_host,
         ssh_port: raw.ssh_port,
-        direct_port_start: raw.direct_port_start,
-        machine_id: raw.machine_id,
+        direct_port_start: raw.direct_port_start.unwrap_or_default(),
+        machine_id: raw.machine_id.unwrap_or_default(),
     })
 }
 
@@ -522,6 +529,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(half_up.status, "loading");
+    }
+
+    /// A machine that cannot be named must be neither admitted nor rejected:
+    /// blacklisting id 0 filters no offer, so the lease would keep reselecting
+    /// the same broken host until its provisioning window closed.
+    #[test]
+    fn an_unnamed_or_unported_instance_is_still_loading() {
+        for body in [
+            r#"{"instances":{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.53,"direct_port_start":28083}}"#,
+            r#"{"instances":{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.53,"direct_port_start":28083,
+                "machine_id":0}}"#,
+            r#"{"instances":{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.53,"machine_id":39562}}"#,
+            r#"{"instances":{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.53,"machine_id":39562,
+                "direct_port_start":null}}"#,
+        ] {
+            assert_eq!(instance_from_response(body).unwrap().status, "loading");
+        }
+
+        let up = instance_from_response(
+            r#"{"instances":{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.53,"machine_id":39562,
+                "direct_port_start":28083}}"#,
+        )
+        .unwrap();
+        assert_eq!(up.status, "running");
+        assert_eq!(up.machine_id, 39562);
+        assert_eq!(up.direct_port_start, 28083);
     }
 
     #[test]

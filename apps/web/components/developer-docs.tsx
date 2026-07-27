@@ -44,7 +44,7 @@ const errors = [
   ["401", "identity_required", "No valid Privy-backed Prism session is available."],
   ["403", "invalid_origin / risk_hold", "The mutation is cross-origin or the account is restricted."],
   ["404", "no_match / quote_not_found", "No compatible capacity exists or the quote is absent/expired."],
-  ["409", "capacity_reserved / node_busy", "Compatible capacity exists but is held by another renter's quote or lease; retry."],
+  ["409", "capacity_reserved", "Compatible capacity exists but is held by another renter's open quote; retry."],
   ["409", "network_capacity / identity_replay", "A concurrency bound or replay guard rejected the operation."],
   ["413", "request_too_large", "The application API body exceeds 256 KiB."],
   ["415", "unsupported_media_type", "A mutation was not submitted as application/json."],
