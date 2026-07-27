@@ -166,21 +166,29 @@ impl VastBroker {
         Ok(response.offers)
     }
 
-    pub(crate) async fn cheapest_l40s(&self) -> anyhow::Result<Option<Offer>> {
+    pub(crate) async fn cheapest_l40s(&self, ceiling: u64) -> anyhow::Result<Option<Offer>> {
         Ok(select_offer(
             self.search_offers().await?,
-            self.max_hourly_micros,
+            self.ceiling(ceiling),
         ))
+    }
+
+    /// Sourcing above what the renter pays is a loss the settlement worker will
+    /// refuse to sign off, stranding the escrow. Whatever the operator sets, the
+    /// lease's own rate is the real ceiling.
+    pub(crate) fn ceiling(&self, retail_hourly_micros: u64) -> u64 {
+        self.max_hourly_micros.min(retail_hourly_micros)
     }
 
     pub(crate) async fn ranked_l40s(
         &self,
         limit: usize,
         rejected: &[i64],
+        ceiling: u64,
     ) -> anyhow::Result<Vec<Offer>> {
         Ok(rank_offers(
             self.search_offers().await?,
-            self.max_hourly_micros,
+            self.ceiling(ceiling),
             limit,
             rejected,
         ))
@@ -491,6 +499,33 @@ mod tests {
     #[test]
     fn rejects_prices_above_the_ceiling() {
         assert!(select_offer(vec![offer(1, "L40S", 46_068, 0.640_001)], 640_000).is_none());
+    }
+
+    /// Lease 29 sourced a host at 802_963 micros/hr against a retail rate of
+    /// 799_200, ran to completion, and then could not be settled: the receipt
+    /// would have signed off a loss, so the escrow stuck.
+    #[test]
+    fn an_operator_ceiling_cannot_exceed_what_the_renter_pays() {
+        let broker = VastBroker {
+            client: Client::new(),
+            base_url: Url::parse(DEFAULT_API_URL).unwrap(),
+            token: Arc::new("token".to_owned()),
+            node_id: "0xabc".to_owned(),
+            max_hourly_micros: 1_100_000,
+            disk_gb: 16,
+        };
+
+        assert_eq!(broker.ceiling(799_200), 799_200);
+        assert!(
+            rank_offers(
+                vec![offer(1, "L40S", 46_068, 0.802_963)],
+                broker.ceiling(799_200),
+                8,
+                &[]
+            )
+            .is_empty()
+        );
+        assert_eq!(broker.ceiling(5_000_000), 1_100_000);
     }
 
     #[test]

@@ -30,6 +30,12 @@ const MAX_REJECTED_MACHINES: usize = 4;
 /// Ranked offers tried per provisioning pass. Retries supply the rest of the
 /// breadth, and a pass that spends the whole window is a refund.
 const CREATES_PER_PASS: usize = 2;
+
+/// What a lease pays for an hour, which is the most the broker can spend on one
+/// without the settlement worker refusing the receipt.
+fn retail_hourly(rate_per_second: u64) -> u64 {
+    rate_per_second.saturating_mul(3_600)
+}
 const CLOUD_CAPACITY_UPSERT: &str = "
     INSERT INTO cloud_capacity
         (node_id, provider, available, provider_offer_id, hourly_cost_micros, observed_at)
@@ -286,7 +292,9 @@ impl Worker {
         };
         // Not being able to ask Vast is a different answer from Vast having
         // nothing, and writing the second for the first empties the market.
-        let provider_offer = vast.cheapest_l40s().await?;
+        let provider_offer = vast
+            .cheapest_l40s(retail_hourly(node_offer.rate_per_second))
+            .await?;
         self.record_cloud_capacity(vast, provider_offer.as_ref())
             .await?;
         if provider_offer.is_some() {
@@ -510,6 +518,7 @@ impl Worker {
         if Utc::now() >= context.lease.created_at + chrono::Duration::minutes(10) {
             anyhow::bail!("the provisioning window for this lease has closed");
         }
+        let retail = retail_hourly(context.lease.rate_per_second);
         if matches!(status.as_str(), "destroying" | "destroyed" | "failed") {
             anyhow::bail!("cloud instance is in terminal state {status}");
         }
@@ -520,7 +529,9 @@ impl Worker {
             None => match self.adopt_labelled(vast, &label).await? {
                 Some(instance_id) => (instance_id, None),
                 None => {
-                    let candidates = vast.ranked_l40s(CREATES_PER_PASS, &rejected).await?;
+                    let candidates = vast
+                        .ranked_l40s(CREATES_PER_PASS, &rejected, retail)
+                        .await?;
                     if candidates.is_empty() {
                         anyhow::bail!("no verified L40S is available under the cost ceiling");
                     }
@@ -626,10 +637,11 @@ impl Worker {
             Some(format!("{} MiB of GPU memory is short", instance.gpu_ram))
         } else if !instance.verification.eq_ignore_ascii_case("verified") {
             Some(format!("host is {}, not verified", instance.verification))
-        } else if instance.hourly_micros > vast.max_hourly_micros {
+        } else if instance.hourly_micros > vast.ceiling(retail) {
             Some(format!(
                 "{} micros/hr is over the {} ceiling",
-                instance.hourly_micros, vast.max_hourly_micros
+                instance.hourly_micros,
+                vast.ceiling(retail)
             ))
         } else if instance.direct_port_start <= 0 {
             Some("host reserved no forwarded ports, so sshd is unreachable".to_owned())
