@@ -36,6 +36,7 @@ pub(crate) struct Instance {
     pub(crate) hourly_micros: u64,
     pub(crate) ssh_host: Option<String>,
     pub(crate) ssh_port: Option<u16>,
+    pub(crate) direct_port_start: i64,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +70,9 @@ struct RawInstance {
     dph_total: f64,
     ssh_host: Option<String>,
     ssh_port: Option<u16>,
+    /// Vast reports -1 when the host could not reserve a forwarded port range.
+    #[serde(default)]
+    direct_port_start: i64,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +133,7 @@ impl VastBroker {
                 "reliability": {"gte": 0.99},
                 "verified": {"eq": true},
                 "rentable": {"eq": true},
+                "direct_port_count": {"gte": 1},
                 "type": "ondemand",
                 "limit": 64
             }))
@@ -269,6 +274,7 @@ impl VastBroker {
             hourly_micros: hourly_micros(response.dph_total)?,
             ssh_host: response.ssh_host,
             ssh_port: response.ssh_port,
+            direct_port_start: response.direct_port_start,
         })
     }
 
@@ -410,6 +416,28 @@ mod tests {
         assert!(validate_api_url(&Url::parse(DEFAULT_API_URL).unwrap()).is_ok());
         assert!(validate_api_url(&Url::parse("http://127.0.0.1:8080/").unwrap()).is_ok());
         assert!(validate_api_url(&Url::parse("http://example.com/").unwrap()).is_err());
+    }
+
+    /// Instance 46008005 came back running and healthy with no forwarded port
+    /// range, and every SSH attempt against the proxy endpoint it advertised
+    /// was refused for the renter's key.
+    #[test]
+    fn an_instance_without_forwarded_ports_says_so() {
+        let unreachable: RawInstance = serde_json::from_str(
+            r#"{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.5363,
+                "ssh_host":"ssh1.vast.ai","ssh_port":18004,"direct_port_start":-1}"#,
+        )
+        .unwrap();
+        assert_eq!(unreachable.direct_port_start, -1);
+
+        let omitted: RawInstance = serde_json::from_str(
+            r#"{"actual_status":"loading","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.5363,
+                "ssh_host":null,"ssh_port":null}"#,
+        )
+        .unwrap();
+        assert_eq!(omitted.direct_port_start, 0);
     }
 
     #[test]

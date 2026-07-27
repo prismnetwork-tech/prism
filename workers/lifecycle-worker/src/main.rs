@@ -573,10 +573,14 @@ impl Worker {
             }
             anyhow::bail!("Vast instance is not ready");
         }
+        // A host that reserved no forwarded ports boots the container without a
+        // reachable sshd, and the renter's key is rejected at the Vast proxy. The
+        // lease is unusable, so fail it here rather than hand out a dead endpoint.
         if !instance.gpu_name.eq_ignore_ascii_case("L40S")
             || instance.gpu_ram < 45_000
             || !instance.verification.eq_ignore_ascii_case("verified")
             || instance.hourly_micros > vast.max_hourly_micros
+            || instance.direct_port_start <= 0
         {
             vast.destroy(instance_id).await?;
             query(
@@ -587,7 +591,9 @@ impl Worker {
             .bind(lease_id as i64)
             .execute(&self.pool)
             .await?;
-            anyhow::bail!("Vast instance failed GPU, verification or cost admission checks");
+            anyhow::bail!(
+                "Vast instance failed GPU, verification, cost or SSH reachability admission checks"
+            );
         }
         let host = instance.ssh_host.context("Vast instance has no SSH host")?;
         let port = instance.ssh_port.context("Vast instance has no SSH port")?;
