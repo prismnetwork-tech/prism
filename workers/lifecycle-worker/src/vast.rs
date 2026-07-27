@@ -22,6 +22,7 @@ pub(crate) struct VastBroker {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Offer {
     pub(crate) id: u64,
+    pub(crate) machine_id: u64,
     pub(crate) gpu_name: String,
     pub(crate) gpu_ram: u64,
     pub(crate) dph_total: f64,
@@ -37,6 +38,7 @@ pub(crate) struct Instance {
     pub(crate) ssh_host: Option<String>,
     pub(crate) ssh_port: Option<u16>,
     pub(crate) direct_port_start: i64,
+    pub(crate) machine_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +75,8 @@ struct RawInstance {
     /// Vast reports -1 when the host could not reserve a forwarded port range.
     #[serde(default)]
     direct_port_start: i64,
+    #[serde(default)]
+    machine_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -155,11 +159,16 @@ impl VastBroker {
         ))
     }
 
-    pub(crate) async fn ranked_l40s(&self, limit: usize) -> anyhow::Result<Vec<Offer>> {
+    pub(crate) async fn ranked_l40s(
+        &self,
+        limit: usize,
+        rejected: &[i64],
+    ) -> anyhow::Result<Vec<Offer>> {
         Ok(rank_offers(
             self.search_offers().await?,
             self.max_hourly_micros,
             limit,
+            rejected,
         ))
     }
 
@@ -275,6 +284,7 @@ impl VastBroker {
             ssh_host: response.ssh_host,
             ssh_port: response.ssh_port,
             direct_port_start: response.direct_port_start,
+            machine_id: response.machine_id,
         })
     }
 
@@ -295,13 +305,19 @@ impl VastBroker {
     }
 }
 
-fn rank_offers(offers: Vec<Offer>, max_hourly_micros: u64, limit: usize) -> Vec<Offer> {
+fn rank_offers(
+    offers: Vec<Offer>,
+    max_hourly_micros: u64,
+    limit: usize,
+    rejected: &[i64],
+) -> Vec<Offer> {
     let mut eligible: Vec<Offer> = offers
         .into_iter()
         .filter(|offer| {
             offer.gpu_name.eq_ignore_ascii_case("L40S")
                 && offer.gpu_ram >= 45_000
                 && hourly_micros(offer.dph_total).is_ok_and(|cost| cost <= max_hourly_micros)
+                && !rejected.contains(&(offer.machine_id as i64))
         })
         .collect();
     eligible.sort_by_key(|offer| hourly_micros(offer.dph_total).unwrap_or(u64::MAX));
@@ -310,7 +326,9 @@ fn rank_offers(offers: Vec<Offer>, max_hourly_micros: u64, limit: usize) -> Vec<
 }
 
 fn select_offer(offers: Vec<Offer>, max_hourly_micros: u64) -> Option<Offer> {
-    rank_offers(offers, max_hourly_micros, 1).into_iter().next()
+    rank_offers(offers, max_hourly_micros, 1, &[])
+        .into_iter()
+        .next()
 }
 
 pub(crate) fn hourly_micros(value: f64) -> anyhow::Result<u64> {
@@ -385,6 +403,7 @@ mod tests {
     fn offer(id: u64, gpu: &str, ram: u64, price: f64) -> Offer {
         Offer {
             id,
+            machine_id: id * 10,
             gpu_name: gpu.to_owned(),
             gpu_ram: ram,
             dph_total: price,
@@ -404,6 +423,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.id, 2);
+    }
+
+    /// Machine 24733 advertises 124 forwarded ports and hands out none, so a
+    /// lease that already burned it has to be able to reach past it to the next
+    /// host instead of failing on the cheapest offer forever.
+    #[test]
+    fn ranking_skips_machines_a_lease_already_rejected() {
+        let offers = vec![
+            offer(1, "L40S", 46_068, 0.53),
+            offer(2, "L40S", 46_068, 0.74),
+            offer(3, "L40S", 46_068, 0.80),
+        ];
+
+        let ranked = rank_offers(offers.clone(), 900_000, 8, &[]);
+        assert_eq!(ranked[0].id, 1);
+
+        let ranked = rank_offers(offers, 900_000, 8, &[10, 20]);
+        assert_eq!(
+            ranked.iter().map(|offer| offer.id).collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 
     #[test]

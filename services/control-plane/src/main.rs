@@ -4204,6 +4204,15 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0007_cloud_broker.sql")),
                 false,
             ),
+            Migration::new(
+                8,
+                Cow::Borrowed("cloud instance rejections"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0008_cloud_instance_rejections.sql"
+                )),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
