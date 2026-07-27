@@ -63,14 +63,24 @@ struct InstancesResponse {
     instances: Vec<ListedInstance>,
 }
 
+/// Every field but the identity is absent for the first minutes of a booting
+/// instance, so none of them can be required: a missing field is a machine that
+/// has not finished coming up, not a malformed response.
 #[derive(Deserialize)]
 struct RawInstance {
-    actual_status: String,
-    gpu_name: String,
-    gpu_ram: u64,
-    verification: String,
-    dph_total: f64,
+    #[serde(default)]
+    actual_status: Option<String>,
+    #[serde(default)]
+    gpu_name: Option<String>,
+    #[serde(default)]
+    gpu_ram: Option<u64>,
+    #[serde(default)]
+    verification: Option<String>,
+    #[serde(default)]
+    dph_total: Option<f64>,
+    #[serde(default)]
     ssh_host: Option<String>,
+    #[serde(default)]
     ssh_port: Option<u16>,
     /// Vast reports -1 when the host could not reserve a forwarded port range.
     #[serde(default)]
@@ -255,7 +265,7 @@ impl VastBroker {
     }
 
     pub(crate) async fn instance(&self, instance_id: u64) -> anyhow::Result<Instance> {
-        let response = self
+        let body = self
             .client
             .get(self.base_url.join(&format!("instances/{instance_id}/"))?)
             .bearer_auth(self.token.as_str())
@@ -264,28 +274,10 @@ impl VastBroker {
             .context("read Vast instance")?
             .error_for_status()
             .context("Vast instance lookup failed")?
-            .json::<InstanceResponse>()
+            .text()
             .await
-            .context("decode Vast instance")?
-            .instances;
-        if response
-            .ssh_host
-            .as_deref()
-            .is_some_and(|host| !valid_ssh_host(host))
-        {
-            anyhow::bail!("Vast returned an invalid SSH host");
-        }
-        Ok(Instance {
-            status: response.actual_status,
-            gpu_name: response.gpu_name,
-            gpu_ram: response.gpu_ram,
-            verification: response.verification,
-            hourly_micros: hourly_micros(response.dph_total)?,
-            ssh_host: response.ssh_host,
-            ssh_port: response.ssh_port,
-            direct_port_start: response.direct_port_start,
-            machine_id: response.machine_id,
-        })
+            .context("read Vast instance body")?;
+        instance_from_response(&body)
     }
 
     pub(crate) async fn destroy(&self, instance_id: u64) -> anyhow::Result<()> {
@@ -302,6 +294,49 @@ impl VastBroker {
                 .context("Vast instance destruction failed")?;
         }
         Ok(())
+    }
+}
+
+/// An instance only counts as running once it reports everything admission has
+/// to judge it on. Reporting a half-populated machine as running would put the
+/// admission checks in front of defaults rather than facts.
+fn instance_from_response(body: &str) -> anyhow::Result<Instance> {
+    let raw = serde_json::from_str::<InstanceResponse>(body)
+        .with_context(|| format!("decode Vast instance: {}", truncate(body, 300)))?
+        .instances;
+    if raw
+        .ssh_host
+        .as_deref()
+        .is_some_and(|host| !valid_ssh_host(host))
+    {
+        anyhow::bail!("Vast returned an invalid SSH host");
+    }
+    let complete = raw.gpu_name.is_some()
+        && raw.gpu_ram.is_some()
+        && raw.verification.is_some()
+        && raw.dph_total.is_some();
+    let status = match raw.actual_status {
+        Some(status) if status == "running" && !complete => "loading".to_owned(),
+        Some(status) => status,
+        None => "loading".to_owned(),
+    };
+    Ok(Instance {
+        status,
+        gpu_name: raw.gpu_name.unwrap_or_default(),
+        gpu_ram: raw.gpu_ram.unwrap_or_default(),
+        verification: raw.verification.unwrap_or_default(),
+        hourly_micros: raw.dph_total.map(hourly_micros).transpose()?.unwrap_or(0),
+        ssh_host: raw.ssh_host,
+        ssh_port: raw.ssh_port,
+        direct_port_start: raw.direct_port_start,
+        machine_id: raw.machine_id,
+    })
+}
+
+fn truncate(value: &str, limit: usize) -> &str {
+    match value.char_indices().nth(limit) {
+        Some((index, _)) => &value[..index],
+        None => value,
     }
 }
 
@@ -463,21 +498,36 @@ mod tests {
     /// was refused for the renter's key.
     #[test]
     fn an_instance_without_forwarded_ports_says_so() {
-        let unreachable: RawInstance = serde_json::from_str(
-            r#"{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
-                "verification":"verified","dph_total":0.5363,
-                "ssh_host":"ssh1.vast.ai","ssh_port":18004,"direct_port_start":-1}"#,
+        let unreachable = instance_from_response(
+            r#"{"instances":{"actual_status":"running","gpu_name":"L40S","gpu_ram":46068,
+                "verification":"verified","dph_total":0.5363,"machine_id":24733,
+                "ssh_host":"ssh1.vast.ai","ssh_port":18004,"direct_port_start":-1}}"#,
         )
         .unwrap();
         assert_eq!(unreachable.direct_port_start, -1);
+        assert_eq!(unreachable.status, "running");
+        assert_eq!(unreachable.machine_id, 24733);
+    }
 
-        let omitted: RawInstance = serde_json::from_str(
-            r#"{"actual_status":"loading","gpu_name":"L40S","gpu_ram":46068,
-                "verification":"verified","dph_total":0.5363,
-                "ssh_host":null,"ssh_port":null}"#,
+    /// Seven of the ten provisioning attempts for lease 28 died on "decode Vast
+    /// instance" while the machine was still coming up, which is time the
+    /// ten-minute provisioning window does not have.
+    #[test]
+    fn a_booting_instance_decodes_as_loading_rather_than_failing() {
+        let booting = instance_from_response(r#"{"instances":{"id":46011038}}"#).unwrap();
+        assert_eq!(booting.status, "loading");
+
+        let half_up = instance_from_response(
+            r#"{"instances":{"actual_status":"running","gpu_name":"L40S","machine_id":1}}"#,
         )
         .unwrap();
-        assert_eq!(omitted.direct_port_start, 0);
+        assert_eq!(half_up.status, "loading");
+    }
+
+    #[test]
+    fn an_undecodable_instance_reports_what_vast_sent() {
+        let error = instance_from_response(r#"{"error":"no such instance"}"#).unwrap_err();
+        assert!(format!("{error:#}").contains("no such instance"));
     }
 
     #[test]
