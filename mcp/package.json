@@ -1,25 +1,43 @@
 {
   "name": "@prismnetwork/mcp",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "MCP server for leasing and running on Prism Network GPUs.",
   "mcpName": "io.github.prismnetwork-tech/mcp",
   "type": "module",
-  "bin": { "prism-mcp": "server.mjs" },
-  "files": ["server.mjs", "README.md"],
-  "engines": { "node": ">=20" },
+  "bin": {
+    "prism-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "@prismnetwork/agent-sdk": "^0.1.0",
+    "@prismnetwork/agent-sdk": "^0.2.0",
     "viem": "^2"
   },
-  "keywords": ["prism", "mcp", "gpu", "agent", "claude", "compute"],
+  "keywords": [
+    "prism",
+    "mcp",
+    "gpu",
+    "agent",
+    "claude",
+    "compute"
+  ],
   "homepage": "https://prismnetwork.tech",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/prismnetwork-tech/prism.git",
     "directory": "mcp"
   },
-  "bugs": { "url": "https://github.com/prismnetwork-tech/prism/issues" },
+  "bugs": {
+    "url": "https://github.com/prismnetwork-tech/prism/issues"
+  },
   "license": "Apache-2.0",
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }
