@@ -106,6 +106,8 @@ async function refundOnBase(to, amount) {
   });
 }
 
+const TX_HASH = /^0x[0-9a-f]{64}$/;
+
 function paymentKey(networkId, txHash) {
   return `${networkId}:${txHash.toLowerCase()}`;
 }
@@ -114,9 +116,15 @@ function reservePayment(key) {
   consumed.add(key);
   return true;
 }
-function commitPayment(key) {
+// The ledger is append-only and read back on restart, so the line is rebuilt
+// here from its two parts rather than trusting a string assembled elsewhere.
+function commitPayment(networkId, txHash) {
+  const hash = String(txHash).toLowerCase();
+  if (!TX_HASH.test(hash)) throw new Error("refusing to record a malformed transaction hash");
+  const network = networks.find((candidate) => candidate.id === networkId);
+  if (!network) throw new Error("refusing to record an unknown network");
   try {
-    appendFileSync(config.paymentsFile, `${key}\n`);
+    appendFileSync(config.paymentsFile, `${network.id}:${hash}\n`);
   } catch (err) {
     console.error(`failed to persist consumed payment: ${err.message}`);
   }
@@ -184,7 +192,7 @@ async function verifyPayment(header) {
     if (!reservePayment(key)) return { ok: false, reason: "payment_reused" };
     const outcome = await settleOn(network, txHash, signer);
     if (outcome.ok) {
-      commitPayment(key);
+      commitPayment(network.id, txHash);
       return { ok: true, payer: getAddress(signer), network: network.id };
     }
     releasePayment(key);
