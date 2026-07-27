@@ -24,6 +24,9 @@ mod vast;
 use vast::VastBroker;
 
 const SIGNER_LOCK: i64 = 4_663_001;
+/// How many Vast hosts a single lease may burn through before the provisioning
+/// attempt is abandoned and the escrow refunded.
+const MAX_REJECTED_MACHINES: usize = 4;
 const CLOUD_CAPACITY_UPSERT: &str = "
     INSERT INTO cloud_capacity
         (node_id, provider, available, provider_offer_id, hourly_cost_micros, observed_at)
@@ -453,16 +456,18 @@ impl Worker {
                 String,
                 Option<DateTime<Utc>>,
                 String,
+                Vec<i64>,
             ),
         >(
             "SELECT provider_instance_id, provider_offer_id, ssh_authorized_key, \
-                    ssh_key_attached_at, status \
+                    ssh_key_attached_at, status, rejected_machines \
              FROM cloud_instances WHERE lease_id = $1",
         )
         .bind(lease_id as i64)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((stored_instance_id, _, ssh_key, ssh_key_attached_at, status)) = row else {
+        let Some((stored_instance_id, _, ssh_key, ssh_key_attached_at, status, rejected)) = row
+        else {
             return Ok(false);
         };
         let vast = self
@@ -484,7 +489,7 @@ impl Worker {
                 if let Some(instance_id) = vast.find_by_label(&label).await? {
                     (instance_id, None)
                 } else {
-                    let candidates = vast.ranked_l40s(8).await?;
+                    let candidates = vast.ranked_l40s(8, &rejected).await?;
                     if candidates.is_empty() {
                         anyhow::bail!("no verified L40S is available under the cost ceiling");
                     }
@@ -575,24 +580,44 @@ impl Worker {
         }
         // A host that reserved no forwarded ports boots the container without a
         // reachable sshd, and the renter's key is rejected at the Vast proxy. The
-        // lease is unusable, so fail it here rather than hand out a dead endpoint.
+        // machine advertises the ports it failed to hand out, so this is only
+        // knowable once the instance is up: drop it and try the next candidate
+        // rather than failing a paid lease over one bad host.
         if !instance.gpu_name.eq_ignore_ascii_case("L40S")
             || instance.gpu_ram < 45_000
             || !instance.verification.eq_ignore_ascii_case("verified")
             || instance.hourly_micros > vast.max_hourly_micros
             || instance.direct_port_start <= 0
+            || rejected.contains(&(instance.machine_id as i64))
         {
             vast.destroy(instance_id).await?;
+            if rejected.len() + 1 >= MAX_REJECTED_MACHINES {
+                query(
+                    "UPDATE cloud_instances SET status = 'failed', destroyed_at = NOW(), \
+                         last_error = 'every candidate host failed admission checks', \
+                         updated_at = NOW() WHERE lease_id = $1",
+                )
+                .bind(lease_id as i64)
+                .execute(&self.pool)
+                .await?;
+                anyhow::bail!("every candidate Vast host failed admission checks");
+            }
             query(
-                "UPDATE cloud_instances SET status = 'failed', destroyed_at = NOW(), \
-                     last_error = 'provider instance failed admission checks', updated_at = NOW() \
-                 WHERE lease_id = $1",
+                "UPDATE cloud_instances SET provider_instance_id = NULL, \
+                     provider_offer_id = NULL, ssh_key_attached_at = NULL, \
+                     rejected_machines = CASE WHEN $2 = ANY(rejected_machines) \
+                         THEN rejected_machines ELSE array_append(rejected_machines, $2) END, \
+                     status = 'provisioning', \
+                     last_error = 'provider instance failed admission checks', \
+                     updated_at = NOW() WHERE lease_id = $1",
             )
             .bind(lease_id as i64)
+            .bind(instance.machine_id as i64)
             .execute(&self.pool)
             .await?;
             anyhow::bail!(
-                "Vast instance failed GPU, verification, cost or SSH reachability admission checks"
+                "Vast machine {} failed GPU, verification, cost or SSH reachability admission checks",
+                instance.machine_id
             );
         }
         let host = instance.ssh_host.context("Vast instance has no SSH host")?;
