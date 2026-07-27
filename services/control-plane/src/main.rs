@@ -2565,6 +2565,7 @@ impl MarketplaceStore {
                     market
                         .leases
                         .values()
+                        .filter(|(_, lease)| occupies_node(lease))
                         .map(|(_, lease)| lease.node_id.clone()),
                 );
                 let cutoff = Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS);
@@ -2625,7 +2626,7 @@ impl MarketplaceStore {
                     "SELECT node_id FROM lease_quotes \
                      WHERE consumed_at IS NULL AND expires_at > NOW() \
                      UNION SELECT document->>'node_id' FROM leases \
-                     WHERE state NOT IN ('finalized', 'refunded', 'failed')",
+                     WHERE state IN ('funded', 'provisioning', 'ready', 'active', 'closing')",
                 )
                 .fetch_all(&mut *transaction)
                 .await
@@ -2772,7 +2773,7 @@ impl MarketplaceStore {
                 if market
                     .leases
                     .values()
-                    .any(|(_, current)| current.node_id == lease.node_id && !is_settled(current))
+                    .any(|(_, current)| current.node_id == lease.node_id && occupies_node(current))
                 {
                     return Err(StoreError::NodeBusy);
                 }
@@ -2825,8 +2826,7 @@ impl MarketplaceStore {
                 let node_busy = query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
-                         WHERE document->>'node_id' = $1 \
-                           AND state NOT IN ('finalized', 'refunded', 'failed') \
+                         WHERE document->>'node_id' = $1 AND state IN ('funded', 'provisioning', 'ready', 'active', 'closing') \
                      )",
                 )
                 .bind(&lease.node_id)
@@ -3413,10 +3413,17 @@ fn valid_command_transition(current: &str, next: &str) -> bool {
         )
 }
 
-fn is_settled(lease: &LeaseRecord) -> bool {
+/// Whether a lease still holds its machine. Settlement runs for a further 24
+/// hours after access closes, and the node is schedulable again long before
+/// that bookkeeping finishes.
+fn occupies_node(lease: &LeaseRecord) -> bool {
     matches!(
         lease.state,
-        LeaseState::Finalized | LeaseState::Refunded | LeaseState::Failed
+        LeaseState::Funded
+            | LeaseState::Provisioning
+            | LeaseState::Ready
+            | LeaseState::Active
+            | LeaseState::Closing
     )
 }
 
@@ -5068,6 +5075,60 @@ mod tests {
             store.quote("other-renter", &request).await,
             Err(StoreError::CapacityReserved)
         ));
+    }
+
+    /// Settlement runs for a further 24 hours after the machine is torn down.
+    /// Holding the node for that whole window took the one-node network out of
+    /// service for a day after every lease.
+    #[tokio::test]
+    async fn a_lease_awaiting_settlement_releases_its_node() {
+        let now = Utc::now();
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 100, 10_000));
+        market.tunnels.insert("only".to_owned(), now);
+        let lease = LeaseRecord {
+            lease_id: 27,
+            quote_id: Uuid::now_v7(),
+            node_id: "only".to_owned(),
+            renter_wallet: format!("0x{}", "11".repeat(20)),
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            rate_per_second: 100,
+            maximum_escrow: 6_000,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: format!("0x{:064x}", 27),
+            state: LeaseState::Active,
+            created_at: now,
+            updated_at: now,
+        };
+        market
+            .leases
+            .insert(lease.lease_id, ("previous-renter".to_owned(), lease));
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+        };
+
+        assert!(matches!(
+            store.quote("renter", &request).await,
+            Err(StoreError::CapacityReserved)
+        ));
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market.write().await.leases.get_mut(&27).unwrap().1.state = LeaseState::SettlementPending;
+
+        assert_eq!(
+            store.quote("renter", &request).await.unwrap().node_id,
+            "only"
+        );
     }
 
     #[tokio::test]
