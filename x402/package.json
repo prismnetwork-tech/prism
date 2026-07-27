@@ -1,23 +1,44 @@
 {
   "name": "@prismnetwork/x402",
-  "version": "0.1.0",
-  "description": "Pay-per-job GPU compute on Prism Network over HTTP 402.",
+  "version": "0.2.0",
+  "description": "Pay-per-job GPU compute on Prism Network over HTTP 402, payable in USDC on Base.",
   "type": "module",
-  "bin": { "prism-x402": "server.mjs" },
-  "files": ["server.mjs", "README.md"],
-  "engines": { "node": ">=20" },
+  "bin": {
+    "prism-x402": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "@prismnetwork/agent-sdk": "^0.1.0",
+    "@prismnetwork/agent-sdk": "^0.2.0",
     "viem": "^2"
   },
-  "keywords": ["prism", "x402", "gpu", "agent", "payments", "compute"],
+  "keywords": [
+    "prism",
+    "x402",
+    "gpu",
+    "agent",
+    "payments",
+    "compute"
+  ],
   "homepage": "https://prismnetwork.tech",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/prismnetwork-tech/prism.git",
     "directory": "x402"
   },
-  "bugs": { "url": "https://github.com/prismnetwork-tech/prism/issues" },
+  "bugs": {
+    "url": "https://github.com/prismnetwork-tech/prism/issues"
+  },
   "license": "Apache-2.0",
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
 }
