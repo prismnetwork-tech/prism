@@ -1,21 +1,42 @@
 {
   "name": "@prismnetwork/agent-sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Headless GPU leasing on Prism Network for wallet-holding agents.",
   "type": "module",
   "main": "prism.mjs",
-  "exports": { ".": "./prism.mjs" },
-  "files": ["prism.mjs", "README.md"],
-  "engines": { "node": ">=20" },
-  "peerDependencies": { "viem": "^2" },
-  "keywords": ["prism", "gpu", "agent", "web3", "usdg", "compute", "llm"],
+  "exports": {
+    ".": "./prism.mjs"
+  },
+  "files": [
+    "prism.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "viem": "^2"
+  },
+  "keywords": [
+    "prism",
+    "gpu",
+    "agent",
+    "web3",
+    "usdg",
+    "compute",
+    "llm"
+  ],
   "homepage": "https://prismnetwork.tech",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/prismnetwork-tech/prism.git",
     "directory": "sdk"
   },
-  "bugs": { "url": "https://github.com/prismnetwork-tech/prism/issues" },
+  "bugs": {
+    "url": "https://github.com/prismnetwork-tech/prism/issues"
+  },
   "license": "Apache-2.0",
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }
