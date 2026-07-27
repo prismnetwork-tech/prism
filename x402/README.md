@@ -1,18 +1,21 @@
 # @prismnetwork/x402
 
-Pay-per-job GPU compute on [Prism Network](https://prismnetwork.tech) over HTTP 402. An agent submits a command, pays USDG on Robinhood Chain, and gets the output. No lease management, no wallet-signature session.
+Pay-per-job GPU compute on [Prism Network](https://prismnetwork.tech) over HTTP 402. An agent submits a command, pays a stablecoin, and gets the output. No lease management, no wallet-signature session.
+
+Payment is accepted in **USDC on Base** or USDG on Robinhood Chain. Base is there because that is what x402 clients actually hold: an endpoint quoting only Robinhood Chain cannot be paid by any of them.
 
 ## Flow
 
 ```
 POST /run  { "command": "nvidia-smi" }
-  -> 402 { accepts: [{ scheme, network, asset, payTo, maxAmountRequired }] }
+  -> 402 { accepts: [ { network: "eip155:8453", asset: USDC, payTo, maxAmountRequired },
+                      { network: "eip155:4663", asset: USDG, payTo, maxAmountRequired } ] }
 ```
 
-Pay `maxAmountRequired` USDG to `payTo` on Robinhood Chain. Then sign the tx hash (`personal_sign`) with the paying wallet and send it as the payment header:
+Pick an entry, pay `maxAmountRequired` of its `asset` to its `payTo`. Then sign the tx hash (`personal_sign`) with the paying wallet and send it as the payment header:
 
 ```
-X-PAYMENT: base64(JSON({ txHash, signature }))
+X-PAYMENT: base64(JSON({ txHash, signature, network }))
 
 POST /run  { "command": "nvidia-smi" }   header X-PAYMENT: <base64 envelope>
   -> 202 { job_id, token, poll: "/jobs/<id>" }
@@ -26,12 +29,19 @@ The signature binds the payment to you, so a third party who sees your tx hash c
 ## Run
 
 ```
-PRISM_AGENT_KEY=0x..   \    # server wallet that funds leases (needs USDG + gas)
-PRISM_ESCROW=0x71Df..  \
-X402_PAY_TO=0x..       \    # address that collects payment
-X402_PRICE_MICROS=300000    # 0.30 USDG per job
+PRISM_AGENT_KEY=0x..     \    # server wallet that funds leases (needs USDG + gas)
+PRISM_ESCROW=0x71Df..    \
+X402_PAY_TO=0x..         \    # collects USDG on Robinhood Chain
+X402_BASE_PAY_TO=0x..    \    # collects USDC on Base; omit to not offer Base
+X402_BASE_RPC_URL=https://mainnet.base.org \
+X402_PRICE_MICROS=300000       # 0.30 of either stablecoin per job
 node server.mjs
 ```
+
+A payer who is refunded is refunded on the network they paid on, so the server
+wallet needs a USDC and gas balance on Base as well to honour a Base payment
+that fails. When a refund cannot be sent, the job record carries `refund_owed`
+with the address, amount and network rather than losing it to a log line.
 
 Install with `npm install @prismnetwork/x402`, or run it directly with `npx @prismnetwork/x402`.
 
