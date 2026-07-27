@@ -8,6 +8,8 @@ use url::Url;
 const DEFAULT_API_URL: &str = "https://console.vast.ai/api/v0/";
 const DEFAULT_MAX_HOURLY_MICROS: u64 = 640_000;
 const DEFAULT_DISK_GB: u64 = 16;
+const DEFAULT_GPU_MODELS: &str = "L40S";
+const DEFAULT_MIN_GPU_RAM_MIB: u64 = 45_000;
 
 #[derive(Clone)]
 pub(crate) struct VastBroker {
@@ -16,6 +18,11 @@ pub(crate) struct VastBroker {
     token: Arc<String>,
     pub(crate) node_id: String,
     pub(crate) max_hourly_micros: u64,
+    /// Which GPUs the broker will rent on a renter's behalf. One class leaves
+    /// the network at the mercy of one market: when a verified L40S costs more
+    /// than a lease charges, there is nothing to sell at any price.
+    pub(crate) gpu_models: Arc<Vec<String>>,
+    pub(crate) min_gpu_ram_mib: u64,
     disk_gb: u32,
 }
 
@@ -122,6 +129,19 @@ impl VastBroker {
         if !(1..=10_000_000).contains(&max_hourly_micros) {
             anyhow::bail!("PRISM_VAST_MAX_HOURLY_MICROS is outside the supported range");
         }
+        let gpu_models: Vec<String> = env::var("PRISM_VAST_GPU_MODELS")
+            .unwrap_or_else(|_| DEFAULT_GPU_MODELS.to_owned())
+            .split(',')
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty())
+            .collect();
+        if gpu_models.is_empty() {
+            anyhow::bail!("PRISM_VAST_GPU_MODELS must name at least one GPU");
+        }
+        let min_gpu_ram_mib = env_u64("PRISM_VAST_MIN_GPU_RAM_MIB", DEFAULT_MIN_GPU_RAM_MIB)?;
+        if !(1_024..=1_048_576).contains(&min_gpu_ram_mib) {
+            anyhow::bail!("PRISM_VAST_MIN_GPU_RAM_MIB is outside the supported range");
+        }
         let disk_gb = u32::try_from(env_u64("PRISM_VAST_DISK_GB", DEFAULT_DISK_GB)?)?;
         if !(16..=2_048).contains(&disk_gb) {
             anyhow::bail!("PRISM_VAST_DISK_GB must be between 16 and 2048");
@@ -135,6 +155,8 @@ impl VastBroker {
             token: Arc::new(token),
             node_id,
             max_hourly_micros,
+            gpu_models: Arc::new(gpu_models),
+            min_gpu_ram_mib,
             disk_gb,
         }))
     }
@@ -145,9 +167,9 @@ impl VastBroker {
             .post(self.base_url.join("bundles/")?)
             .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({
-                "gpu_name": {"in": ["L40S"]},
+                "gpu_name": {"in": self.gpu_models.as_ref()},
                 "num_gpus": {"eq": 1},
-                "gpu_ram": {"gte": 45000},
+                "gpu_ram": {"gte": self.min_gpu_ram_mib},
                 "reliability": {"gte": 0.99},
                 "verified": {"eq": true},
                 "rentable": {"eq": true},
@@ -166,11 +188,17 @@ impl VastBroker {
         Ok(response.offers)
     }
 
-    pub(crate) async fn cheapest_l40s(&self, ceiling: u64) -> anyhow::Result<Option<Offer>> {
-        Ok(select_offer(
-            self.search_offers().await?,
-            self.ceiling(ceiling),
-        ))
+    pub(crate) async fn cheapest(&self, ceiling: u64) -> anyhow::Result<Option<Offer>> {
+        Ok(self.ranked(1, &[], ceiling).await?.into_iter().next())
+    }
+
+    /// Whether an instance is one of the classes this broker rents.
+    pub(crate) fn admits(&self, gpu_name: &str, gpu_ram_mib: u64) -> bool {
+        gpu_ram_mib >= self.min_gpu_ram_mib
+            && self
+                .gpu_models
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case(gpu_name))
     }
 
     /// Sourcing above what the renter pays is a loss the settlement worker will
@@ -180,18 +208,19 @@ impl VastBroker {
         self.max_hourly_micros.min(retail_hourly_micros)
     }
 
-    pub(crate) async fn ranked_l40s(
+    pub(crate) async fn ranked(
         &self,
         limit: usize,
         rejected: &[i64],
         ceiling: u64,
     ) -> anyhow::Result<Vec<Offer>> {
-        Ok(rank_offers(
-            self.search_offers().await?,
-            self.ceiling(ceiling),
-            limit,
-            rejected,
-        ))
+        let offers = self
+            .search_offers()
+            .await?
+            .into_iter()
+            .filter(|offer| self.admits(&offer.gpu_name, offer.gpu_ram))
+            .collect();
+        Ok(rank_offers(offers, self.ceiling(ceiling), limit, rejected))
     }
 
     pub(crate) async fn create(
@@ -364,21 +393,13 @@ fn rank_offers(
     let mut eligible: Vec<Offer> = offers
         .into_iter()
         .filter(|offer| {
-            offer.gpu_name.eq_ignore_ascii_case("L40S")
-                && offer.gpu_ram >= 45_000
-                && hourly_micros(offer.dph_total).is_ok_and(|cost| cost <= max_hourly_micros)
+            hourly_micros(offer.dph_total).is_ok_and(|cost| cost <= max_hourly_micros)
                 && !rejected.contains(&(offer.machine_id as i64))
         })
         .collect();
     eligible.sort_by_key(|offer| hourly_micros(offer.dph_total).unwrap_or(u64::MAX));
     eligible.truncate(limit);
     eligible
-}
-
-fn select_offer(offers: Vec<Offer>, max_hourly_micros: u64) -> Option<Offer> {
-    rank_offers(offers, max_hourly_micros, 1, &[])
-        .into_iter()
-        .next()
 }
 
 pub(crate) fn hourly_micros(value: f64) -> anyhow::Result<u64> {
@@ -450,6 +471,32 @@ fn valid_ssh_host(host: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The same two steps `ranked` runs: keep the classes the broker rents,
+    /// then take the cheapest that clears the ceiling.
+    fn cheapest_of(offers: Vec<Offer>, max_hourly_micros: u64) -> Option<Offer> {
+        let broker = broker(&["L40S"], 45_000, max_hourly_micros);
+        let eligible = offers
+            .into_iter()
+            .filter(|offer| broker.admits(&offer.gpu_name, offer.gpu_ram))
+            .collect();
+        rank_offers(eligible, max_hourly_micros, 1, &[])
+            .into_iter()
+            .next()
+    }
+
+    fn broker(models: &[&str], min_gpu_ram_mib: u64, max_hourly_micros: u64) -> VastBroker {
+        VastBroker {
+            client: Client::new(),
+            base_url: Url::parse(DEFAULT_API_URL).unwrap(),
+            token: Arc::new("token".to_owned()),
+            node_id: "0xabc".to_owned(),
+            max_hourly_micros,
+            gpu_models: Arc::new(models.iter().map(|model| (*model).to_owned()).collect()),
+            min_gpu_ram_mib,
+            disk_gb: 16,
+        }
+    }
+
     fn offer(id: u64, gpu: &str, ram: u64, price: f64) -> Offer {
         Offer {
             id,
@@ -462,7 +509,7 @@ mod tests {
 
     #[test]
     fn selects_the_cheapest_qualified_l40s() {
-        let selected = select_offer(
+        let selected = cheapest_of(
             vec![
                 offer(1, "L40S", 46_068, 0.61),
                 offer(2, "L40S", 46_068, 0.59),
@@ -498,7 +545,7 @@ mod tests {
 
     #[test]
     fn rejects_prices_above_the_ceiling() {
-        assert!(select_offer(vec![offer(1, "L40S", 46_068, 0.640_001)], 640_000).is_none());
+        assert!(cheapest_of(vec![offer(1, "L40S", 46_068, 0.640_001)], 640_000).is_none());
     }
 
     /// Lease 29 sourced a host at 802_963 micros/hr against a retail rate of
@@ -506,14 +553,7 @@ mod tests {
     /// would have signed off a loss, so the escrow stuck.
     #[test]
     fn an_operator_ceiling_cannot_exceed_what_the_renter_pays() {
-        let broker = VastBroker {
-            client: Client::new(),
-            base_url: Url::parse(DEFAULT_API_URL).unwrap(),
-            token: Arc::new("token".to_owned()),
-            node_id: "0xabc".to_owned(),
-            max_hourly_micros: 1_100_000,
-            disk_gb: 16,
-        };
+        let broker = broker(&["L40S"], 45_000, 1_100_000);
 
         assert_eq!(broker.ceiling(799_200), 799_200);
         assert!(
@@ -601,6 +641,21 @@ mod tests {
     fn an_undecodable_instance_reports_what_vast_sent() {
         let error = instance_from_response(r#"{"error":"no such instance"}"#).unwrap_err();
         assert!(format!("{error:#}").contains("no such instance"));
+    }
+
+    /// A verified L40S costing more than a lease charges means no capacity at
+    /// all while an A6000 with the same memory sits at half the price.
+    #[test]
+    fn a_broker_rents_every_class_it_is_configured_for() {
+        let single = broker(&["L40S"], 45_000, 900_000);
+        assert!(single.admits("L40S", 46_068));
+        assert!(!single.admits("RTX A6000", 46_068));
+        assert!(!single.admits("L40S", 24_576));
+
+        let wide = broker(&["L40S", "RTX A6000"], 45_000, 900_000);
+        assert!(wide.admits("L40S", 46_068));
+        assert!(wide.admits("rtx a6000", 46_068));
+        assert!(!wide.admits("RTX 4090", 24_564));
     }
 
     #[test]

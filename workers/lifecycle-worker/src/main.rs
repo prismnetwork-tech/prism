@@ -293,11 +293,15 @@ impl Worker {
         // Not being able to ask Vast is a different answer from Vast having
         // nothing, and writing the second for the first empties the market.
         let provider_offer = vast
-            .cheapest_l40s(retail_hourly(node_offer.rate_per_second))
+            .cheapest(retail_hourly(node_offer.rate_per_second))
             .await?;
         self.record_cloud_capacity(vast, provider_offer.as_ref())
             .await?;
-        if provider_offer.is_some() {
+        if let Some(offer) = provider_offer.as_ref() {
+            // Advertise the class that will actually be handed over, not the one
+            // the broker enrolled with.
+            node_offer.gpu.model = offer.gpu_name.clone();
+            node_offer.gpu.vram_mib = u32::try_from(offer.gpu_ram)?;
             node_offer.online = true;
             node_offer.updated_at = Utc::now();
             query("UPDATE node_offers SET document = $2, updated_at = NOW() WHERE node_id = $1")
@@ -529,11 +533,12 @@ impl Worker {
             None => match self.adopt_labelled(vast, &label).await? {
                 Some(instance_id) => (instance_id, None),
                 None => {
-                    let candidates = vast
-                        .ranked_l40s(CREATES_PER_PASS, &rejected, retail)
-                        .await?;
+                    let candidates = vast.ranked(CREATES_PER_PASS, &rejected, retail).await?;
                     if candidates.is_empty() {
-                        anyhow::bail!("no verified L40S is available under the cost ceiling");
+                        anyhow::bail!(
+                            "no verified {} is available under the cost ceiling",
+                            vast.gpu_models.join(" or ")
+                        );
                     }
                     // Vast can reject a create even when the offer showed rentable, because
                     // another renter took the machine in between. A lost response means the
@@ -631,10 +636,16 @@ impl Worker {
         // machine advertises the ports it failed to hand out, so this is only
         // knowable once the instance is up: drop it and try the next candidate
         // rather than failing a paid lease over one bad host.
-        let refusal = if !instance.gpu_name.eq_ignore_ascii_case("L40S") {
-            Some(format!("gpu is {}, not an L40S", instance.gpu_name))
-        } else if instance.gpu_ram < 45_000 {
-            Some(format!("{} MiB of GPU memory is short", instance.gpu_ram))
+        let refusal = if !vast.admits(&instance.gpu_name, instance.gpu_ram) {
+            Some(format!(
+                "{} with {} MiB is not a class this broker rents",
+                instance.gpu_name, instance.gpu_ram
+            ))
+        } else if instance.gpu_ram < u64::from(context.offer.gpu.vram_mib) {
+            Some(format!(
+                "{} MiB is short of the {} MiB advertised",
+                instance.gpu_ram, context.offer.gpu.vram_mib
+            ))
         } else if !instance.verification.eq_ignore_ascii_case("verified") {
             Some(format!("host is {}, not verified", instance.verification))
         } else if instance.hourly_micros > vast.ceiling(retail) {
