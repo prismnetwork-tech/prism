@@ -26,6 +26,7 @@ class FakeAgent:
             {
                 "gpu": {"model": "Test GPU", "vram_mib": 24_576},
                 "rate_per_second": 25,
+                "trust_class": "isolated",
             }
         ]
 
@@ -60,13 +61,15 @@ assert set(actions) == {"wallet", "list_gpus", "lease_and_run", "run", "end_leas
 
 with patch("coinbase_agentkit.action_providers.action_decorator.send_analytics_event"):
     assert "1.250000 USDG" in actions["wallet"].invoke({})
-    assert "Test GPU" in actions["list_gpus"].invoke({})
+    listed = actions["list_gpus"].invoke({})
+    assert "Test GPU" in listed and "isolated" in listed
     leased = actions["lease_and_run"].invoke(
         {
             "command": "nvidia-smi",
             "duration_seconds": 120,
             "min_vram_mib": 8192,
             "max_usdg": 0.25,
+            "min_trust_class": "isolated",
         }
     )
     assert "lease 7 funded onchain" in leased
@@ -75,6 +78,7 @@ with patch("coinbase_agentkit.action_providers.action_decorator.send_analytics_e
         "duration_seconds": 120,
         "min_vram_mib": 8192,
         "max_deposit": 250_000,
+        "min_trust_class": "isolated",
     }
     assert actions["run"].invoke({"lease_id": 7, "command": "echo ready"}).endswith("7:echo ready")
     assert actions["end_lease"].invoke({"lease_id": 7}) == "released lease 7"
