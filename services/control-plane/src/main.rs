@@ -257,6 +257,10 @@ enum StoreError {
     NetworkCapacity,
     #[error("no compatible bonded node is online")]
     NoMatch,
+    #[error("all compatible capacity is held by an open quote or an active lease")]
+    CapacityReserved,
+    #[error("node is already running a lease")]
+    NodeBusy,
     #[error("matched offer exceeds the escrow limit")]
     EscrowLimit,
     #[error("telemetry sequence was already accepted")]
@@ -2522,6 +2526,21 @@ impl MarketplaceStore {
                 market
                     .open_quotes
                     .retain(|_, quote| quote.expires_at > Utc::now() - Duration::hours(24));
+                // A renter asking for a new quote is no longer holding the old
+                // one. The quote stays honourable for anyone who already
+                // funded it on chain; it just stops reserving the node.
+                let superseded: Vec<Uuid> = market
+                    .quote_subjects
+                    .iter()
+                    .filter(|(_, owner)| owner.as_str() == subject)
+                    .map(|(quote_id, _)| *quote_id)
+                    .collect();
+                let released_at = Utc::now();
+                for quote_id in superseded {
+                    if let Some(quote) = market.open_quotes.get_mut(&quote_id) {
+                        quote.expires_at = released_at;
+                    }
+                }
                 let active_quote_count = market
                     .open_quotes
                     .values()
@@ -2579,6 +2598,14 @@ impl MarketplaceStore {
                     "DELETE FROM lease_quotes \
                      WHERE consumed_at IS NULL AND expires_at <= NOW() - INTERVAL '24 hours'",
                 )
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                query(
+                    "UPDATE lease_quotes SET expires_at = NOW() \
+                     WHERE subject = $1 AND consumed_at IS NULL AND expires_at > NOW()",
+                )
+                .bind(subject)
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
@@ -2742,6 +2769,13 @@ impl MarketplaceStore {
                 }) {
                     return Err(StoreError::FundingMismatch);
                 }
+                if market
+                    .leases
+                    .values()
+                    .any(|(_, current)| current.node_id == lease.node_id && !is_settled(current))
+                {
+                    return Err(StoreError::NodeBusy);
+                }
                 market.consumed_quotes.insert(quote.quote_id);
                 market
                     .leases
@@ -2787,6 +2821,20 @@ impl MarketplaceStore {
                     } else {
                         Err(StoreError::FundingMismatch)
                     };
+                }
+                let node_busy = query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM leases \
+                         WHERE document->>'node_id' = $1 \
+                           AND state NOT IN ('finalized', 'refunded', 'failed') \
+                     )",
+                )
+                .bind(&lease.node_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if node_busy {
+                    return Err(StoreError::NodeBusy);
                 }
                 let consumed = query(
                     "UPDATE lease_quotes SET consumed_at = NOW() \
@@ -3363,6 +3411,13 @@ fn valid_command_transition(current: &str, next: &str) -> bool {
             ("queued" | "leased", "ready" | "completed" | "failed")
                 | ("ready", "completed" | "failed")
         )
+}
+
+fn is_settled(lease: &LeaseRecord) -> bool {
+    matches!(
+        lease.state,
+        LeaseState::Finalized | LeaseState::Refunded | LeaseState::Failed
+    )
 }
 
 fn lease_state_name(state: &LeaseState) -> &'static str {
@@ -4160,10 +4215,10 @@ fn quote_for_offers<'a>(
     reserved: &BTreeSet<String>,
 ) -> Result<LeaseQuote, StoreError> {
     let cutoff = Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS);
-    let selected = offers
+    let mut compatible = offers
         .into_iter()
         .filter(|offer| offer.online && offer.bonded && offer.public_image_only)
-        .filter(|offer| offer.updated_at >= cutoff && !reserved.contains(&offer.node_id))
+        .filter(|offer| offer.updated_at >= cutoff)
         .filter(|offer| offer.gpu.vram_mib >= request.min_vram_mib)
         .filter(|offer| offer.trust_class >= request.min_trust_class)
         .filter(|offer| {
@@ -4172,6 +4227,14 @@ fn quote_for_offers<'a>(
                 .as_ref()
                 .is_none_or(|node_id| node_id == &offer.node_id)
         })
+        .peekable();
+    if compatible.peek().is_none() {
+        return Err(StoreError::NoMatch);
+    }
+    // Capacity that exists but is spoken for is a different answer than no
+    // capacity at all: one clears on its own, the other needs supply.
+    let selected = compatible
+        .filter(|offer| !reserved.contains(&offer.node_id))
         .min_by_key(|offer| {
             (
                 offer.rate_per_second,
@@ -4179,7 +4242,7 @@ fn quote_for_offers<'a>(
                 Reverse(offer.benchmark_score),
             )
         })
-        .ok_or(StoreError::NoMatch)?;
+        .ok_or(StoreError::CapacityReserved)?;
     let maximum_escrow = selected
         .rate_per_second
         .saturating_mul(request.duration_seconds as u64);
@@ -4416,6 +4479,11 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
         }
         StoreError::NetworkCapacity => conflict("network_capacity", "network lease limit reached"),
         StoreError::NoMatch => not_found("no_match", "no compatible bonded node is online"),
+        StoreError::CapacityReserved => conflict(
+            "capacity_reserved",
+            "all compatible capacity is held by an open quote or an active lease",
+        ),
+        StoreError::NodeBusy => conflict("node_busy", "node is already running a lease"),
         StoreError::EscrowLimit => {
             bad_request("escrow_limit", "matched offer exceeds the escrow limit")
         }
@@ -4765,6 +4833,32 @@ mod tests {
         assert_eq!(quote.node_id, "available");
     }
 
+    /// A network with one node reads as empty the moment anyone holds a quote
+    /// on it, which sent an operator hunting for missing supply that was in
+    /// `/v1/offers` the whole time.
+    #[test]
+    fn fully_reserved_capacity_is_not_reported_as_missing_capacity() {
+        let only = offer("only", 100, 10_000);
+        let mut undersized = offer("undersized", 100, 10_000);
+        undersized.gpu.vram_mib = 8_192;
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "a".repeat(64)),
+            duration_seconds: 60,
+            min_vram_mib: 16_000,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+        };
+
+        assert!(matches!(
+            quote_for_offers(&request, [&only], &BTreeSet::from(["only".to_owned()])),
+            Err(StoreError::CapacityReserved)
+        ));
+        assert!(matches!(
+            quote_for_offers(&request, [&undersized], &BTreeSet::new()),
+            Err(StoreError::NoMatch)
+        ));
+    }
+
     #[test]
     fn image_reference_requires_a_complete_digest() {
         assert!(is_pinned_image(&format!(
@@ -4934,6 +5028,36 @@ mod tests {
         assert!(matches!(
             store.quote("subject-over-cap", &request).await,
             Err(StoreError::NetworkCapacity)
+        ));
+    }
+
+    /// The renter who abandons a quote is the one most likely to ask for
+    /// another, and on a one-node network its own five-minute hold used to
+    /// lock it out until the quote expired.
+    #[tokio::test]
+    async fn a_renter_is_not_blocked_by_its_own_open_quote() {
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 100, 10_000));
+        market.tunnels.insert("only".to_owned(), Utc::now());
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+        };
+
+        let first = store.quote("renter", &request).await.unwrap();
+        let second = store.quote("renter", &request).await.unwrap();
+        assert_eq!(second.node_id, "only");
+        assert_ne!(second.quote_id, first.quote_id);
+
+        assert!(matches!(
+            store.quote("other-renter", &request).await,
+            Err(StoreError::CapacityReserved)
         ));
     }
 
