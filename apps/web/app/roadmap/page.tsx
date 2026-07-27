@@ -48,6 +48,14 @@ export default function RoadmapPage() {
         </p>
         <h3>NVIDIA L40S capacity</h3>
         <p>GPU supply sourced from vetted providers and matched to a lease on demand.</p>
+        <h3>A stated trust class per offer</h3>
+        <p>
+          Every offer, quote, lease, and receipt carries what the supplier protects, derived by the
+          network from evidence it can check rather than asserted by the host. An agent can require
+          a minimum class instead of reading a disclaimer. All capacity live today is the weakest
+          one, and the <Link href="/security">security page</Link> states what that does and does
+          not cover.
+        </p>
       </InformationSection>
 
       <InformationSection index="02" title="In progress">
@@ -57,13 +65,20 @@ export default function RoadmapPage() {
         </p>
         <h3>Coinbase AgentKit provider</h3>
         <p>
-          A Prism action provider is in review for AgentKit, so an agent built on AgentKit,
-          LangGraph, or the Vercel AI SDK can rent a GPU with no custom integration.
+          The Prism action provider is published and installable today, so an agent built on
+          AgentKit, LangGraph, or the Vercel AI SDK can rent a GPU with no custom integration.
+          Inclusion in AgentKit itself is in review upstream.
         </p>
         <h3>Dependable on-demand provisioning</h3>
         <p>
           Matching a lease to live capacity across a volatile spot market, so a request placed at any
           moment resolves to a running machine.
+        </p>
+        <h3>Independent node operators</h3>
+        <p>
+          The relay a self-hosted machine reaches renters through now runs, so an operator&apos;s own
+          GPU can be leased rather than only registered. What remains is the hardware validation that
+          lets such a node advertise a stronger trust class than brokered capacity.
         </p>
         <h3>Broader capacity</h3>
         <p>Additional GPU classes and more concurrent supply beyond a single machine type.</p>
@@ -74,10 +89,12 @@ export default function RoadmapPage() {
           Directional commitments that widen what the network can be trusted to run. Each ships only
           when it meets the same onchain, verifiable standard as the rest of Prism.
         </p>
-        <h3>Confidential compute</h3>
+        <h3>Attested and confidential capacity</h3>
         <p>
-          Hardware-backed trusted execution and confidential GPU memory, so a workload and its data
-          stay private from the infrastructure provider.
+          The two classes above what the network can verify today: a launch measurement checked
+          against vendor roots, then hardware-backed trusted execution with encrypted GPU memory, so
+          a workload and its data stay private from the infrastructure provider. Both need hardware
+          the network does not have yet, not a software change.
         </p>
         <h3>Durable workspaces</h3>
         <p>Persistent state and storage that survive across leases, beyond today&apos;s ephemeral containers.</p>
