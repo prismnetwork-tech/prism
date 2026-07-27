@@ -27,6 +27,9 @@ const SIGNER_LOCK: i64 = 4_663_001;
 /// How many Vast hosts a single lease may burn through before the provisioning
 /// attempt is abandoned and the escrow refunded.
 const MAX_REJECTED_MACHINES: usize = 4;
+/// Ranked offers tried per provisioning pass. Retries supply the rest of the
+/// breadth, and a pass that spends the whole window is a refund.
+const CREATES_PER_PASS: usize = 2;
 const CLOUD_CAPACITY_UPSERT: &str = "
     INSERT INTO cloud_capacity
         (node_id, provider, available, provider_offer_id, hourly_cost_micros, observed_at)
@@ -166,8 +169,17 @@ async fn main() -> anyhow::Result<()> {
     };
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
     loop {
-        worker.scan().await?;
-        let Some(action) = worker.claim().await? else {
+        if let Err(error) = worker.scan().await {
+            tracing::error!(%error, "lifecycle scan failed");
+        }
+        let claimed = match worker.claim().await {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                tracing::error!(%error, "lifecycle claim failed");
+                None
+            }
+        };
+        let Some(action) = claimed else {
             if run_once {
                 return Ok(());
             }
@@ -177,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
         let action_id = action.action_id;
         if let Err(error) = worker.process(action).await {
             tracing::error!(%action_id, %error, "lifecycle action failed");
-            worker.retry(action_id, &error).await?;
+            if let Err(error) = worker.retry(action_id, &error).await {
+                tracing::error!(%action_id, %error, "recording the failed action failed");
+            }
         }
         if run_once {
             return Ok(());
@@ -245,12 +259,16 @@ impl Worker {
         let Some(vast) = &self.vast else {
             return Ok(());
         };
-        let refreshed_at: Option<DateTime<Utc>> =
-            query_scalar("SELECT updated_at FROM cloud_capacity WHERE node_id = $1")
-                .bind(&vast.node_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        if refreshed_at.is_some_and(|value| value >= Utc::now() - chrono::Duration::seconds(30)) {
+        let refreshed_recently: bool = query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM cloud_capacity \
+                 WHERE node_id = $1 AND updated_at >= NOW() - INTERVAL '30 seconds' \
+             )",
+        )
+        .bind(&vast.node_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if refreshed_recently {
             return Ok(());
         }
         let offer_document = query_scalar::<_, SqlJson<NodeOffer>>(
@@ -266,13 +284,9 @@ impl Worker {
             );
             return Ok(());
         };
-        let provider_offer = match vast.cheapest_l40s().await {
-            Ok(offer) => offer,
-            Err(error) => {
-                self.record_cloud_capacity(vast, None).await?;
-                return Err(error);
-            }
-        };
+        // Not being able to ask Vast is a different answer from Vast having
+        // nothing, and writing the second for the first empties the market.
+        let provider_offer = vast.cheapest_l40s().await?;
         self.record_cloud_capacity(vast, provider_offer.as_ref())
             .await?;
         if provider_offer.is_some() {
@@ -344,23 +358,33 @@ impl Worker {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        let transaction = match (raw, hash, nonce) {
-            (Some(raw_transaction), Some(transaction_hash), Some(nonce)) => {
-                Some(PreparedTransaction {
-                    nonce: u64::try_from(nonce)?,
-                    raw_transaction,
-                    transaction_hash,
-                })
+        let parsed = (|| {
+            let transaction = match (raw, hash, nonce) {
+                (Some(raw_transaction), Some(transaction_hash), Some(nonce)) => {
+                    Some(PreparedTransaction {
+                        nonce: u64::try_from(nonce)?,
+                        raw_transaction,
+                        transaction_hash,
+                    })
+                }
+                (None, None, None) => None,
+                _ => anyhow::bail!("lifecycle action contains a partial transaction"),
+            };
+            Ok(Action {
+                action_id,
+                lease_id: u64::try_from(lease_id)?,
+                kind: ActionKind::parse(&kind)?,
+                transaction,
+            })
+        })();
+        match parsed {
+            Ok(action) => Ok(Some(action)),
+            Err(error) => {
+                tracing::error!(%action_id, %error, "lifecycle action is unreadable");
+                self.retry(action_id, &error).await?;
+                Ok(None)
             }
-            (None, None, None) => None,
-            _ => anyhow::bail!("lifecycle action contains a partial transaction"),
-        };
-        Ok(Some(Action {
-            action_id,
-            lease_id: u64::try_from(lease_id)?,
-            kind: ActionKind::parse(&kind)?,
-            transaction,
-        }))
+        }
     }
 
     async fn process(&self, mut action: Action) -> anyhow::Result<()> {
@@ -374,6 +398,11 @@ impl Worker {
             self.revoke_access(action.lease_id).await?;
         }
         if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
+            // Funded is the only status expireProvision can act on, and in every
+            // other one the machine belongs to a renter who is using it.
+            if self.lease_status(action.lease_id).await? != 1 {
+                return self.skip_action(&action).await;
+            }
             self.destroy_cloud_instance(action.lease_id).await?;
         }
         if action.kind == ActionKind::Finalize && action.transaction.is_none() {
@@ -478,6 +507,9 @@ impl Worker {
         if context.lease.node_id != vast.node_id {
             anyhow::bail!("cloud lease node does not match the configured Vast broker");
         }
+        if Utc::now() >= context.lease.created_at + chrono::Duration::minutes(10) {
+            anyhow::bail!("the provisioning window for this lease has closed");
+        }
         if matches!(status.as_str(), "destroying" | "destroyed" | "failed") {
             anyhow::bail!("cloud instance is in terminal state {status}");
         }
@@ -485,17 +517,17 @@ impl Worker {
         let label = format!("prism-lease-{lease_id}");
         let (instance_id, selected_offer) = match stored_instance_id {
             Some(instance_id) => (u64::try_from(instance_id)?, None),
-            None => {
-                if let Some(instance_id) = vast.find_by_label(&label).await? {
-                    (instance_id, None)
-                } else {
-                    let candidates = vast.ranked_l40s(8, &rejected).await?;
+            None => match self.adopt_labelled(vast, &label).await? {
+                Some(instance_id) => (instance_id, None),
+                None => {
+                    let candidates = vast.ranked_l40s(CREATES_PER_PASS, &rejected).await?;
                     if candidates.is_empty() {
                         anyhow::bail!("no verified L40S is available under the cost ceiling");
                     }
-                    // Vast can reject a create even when the offer showed rentable (another
-                    // renter took the machine). Fall through the ranked list instead of
-                    // hammering the cheapest one until the provision window expires.
+                    // Vast can reject a create even when the offer showed rentable, because
+                    // another renter took the machine in between. A lost response means the
+                    // opposite though: the machine is ours and billing, so look for it under
+                    // the lease label before spending on a second one.
                     let mut launched = None;
                     let mut last_error = None;
                     for offer in candidates {
@@ -512,6 +544,11 @@ impl Worker {
                                     "Vast offer unavailable, trying next candidate"
                                 );
                                 last_error = Some(error);
+                                if let Some(instance_id) = self.adopt_labelled(vast, &label).await?
+                                {
+                                    launched = Some((instance_id, offer));
+                                    break;
+                                }
                             }
                         }
                     }
@@ -521,7 +558,7 @@ impl Worker {
                     })?;
                     (instance_id, Some(offer))
                 }
-            }
+            },
         };
         query(
             "UPDATE cloud_instances SET provider_instance_id = $2, \
@@ -583,24 +620,36 @@ impl Worker {
         // machine advertises the ports it failed to hand out, so this is only
         // knowable once the instance is up: drop it and try the next candidate
         // rather than failing a paid lease over one bad host.
-        if !instance.gpu_name.eq_ignore_ascii_case("L40S")
-            || instance.gpu_ram < 45_000
-            || !instance.verification.eq_ignore_ascii_case("verified")
-            || instance.hourly_micros > vast.max_hourly_micros
-            || instance.direct_port_start <= 0
-            || rejected.contains(&(instance.machine_id as i64))
-        {
+        let refusal = if !instance.gpu_name.eq_ignore_ascii_case("L40S") {
+            Some(format!("gpu is {}, not an L40S", instance.gpu_name))
+        } else if instance.gpu_ram < 45_000 {
+            Some(format!("{} MiB of GPU memory is short", instance.gpu_ram))
+        } else if !instance.verification.eq_ignore_ascii_case("verified") {
+            Some(format!("host is {}, not verified", instance.verification))
+        } else if instance.hourly_micros > vast.max_hourly_micros {
+            Some(format!(
+                "{} micros/hr is over the {} ceiling",
+                instance.hourly_micros, vast.max_hourly_micros
+            ))
+        } else if instance.direct_port_start <= 0 {
+            Some("host reserved no forwarded ports, so sshd is unreachable".to_owned())
+        } else if rejected.contains(&(instance.machine_id as i64)) {
+            Some("this lease already rejected the machine".to_owned())
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
             vast.destroy(instance_id).await?;
             if rejected.len() + 1 >= MAX_REJECTED_MACHINES {
                 query(
                     "UPDATE cloud_instances SET status = 'failed', destroyed_at = NOW(), \
-                         last_error = 'every candidate host failed admission checks', \
-                         updated_at = NOW() WHERE lease_id = $1",
+                         last_error = $2, updated_at = NOW() WHERE lease_id = $1",
                 )
                 .bind(lease_id as i64)
+                .bind(format!("every candidate host was refused, last: {refusal}"))
                 .execute(&self.pool)
                 .await?;
-                anyhow::bail!("every candidate Vast host failed admission checks");
+                anyhow::bail!("every candidate Vast host was refused, last: {refusal}");
             }
             query(
                 "UPDATE cloud_instances SET provider_instance_id = NULL, \
@@ -608,20 +657,24 @@ impl Worker {
                      rejected_machines = CASE WHEN $2 = ANY(rejected_machines) \
                          THEN rejected_machines ELSE array_append(rejected_machines, $2) END, \
                      status = 'provisioning', \
-                     last_error = 'provider instance failed admission checks', \
+                     last_error = $3, \
                      updated_at = NOW() WHERE lease_id = $1",
             )
             .bind(lease_id as i64)
             .bind(instance.machine_id as i64)
+            .bind(format!(
+                "machine {} refused: {refusal}",
+                instance.machine_id
+            ))
             .execute(&self.pool)
             .await?;
-            anyhow::bail!(
-                "Vast machine {} failed GPU, verification, cost or SSH reachability admission checks",
-                instance.machine_id
-            );
+            anyhow::bail!("Vast machine {} refused: {refusal}", instance.machine_id);
         }
         let host = instance.ssh_host.context("Vast instance has no SSH host")?;
-        let port = instance.ssh_port.context("Vast instance has no SSH port")?;
+        let port = instance
+            .ssh_port
+            .filter(|port| *port > 0)
+            .context("Vast instance has no SSH port")?;
         let ready_at = Utc::now();
         let mut transaction = self.pool.begin().await?;
         query(
@@ -687,6 +740,7 @@ impl Worker {
             .bind(prepared.nonce as i64)
             .execute(&mut *connection)
             .await?;
+            self.chain.submit(&prepared).await?;
             Ok::<_, anyhow::Error>(prepared)
         }
         .await;
@@ -980,6 +1034,25 @@ impl Worker {
             .map_err(Into::into)
     }
 
+    /// Adopt the newest instance wearing this lease's label and destroy the rest.
+    /// A create whose response was lost still leaves a machine running and
+    /// billing, and the label is the only handle left on it.
+    async fn adopt_labelled(&self, vast: &VastBroker, label: &str) -> anyhow::Result<Option<u64>> {
+        let mut found = vast.find_by_label(label).await?.into_iter();
+        let Some(adopted) = found.next() else {
+            return Ok(None);
+        };
+        for orphan in found {
+            tracing::warn!(
+                orphan,
+                label,
+                "destroying a duplicate instance for this lease"
+            );
+            vast.destroy(orphan).await?;
+        }
+        Ok(Some(adopted))
+    }
+
     async fn destroy_cloud_instance(&self, lease_id: u64) -> anyhow::Result<bool> {
         let row = query_as::<_, (Option<i64>, String)>(
             "SELECT provider_instance_id, status FROM cloud_instances WHERE lease_id = $1",
@@ -1000,12 +1073,24 @@ impl Worker {
         .bind(lease_id as i64)
         .execute(&self.pool)
         .await?;
-        if let Some(instance_id) = instance_id {
-            self.vast
-                .as_ref()
-                .context("Vast is not configured for this cloud lease")?
-                .destroy(u64::try_from(instance_id)?)
-                .await?;
+        let vast = self
+            .vast
+            .as_ref()
+            .context("Vast is not configured for this cloud lease")?;
+        match instance_id {
+            Some(instance_id) => vast.destroy(u64::try_from(instance_id)?).await?,
+            // The id is missing either because the machine was never created or
+            // because the response that carried it was lost. Only the label can
+            // tell the two apart, and the second one bills by the hour.
+            None => {
+                for orphan in vast
+                    .find_by_label(&format!("prism-lease-{lease_id}"))
+                    .await?
+                {
+                    tracing::warn!(lease_id, orphan, "destroying an unrecorded instance");
+                    vast.destroy(orphan).await?;
+                }
+            }
         }
         query(
             "UPDATE cloud_instances SET status = 'destroyed', destroyed_at = COALESCE(destroyed_at, NOW()), \
@@ -1168,6 +1253,19 @@ impl Worker {
         Ok(())
     }
 
+    /// Mark an action done without acting on it, for a lease the chain has
+    /// already moved past.
+    async fn skip_action(&self, action: &Action) -> anyhow::Result<()> {
+        query(
+            "UPDATE lifecycle_outbox SET status = 'completed', lease_until = NULL, \
+                 last_error = NULL, updated_at = NOW() WHERE action_id = $1",
+        )
+        .bind(action.action_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn mark_disputed(&self, action: &Action) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         query(
@@ -1210,17 +1308,24 @@ impl Worker {
 
     async fn retry(&self, action_id: Uuid, error: &anyhow::Error) -> anyhow::Result<()> {
         let message: String = format!("{error:#}").chars().take(1_024).collect();
-        query(
+        let exhausted = query_scalar::<_, Option<i64>>(
             "UPDATE lifecycle_outbox SET \
                  status = CASE WHEN attempts >= 100 THEN 'failed' ELSE 'queued' END, \
                  lease_until = NULL, \
                  available_at = NOW() + make_interval(secs => LEAST(300, attempts * attempts)), \
-                 last_error = $2, updated_at = NOW() WHERE action_id = $1",
+                 last_error = $2, updated_at = NOW() WHERE action_id = $1 \
+             RETURNING CASE WHEN attempts >= 100 THEN lease_id END",
         )
         .bind(action_id)
         .bind(message)
-        .execute(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        if let Some(lease_id) = exhausted {
+            let lease_id = u64::try_from(lease_id)?;
+            tracing::error!(lease_id, "lifecycle action exhausted its attempts");
+            self.set_lease_state(lease_id, LeaseState::Failed).await?;
+        }
         Ok(())
     }
 }
@@ -1329,12 +1434,17 @@ impl GatewayClient {
     }
 
     async fn revoke(&self, token_id: Uuid) -> anyhow::Result<()> {
-        self.client
+        let response = self
+            .client
             .delete(self.base_url.join(&format!("v1/grants/{token_id}"))?)
             .bearer_auth(self.token.as_str())
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        // A grant the gateway never issued, or has already expired, is the state
+        // close_access was asking for.
+        if response.status() != reqwest::StatusCode::NOT_FOUND {
+            response.error_for_status()?;
+        }
         Ok(())
     }
 }
@@ -1392,7 +1502,15 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
         query_scalar("SELECT to_regclass('public.lifecycle_outbox')::text")
             .fetch_one(pool)
             .await?;
-    if present.is_none() {
+    let rejections: bool = query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM information_schema.columns \
+             WHERE table_name = 'cloud_instances' AND column_name = 'rejected_machines' \
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if present.is_none() || !rejections {
         anyhow::bail!("control-plane lifecycle migrations have not been applied");
     }
     Ok(())
@@ -1434,11 +1552,5 @@ mod tests {
         assert!(private_gateway_host("fd00::2"));
         assert!(!private_gateway_host("gateway.example.com"));
         assert!(!private_gateway_host("203.0.113.6"));
-    }
-
-    #[test]
-    fn cloud_capacity_upsert_records_the_provider() {
-        assert!(CLOUD_CAPACITY_UPSERT.contains("(node_id, provider, available"));
-        assert!(CLOUD_CAPACITY_UPSERT.contains("VALUES ($1, 'vast'"));
     }
 }

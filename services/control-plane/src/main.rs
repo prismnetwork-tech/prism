@@ -259,8 +259,6 @@ enum StoreError {
     NoMatch,
     #[error("all compatible capacity is held by an open quote or an active lease")]
     CapacityReserved,
-    #[error("node is already running a lease")]
-    NodeBusy,
     #[error("matched offer exceeds the escrow limit")]
     EscrowLimit,
     #[error("telemetry sequence was already accepted")]
@@ -2549,7 +2547,17 @@ impl MarketplaceStore {
                             && !market.consumed_quotes.contains(&quote.quote_id)
                     })
                     .count();
-                if active_quote_count + market.leases.len() >= MAX_NETWORK_LEASES {
+                let unsettled = market
+                    .leases
+                    .values()
+                    .filter(|(_, lease)| {
+                        !matches!(
+                            lease.state,
+                            LeaseState::Finalized | LeaseState::Refunded | LeaseState::Failed
+                        )
+                    })
+                    .count();
+                if active_quote_count + unsettled >= MAX_NETWORK_LEASES {
                     return Err(StoreError::NetworkCapacity);
                 }
                 let mut reserved: BTreeSet<_> = market
@@ -2572,6 +2580,7 @@ impl MarketplaceStore {
                 let offers = market
                     .offers
                     .values()
+                    .filter(|offer| !market.suspended_nodes.contains(&offer.node_id))
                     .cloned()
                     .map(|mut offer| {
                         offer.online = market
@@ -2634,19 +2643,23 @@ impl MarketplaceStore {
                 .into_iter()
                 .collect();
                 let documents = query_scalar::<_, SqlJson<NodeOffer>>(
-                    "SELECT document FROM node_offers FOR UPDATE",
+                    "SELECT o.document FROM node_offers o \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM node_controls c \
+                         WHERE c.node_id = o.node_id AND c.suspended \
+                     ) \
+                     FOR UPDATE",
                 )
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
                 let online: BTreeSet<String> = query_scalar(
-                    "SELECT node_id FROM node_tunnels \
-                     WHERE observed_at >= NOW() - INTERVAL '90 seconds' \
+                    "SELECT node_id FROM node_tunnels WHERE observed_at >= $1 \
                      UNION \
                      SELECT node_id FROM cloud_capacity \
-                     WHERE provider = 'vast' AND available \
-                       AND observed_at >= NOW() - INTERVAL '90 seconds'",
+                     WHERE provider = 'vast' AND available AND observed_at >= $1",
                 )
+                .bind(Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS))
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?
@@ -2775,7 +2788,11 @@ impl MarketplaceStore {
                     .values()
                     .any(|(_, current)| current.node_id == lease.node_id && occupies_node(current))
                 {
-                    return Err(StoreError::NodeBusy);
+                    tracing::warn!(
+                        lease_id = lease.lease_id,
+                        node_id = %lease.node_id,
+                        "funding confirmed for a node this store still thinks is busy"
+                    );
                 }
                 market.consumed_quotes.insert(quote.quote_id);
                 market
@@ -2826,7 +2843,8 @@ impl MarketplaceStore {
                 let node_busy = query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
-                         WHERE document->>'node_id' = $1 AND state IN ('funded', 'provisioning', 'ready', 'active', 'closing') \
+                         WHERE document->>'node_id' = $1 \
+                           AND state IN ('funded', 'provisioning', 'ready', 'active', 'closing') \
                      )",
                 )
                 .bind(&lease.node_id)
@@ -2834,7 +2852,11 @@ impl MarketplaceStore {
                 .await
                 .map_err(StoreError::Storage)?;
                 if node_busy {
-                    return Err(StoreError::NodeBusy);
+                    tracing::warn!(
+                        lease_id = lease.lease_id,
+                        node_id = %lease.node_id,
+                        "funding confirmed for a node this store still thinks is busy"
+                    );
                 }
                 let consumed = query(
                     "UPDATE lease_quotes SET consumed_at = NOW() \
@@ -4011,6 +4033,17 @@ async fn match_lease(
             "minimum GPU memory must be non-zero",
         ));
     }
+    if payload
+        .request
+        .preferred_node_id
+        .as_deref()
+        .is_some_and(|node_id| !is_hash(node_id))
+    {
+        return Err(bad_request(
+            "invalid_node_id",
+            "preferred node must be a 32-byte hex node id",
+        ));
+    }
     state
         .store
         .quote(&account.subject, &payload.request)
@@ -4499,7 +4532,6 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
             "capacity_reserved",
             "all compatible capacity is held by an open quote or an active lease",
         ),
-        StoreError::NodeBusy => conflict("node_busy", "node is already running a lease"),
         StoreError::EscrowLimit => {
             bad_request("escrow_limit", "matched offer exceeds the escrow limit")
         }
@@ -4644,7 +4676,7 @@ fn registry_error(error: RegistryError) -> (StatusCode, Json<ApiError>) {
 }
 
 fn internal_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
-    tracing::error!(error = %error, "control-plane storage failure");
+    tracing::error!(error = ?error, "control-plane storage failure");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ApiError {

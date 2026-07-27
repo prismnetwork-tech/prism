@@ -166,6 +166,7 @@ node -e '
   if (summary.nodes[0].certificate_status !== "active") process.exit(1);
 ' "$supplier_summary"
 
+request='{"request":{"image":"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","duration_seconds":60,"min_vram_mib":16000,"preferred_node_id":null}}'
 node_suspend_id=018f0000-0000-7000-8000-000000000201
 node_suspend="{\"action_id\":\"$node_suspend_id\",\"action\":\"node_suspend\",\"target_id\":\"$node_id\",\"reason\":\"integration node suspension\",\"evidence_hash\":null}"
 curl --fail --silent \
@@ -176,6 +177,25 @@ curl --fail --silent \
   -d "$node_suspend" \
   "http://127.0.0.1:$port/v1/operator/controls" >/dev/null
 [[ $(curl --fail --silent "http://127.0.0.1:$port/v1/offers") == "[]" ]]
+# Suspension deletes the node's tunnel rows, so a tunnelled node drops out of
+# both listing and matching on its own. Broker capacity does not: its liveness
+# comes from cloud_capacity, which suspension does not touch, so matching used
+# to keep quoting and funding a node that had already left /v1/offers.
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -U prism -d prism -Atc \
+  "INSERT INTO cloud_capacity (node_id, provider, available, observed_at)
+   VALUES ('$node_id', 'vast', TRUE, NOW())
+   ON CONFLICT (node_id) DO UPDATE SET available = TRUE, observed_at = NOW();" >/dev/null
+[[ $(curl --fail --silent "http://127.0.0.1:$port/v1/offers") == "[]" ]]
+suspended_match=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -H "Content-Type: application/json" \
+  -H "x-prism-development-subject: did:privy:integration" \
+  -H "x-prism-development-session: session-integration" \
+  -H "x-request-id: suspended-match-integration" \
+  -d "$request" "http://127.0.0.1:$port/v1/leases/match")
+[[ $suspended_match == 404 ]]
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -U prism -d prism -Atc "DELETE FROM cloud_capacity WHERE node_id = '$node_id';" >/dev/null
 curl --fail --silent \
   -H "Content-Type: application/json" \
   -H "x-prism-development-subject: did:privy:operator" \
@@ -198,7 +218,6 @@ curl --fail --silent \
   -d "{\"connection_id\":\"integration-tunnel\",\"certificate_fingerprint\":\"$certificate_fingerprint\",\"observed_at\":\"$observed_at\"}" \
   "http://127.0.0.1:$port/v1/gateway/tunnels/$node_id" >/dev/null
 
-request='{"request":{"image":"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","duration_seconds":60,"min_vram_mib":16000,"preferred_node_id":null}}'
 auth_headers=(
   -H "Content-Type: application/json"
   -H "x-prism-development-subject: did:privy:integration"
