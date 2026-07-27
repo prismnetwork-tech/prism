@@ -15,10 +15,17 @@ matching settlement event. It is intentionally pseudonymous.
   "provider_paid_base_units": 0,
   "failure_class": null,
   "outcome": "finalized | refunded | disputed",
+  "trust_class": "open | isolated | attested | confidential",
   "receipt_hash": "sha256 canonical JSON hash",
   "transaction_hash": "Robinhood Chain transaction hash"
 }
 ```
+
+`trust_class` records what the renter was promised when the quote was issued,
+so a receipt states the terms it settled under and not just the amount. It is
+omitted entirely on receipts minted before the field existed, which keeps their
+canonical payload, and therefore the receipt hash already committed by their
+settlement transaction, byte-identical.
 
 `receipt_hash` is the SHA-256 hash of the canonical payload with the
 `receipt_hash` and `transaction_hash` fields omitted. The transaction hash
@@ -36,9 +43,10 @@ expose wallet addresses, precise geography, image digests, files, terminal
 output or private telemetry.
 
 Proof establishes an onchain payment event paired with a platform-attested
-usage record. It does not establish that a supplier executed a workload
-faithfully, that hardware was unmodified, or that the deployed contracts have
-no defect.
+usage record, under a stated trust class. It does not establish that a supplier
+executed a workload faithfully, that hardware was unmodified, or that the
+deployed contracts have no defect. Until hardware attestation is verified, a
+trust class above `open` is never published.
 
 The checked-in proof worker provides receipt-file aggregation, safe-chain
 event verification, public artifact generation and a daily X outbox.

@@ -23,8 +23,8 @@ use prism_protocol::{
     Account, CredentialCipher, EncryptedSecret, LeaseAccess, LeaseQuote, LeaseRecord, LeaseRequest,
     LeaseState, MAX_ESCROW_BASE_UNITS, MAX_LEASE_SECONDS, MAX_NETWORK_LEASES,
     NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
-    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer,
-    NodeTelemetry, SettlementEvidence, node_id, verifying_key,
+    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture,
+    NodeTelemetry, SettlementEvidence, TrustClass, node_id, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -56,6 +56,16 @@ const AUTH_MAX_AGE_SECONDS: i64 = 60;
 const NODE_MESSAGE_MAX_AGE_SECONDS: i64 = 300;
 const OFFER_MAX_AGE_SECONDS: i64 = 90;
 type HmacSha256 = Hmac<Sha256>;
+
+/// Broker-backed capacity reaches renters over direct SSH with no tunnel and
+/// no daemon, so it can never rise above `Open`. Everything stronger has to
+/// come from a device-signed posture on a node we hold a bond for.
+fn trust_class_for(tunneled: bool, posture: Option<&NodePosture>) -> TrustClass {
+    if !tunneled {
+        return TrustClass::Open;
+    }
+    posture.map_or(TrustClass::Open, NodePosture::effective_class)
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -2246,13 +2256,28 @@ impl MarketplaceStore {
                     .cloned()
                     .map(|mut offer| {
                         offer.online = true;
+                        offer.trust_class = trust_class_for(
+                            true,
+                            market
+                                .telemetry
+                                .get(&offer.node_id)
+                                .and_then(|telemetry| telemetry.posture.as_ref()),
+                        );
                         offer
                     })
                     .collect())
             }
             Self::Postgres(pool) => {
-                let documents = query_scalar::<_, SqlJson<NodeOffer>>(
-                    "SELECT o.document FROM node_offers o \
+                let documents =
+                    query_as::<_, (SqlJson<NodeOffer>, bool, Option<SqlJson<NodePosture>>)>(
+                        "SELECT o.document, \
+                            EXISTS ( \
+                                SELECT 1 FROM node_tunnels t \
+                                WHERE t.node_id = o.node_id AND t.observed_at >= $1 \
+                            ), \
+                            (SELECT nt.document->'posture' FROM node_telemetry nt \
+                             WHERE nt.node_id = o.node_id AND nt.observed_at >= $1) \
+                     FROM node_offers o \
                      WHERE (o.document->>'bonded')::boolean = true \
                        AND (document->>'public_image_only')::boolean = true \
                        AND (o.updated_at >= $1 OR EXISTS ( \
@@ -2278,15 +2303,17 @@ impl MarketplaceStore {
                        ) \
                        ) \
                      ORDER BY (o.document->>'rate_per_second')::bigint ASC, o.updated_at DESC",
-                )
-                .bind(cutoff)
-                .fetch_all(pool)
-                .await
-                .map_err(StoreError::Storage)?;
+                    )
+                    .bind(cutoff)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(StoreError::Storage)?;
                 Ok(documents
                     .into_iter()
-                    .map(|SqlJson(mut offer)| {
+                    .map(|(SqlJson(mut offer), tunneled, posture)| {
                         offer.online = true;
+                        offer.trust_class =
+                            trust_class_for(tunneled, posture.as_ref().map(|SqlJson(p)| p));
                         offer
                     })
                     .collect())
@@ -2680,6 +2707,7 @@ impl MarketplaceStore {
             duration_seconds: quote.duration_seconds,
             rate_per_second: quote.rate_per_second,
             maximum_escrow: quote.maximum_escrow,
+            trust_class: quote.trust_class,
             funding_transaction_hash: transaction_hash.to_ascii_lowercase(),
             state: LeaseState::Funded,
             created_at: now,
@@ -3383,15 +3411,23 @@ async fn health(
     }))
 }
 
+#[derive(Deserialize)]
+struct OfferFilter {
+    #[serde(default)]
+    min_trust: TrustClass,
+}
+
 async fn list_offers(
     State(state): State<AppState>,
+    Query(filter): Query<OfferFilter>,
 ) -> Result<Json<Vec<NodeOffer>>, (StatusCode, Json<ApiError>)> {
-    state
-        .store
-        .list_offers()
-        .await
-        .map(Json)
-        .map_err(internal_error)
+    let offers = state.store.list_offers().await.map_err(internal_error)?;
+    Ok(Json(
+        offers
+            .into_iter()
+            .filter(|offer| offer.trust_class >= filter.min_trust)
+            .collect(),
+    ))
 }
 
 async fn enroll_node(
@@ -3453,6 +3489,7 @@ async fn enroll_node(
         bonded: false,
         online: false,
         public_image_only: true,
+        trust_class: TrustClass::Open,
         updated_at: Utc::now(),
     };
     offer.bonded = state
@@ -4128,6 +4165,7 @@ fn quote_for_offers<'a>(
         .filter(|offer| offer.online && offer.bonded && offer.public_image_only)
         .filter(|offer| offer.updated_at >= cutoff && !reserved.contains(&offer.node_id))
         .filter(|offer| offer.gpu.vram_mib >= request.min_vram_mib)
+        .filter(|offer| offer.trust_class >= request.min_trust_class)
         .filter(|offer| {
             request
                 .preferred_node_id
@@ -4156,6 +4194,7 @@ fn quote_for_offers<'a>(
         min_vram_mib: request.min_vram_mib,
         rate_per_second: selected.rate_per_second,
         maximum_escrow,
+        trust_class: selected.trust_class,
         expires_at: Utc::now() + Duration::minutes(5),
     })
 }
@@ -4571,7 +4610,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_protocol::GpuSpec;
+    use prism_protocol::{GpuSpec, IsolationMode, NodePosture};
 
     fn offer(node_id: &str, rate_per_second: u64, benchmark_score: u32) -> NodeOffer {
         NodeOffer {
@@ -4590,6 +4629,7 @@ mod tests {
             bonded: true,
             online: true,
             public_image_only: true,
+            trust_class: TrustClass::Open,
             updated_at: Utc::now(),
         }
     }
@@ -4605,6 +4645,7 @@ mod tests {
                 duration_seconds: 60,
                 min_vram_mib: 16_000,
                 preferred_node_id: None,
+                min_trust_class: TrustClass::Open,
             },
             [&slower, &faster, &expensive],
             &BTreeSet::new(),
@@ -4613,6 +4654,75 @@ mod tests {
 
         assert_eq!(quote.node_id, "faster");
         assert_eq!(quote.maximum_escrow, 6_000);
+        assert_eq!(quote.trust_class, TrustClass::Open);
+    }
+
+    #[test]
+    fn matching_refuses_offers_below_the_requested_trust_class() {
+        let broker = offer("broker", 100, 10_000);
+        let mut isolated = offer("isolated", 900, 1_000);
+        isolated.trust_class = TrustClass::Isolated;
+        let request = |min_trust_class| LeaseRequest {
+            image: "registry.example/runtime@sha256:abc".to_owned(),
+            duration_seconds: 60,
+            min_vram_mib: 16_000,
+            preferred_node_id: None,
+            min_trust_class,
+        };
+
+        let cheapest = quote_for_offers(
+            &request(TrustClass::Open),
+            [&broker, &isolated],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(cheapest.node_id, "broker");
+
+        let guarded = quote_for_offers(
+            &request(TrustClass::Isolated),
+            [&broker, &isolated],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(guarded.node_id, "isolated");
+        assert_eq!(guarded.trust_class, TrustClass::Isolated);
+
+        assert!(matches!(
+            quote_for_offers(
+                &request(TrustClass::Confidential),
+                [&broker, &isolated],
+                &BTreeSet::new()
+            ),
+            Err(StoreError::NoMatch)
+        ));
+    }
+
+    #[test]
+    fn broker_capacity_cannot_rise_above_open() {
+        let kata = NodePosture {
+            isolation: IsolationMode::KataVfio,
+            attestation: None,
+        };
+
+        assert_eq!(trust_class_for(false, Some(&kata)), TrustClass::Open);
+        assert_eq!(trust_class_for(true, Some(&kata)), TrustClass::Isolated);
+        assert_eq!(trust_class_for(true, None), TrustClass::Open);
+    }
+
+    #[test]
+    fn attested_hardware_claims_are_capped_until_a_verifier_exists() {
+        let confidential = NodePosture {
+            isolation: IsolationMode::KataVfio,
+            attestation: Some(prism_protocol::AttestationRef {
+                kind: prism_protocol::AttestationKind::NvidiaCc,
+                quote_sha256: "0".repeat(64),
+            }),
+        };
+
+        assert_eq!(
+            trust_class_for(true, Some(&confidential)),
+            prism_protocol::MAX_VERIFIABLE_TRUST_CLASS
+        );
     }
 
     #[test]
@@ -4624,6 +4734,7 @@ mod tests {
                 duration_seconds: MAX_LEASE_SECONDS,
                 min_vram_mib: 1,
                 preferred_node_id: None,
+                min_trust_class: TrustClass::Open,
             },
             [&offer],
             &BTreeSet::new(),
@@ -4644,6 +4755,7 @@ mod tests {
                 duration_seconds: 60,
                 min_vram_mib: 1,
                 preferred_node_id: None,
+                min_trust_class: TrustClass::Open,
             },
             [&reserved, &stale, &available],
             &BTreeSet::from(["reserved".to_owned()]),
@@ -4804,6 +4916,7 @@ mod tests {
             duration_seconds: 60,
             min_vram_mib: 1,
             preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
         };
         let mut tasks = Vec::new();
         for index in 0..MAX_NETWORK_LEASES {
@@ -4839,6 +4952,7 @@ mod tests {
                 duration_seconds: 60,
                 rate_per_second: 100,
                 maximum_escrow: 6_000,
+                trust_class: TrustClass::Open,
                 funding_transaction_hash: format!("0x{index:064x}"),
                 state: LeaseState::Funded,
                 created_at: now,
@@ -4890,6 +5004,7 @@ mod tests {
             min_vram_mib: 16_000,
             rate_per_second: 100,
             maximum_escrow: 60_000,
+            trust_class: TrustClass::Open,
             expires_at: Utc::now() + Duration::minutes(5),
         };
         let lease_id = 42_u64;
@@ -4974,6 +5089,7 @@ mod tests {
             duration_seconds: 60,
             rate_per_second: 100,
             maximum_escrow: 6_000,
+            trust_class: TrustClass::Open,
             funding_transaction_hash: format!("0x{}", "cc".repeat(32)),
             state: LeaseState::Funded,
             created_at: now,

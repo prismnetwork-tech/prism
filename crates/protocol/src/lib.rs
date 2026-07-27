@@ -56,6 +56,93 @@ pub struct GpuSpec {
     pub cuda_major: u16,
 }
 
+/// What a renter can rely on for a given offer, ordered from weakest to
+/// strongest. Every level above `Open` must be earned from evidence the
+/// control plane can check itself; a node cannot talk its way up.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustClass {
+    /// Bonded identity and metered billing. The operator can read anything the
+    /// workload touches.
+    #[default]
+    Open,
+    /// Kata VM with exclusive VFIO passthrough and a digest-pinned public
+    /// image. Narrows the attack surface; the host is still privileged.
+    Isolated,
+    /// Launch measurement and GPU device identity verified against vendor
+    /// roots, so the renter can check what booted.
+    Attested,
+    /// Guest memory and VRAM are encrypted against the host.
+    Confidential,
+}
+
+/// The strongest class the network can currently substantiate. Attestation
+/// evidence is carried end to end but not yet verified, so nothing is served
+/// above `Isolated` no matter what a node claims. Raise this only when a
+/// verifier is wired in.
+pub const MAX_VERIFIABLE_TRUST_CLASS: TrustClass = TrustClass::Isolated;
+
+impl TrustClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Isolated => "isolated",
+            Self::Attested => "attested",
+            Self::Confidential => "confidential",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationMode {
+    #[default]
+    Shared,
+    KataVfio,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationKind {
+    SevSnp,
+    Tdx,
+    NvidiaCc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestationRef {
+    pub kind: AttestationKind,
+    pub quote_sha256: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodePosture {
+    pub isolation: IsolationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<AttestationRef>,
+}
+
+impl NodePosture {
+    /// The class this posture would justify if every piece of evidence in it
+    /// checked out. Callers must clamp it with [`MAX_VERIFIABLE_TRUST_CLASS`].
+    pub fn claimed_class(&self) -> TrustClass {
+        match (self.isolation, self.attestation.as_ref()) {
+            (IsolationMode::Shared, _) => TrustClass::Open,
+            (IsolationMode::KataVfio, None) => TrustClass::Isolated,
+            (IsolationMode::KataVfio, Some(attestation)) => match attestation.kind {
+                AttestationKind::NvidiaCc => TrustClass::Confidential,
+                AttestationKind::SevSnp | AttestationKind::Tdx => TrustClass::Attested,
+            },
+        }
+    }
+
+    pub fn effective_class(&self) -> TrustClass {
+        self.claimed_class().min(MAX_VERIFIABLE_TRUST_CLASS)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeOffer {
     pub node_id: String,
@@ -69,6 +156,8 @@ pub struct NodeOffer {
     pub bonded: bool,
     pub online: bool,
     pub public_image_only: bool,
+    #[serde(default)]
+    pub trust_class: TrustClass,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -143,9 +232,13 @@ pub struct NodeTelemetry {
     pub active_lease: Option<String>,
     pub tunnel_connected: bool,
     pub image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posture: Option<NodePosture>,
     pub signature: String,
 }
 
+/// Skipping `posture` when absent keeps the canonical payload byte-identical
+/// to the pre-posture format, so nodes running older builds still verify.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnsignedTelemetry {
     pub node_id: String,
@@ -156,6 +249,8 @@ pub struct UnsignedTelemetry {
     pub active_lease: Option<String>,
     pub tunnel_connected: bool,
     pub image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posture: Option<NodePosture>,
 }
 
 impl NodeTelemetry {
@@ -171,6 +266,7 @@ impl NodeTelemetry {
             active_lease: unsigned.active_lease,
             tunnel_connected: unsigned.tunnel_connected,
             image_digest: unsigned.image_digest,
+            posture: unsigned.posture,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         })
     }
@@ -186,6 +282,7 @@ impl NodeTelemetry {
                 active_lease: self.active_lease.clone(),
                 tunnel_connected: self.tunnel_connected,
                 image_digest: self.image_digest.clone(),
+                posture: self.posture.clone(),
             },
             &self.signature,
             key,
@@ -308,6 +405,8 @@ pub struct LeaseRequest {
     pub duration_seconds: u32,
     pub min_vram_mib: u32,
     pub preferred_node_id: Option<String>,
+    #[serde(default)]
+    pub min_trust_class: TrustClass,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +418,8 @@ pub struct LeaseQuote {
     pub min_vram_mib: u32,
     pub rate_per_second: u64,
     pub maximum_escrow: u64,
+    #[serde(default)]
+    pub trust_class: TrustClass,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -347,6 +448,8 @@ pub struct LeaseRecord {
     pub duration_seconds: u32,
     pub rate_per_second: u64,
     pub maximum_escrow: u64,
+    #[serde(default)]
+    pub trust_class: TrustClass,
     pub funding_transaction_hash: String,
     pub state: LeaseState,
     pub created_at: DateTime<Utc>,
@@ -516,6 +619,8 @@ pub struct PublicReceipt {
     pub provider_paid_base_units: u64,
     pub failure_class: Option<String>,
     pub outcome: ReceiptOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_class: Option<TrustClass>,
     pub receipt_hash: String,
     pub transaction_hash: String,
 }
@@ -536,6 +641,8 @@ pub struct SettlementEvidence {
     pub cuda_ready_at: u64,
     pub interactive_access_ready_at: u64,
     pub gateway_closed_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_class: Option<TrustClass>,
     #[serde(default)]
     pub execution: ExecutionEvidence,
     pub node_telemetry: Vec<NodeTelemetry>,
@@ -564,6 +671,8 @@ struct ReceiptPayload {
     provider_paid_base_units: u64,
     failure_class: Option<String>,
     outcome: ReceiptOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_class: Option<TrustClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -692,6 +801,7 @@ pub fn receipt_hash(receipt: &PublicReceipt) -> Result<String, ProtocolError> {
         provider_paid_base_units: receipt.provider_paid_base_units,
         failure_class: receipt.failure_class.clone(),
         outcome: receipt.outcome.clone(),
+        trust_class: receipt.trust_class,
     };
     Ok(hex::encode(Sha256::digest(canonical_json(&payload)?)))
 }
@@ -759,12 +869,104 @@ mod tests {
                 active_lease: None,
                 tunnel_connected: true,
                 image_digest: Some("sha256:abc".to_owned()),
+                posture: None,
             },
             &key,
         )
         .unwrap();
 
         assert!(telemetry.verify(&key.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn telemetry_without_posture_signs_the_legacy_payload() {
+        let unsigned = UnsignedTelemetry {
+            node_id: "0xabc".to_owned(),
+            sequence: 1,
+            observed_at: Utc::now(),
+            gpu_utilization_bps: 0,
+            gpu_memory_used_mib: 0,
+            active_lease: None,
+            tunnel_connected: true,
+            image_digest: None,
+            posture: None,
+        };
+
+        assert!(!canonical_json(&unsigned).unwrap().contains("posture"));
+    }
+
+    #[test]
+    fn telemetry_posture_is_covered_by_the_signature() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut telemetry = NodeTelemetry::sign(
+            UnsignedTelemetry {
+                node_id: node_id(&key.verifying_key()),
+                sequence: 1,
+                observed_at: Utc::now(),
+                gpu_utilization_bps: 0,
+                gpu_memory_used_mib: 0,
+                active_lease: None,
+                tunnel_connected: true,
+                image_digest: None,
+                posture: Some(NodePosture {
+                    isolation: IsolationMode::KataVfio,
+                    attestation: None,
+                }),
+            },
+            &key,
+        )
+        .unwrap();
+
+        assert!(telemetry.verify(&key.verifying_key()).is_ok());
+        telemetry.posture = None;
+        assert!(telemetry.verify(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn trust_classes_order_weakest_first() {
+        assert!(TrustClass::Open < TrustClass::Isolated);
+        assert!(TrustClass::Isolated < TrustClass::Attested);
+        assert!(TrustClass::Attested < TrustClass::Confidential);
+        assert_eq!(TrustClass::default(), TrustClass::Open);
+    }
+
+    #[test]
+    fn offers_without_a_trust_class_default_to_open() {
+        let document = serde_json::json!({
+            "node_id": "0xabc",
+            "operator_wallet": "0x1111111111111111111111111111111111111111",
+            "payout_wallet": "0x2222222222222222222222222222222222222222",
+            "device_public_key": "key",
+            "gpu": {"model": "NVIDIA L40S", "vram_mib": 46_068, "cuda_major": 12},
+            "rate_per_second": 222,
+            "reliability_bps": 10_000,
+            "benchmark_score": 10_000,
+            "bonded": true,
+            "online": true,
+            "public_image_only": true,
+            "updated_at": "2026-07-24T00:00:00Z",
+        });
+        let offer: NodeOffer = serde_json::from_value(document).unwrap();
+
+        assert_eq!(offer.trust_class, TrustClass::Open);
+    }
+
+    #[test]
+    fn posture_claims_are_clamped_to_what_the_network_can_verify() {
+        let confidential = NodePosture {
+            isolation: IsolationMode::KataVfio,
+            attestation: Some(AttestationRef {
+                kind: AttestationKind::NvidiaCc,
+                quote_sha256: "0".repeat(64),
+            }),
+        };
+
+        assert_eq!(confidential.claimed_class(), TrustClass::Confidential);
+        assert_eq!(confidential.effective_class(), MAX_VERIFIABLE_TRUST_CLASS);
+
+        let shared = NodePosture::default();
+        assert_eq!(shared.claimed_class(), TrustClass::Open);
+        assert_eq!(shared.effective_class(), TrustClass::Open);
     }
 
     #[test]
@@ -805,6 +1007,7 @@ mod tests {
             provider_paid_base_units: 900,
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
+            trust_class: None,
             receipt_hash: String::new(),
             transaction_hash: "0x5678".to_owned(),
         };
@@ -816,6 +1019,61 @@ mod tests {
         receipt.runtime_seconds = 60;
         receipt.transaction_hash = "0x9999".to_owned();
         assert!(receipt_hash_matches(&receipt).unwrap());
+    }
+
+    /// Receipts already published on chain carry no trust class. Their hashes
+    /// are committed by settlement transactions, so the payload must still
+    /// serialize exactly as it did before the field existed.
+    #[test]
+    fn receipts_without_a_trust_class_keep_their_published_hash() {
+        let receipt_id = Uuid::now_v7();
+        let receipt = PublicReceipt {
+            receipt_id,
+            lease_id: "11".to_owned(),
+            node_id_hash: "0x1234".to_owned(),
+            gpu_model: "NVIDIA L40S".to_owned(),
+            runtime_seconds: 300,
+            charged_base_units: 66_600,
+            refunded_base_units: 0,
+            provider_paid_base_units: 59_940,
+            failure_class: None,
+            outcome: ReceiptOutcome::Finalized,
+            trust_class: None,
+            receipt_hash: String::new(),
+            transaction_hash: "0x3669fa89".to_owned(),
+        };
+        let legacy = format!(
+            r#"{{"receipt_id":"{receipt_id}","lease_id":"11","node_id_hash":"0x1234","gpu_model":"NVIDIA L40S","runtime_seconds":300,"charged_base_units":66600,"refunded_base_units":0,"provider_paid_base_units":59940,"failure_class":null,"outcome":"finalized"}}"#
+        );
+
+        assert_eq!(
+            receipt_hash(&receipt).unwrap(),
+            hex::encode(Sha256::digest(legacy))
+        );
+    }
+
+    #[test]
+    fn receipt_hashes_cover_the_trust_class() {
+        let mut receipt = PublicReceipt {
+            receipt_id: Uuid::now_v7(),
+            lease_id: "12".to_owned(),
+            node_id_hash: "0x1234".to_owned(),
+            gpu_model: "NVIDIA L40S".to_owned(),
+            runtime_seconds: 300,
+            charged_base_units: 66_600,
+            refunded_base_units: 0,
+            provider_paid_base_units: 59_940,
+            failure_class: None,
+            outcome: ReceiptOutcome::Finalized,
+            trust_class: Some(TrustClass::Open),
+            receipt_hash: String::new(),
+            transaction_hash: "0x3669fa89".to_owned(),
+        };
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        assert!(receipt_hash_matches(&receipt).unwrap());
+        receipt.trust_class = Some(TrustClass::Confidential);
+        assert!(!receipt_hash_matches(&receipt).unwrap());
     }
 
     #[test]

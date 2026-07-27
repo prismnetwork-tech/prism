@@ -7,6 +7,8 @@ import tempfile
 import time
 from dataclasses import dataclass
 
+from urllib.parse import urlencode
+
 import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -18,6 +20,10 @@ USDG = Web3.to_checksum_address("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168")
 
 # A digest-pinned image, matching the Node SDK so a default can't drift.
 DEFAULT_IMAGE = "docker.io/ollama/ollama@sha256:a61a8fd395dbb931cc8cb1b5da7a2510746575c87113fdc45b647ee59ef7f808"
+
+# Weakest to strongest. "open" means the supplier can read everything the
+# workload touches, so raise it for anything sensitive.
+TRUST_CLASSES = ("open", "isolated", "attested", "confidential")
 
 CONFIRMATIONS = 12
 FETCH_TIMEOUT = 30
@@ -40,6 +46,12 @@ _ESCROW = [
 ]
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+
+
+def _trust_class(value: str) -> str:
+    if value not in TRUST_CLASSES:
+        raise PrismError(400, "invalid_trust_class", {"expected": list(TRUST_CLASSES)})
+    return value
 
 
 class PrismError(Exception):
@@ -93,8 +105,8 @@ class PrismAgent:
         self.session = session["session"]
         return session
 
-    def offers(self) -> list:
-        return self._proxy("GET", ["offers"])
+    def offers(self, min_trust: str = "open") -> list:
+        return self._proxy("GET", ["offers"], query={"min_trust": _trust_class(min_trust)})
 
     def balances(self) -> dict:
         return {
@@ -104,7 +116,7 @@ class PrismAgent:
         }
 
     def quote(self, image: str, duration_seconds: int, min_vram_mib: int = 16000,
-              preferred_node_id: str | None = None) -> dict:
+              preferred_node_id: str | None = None, min_trust_class: str = "open") -> dict:
         if not isinstance(image, str) or not _DIGEST.search(image):
             raise PrismError(400, "image_must_be_digest_pinned")
         return self._proxy("POST", ["leases", "match"], {"request": {
@@ -112,6 +124,7 @@ class PrismAgent:
             "duration_seconds": duration_seconds,
             "min_vram_mib": min_vram_mib,
             "preferred_node_id": preferred_node_id,
+            "min_trust_class": _trust_class(min_trust_class),
         }})
 
     def confirm(self, quote_id: str, transaction_hash: str, ssh_authorized_key: str) -> dict:
@@ -139,10 +152,11 @@ class PrismAgent:
         raise PrismError(408, "access_timeout")
 
     def lease(self, image: str, duration_seconds: int, min_vram_mib: int = 16000,
-              preferred_node_id: str | None = None, max_deposit: int | None = None) -> Lease:
+              preferred_node_id: str | None = None, max_deposit: int | None = None,
+              min_trust_class: str = "open") -> Lease:
         if not self.session:
             self.authenticate()
-        quote = self.quote(image, duration_seconds, min_vram_mib, preferred_node_id)
+        quote = self.quote(image, duration_seconds, min_vram_mib, preferred_node_id, min_trust_class)
         if max_deposit is not None and int(quote["maximum_escrow"]) > int(max_deposit):
             raise PrismError(402, "cost_exceeds_max",
                              {"required": quote["maximum_escrow"], "max": str(max_deposit)})
@@ -211,15 +225,17 @@ class PrismAgent:
                 time.sleep(2)
         return h.hex()
 
-    def _proxy(self, method: str, segments: list, body=None, raw: bool = False, reauthed: bool = False):
+    def _proxy(self, method: str, segments: list, body=None, raw: bool = False,
+               reauthed: bool = False, query: dict | None = None):
         if not self.session:
             self.authenticate()
-        res = self._request(f"/api/agent/proxy/{'/'.join(segments)}", method, body,
+        search = f"?{urlencode(query)}" if query else ""
+        res = self._request(f"/api/agent/proxy/{'/'.join(segments)}{search}", method, body,
                             {"authorization": f"Bearer {self.session}"})
         if res.status_code == 401 and not reauthed:
             self.session = None
             self.authenticate()
-            return self._proxy(method, segments, body, raw, True)
+            return self._proxy(method, segments, body, raw, True, query)
         if raw:
             return res.status_code, _safe_json(res)
         return self._unwrap(res)

@@ -152,15 +152,16 @@ export function LandingPage() {
           </div>
           <div className="security-copy">
             <p className="section-index">04 / Isolation</p>
-            <h2>Ephemeral workspaces with a defined security boundary.</h2>
+            <h2>Every offer states what it protects.</h2>
             <p>
-              Each cloud lease starts in a fresh container with temporary credentials. Workspace
-              storage is destroyed when the instance closes, but the infrastructure provider remains inside
-              the trust boundary.
+              Each cloud lease starts in a fresh container with temporary credentials, and workspace
+              storage is destroyed when the instance closes. What differs between suppliers is how much
+              the host can see, so every offer carries a trust class and agents can refuse anything below
+              the level they need.
             </p>
             <div className="security-disclosure">
               <span>Security scope</span>
-              <p>Do not place private keys, production credentials or confidential data in a workspace. Container isolation is not hardware-backed confidential computing.</p>
+              <p>Today&rsquo;s capacity is open class: the host operator remains inside the trust boundary, so keep private keys, production credentials and model weights off it. Stronger classes are earned from hardware attestation, never from a supplier&rsquo;s own claim.</p>
             </div>
           </div>
         </section>

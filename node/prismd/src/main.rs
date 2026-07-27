@@ -12,10 +12,10 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use prism_protocol::{
-    GpuSpec, NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
-    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeCommandReportPayload,
-    NodeEnrollment, NodeTelemetry, UnsignedNodeCertificateRequest, UnsignedNodeEnrollment,
-    UnsignedTelemetry, node_id,
+    GpuSpec, IsolationMode, NodeCertificateBundle, NodeCertificateRequest, NodeCommand,
+    NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport,
+    NodeCommandReportPayload, NodeEnrollment, NodePosture, NodeTelemetry,
+    UnsignedNodeCertificateRequest, UnsignedNodeEnrollment, UnsignedTelemetry, node_id,
 };
 use rand::RngCore;
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
@@ -555,6 +555,19 @@ fn persist_certificate_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> 
     result
 }
 
+/// Reported under the device signature, so a node that overstates its
+/// isolation has signed the claim the network would slash it for.
+fn local_posture() -> NodePosture {
+    let isolation = match runtime::discover_vfio_gpu_groups() {
+        Ok(groups) if !groups.is_empty() => IsolationMode::KataVfio,
+        _ => IsolationMode::Shared,
+    };
+    NodePosture {
+        isolation,
+        attestation: None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_telemetry(
     identity_path: &Path,
@@ -583,6 +596,7 @@ async fn publish_telemetry(
             active_lease,
             tunnel_connected,
             image_digest,
+            posture: Some(local_posture()),
         },
         &signing_key,
     )?;

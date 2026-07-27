@@ -4,7 +4,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { DEFAULT_IMAGE, PrismAgent } from "@prismnetwork/agent-sdk";
+import { DEFAULT_IMAGE, PrismAgent, TRUST_CLASSES } from "@prismnetwork/agent-sdk";
 
 const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 
@@ -55,8 +55,17 @@ const TOOLS = [
   },
   {
     name: "prism_list_gpus",
-    description: "List GPUs currently available to lease on Prism Network, with model, VRAM, and price per second in USDG.",
-    inputSchema: { type: "object", properties: {} },
+    description: "List GPUs currently available to lease on Prism Network, with model, VRAM, price per second in USDG, and trust class. Trust class runs open < isolated < attested < confidential; on an 'open' supplier the host operator can read anything the workload touches, so never send secrets, credentials or private model weights to one.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        min_trust: {
+          type: "string",
+          enum: TRUST_CLASSES,
+          description: "Only list suppliers at or above this trust class (default 'open').",
+        },
+      },
+    },
   },
   {
     name: "prism_lease_and_run",
@@ -67,6 +76,11 @@ const TOOLS = [
         command: { type: "string", description: "Shell command to run on the GPU (e.g. 'nvidia-smi')." },
         duration_seconds: { type: "integer", description: "Lease length in seconds (default 900, max 21600)." },
         min_vram_mib: { type: "integer", description: "Minimum GPU memory in MiB (default 16000)." },
+        min_trust_class: {
+          type: "string",
+          enum: TRUST_CLASSES,
+          description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
+        },
       },
       required: ["command"],
     },
@@ -79,6 +93,11 @@ const TOOLS = [
       properties: {
         duration_seconds: { type: "integer", description: "Lease length in seconds (default 900, max 21600)." },
         min_vram_mib: { type: "integer", description: "Minimum GPU memory in MiB (default 16000)." },
+        min_trust_class: {
+          type: "string",
+          enum: TRUST_CLASSES,
+          description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
+        },
       },
     },
   },
@@ -113,7 +132,7 @@ async function handle(name, args) {
   }
   if (name === "prism_list_gpus") {
     await ensureAuth();
-    const offers = await agent.offers();
+    const offers = await agent.offers({ minTrust: args.min_trust ?? "open" });
     return {
       available: offers.length,
       gpus: offers.map((o) => ({
@@ -121,6 +140,7 @@ async function handle(name, args) {
         vram_mib: o.gpu.vram_mib,
         price_per_second: usdg(o.rate_per_second),
         price_per_hour: usdg(o.rate_per_second * 3600),
+        trust: o.trust_class,
       })),
     };
   }
@@ -132,11 +152,13 @@ async function handle(name, args) {
       image: IMAGE,
       durationSeconds: args.duration_seconds ?? 900,
       minVramMib: args.min_vram_mib ?? 16000,
+      minTrustClass: args.min_trust_class ?? "open",
     });
     leases.set(lease.leaseId, lease);
     const summary = {
       lease_id: lease.leaseId,
       ssh: { host: lease.access.ssh_host, port: lease.access.ssh_port, user: lease.access.ssh_user },
+      trust: lease.quote?.trust_class ?? "open",
       expires_at: lease.access.expires_at,
     };
     if (name === "prism_lease") return summary;

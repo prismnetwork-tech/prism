@@ -492,6 +492,7 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         provider_paid_base_units: charged_base_units - charged_base_units * 1_000 / 10_000,
         failure_class: None,
         outcome: ReceiptOutcome::Finalized,
+        trust_class: evidence.trust_class,
         receipt_hash: String::new(),
         transaction_hash: String::new(),
     };
@@ -971,6 +972,7 @@ mod tests {
                         active_lease: Some("1".to_owned()),
                         tunnel_connected: true,
                         image_digest: Some(image_digest.clone()),
+                        posture: None,
                     },
                     &key,
                 )
@@ -992,6 +994,7 @@ mod tests {
             cuda_ready_at: 10,
             interactive_access_ready_at: 20,
             gateway_closed_at: 100,
+            trust_class: None,
             execution: ExecutionEvidence::Physical,
             node_telemetry: telemetry,
         }

@@ -856,6 +856,7 @@ mod tests {
                 provider_paid_base_units: 1_125_000,
                 failure_class: None,
                 outcome: ReceiptOutcome::Finalized,
+                trust_class: None,
                 receipt_hash: String::new(),
                 transaction_hash: format!("0x{}", "a".repeat(64)),
             },
@@ -870,6 +871,7 @@ mod tests {
                 provider_paid_base_units: 0,
                 failure_class: Some("provisioning_timeout".to_owned()),
                 outcome: ReceiptOutcome::Refunded,
+                trust_class: None,
                 receipt_hash: String::new(),
                 transaction_hash: format!("0x{}", "b".repeat(64)),
             },
@@ -899,6 +901,7 @@ mod tests {
             provider_paid_base_units: 1,
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
+            trust_class: None,
             receipt_hash: String::new(),
             transaction_hash: format!("0x{}", "b".repeat(64)),
         };
@@ -1040,6 +1043,7 @@ mod tests {
             provider_paid_base_units: 900_000,
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
+            trust_class: None,
             receipt_hash: String::new(),
             transaction_hash: format!("0x{}", transaction.to_string().repeat(64)),
         }

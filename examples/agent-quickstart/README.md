@@ -34,7 +34,8 @@ wallet funded with USDG and native Robinhood-Chain gas (see the SDK's
 
 ## Before you point it at real funds
 
-Prism is pre-production and unaudited; mainnet escrow is paused pending a funded
-canary and physical-hardware validation. Run against a development deployment,
-and do not lease with a wallet or workload you cannot afford to lose. A permissionless
-supplier is not a trusted computing environment.
+Prism is pre-production and unaudited, so do not lease with a wallet or workload
+you cannot afford to lose. Every offer carries a trust class; all capacity live
+today is `open`, which means the host operator can read anything the workload
+touches. Pass `minTrustClass` (`min_trust_class` in Python) to refuse anything
+weaker than you need.
