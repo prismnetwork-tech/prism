@@ -91,7 +91,7 @@ log("canary OK.");
 log(`funding tx: ${TX}${lease.fundingHash}`);
 log(`lease id:   ${lease.leaseId}`);
 log("settlement (SettlementProposed, receiptHash) is proposed on-chain after the lease window;");
-log("finalize() unlocks 24h later (DISPUTE_WINDOW), then the receipt publishes to /proof.");
+log("finalize() unlocks after DISPUTE_WINDOW (5 minutes on the deployed escrow), then the receipt publishes to /proof.");
 
 function env(name) {
   const v = process.env[name];
