@@ -318,7 +318,8 @@ async fn process_settlement(
     else {
         return Ok(());
     };
-    let finalize_at = DateTime::from_timestamp(block_time as i64 + 86_400, 0)
+    let dispute_window = chain.dispute_window(escrow).await?;
+    let finalize_at = DateTime::from_timestamp(block_time as i64 + dispute_window as i64, 0)
         .context("settlement finalization time is invalid")?;
     let mut transaction = pool.begin().await?;
     query(
@@ -771,6 +772,34 @@ impl ChainClient {
         .context("RPC quantity exceeds uint64")
     }
 
+    /// The escrow decides how long a proposal can be disputed. Reading it beats
+    /// assuming: the value is a constant in a non-upgradeable contract, so a
+    /// hardcoded guess is wrong for every deployment that does not share it.
+    async fn dispute_window(&self, escrow: [u8; 20]) -> anyhow::Result<u64> {
+        let selector = Keccak256::digest(b"DISPUTE_WINDOW()");
+        let value: String = self
+            .call(
+                "eth_call",
+                serde_json::json!([
+                    {
+                        "to": format!("0x{}", hex::encode(escrow)),
+                        "data": format!("0x{}", hex::encode(&selector[..4])),
+                    },
+                    "latest"
+                ]),
+            )
+            .await?;
+        let raw = value
+            .strip_prefix("0x")
+            .context("dispute window is not hex")?;
+        let window = u64::from_str_radix(raw.trim_start_matches('0'), 16)
+            .context("dispute window exceeds uint64")?;
+        if window == 0 || window > 30 * 86_400 {
+            anyhow::bail!("escrow reported an implausible dispute window of {window}s");
+        }
+        Ok(window)
+    }
+
     async fn confirmed(
         &self,
         transaction_hash: &str,
@@ -1030,6 +1059,12 @@ mod tests {
         let mut evidence = evidence();
         evidence.node_telemetry[1].gpu_utilization_bps = 9_999;
         assert!(reconcile(&evidence).is_err());
+    }
+
+    #[test]
+    fn dispute_window_selector_matches_the_escrow() {
+        let selector = Keccak256::digest(b"DISPUTE_WINDOW()");
+        assert_eq!(hex::encode(&selector[..4]), "f585dc57");
     }
 
     #[test]
