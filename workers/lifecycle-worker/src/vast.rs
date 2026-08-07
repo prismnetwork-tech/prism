@@ -36,6 +36,17 @@ pub(crate) struct Offer {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct Survey {
+    /// Offers Vast returned for the search, before this broker's own rules.
+    pub(crate) listed: usize,
+    /// Of those, the ones in a class and memory size this broker rents.
+    pub(crate) of_our_class: usize,
+    pub(crate) cheapest_of_class: Option<u64>,
+    pub(crate) ceiling: u64,
+    pub(crate) offer: Option<Offer>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Instance {
     pub(crate) status: String,
     pub(crate) gpu_name: String,
@@ -188,11 +199,41 @@ impl VastBroker {
         Ok(response.offers)
     }
 
-    pub(crate) async fn cheapest(&self, ceiling: u64) -> anyhow::Result<Option<Offer>> {
-        Ok(self.ranked(1, &[], ceiling).await?.into_iter().next())
+    /// What the market held, what this broker would rent, and the best of it.
+    /// "No capacity" is three different situations and they need telling apart.
+    pub(crate) async fn survey(&self, ceiling: u64) -> anyhow::Result<Survey> {
+        let offers = self.search_offers().await?;
+        let listed = offers.len();
+        let admitted: Vec<Offer> = offers
+            .into_iter()
+            .filter(|offer| self.admits(&offer.gpu_name, offer.gpu_ram))
+            .collect();
+        let of_our_class = admitted.len();
+        let cheapest_of_class = admitted
+            .iter()
+            .filter_map(|offer| hourly_micros(offer.dph_total).ok())
+            .min();
+        Ok(Survey {
+            listed,
+            of_our_class,
+            cheapest_of_class,
+            ceiling: self.ceiling(ceiling),
+            offer: rank_offers(admitted, self.ceiling(ceiling), 1, &[])
+                .into_iter()
+                .next(),
+        })
     }
 
     /// Whether an instance is one of the classes this broker rents.
+    pub(crate) fn policy(&self) -> String {
+        format!(
+            "{} with at least {} MiB, up to {} micros/hr",
+            self.gpu_models.join(" or "),
+            self.min_gpu_ram_mib,
+            self.max_hourly_micros
+        )
+    }
+
     pub(crate) fn admits(&self, gpu_name: &str, gpu_ram_mib: u64) -> bool {
         gpu_ram_mib >= self.min_gpu_ram_mib
             && self

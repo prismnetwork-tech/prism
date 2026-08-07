@@ -55,6 +55,14 @@ const SCHEDULER_LOCK_KEY: i64 = 4_663;
 const AUTH_MAX_AGE_SECONDS: i64 = 60;
 const NODE_MESSAGE_MAX_AGE_SECONDS: i64 = 300;
 const OFFER_MAX_AGE_SECONDS: i64 = 90;
+/// How long a quote holds its node against other renters. A quote stays valid
+/// for five minutes, but the hold only has to cover the funding round trip:
+/// approve, createLease, confirm. Holding for the whole five minutes means one
+/// renter who changes their mind takes a small network out of service, and
+/// losing the race afterwards costs gas rather than the deposit, because
+/// createLease reverts as a whole when the node is no longer schedulable.
+const QUOTE_HOLD_SECONDS: i64 = 90;
+const QUOTE_TTL_MINUTES: i64 = 5;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Broker-backed capacity reaches renters over direct SSH with no tunnel and
@@ -2564,8 +2572,7 @@ impl MarketplaceStore {
                     .open_quotes
                     .values()
                     .filter(|quote| {
-                        quote.expires_at > Utc::now()
-                            && !market.consumed_quotes.contains(&quote.quote_id)
+                        holds_node(quote) && !market.consumed_quotes.contains(&quote.quote_id)
                     })
                     .map(|quote| quote.node_id.clone())
                     .collect();
@@ -2634,9 +2641,11 @@ impl MarketplaceStore {
                 let reserved: BTreeSet<String> = query_scalar(
                     "SELECT node_id FROM lease_quotes \
                      WHERE consumed_at IS NULL AND expires_at > NOW() \
+                       AND created_at > NOW() - make_interval(secs => $1) \
                      UNION SELECT document->>'node_id' FROM leases \
                      WHERE state IN ('funded', 'provisioning', 'ready', 'active', 'closing')",
                 )
+                .bind(QUOTE_HOLD_SECONDS as f64)
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?
@@ -4258,6 +4267,13 @@ fn embedded_migrator() -> Migrator {
     }
 }
 
+/// A quote holds its node only for the funding round trip, not for the whole
+/// five minutes it stays valid.
+fn holds_node(quote: &LeaseQuote) -> bool {
+    let issued_at = quote.expires_at - Duration::minutes(QUOTE_TTL_MINUTES);
+    Utc::now() < issued_at + Duration::seconds(QUOTE_HOLD_SECONDS)
+}
+
 fn quote_for_offers<'a>(
     request: &LeaseRequest,
     offers: impl IntoIterator<Item = &'a NodeOffer>,
@@ -4307,7 +4323,7 @@ fn quote_for_offers<'a>(
         rate_per_second: selected.rate_per_second,
         maximum_escrow,
         trust_class: selected.trust_class,
-        expires_at: Utc::now() + Duration::minutes(5),
+        expires_at: Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES),
     })
 }
 
@@ -5112,6 +5128,56 @@ mod tests {
     /// Settlement runs for a further 24 hours after the machine is torn down.
     /// Holding the node for that whole window took the one-node network out of
     /// service for a day after every lease.
+    /// One renter quoting and walking away used to take a one-node network out
+    /// of service for the full five minutes the quote stayed valid.
+    #[tokio::test]
+    async fn an_abandoned_quote_stops_holding_its_node_before_it_expires() {
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 100, 10_000));
+        market.tunnels.insert("only".to_owned(), Utc::now());
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+        };
+
+        let abandoned = store.quote("renter", &request).await.unwrap();
+        assert!(matches!(
+            store.quote("other-renter", &request).await,
+            Err(StoreError::CapacityReserved)
+        ));
+
+        // Age it past the hold while leaving it valid, and fundable, for the
+        // rest of its five minutes.
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market
+            .write()
+            .await
+            .open_quotes
+            .get_mut(&abandoned.quote_id)
+            .unwrap()
+            .expires_at = Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES)
+            - Duration::seconds(QUOTE_HOLD_SECONDS + 1);
+
+        assert_eq!(
+            store.quote("other-renter", &request).await.unwrap().node_id,
+            "only"
+        );
+        assert!(
+            store
+                .quote_for_subject("renter", abandoned.quote_id)
+                .await
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn a_lease_awaiting_settlement_releases_its_node() {
         let now = Utc::now();
@@ -5231,7 +5297,7 @@ mod tests {
             rate_per_second: 100,
             maximum_escrow: 60_000,
             trust_class: TrustClass::Open,
-            expires_at: Utc::now() + Duration::minutes(5),
+            expires_at: Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES),
         };
         let lease_id = 42_u64;
         let renter = "11".repeat(20);
