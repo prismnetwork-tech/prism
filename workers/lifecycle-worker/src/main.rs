@@ -330,7 +330,8 @@ impl Worker {
         let note = match (survey.offer.as_ref(), survey.cheapest_of_class) {
             (Some(offer), _) => format!(
                 "sourcing {} at {} micros/hr",
-                offer.gpu_name, offer.dph_total
+                offer.gpu_name,
+                vast::hourly_micros(offer.dph_total).unwrap_or_default()
             ),
             (None, None) if survey.listed == 0 => {
                 format!(
