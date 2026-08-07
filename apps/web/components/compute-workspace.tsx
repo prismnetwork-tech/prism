@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { encodeFunctionData, keccak256, toBytes, type Address, type Hex } from "viem";
+import { createPublicClient, encodeFunctionData, http, keccak256, toBytes, type Address, type Hex } from "viem";
 import { usePrismAuth, useSmartWallet } from "@/components/providers";
 import { escrowAbi, escrowAddress, robinhoodChain, usdgAbi, usdgAddress } from "@/lib/chain";
 
@@ -160,6 +160,17 @@ export function ComputeWorkspace() {
       ] as const;
       if (!fundingAddress) {
         setNotice("Connect a funding wallet before launching compute.");
+        return;
+      }
+      // Leases are paid in USDG. A wallet with gas and no USDG gets through the
+      // approval and then reverts inside createLease, which reads as a broken
+      // site rather than an empty balance.
+      const held = await readUsdgBalance(fundingAddress);
+      if (held < maximumBaseUnits) {
+        setNotice(
+          `This lease escrows ${formatUsdg(maximumBaseUnits)} USDG and this wallet holds ${formatUsdg(held)}. ` +
+            "USDG is the stablecoin leases are paid in; the ETH in your wallet only covers gas.",
+        );
         return;
       }
       const result = await smartWallet.executeCalls([...calls], fundingAddress);
@@ -339,6 +350,15 @@ export function ComputeWorkspace() {
       )}
     </section>
   );
+}
+
+async function readUsdgBalance(address: Address): Promise<bigint> {
+  const client = createPublicClient({ chain: robinhoodChain, transport: http() });
+  return client.readContract({ address: usdgAddress, abi: usdgAbi, functionName: "balanceOf", args: [address] });
+}
+
+function formatUsdg(baseUnits: bigint): string {
+  return (Number(baseUnits) / 1_000_000).toFixed(6);
 }
 
 async function loadOffers(signal: AbortSignal): Promise<MarketplaceOffer[]> {
