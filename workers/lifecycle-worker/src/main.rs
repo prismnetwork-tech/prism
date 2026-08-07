@@ -58,6 +58,7 @@ struct Worker {
     gateway: GatewayClient,
     cipher: CredentialCipher,
     vast: Option<VastBroker>,
+    supply_note: tokio::sync::Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -172,7 +173,11 @@ async fn main() -> anyhow::Result<()> {
         cipher: CredentialCipher::from_hex(&required_env("PRISM_ACCESS_CREDENTIAL_KEY")?)
             .context("PRISM_ACCESS_CREDENTIAL_KEY must be 32 bytes of hex")?,
         vast: VastBroker::from_environment()?,
+        supply_note: tokio::sync::Mutex::new(None),
     };
+    if let Some(vast) = worker.vast.as_ref() {
+        tracing::info!(node_id = %vast.node_id, "broker will rent {}", vast.policy());
+    }
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
     loop {
         if let Err(error) = worker.scan().await {
@@ -292,11 +297,13 @@ impl Worker {
         };
         // Not being able to ask Vast is a different answer from Vast having
         // nothing, and writing the second for the first empties the market.
-        let provider_offer = vast
-            .cheapest(retail_hourly(node_offer.rate_per_second))
+        let survey = vast
+            .survey(retail_hourly(node_offer.rate_per_second))
             .await?;
+        let provider_offer = survey.offer.clone();
         self.record_cloud_capacity(vast, provider_offer.as_ref())
             .await?;
+        self.report_supply(vast, &survey).await;
         if let Some(offer) = provider_offer.as_ref() {
             // Advertise the class that will actually be handed over, not the one
             // the broker enrolled with.
@@ -311,6 +318,38 @@ impl Worker {
                 .await?;
         }
         Ok(())
+    }
+
+    /// An empty marketplace looks the same from outside whether the provider had
+    /// nothing, this broker rents the wrong classes, or everything on offer costs
+    /// more than a lease earns. Say which, once per change rather than per poll.
+    async fn report_supply(&self, vast: &VastBroker, survey: &vast::Survey) {
+        let mut last = self.supply_note.lock().await;
+        let note = match (survey.offer.as_ref(), survey.cheapest_of_class) {
+            (Some(offer), _) => format!(
+                "sourcing {} at {} micros/hr",
+                offer.gpu_name, offer.dph_total
+            ),
+            (None, None) if survey.listed == 0 => {
+                format!(
+                    "no capacity: the provider lists nothing matching {}",
+                    vast.policy()
+                )
+            }
+            (None, None) => format!(
+                "no capacity: {} offers listed, none of the classes this broker rents ({})",
+                survey.listed,
+                vast.policy()
+            ),
+            (None, Some(cheapest)) => format!(
+                "no capacity: cheapest of {} eligible hosts is {} micros/hr, over the {} ceiling",
+                survey.of_our_class, cheapest, survey.ceiling
+            ),
+        };
+        if last.as_deref() != Some(note.as_str()) {
+            tracing::info!(node_id = %vast.node_id, "{note}");
+            *last = Some(note);
+        }
     }
 
     async fn record_cloud_capacity(

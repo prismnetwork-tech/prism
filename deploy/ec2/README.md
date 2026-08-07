@@ -74,6 +74,21 @@ The script refuses to run without an existing CA and refuses to overwrite
 leaves that are already present. `generate-lightsail-tls.sh` creates a fresh
 authority and is only for a deployment that has none.
 
+The broker's supply policy comes from `PRISM_VAST_GPU_MODELS` and
+`PRISM_VAST_MIN_GPU_RAM_MIB`. A variable set in `.env` but absent from the
+host's `compose.yml` never reaches the container, and the effect is an empty
+marketplace with a healthy stack, so check the container rather than the file:
+
+```sh
+docker compose --env-file deploy/ec2/.env -f deploy/ec2/compose.yml \
+  exec lifecycle-worker env | grep PRISM_VAST_
+```
+
+The worker also logs the policy it resolved on startup, and says which of the
+three reasons it has no capacity: the provider listed nothing, nothing it
+listed is a class this broker rents, or everything eligible costs more than a
+lease earns.
+
 Validate the fully resolved configuration before changing the host:
 
 ```sh
