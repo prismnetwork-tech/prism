@@ -1,8 +1,28 @@
 # @prismnetwork/mcp
 
-An MCP server that lets Claude (or any MCP client) lease and run on real GPUs through [Prism Network](https://prismnetwork.tech). Give it a wallet; it handles auth, on-chain payment, provisioning, and SSH.
+An MCP server that lets Claude (or any MCP client) see and lease real GPUs through [Prism Network](https://prismnetwork.tech). Give it a wallet and it handles auth, onchain payment, provisioning, and SSH.
+
+## Try it without a wallet
+
+Looking costs nothing and needs no configuration:
+
+```sh
+claude mcp add prism -- npx -y @prismnetwork/mcp
+```
+
+Then ask what you can rent. `prism_list_gpus` answers from live capacity with
+real prices. Leasing spends money, so those tools ask for a wallet and say so.
 
 ## Tools
+
+| Tool | Wallet |
+| --- | --- |
+| `prism_list_gpus` | no |
+| `prism_wallet` | yes |
+| `prism_lease_and_run` | yes |
+| `prism_lease` | yes |
+| `prism_run` | yes |
+| `prism_end_lease` | yes |
 
 - `prism_wallet`: the agent's address and USDG/ETH balances.
 - `prism_list_gpus`: GPUs available to lease, with price per second and per hour.
