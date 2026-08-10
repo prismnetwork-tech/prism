@@ -217,7 +217,11 @@ async fn main() -> anyhow::Result<()> {
         last_orphan_sweep: tokio::sync::Mutex::new(None),
     };
     if let Some(vast) = worker.vast.as_ref() {
-        tracing::info!(node_id = %vast.node_id, "broker will rent {}", vast.policy());
+        tracing::info!(
+            slots = vast.node_ids.len(),
+            "broker will rent {}",
+            vast.policy()
+        );
     }
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
     loop {
@@ -434,47 +438,70 @@ impl Worker {
         let refreshed_recently: bool = query_scalar(
             "SELECT EXISTS ( \
                  SELECT 1 FROM cloud_capacity \
-                 WHERE node_id = $1 AND updated_at >= NOW() - INTERVAL '30 seconds' \
+                 WHERE node_id = ANY($1) AND updated_at >= NOW() - INTERVAL '30 seconds' \
              )",
         )
-        .bind(&vast.node_id)
+        .bind(vast.node_ids.as_slice())
         .fetch_one(&self.pool)
         .await?;
         if refreshed_recently {
             return Ok(());
         }
-        let offer_document = query_scalar::<_, SqlJson<NodeOffer>>(
-            "SELECT document FROM node_offers WHERE node_id = $1",
+
+        // Nodes with a lease on them are not for sale, so they are neither
+        // advertised nor counted against the hosts we found.
+        let busy: Vec<String> = query_scalar(
+            "SELECT document->>'node_id' FROM leases \
+             WHERE state IN ('funded', 'provisioning', 'ready', 'active', 'closing')",
         )
-        .bind(&vast.node_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        let Some(SqlJson(mut node_offer)) = offer_document else {
-            tracing::warn!(
-                node_id = %vast.node_id,
-                "Vast broker node is not enrolled; cloud capacity is disabled"
-            );
+        let free: Vec<&String> = vast
+            .node_ids
+            .iter()
+            .filter(|node_id| !busy.iter().any(|held| held == *node_id))
+            .collect();
+        if free.is_empty() {
+            return Ok(());
+        }
+
+        let offers = query_as::<_, (String, SqlJson<NodeOffer>)>(
+            "SELECT node_id, document FROM node_offers WHERE node_id = ANY($1)",
+        )
+        .bind(vast.node_ids.as_slice())
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(rate) = offers
+            .first()
+            .map(|(_, SqlJson(offer))| offer.rate_per_second)
+        else {
+            tracing::warn!("no Vast broker node is enrolled; cloud capacity is disabled");
             return Ok(());
         };
-        // Not being able to ask Vast is a different answer from Vast having
-        // nothing, and writing the second for the first empties the market.
-        let survey = vast
-            .survey(retail_hourly(node_offer.rate_per_second))
-            .await?;
-        let provider_offer = survey.offer.clone();
-        self.record_cloud_capacity(vast, provider_offer.as_ref())
-            .await?;
+
+        // One search for the whole pool. Advertise as many slots as there are
+        // distinct hosts to fill them with, so the market never lists capacity
+        // that a second renter would find already taken.
+        let survey = vast.survey_many(retail_hourly(rate), free.len()).await?;
         self.report_supply(vast, &survey).await;
-        if let Some(offer) = provider_offer.as_ref() {
+
+        for (index, node_id) in free.iter().enumerate() {
+            let host = survey.hosts.get(index);
+            self.record_cloud_capacity(node_id, host).await?;
+            let Some(host) = host else { continue };
+            let Some((_, SqlJson(offer))) = offers.iter().find(|(id, _)| id == *node_id) else {
+                continue;
+            };
+            let mut offer = offer.clone();
             // Advertise the class that will actually be handed over, not the one
             // the broker enrolled with.
-            node_offer.gpu.model = offer.gpu_name.clone();
-            node_offer.gpu.vram_mib = u32::try_from(offer.gpu_ram)?;
-            node_offer.online = true;
-            node_offer.updated_at = Utc::now();
+            offer.gpu.model = host.gpu_name.clone();
+            offer.gpu.vram_mib = u32::try_from(host.gpu_ram)?;
+            offer.online = true;
+            offer.updated_at = Utc::now();
             query("UPDATE node_offers SET document = $2, updated_at = NOW() WHERE node_id = $1")
-                .bind(&vast.node_id)
-                .bind(SqlJson(node_offer))
+                .bind(node_id)
+                .bind(SqlJson(offer))
                 .execute(&self.pool)
                 .await?;
         }
@@ -486,10 +513,12 @@ impl Worker {
     /// more than a lease earns. Say which, once per change rather than per poll.
     async fn report_supply(&self, vast: &VastBroker, survey: &vast::Survey) {
         let mut last = self.supply_note.lock().await;
-        let note = match (survey.offer.as_ref(), survey.cheapest_of_class) {
+        let note = match (survey.hosts.first(), survey.cheapest_of_class) {
             (Some(offer), _) => format!(
-                "sourcing {} at {} micros/hr",
+                "sourcing {} for {} of {} slots at {} micros/hr",
                 offer.gpu_name,
+                survey.hosts.len(),
+                vast.node_ids.len(),
                 vast::hourly_micros(offer.dph_total).unwrap_or_default()
             ),
             (None, None) if survey.listed == 0 => {
@@ -509,14 +538,14 @@ impl Worker {
             ),
         };
         if last.as_deref() != Some(note.as_str()) {
-            tracing::info!(node_id = %vast.node_id, "{note}");
+            tracing::info!("{note}");
             *last = Some(note);
         }
     }
 
     async fn record_cloud_capacity(
         &self,
-        vast: &VastBroker,
+        node_id: &str,
         offer: Option<&vast::Offer>,
     ) -> anyhow::Result<()> {
         let provider_offer_id = offer.map(|offer| i64::try_from(offer.id)).transpose()?;
@@ -526,7 +555,7 @@ impl Worker {
             .map(i64::try_from)
             .transpose()?;
         query(CLOUD_CAPACITY_UPSERT)
-            .bind(&vast.node_id)
+            .bind(node_id)
             .bind(offer.is_some())
             .bind(provider_offer_id)
             .bind(hourly_micros)
@@ -724,8 +753,8 @@ impl Worker {
             .as_ref()
             .context("Vast is not configured for this cloud lease")?;
         let context = self.lease_context(lease_id).await?;
-        if context.lease.node_id != vast.node_id {
-            anyhow::bail!("cloud lease node does not match the configured Vast broker");
+        if !vast.owns(&context.lease.node_id) {
+            anyhow::bail!("cloud lease node is not brokered by this worker");
         }
         if Utc::now() >= context.lease.created_at + chrono::Duration::minutes(10) {
             anyhow::bail!("the provisioning window for this lease has closed");
