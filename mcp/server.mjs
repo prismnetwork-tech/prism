@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Prism Network MCP server: lets an MCP client (Claude, agents) lease and run on
-// real GPUs. Configure with a wallet: PRISM_AGENT_KEY, PRISM_ESCROW.
+// Prism Network MCP server: lets an MCP client (Claude, agents) see and lease
+// real GPUs. Looking is free and needs no configuration. Leasing spends money,
+// so it needs a wallet: PRISM_AGENT_KEY, PRISM_ESCROW.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -14,7 +15,12 @@ function requireEnv(name) {
   return value;
 }
 
-let agent;
+const PUBLIC_API = process.env.PRISM_PUBLIC_API ?? "https://api.prismnetwork.tech";
+
+// Refusing to start without a wallet meant nobody could ask what a GPU costs
+// without first producing a private key, which is a strange thing to demand of
+// someone deciding whether to use you at all.
+let agent = null;
 try {
   agent = new PrismAgent({
     privateKey: requireEnv("PRISM_AGENT_KEY"),
@@ -22,9 +28,28 @@ try {
     apiBase: process.env.PRISM_API_BASE ?? "https://prismnetwork.tech",
     rpcUrl: process.env.PRISM_RPC_URL,
   });
-} catch (err) {
-  console.error(`prism mcp config error: ${err.message}. Set PRISM_AGENT_KEY and PRISM_ESCROW in the server env.`);
-  process.exit(1);
+} catch {
+  console.error(
+    "prism mcp: no wallet configured, so capacity and pricing are readable and leasing is not. " +
+      "Set PRISM_AGENT_KEY and PRISM_ESCROW to lease.",
+  );
+}
+
+function requireWallet(tool) {
+  if (!agent) {
+    throw new Error(
+      `${tool} spends money, so it needs a wallet. Set PRISM_AGENT_KEY and PRISM_ESCROW in this server's environment and restart it.`,
+    );
+  }
+  return agent;
+}
+
+async function publicOffers(minTrust) {
+  const url = new URL("/v1/offers", PUBLIC_API);
+  if (minTrust) url.searchParams.set("min_trust", minTrust);
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error(`prism offers unavailable (${response.status})`);
+  return response.json();
 }
 
 const leases = new Map();
@@ -127,12 +152,18 @@ const TOOLS = [
 
 async function handle(name, args) {
   if (name === "prism_wallet") {
-    const b = await agent.balances();
+    const b = await requireWallet("prism_wallet").balances();
     return { address: b.address, usdg: usdg(b.usdg), eth_wei: b.eth };
   }
   if (name === "prism_list_gpus") {
-    await ensureAuth();
-    const offers = await agent.offers({ minTrust: args.min_trust ?? "open" });
+    const minTrust = args.min_trust ?? "open";
+    let offers;
+    if (agent) {
+      await ensureAuth();
+      offers = await agent.offers({ minTrust });
+    } else {
+      offers = await publicOffers(minTrust);
+    }
     return {
       available: offers.length,
       gpus: offers.map((o) => ({
@@ -146,6 +177,7 @@ async function handle(name, args) {
   }
   if (name === "prism_lease_and_run" || name === "prism_lease") {
     if (name === "prism_lease_and_run" && !args.command) throw new Error("command is required");
+    requireWallet(name);
     await ensureAuth();
     sweepExpiredLeases();
     const lease = await agent.lease({
