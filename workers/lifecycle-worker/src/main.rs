@@ -39,6 +39,8 @@ const ORPHAN_SCAN_DEPTH: u64 = 32;
 const ORPHAN_SCAN_INTERVAL_SECONDS: u64 = 300;
 /// LeaseStatus.Funded in the escrow's enum.
 const LEASE_STATUS_FUNDED: u8 = 1;
+const LEASE_STATUS_FINALIZED: u8 = 5;
+const LEASE_STATUS_REFUNDED: u8 = 6;
 
 /// What a lease pays for an hour, which is the most the broker can spend on one
 /// without the settlement worker refusing the receipt.
@@ -623,6 +625,13 @@ impl Worker {
                     return Ok(());
                 }
                 3 => {}
+                // The escrow has already settled this one. Retrying cannot
+                // un-settle it, so catch the bookkeeping up instead of asking
+                // a hundred more times.
+                status @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
+                    self.adopt_settled_lease(&action, status).await?;
+                    return Ok(());
+                }
                 status => anyhow::bail!("lease cannot be finalized from onchain status {status}"),
             }
         }
@@ -1485,6 +1494,43 @@ impl Worker {
         .bind(action.action_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Record a lease the escrow settled without us seeing the transaction that
+    /// did it. The money has moved and the node is already free; what is left is
+    /// our own state. The public receipt is not published here, because a
+    /// receipt names the settling transaction and we never observed one.
+    async fn adopt_settled_lease(&self, action: &Action, status: u8) -> anyhow::Result<()> {
+        let (state, job) = if status == LEASE_STATUS_FINALIZED {
+            (LeaseState::Finalized, "finalized")
+        } else {
+            (LeaseState::Refunded, "failed")
+        };
+        let mut transaction = self.pool.begin().await?;
+        query(
+            "UPDATE settlement_jobs SET status = $2, \
+                 last_error = 'settled on chain without an observed transaction', \
+                 updated_at = NOW() WHERE lease_id = $1",
+        )
+        .bind(action.lease_id as i64)
+        .bind(job)
+        .execute(&mut *transaction)
+        .await?;
+        set_lease_state_in(&mut transaction, action.lease_id, state).await?;
+        query(
+            "UPDATE lifecycle_outbox SET status = 'completed', lease_until = NULL, \
+                 updated_at = NOW() WHERE action_id = $1",
+        )
+        .bind(action.action_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        tracing::warn!(
+            lease_id = action.lease_id,
+            status,
+            "escrow had already settled this lease; adopted the outcome without a public receipt"
+        );
         Ok(())
     }
 
