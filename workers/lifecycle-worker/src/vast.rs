@@ -16,7 +16,11 @@ pub(crate) struct VastBroker {
     client: Client,
     base_url: Url,
     token: Arc<String>,
-    pub(crate) node_id: String,
+    /// Every broker identity this worker answers for. One bonded node is one
+    /// concurrent lease, because the registry frees a node only when its lease
+    /// settles, so serving more than one customer at a time means holding more
+    /// than one identity.
+    pub(crate) node_ids: Arc<Vec<String>>,
     pub(crate) max_hourly_micros: u64,
     /// Which GPUs the broker will rent on a renter's behalf. One class leaves
     /// the network at the mercy of one market: when a verified L40S costs more
@@ -43,7 +47,10 @@ pub(crate) struct Survey {
     pub(crate) of_our_class: usize,
     pub(crate) cheapest_of_class: Option<u64>,
     pub(crate) ceiling: u64,
-    pub(crate) offer: Option<Offer>,
+    /// One host per slot we are willing to advertise, cheapest first.
+    pub(crate) hosts: Vec<Offer>,
+    /// Every host of a class this broker rents, before the price ceiling.
+    admitted: Vec<Offer>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,10 +132,15 @@ struct CreateRequest<'a> {
 
 impl VastBroker {
     pub(crate) fn from_environment() -> anyhow::Result<Option<Self>> {
-        let Ok(node_id) = env::var("PRISM_VAST_NODE_ID") else {
-            return Ok(None);
-        };
-        if node_id.trim().is_empty() {
+        let configured = env::var("PRISM_VAST_NODE_IDS")
+            .or_else(|_| env::var("PRISM_VAST_NODE_ID"))
+            .unwrap_or_default();
+        let node_ids: Vec<String> = configured
+            .split(',')
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if node_ids.is_empty() {
             return Ok(None);
         }
         let token = read_token()?;
@@ -164,7 +176,7 @@ impl VastBroker {
                 .build()?,
             base_url,
             token: Arc::new(token),
-            node_id,
+            node_ids: Arc::new(node_ids),
             max_hourly_micros,
             gpu_models: Arc::new(gpu_models),
             min_gpu_ram_mib,
@@ -199,6 +211,15 @@ impl VastBroker {
         Ok(response.offers)
     }
 
+    /// The same survey, but keeping as many distinct hosts as there are free
+    /// slots to advertise. Listing more slots than hosts sells capacity that is
+    /// not there.
+    pub(crate) async fn survey_many(&self, ceiling: u64, slots: usize) -> anyhow::Result<Survey> {
+        let mut survey = self.survey(ceiling).await?;
+        survey.hosts = rank_offers(survey.admitted.clone(), self.ceiling(ceiling), slots, &[]);
+        Ok(survey)
+    }
+
     /// What the market held, what this broker would rent, and the best of it.
     /// "No capacity" is three different situations and they need telling apart.
     pub(crate) async fn survey(&self, ceiling: u64) -> anyhow::Result<Survey> {
@@ -218,13 +239,17 @@ impl VastBroker {
             of_our_class,
             cheapest_of_class,
             ceiling: self.ceiling(ceiling),
-            offer: rank_offers(admitted, self.ceiling(ceiling), 1, &[])
-                .into_iter()
-                .next(),
+            hosts: rank_offers(admitted.clone(), self.ceiling(ceiling), 1, &[]),
+            admitted,
         })
     }
 
     /// Whether an instance is one of the classes this broker rents.
+    /// Whether a lease's node is one this worker brokers for.
+    pub(crate) fn owns(&self, node_id: &str) -> bool {
+        self.node_ids.iter().any(|owned| owned == node_id)
+    }
+
     pub(crate) fn policy(&self) -> String {
         format!(
             "{} with at least {} MiB, up to {} micros/hr",
@@ -530,7 +555,7 @@ mod tests {
             client: Client::new(),
             base_url: Url::parse(DEFAULT_API_URL).unwrap(),
             token: Arc::new("token".to_owned()),
-            node_id: "0xabc".to_owned(),
+            node_ids: Arc::new(vec!["0xabc".to_owned()]),
             max_hourly_micros,
             gpu_models: Arc::new(models.iter().map(|model| (*model).to_owned()).collect()),
             min_gpu_ram_mib,
@@ -697,6 +722,42 @@ mod tests {
         assert!(wide.admits("L40S", 46_068));
         assert!(wide.admits("rtx a6000", 46_068));
         assert!(!wide.admits("RTX 4090", 24_564));
+    }
+
+    /// One bonded node is one concurrent lease. Advertising a slot with no host
+    /// behind it sells capacity a second renter would find already taken, which
+    /// is the listing-and-matching disagreement all over again.
+    #[test]
+    fn the_pool_never_advertises_more_slots_than_hosts() {
+        let hosts = vec![
+            offer(1, "RTX A6000", 49_140, 0.40),
+            offer(2, "RTX A6000", 49_140, 0.44),
+            offer(3, "L40S", 46_068, 0.60),
+        ];
+
+        // Four free slots, three hosts: three get advertised.
+        assert_eq!(rank_offers(hosts.clone(), 799_200, 4, &[]).len(), 3);
+        // Two free slots, three hosts: only two are sold, cheapest first.
+        let two = rank_offers(hosts.clone(), 799_200, 2, &[]);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].id, 1);
+        // A ceiling that excludes everything sells nothing, however many slots.
+        assert!(rank_offers(hosts, 300_000, 8, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_broker_answers_only_for_the_nodes_it_holds() {
+        let single = broker(&["L40S"], 45_000, 900_000);
+        assert!(single.owns("0xabc"));
+        assert!(!single.owns("0xdef"));
+
+        let pool = VastBroker {
+            node_ids: Arc::new(vec!["0xaaa".to_owned(), "0xbbb".to_owned()]),
+            ..broker(&["L40S"], 45_000, 900_000)
+        };
+        assert!(pool.owns("0xaaa"));
+        assert!(pool.owns("0xbbb"));
+        assert!(!pool.owns("0xccc"));
     }
 
     #[test]

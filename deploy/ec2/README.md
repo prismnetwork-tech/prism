@@ -74,6 +74,12 @@ The script refuses to run without an existing CA and refuses to overwrite
 leaves that are already present. `generate-lightsail-tls.sh` creates a fresh
 authority and is only for a deployment that has none.
 
+`PRISM_VAST_NODE_IDS` is a comma separated list of bonded broker identities and
+sets how many customers the network can serve at once: the registry frees a node
+only when its lease settles, so one identity is one concurrent lease. Each needs
+its own onchain registration and a `MIN_BOND` deposit. `PRISM_VAST_NODE_ID` is
+still read as a single-node shorthand.
+
 The broker's supply policy comes from `PRISM_VAST_GPU_MODELS` and
 `PRISM_VAST_MIN_GPU_RAM_MIB`. A variable set in `.env` but absent from the
 host's `compose.yml` never reaches the container, and the effect is an empty
