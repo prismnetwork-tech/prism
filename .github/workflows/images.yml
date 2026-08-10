@@ -51,6 +51,8 @@ jobs:
           build-args: BINARY=${{ matrix.binary }}
           push: true
           provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
             ghcr.io/${{ github.repository }}/${{ matrix.binary }}:${{ github.sha }}
             ghcr.io/${{ github.repository }}/${{ matrix.binary }}:main
