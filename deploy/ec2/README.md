@@ -54,10 +54,26 @@ deploy/ec2/secrets/tls/cache.key
 
 The environment must provide the image references, domain and ACME email,
 database and service secrets, operator subjects, deployed registry and escrow
-addresses, RPC URL, KMS key identifiers and bonded Vast broker node ID required
-by `compose.yml`. The gateway additionally needs `PRISM_ACCESS_GATEWAY_IMAGE`,
+addresses, RPC URL, KMS key identifiers and the comma-separated
+`PRISM_VAST_NODE_IDS` the broker rents against, all required by `compose.yml`.
+The gateway additionally needs `PRISM_ACCESS_GATEWAY_IMAGE`,
 `PRISM_GATEWAY_HMAC_KEY`, `PRISM_GATEWAY_CONTROL_TOKEN` and
-`PRISM_REDIS_PASSWORD`.
+`PRISM_REDIS_PASSWORD`. Every one of these belongs in the env file. Passing a
+value inline on the `docker compose` command line survives exactly one
+`up`, and the next plain `restart` silently drops it.
+
+### Images
+
+The `images` workflow builds each service on a native amd64 runner and pushes
+`ghcr.io/prismnetwork-tech/prism/<binary>:<sha>` plus a moving `:main` tag, so a
+deploy is a pull rather than a local cross-build. Building these on an Apple
+Silicon laptop means emulating amd64, and `aws-lc-sys` reliably crashes the
+emulated compiler.
+
+```sh
+PRISM_LIFECYCLE_WORKER_IMAGE=ghcr.io/prismnetwork-tech/prism/prism-lifecycle-worker:main
+docker compose pull lifecycle-worker && docker compose up -d lifecycle-worker
+```
 
 ### Gateway certificates
 
