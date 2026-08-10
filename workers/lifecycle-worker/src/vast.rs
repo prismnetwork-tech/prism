@@ -132,8 +132,11 @@ struct CreateRequest<'a> {
 
 impl VastBroker {
     pub(crate) fn from_environment() -> anyhow::Result<Option<Self>> {
-        let configured = env::var("PRISM_VAST_NODE_IDS")
-            .or_else(|_| env::var("PRISM_VAST_NODE_ID"))
+        // Compose renders an unset variable as the empty string, so an env_var
+        // that is present and blank has to read as absent. Taking Ok("") for an
+        // answer here skips the singular name and takes the whole market down.
+        let configured = non_empty_env("PRISM_VAST_NODE_IDS")
+            .or_else(|| non_empty_env("PRISM_VAST_NODE_ID"))
             .unwrap_or_default();
         let node_ids: Vec<String> = configured
             .split(',')
@@ -141,6 +144,13 @@ impl VastBroker {
             .filter(|id| !id.is_empty())
             .collect();
         if node_ids.is_empty() {
+            if non_empty_env("PRISM_VAST_API_KEY_FILE").is_some()
+                || non_empty_env("PRISM_VAST_API_KEY").is_some()
+            {
+                tracing::warn!(
+                    "PRISM_VAST_NODE_IDS is empty, so the broker offers no capacity at all"
+                );
+            }
             return Ok(None);
         }
         let token = read_token()?;
@@ -492,6 +502,10 @@ fn read_token() -> anyhow::Result<String> {
     Ok(token)
 }
 
+fn non_empty_env(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
 fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     env::var(key)
         .ok()
@@ -536,6 +550,19 @@ fn valid_ssh_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compose writes an unset variable as the empty string. Reading that as a
+    /// real value once left the broker with no nodes and the market with no GPUs.
+    #[test]
+    fn a_blank_variable_reads_as_absent() {
+        let key = "PRISM_TEST_BLANK_NODE_IDS";
+        unsafe { env::set_var(key, "  ") };
+        assert_eq!(non_empty_env(key), None);
+        unsafe { env::set_var(key, "0xabc") };
+        assert_eq!(non_empty_env(key).as_deref(), Some("0xabc"));
+        unsafe { env::remove_var(key) };
+        assert_eq!(non_empty_env(key), None);
+    }
 
     /// The same two steps `ranked` runs: keep the classes the broker rents,
     /// then take the cheapest that clears the ceiling.
