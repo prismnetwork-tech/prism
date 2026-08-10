@@ -3,7 +3,8 @@ use std::{env, sync::Arc, time::Duration};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use prism_chain::{
-    EthereumSigner, Finality, PreparedTransaction, RpcClient, address, selector, word_u128,
+    EthereumSigner, Finality, PreparedTransaction, RpcClient, address, selector, word_bytes32,
+    word_u128,
 };
 use prism_protocol::{
     CredentialCipher, ExecutionEvidence, LeaseRecord, LeaseState, NodeOffer, NodeTelemetry,
@@ -30,6 +31,14 @@ const MAX_REJECTED_MACHINES: usize = 4;
 /// Ranked offers tried per provisioning pass. Retries supply the rest of the
 /// breadth, and a pass that spends the whole window is a refund.
 const CREATES_PER_PASS: usize = 2;
+/// The escrow's own PROVISION_TIMEOUT. A funded lease older than this can be
+/// expired by anyone, which refunds the renter and frees the node.
+const PROVISION_TIMEOUT_SECONDS: u64 = 600;
+/// How far back to look for leases the escrow knows about and we do not.
+const ORPHAN_SCAN_DEPTH: u64 = 32;
+const ORPHAN_SCAN_INTERVAL_SECONDS: u64 = 300;
+/// LeaseStatus.Funded in the escrow's enum.
+const LEASE_STATUS_FUNDED: u8 = 1;
 
 /// What a lease pays for an hour, which is the most the broker can spend on one
 /// without the settlement worker refusing the receipt.
@@ -59,6 +68,7 @@ struct Worker {
     cipher: CredentialCipher,
     vast: Option<VastBroker>,
     supply_note: tokio::sync::Mutex<Option<String>>,
+    last_orphan_sweep: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Debug)]
@@ -123,6 +133,32 @@ struct Grant {
     expires_at: DateTime<Utc>,
 }
 
+/// `getLease` returns the struct as fourteen words. `createdAt` is the seventh
+/// and `status` the last, both right aligned in their word.
+fn decode_lease(bytes: &[u8]) -> anyhow::Result<OnchainLease> {
+    if bytes.len() != 32 * 14 {
+        anyhow::bail!("escrow returned an invalid lease");
+    }
+    let mut created = [0u8; 8];
+    created.copy_from_slice(&bytes[32 * 7 - 8..32 * 7]);
+    Ok(OnchainLease {
+        created_at: u64::from_be_bytes(created),
+        status: bytes[32 * 14 - 1],
+    })
+}
+
+/// Only a lease still waiting to be provisioned can be expired, and only once
+/// the escrow's own window has closed. Anything else belongs to a renter.
+fn expirable(lease: OnchainLease, now: u64) -> bool {
+    lease.status == LEASE_STATUS_FUNDED && now > lease.created_at + PROVISION_TIMEOUT_SECONDS
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OnchainLease {
+    created_at: u64,
+    status: u8,
+}
+
 #[derive(Debug)]
 struct LeaseContext {
     lease: LeaseRecord,
@@ -176,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
             .context("PRISM_ACCESS_CREDENTIAL_KEY must be 32 bytes of hex")?,
         vast: VastBroker::from_environment()?,
         supply_note: tokio::sync::Mutex::new(None),
+        last_orphan_sweep: tokio::sync::Mutex::new(None),
     };
     if let Some(vast) = worker.vast.as_ref() {
         tracing::info!(node_id = %vast.node_id, "broker will rent {}", vast.policy());
@@ -216,6 +253,9 @@ impl Worker {
     async fn scan(&self) -> anyhow::Result<()> {
         if let Err(error) = self.refresh_cloud_capacity().await {
             tracing::error!(%error, "cloud capacity refresh failed");
+        }
+        if let Err(error) = self.expire_orphaned_leases().await {
+            tracing::error!(%error, "orphaned lease sweep failed");
         }
         query(
             "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
@@ -265,6 +305,123 @@ impl Worker {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// A renter can fund a lease on chain and never reach `/leases/confirm`: the
+    /// wallet call succeeds, the request that would have recorded it does not.
+    /// Nothing else looks at those. They hold their node until someone notices,
+    /// and the renter's deposit sits in the escrow with nothing tracking it.
+    /// `expireProvision` is permissionless once the provisioning window closes,
+    /// so the network can clean up after itself.
+    async fn expire_orphaned_leases(&self) -> anyhow::Result<()> {
+        {
+            let mut last = self.last_orphan_sweep.lock().await;
+            let due = last.is_none_or(|at| {
+                at.elapsed() >= std::time::Duration::from_secs(ORPHAN_SCAN_INTERVAL_SECONDS)
+            });
+            if !due {
+                return Ok(());
+            }
+            *last = Some(std::time::Instant::now());
+        }
+
+        let highest = self.lease_count().await?;
+        if highest == 0 {
+            return Ok(());
+        }
+        let floor = highest.saturating_sub(ORPHAN_SCAN_DEPTH).max(1);
+        let known: Vec<i64> = query_scalar("SELECT lease_id FROM leases WHERE lease_id >= $1")
+            .bind(floor as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        let now = Utc::now().timestamp() as u64;
+
+        for lease_id in floor..=highest {
+            if known.contains(&(lease_id as i64)) {
+                continue;
+            }
+            let lease = self.lease_summary(lease_id).await?;
+            if !expirable(lease, now) {
+                continue;
+            }
+            tracing::warn!(
+                lease_id,
+                "expiring a lease the escrow holds and this control plane never recorded"
+            );
+            self.expire_provision_onchain(lease_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn lease_count(&self) -> anyhow::Result<u64> {
+        let encoded: String = self
+            .chain
+            .call(
+                "eth_call",
+                serde_json::json!([{
+                    "to": format!("0x{}", hex::encode(self.escrow)),
+                    "data": format!("0x{}", hex::encode(selector("leaseCount()")))
+                }, "latest"]),
+            )
+            .await?;
+        let bytes = hex::decode(encoded.strip_prefix("0x").unwrap_or(&encoded))?;
+        if bytes.len() != 32 {
+            anyhow::bail!("escrow returned an invalid lease count");
+        }
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[24..32]);
+        Ok(u64::from_be_bytes(word))
+    }
+
+    async fn lease_summary(&self, lease_id: u64) -> anyhow::Result<OnchainLease> {
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&selector("getLease(uint256)"));
+        data.extend_from_slice(&word_u128(u128::from(lease_id)));
+        let encoded: String = self
+            .chain
+            .call(
+                "eth_call",
+                serde_json::json!([{
+                    "to": format!("0x{}", hex::encode(self.escrow)),
+                    "data": format!("0x{}", hex::encode(data))
+                }, "latest"]),
+            )
+            .await?;
+        let bytes = hex::decode(encoded.strip_prefix("0x").unwrap_or(&encoded))?;
+        decode_lease(&bytes)
+    }
+
+    async fn expire_provision_onchain(&self, lease_id: u64) -> anyhow::Result<()> {
+        let reason: [u8; 32] =
+            Keccak256::digest(b"prism: funded on chain, never confirmed to the control plane")
+                .into();
+        let mut data = Vec::with_capacity(68);
+        data.extend_from_slice(&selector("expireProvision(uint256,bytes32)"));
+        data.extend_from_slice(&word_u128(u128::from(lease_id)));
+        data.extend_from_slice(&word_bytes32(reason));
+
+        let mut connection = self.pool.acquire().await?;
+        query("SELECT pg_advisory_lock($1)")
+            .bind(SIGNER_LOCK)
+            .execute(&mut *connection)
+            .await?;
+        let result = async {
+            let prepared = self
+                .chain
+                .prepare_transaction(&self.signer, self.escrow, &data, ROBINHOOD_CHAIN_ID)
+                .await?;
+            self.chain.submit(&prepared).await?;
+            Ok::<_, anyhow::Error>(prepared.transaction_hash)
+        }
+        .await;
+        let unlock = query("SELECT pg_advisory_unlock($1)")
+            .bind(SIGNER_LOCK)
+            .execute(&mut *connection)
+            .await;
+        unlock?;
+        let hash = result?;
+        tracing::warn!(lease_id, %hash, "refunded an unrecorded lease and released its node");
         Ok(())
     }
 
@@ -1598,6 +1755,50 @@ mod tests {
         let expiry = ActionKind::ExpireProvision.calldata(7);
         assert_eq!(&expiry[..4], &selector("expireProvision(uint256,bytes32)"));
         assert_eq!(expiry.len(), 68);
+    }
+
+    /// Lease 37 was funded on chain, never confirmed to the control plane, and
+    /// held the only node in the network until someone read the registry by hand.
+    #[test]
+    fn only_an_unprovisioned_lease_past_its_window_is_expirable() {
+        let now = 1_000_000u64;
+        let funded_and_stale = OnchainLease {
+            created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
+            status: 1,
+        };
+        assert!(expirable(funded_and_stale, now));
+
+        let funded_but_fresh = OnchainLease {
+            created_at: now - 60,
+            status: 1,
+        };
+        assert!(
+            !expirable(funded_but_fresh, now),
+            "still inside the provisioning window"
+        );
+
+        for status in [0u8, 2, 3, 4, 5, 6] {
+            let other = OnchainLease {
+                created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
+                status,
+            };
+            assert!(
+                !expirable(other, now),
+                "status {status} belongs to a renter"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lease_decodes_from_the_words_the_escrow_returns() {
+        let mut blob = vec![0u8; 32 * 14];
+        blob[32 * 7 - 8..32 * 7].copy_from_slice(&1_754_000_000u64.to_be_bytes());
+        blob[32 * 14 - 1] = 5;
+
+        let lease = decode_lease(&blob).unwrap();
+        assert_eq!(lease.created_at, 1_754_000_000);
+        assert_eq!(lease.status, 5);
+        assert!(decode_lease(&blob[..32 * 13]).is_err());
     }
 
     #[test]
