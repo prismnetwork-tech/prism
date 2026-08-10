@@ -135,6 +135,20 @@ struct Grant {
     expires_at: DateTime<Utc>,
 }
 
+/// A box that is still booting has not failed, and the retry backoff is
+/// quadratic. Left undistinguished, a ninety second boot costs the renter
+/// eight minutes of a lease they are already paying for.
+#[derive(Debug)]
+struct StillProvisioning;
+
+impl std::fmt::Display for StillProvisioning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Vast instance is not ready")
+    }
+}
+
+impl std::error::Error for StillProvisioning {}
+
 /// `getLease` returns the struct as fourteen words. `createdAt` is the seventh
 /// and `status` the last, both right aligned in their word.
 fn decode_lease(bytes: &[u8]) -> anyhow::Result<OnchainLease> {
@@ -244,7 +258,11 @@ async fn main() -> anyhow::Result<()> {
         };
         let action_id = action.action_id;
         if let Err(error) = worker.process(action).await {
-            tracing::error!(%action_id, %error, "lifecycle action failed");
+            if error.downcast_ref::<StillProvisioning>().is_some() {
+                tracing::debug!(%action_id, "waiting on the box to boot");
+            } else {
+                tracing::error!(%action_id, %error, "lifecycle action failed");
+            }
             if let Err(error) = worker.retry(action_id, &error).await {
                 tracing::error!(%action_id, %error, "recording the failed action failed");
             }
@@ -866,7 +884,7 @@ impl Worker {
                 .await?;
                 anyhow::bail!("Vast instance entered terminal state {}", instance.status);
             }
-            anyhow::bail!("Vast instance is not ready");
+            return Err(StillProvisioning.into());
         }
         // A host that reserved no forwarded ports boots the container without a
         // reachable sshd, and the renter's key is rejected at the Vast proxy. The
@@ -1605,6 +1623,21 @@ impl Worker {
 
     async fn retry(&self, action_id: Uuid, error: &anyhow::Error) -> anyhow::Result<()> {
         let message: String = format!("{error:#}").chars().take(1_024).collect();
+        if error.downcast_ref::<StillProvisioning>().is_some() {
+            // Waiting is not an attempt, and `expire_provision` already bounds
+            // how long the whole thing may take.
+            query(
+                "UPDATE lifecycle_outbox SET status = 'queued', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + INTERVAL '5 seconds', \
+                     last_error = $2, updated_at = NOW() WHERE action_id = $1",
+            )
+            .bind(action_id)
+            .bind(message)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
         let exhausted = query_scalar::<_, Option<i64>>(
             "UPDATE lifecycle_outbox SET \
                  status = CASE WHEN attempts >= 100 THEN 'failed' ELSE 'queued' END, \
@@ -1820,6 +1853,19 @@ fn required_env(key: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retry path tells a booting box apart from a broken one by downcast,
+    /// so it has to survive whatever context a caller adds on the way up.
+    #[test]
+    fn a_booting_box_stays_recognisable_through_added_context() {
+        let error = anyhow::Error::from(StillProvisioning).context("start access for lease 39");
+        assert!(error.downcast_ref::<StillProvisioning>().is_some());
+        assert!(
+            anyhow::anyhow!("Vast instance entered terminal state exited")
+                .downcast_ref::<StillProvisioning>()
+                .is_none()
+        );
+    }
 
     #[test]
     fn lifecycle_calldata_uses_exact_contract_selectors() {
