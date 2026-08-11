@@ -28,6 +28,14 @@ const SIGNER_LOCK: i64 = 4_663_001;
 /// How many Vast hosts a single lease may burn through before the provisioning
 /// attempt is abandoned and the escrow refunded.
 const MAX_REJECTED_MACHINES: usize = 4;
+/// How long a host gets to boot before the lease abandons it for another.
+///
+/// The escrow's PROVISION_TIMEOUT is ten minutes and cannot be raised without
+/// redeploying it, so the only way to survive a slow host is to stop waiting on
+/// one. A healthy box is reachable inside two minutes; past this it is very
+/// unlikely to make the window, and burning the whole window on it refunds a
+/// lease that a different machine would have served.
+const HOST_BOOT_BUDGET_SECONDS: i64 = 180;
 /// Ranked offers tried per provisioning pass. Retries supply the rest of the
 /// breadth, and a pass that spends the whole window is a refund.
 const CREATES_PER_PASS: usize = 2;
@@ -148,6 +156,16 @@ impl std::fmt::Display for StillProvisioning {
 }
 
 impl std::error::Error for StillProvisioning {}
+
+/// Whether a host has used up its boot budget. `ssh_key_attached_at` is set
+/// once per instance right after it is created and cleared whenever one is
+/// dropped, which makes it the point this lease started waiting on this
+/// machine. No timestamp means nothing is booting yet, so nothing has stalled.
+fn boot_budget_exhausted(attached_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    attached_at.is_some_and(|attached| {
+        now.signed_duration_since(attached).num_seconds() > HOST_BOOT_BUDGET_SECONDS
+    })
+}
 
 /// `getLease` returns the struct as fourteen words. `createdAt` is the seventh
 /// and `status` the last, both right aligned in their word.
@@ -873,6 +891,7 @@ impl Worker {
         }
 
         let instance = vast.instance(instance_id).await?;
+        let stalled = boot_budget_exhausted(ssh_key_attached_at, Utc::now());
         if instance.status != "running" {
             if matches!(
                 instance.status.as_str(),
@@ -888,7 +907,11 @@ impl Worker {
                 .await?;
                 anyhow::bail!("Vast instance entered terminal state {}", instance.status);
             }
-            return Err(StillProvisioning.into());
+            if !stalled {
+                return Err(StillProvisioning.into());
+            }
+            // Out of boot budget. Fall through so this machine is destroyed,
+            // blacklisted for this lease and replaced, exactly as a refusal is.
         }
         // A host that reserved no forwarded ports boots the container without a
         // reachable sshd, and the renter's key is rejected at the Vast proxy. The
@@ -917,6 +940,11 @@ impl Worker {
             Some("host reserved no forwarded ports, so sshd is unreachable".to_owned())
         } else if rejected.contains(&(instance.machine_id as i64)) {
             Some("this lease already rejected the machine".to_owned())
+        } else if stalled {
+            Some(format!(
+                "host was still {} after {HOST_BOOT_BUDGET_SECONDS}s of boot budget",
+                instance.status
+            ))
         } else {
             None
         };
@@ -1872,6 +1900,22 @@ mod tests {
 
     /// The retry path tells a booting box apart from a broken one by downcast,
     /// so it has to survive whatever context a caller adds on the way up.
+    #[test]
+    fn a_host_keeps_its_boot_budget_then_loses_it() {
+        let now = Utc::now();
+
+        assert!(!boot_budget_exhausted(None, now));
+        assert!(!boot_budget_exhausted(Some(now), now));
+        assert!(!boot_budget_exhausted(
+            Some(now - chrono::Duration::seconds(HOST_BOOT_BUDGET_SECONDS)),
+            now
+        ));
+        assert!(boot_budget_exhausted(
+            Some(now - chrono::Duration::seconds(HOST_BOOT_BUDGET_SECONDS + 1)),
+            now
+        ));
+    }
+
     #[test]
     fn a_booting_box_stays_recognisable_through_added_context() {
         let error = anyhow::Error::from(StillProvisioning).context("start access for lease 39");
