@@ -275,17 +275,23 @@ def main():
     if not alarms:
         print("all clear")
 
+    delivered = True
     if announce and not arguments.quiet:
-        message = "\n".join(announce)
-        if not notify(
-            message,
-            os.environ.get("PRISM_ALERT_TELEGRAM_TOKEN"),
-            os.environ.get("PRISM_ALERT_TELEGRAM_CHAT"),
-            os.environ.get("PRISM_ALERT_WEBHOOK_URL"),
-        ):
-            print("no alert channel configured, so this went nowhere", file=sys.stderr)
+        try:
+            delivered = notify(
+                "\n".join(announce),
+                os.environ.get("PRISM_ALERT_TELEGRAM_TOKEN"),
+                os.environ.get("PRISM_ALERT_TELEGRAM_CHAT"),
+                os.environ.get("PRISM_ALERT_WEBHOOK_URL"),
+            )
+            if not delivered:
+                print("no alert channel configured, so this went nowhere", file=sys.stderr)
+        except Exception as error:  # a channel outage is a condition, not a crash
+            delivered = False
+            print(f"alert delivery failed: {error}", file=sys.stderr)
 
-    if not arguments.quiet:
+    # Recording an alarm that never reached anyone would mute the retry.
+    if not arguments.quiet and delivered:
         save_state(arguments.state, current)
     return 1 if alarms else 0
 
