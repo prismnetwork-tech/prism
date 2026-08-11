@@ -20,8 +20,32 @@
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 28px;
-  border-bottom: 1px solid rgba(230, 237, 220, 0.12);
   background: #000;
+}
+
+/* The page caps its content at 1920px, but these rules divide the whole screen.
+   Capping them too leaves a short line floating in the middle of a wide display
+   while every other divider on the site runs edge to edge. Draw them across the
+   viewport instead; .landing-page clips the overflow. */
+.landing-header::after,
+.landing-hero::after,
+.hero-status::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 100vw;
+  transform: translateX(-50%);
+  border-top: 1px solid rgba(230, 237, 220, 0.12);
+  pointer-events: none;
+}
+
+.landing-header::after,
+.landing-hero::after {
+  bottom: 0;
+}
+
+.hero-status::before {
+  top: 0;
 }
 
 .landing-brand {
@@ -119,7 +143,6 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  border-bottom: 1px solid rgba(230, 237, 220, 0.12);
 }
 
 .hero-grid {
@@ -297,6 +320,7 @@
 }
 
 .hero-status {
+  position: relative;
   min-height: 58px;
   margin: 0;
   padding: 0 var(--landing-gutter);
@@ -304,7 +328,6 @@
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 20px;
-  border-top: 1px solid rgba(230, 237, 220, 0.12);
   color: #737a70;
   text-transform: uppercase;
   letter-spacing: 0.12em;
