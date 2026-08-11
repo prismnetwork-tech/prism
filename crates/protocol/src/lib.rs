@@ -475,7 +475,64 @@ pub enum NodeCommandKind {
         ssh_authorized_key: String,
         jupyter_token: String,
     },
+    /// Run one command to completion and report what it printed. No credentials
+    /// are issued: nobody gets a shell, and the operator never holds a key to
+    /// the renter's workspace, which is the property a server-side executor
+    /// would have had to give up.
+    Batch {
+        image: String,
+        command: String,
+        duration_seconds: u32,
+    },
     Stop,
+}
+
+/// What a batch command left behind. Output is captured on the node and bounded
+/// there: a command that prints a gigabyte should cost the renter its tail, not
+/// take out the control plane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// Set when either stream hit `MAX_CAPTURED_OUTPUT_BYTES` and lost its head.
+    pub truncated: bool,
+}
+
+/// Per stream. Held small enough that a report stays a single ordinary request.
+pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
+
+impl CommandResult {
+    /// Keep the tail rather than the head. A failing command explains itself in
+    /// its last lines, not its first.
+    pub fn capture(exit_code: i32, stdout: &str, stderr: &str) -> Self {
+        let (stdout, out_cut) = tail(stdout);
+        let (stderr, err_cut) = tail(stderr);
+        Self {
+            exit_code,
+            stdout,
+            stderr,
+            truncated: out_cut || err_cut,
+        }
+    }
+
+    pub fn within_limits(&self) -> bool {
+        self.stdout.len() <= MAX_CAPTURED_OUTPUT_BYTES
+            && self.stderr.len() <= MAX_CAPTURED_OUTPUT_BYTES
+    }
+}
+
+fn tail(stream: &str) -> (String, bool) {
+    if stream.len() <= MAX_CAPTURED_OUTPUT_BYTES {
+        return (stream.to_owned(), false);
+    }
+    // Cutting by bytes can land inside a character, so step forward to the next
+    // boundary rather than hand back something that is not a string.
+    let mut start = stream.len() - MAX_CAPTURED_OUTPUT_BYTES;
+    while start < stream.len() && !stream.is_char_boundary(start) {
+        start += 1;
+    }
+    (stream[start..].to_owned(), true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -554,6 +611,8 @@ pub struct NodeCommandReport {
     pub outcome: NodeCommandOutcome,
     pub observed_at: DateTime<Utc>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CommandResult>,
     pub signature: String,
 }
 
@@ -566,6 +625,10 @@ pub struct NodeCommandReportPayload {
     pub outcome: NodeCommandOutcome,
     pub observed_at: DateTime<Utc>,
     pub error: Option<String>,
+    /// Skipped when absent, so a Launch or Stop report signs exactly the bytes
+    /// it signed before batch existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CommandResult>,
 }
 
 impl NodeCommandReport {
@@ -585,6 +648,7 @@ impl NodeCommandReport {
             outcome: unsigned.outcome,
             observed_at: unsigned.observed_at,
             error: unsigned.error,
+            result: unsigned.result,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         })
     }
@@ -599,6 +663,7 @@ impl NodeCommandReport {
                 outcome: self.outcome.clone(),
                 observed_at: self.observed_at,
                 error: self.error.clone(),
+                result: self.result.clone(),
             },
             &self.signature,
             key,
@@ -1246,6 +1311,81 @@ mod tests {
         assert!(request.verify(&key.verifying_key()).is_err());
     }
 
+    fn signed_report(key: &SigningKey, result: Option<CommandResult>) -> NodeCommandReport {
+        NodeCommandReport::sign(
+            NodeCommandReportPayload {
+                node_id: node_id(&key.verifying_key()),
+                device_public_key: URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+                request_id: Uuid::now_v7(),
+                command_id: Uuid::now_v7(),
+                outcome: NodeCommandOutcome::Completed,
+                observed_at: Utc::now(),
+                error: None,
+                result,
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    /// A node that can edit the exit code after signing could bill a failure as
+    /// a success, so the result has to sit inside the signature.
+    #[test]
+    fn a_batch_result_cannot_be_edited_after_signing() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut report = signed_report(&key, Some(CommandResult::capture(1, "out", "boom")));
+        assert!(report.verify(&key.verifying_key()).is_ok());
+
+        report.result.as_mut().unwrap().exit_code = 0;
+        assert!(report.verify(&key.verifying_key()).is_err());
+    }
+
+    /// Launch and Stop predate batch and must keep signing the bytes they
+    /// always signed, which only holds while an absent result is skipped
+    /// rather than encoded as null.
+    #[test]
+    fn a_report_without_a_result_signs_the_same_bytes_as_before() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let report = signed_report(&key, None);
+        let encoded = canonical_json(&NodeCommandReportPayload {
+            node_id: report.node_id.clone(),
+            device_public_key: report.device_public_key.clone(),
+            request_id: report.request_id,
+            command_id: report.command_id,
+            outcome: report.outcome.clone(),
+            observed_at: report.observed_at,
+            error: None,
+            result: None,
+        })
+        .unwrap();
+        assert!(!encoded.contains("result"), "{encoded}");
+        assert!(report.verify(&key.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn capture_keeps_the_tail_and_says_so() {
+        let short = CommandResult::capture(0, "all of it", "");
+        assert_eq!(short.stdout, "all of it");
+        assert!(!short.truncated);
+
+        let long = "x".repeat(MAX_CAPTURED_OUTPUT_BYTES + 500);
+        let cut = CommandResult::capture(0, &long, "");
+        assert!(cut.truncated);
+        assert_eq!(cut.stdout.len(), MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(cut.within_limits());
+    }
+
+    /// Cutting a byte count out of the middle of a character would leave a
+    /// string that will not serialize.
+    #[test]
+    fn capture_cuts_on_a_character_boundary() {
+        let long = "é".repeat(MAX_CAPTURED_OUTPUT_BYTES);
+        let cut = CommandResult::capture(0, &long, "");
+        assert!(cut.truncated);
+        assert!(cut.stdout.len() <= MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(cut.stdout.chars().all(|character| character == 'é'));
+    }
+
     #[test]
     fn command_reports_are_bound_to_the_command_and_outcome() {
         let key = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -1259,6 +1399,7 @@ mod tests {
                 outcome: NodeCommandOutcome::Ready,
                 observed_at: Utc::now(),
                 error: None,
+                result: None,
             },
             &key,
         )

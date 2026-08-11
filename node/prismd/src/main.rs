@@ -12,8 +12,8 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use prism_protocol::{
-    GpuSpec, IsolationMode, NodeCertificateBundle, NodeCertificateRequest, NodeCommand,
-    NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport,
+    CommandResult, GpuSpec, IsolationMode, NodeCertificateBundle, NodeCertificateRequest,
+    NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport,
     NodeCommandReportPayload, NodeEnrollment, NodePosture, NodeTelemetry,
     UnsignedNodeCertificateRequest, UnsignedNodeEnrollment, UnsignedTelemetry, node_id,
 };
@@ -723,9 +723,29 @@ async fn execute_node_command(
             command.command_id,
             NodeCommandOutcome::Failed,
             Some("command identity is invalid or expired".to_owned()),
+            None,
         )
         .await?;
         return Ok(());
+    }
+    if let NodeCommandKind::Batch {
+        image,
+        command: program,
+        duration_seconds,
+    } = &command.kind
+    {
+        return run_batch_command(
+            client,
+            config,
+            node,
+            public_key,
+            key,
+            &command,
+            image,
+            program,
+            *duration_seconds,
+        )
+        .await;
     }
     let NodeCommandKind::Launch {
         image,
@@ -743,6 +763,7 @@ async fn execute_node_command(
             command.command_id,
             NodeCommandOutcome::Failed,
             Some("stop commands require an active runtime supervisor".to_owned()),
+            None,
         )
         .await?;
         return Ok(());
@@ -762,6 +783,7 @@ async fn execute_node_command(
             command.command_id,
             NodeCommandOutcome::Failed,
             Some("no schedulable VFIO GPU group is available".to_owned()),
+            None,
         )
         .await?;
         return Ok(());
@@ -840,6 +862,7 @@ async fn execute_node_command(
                 command.command_id,
                 NodeCommandOutcome::Ready,
                 None,
+                None,
             )
             .await?;
             ready_reported_at = Some(Utc::now());
@@ -876,8 +899,91 @@ async fn execute_node_command(
         command.command_id,
         outcome,
         error,
+        None,
     )
     .await
+}
+
+/// A batch command occupies the GPU exactly like a lease does, so it takes the
+/// same VFIO group and reports through the same signed channel. The difference
+/// is what comes back: what the command printed, rather than a way in.
+#[allow(clippy::too_many_arguments)]
+async fn run_batch_command(
+    client: &reqwest::Client,
+    config: &CommandLoopConfig,
+    node: &str,
+    public_key: &str,
+    key: &SigningKey,
+    command: &NodeCommand,
+    image: &str,
+    program: &str,
+    duration_seconds: u32,
+) -> anyhow::Result<()> {
+    let groups = runtime::discover_vfio_gpu_groups()?;
+    let Some(group) = groups.first() else {
+        return report_command(
+            client,
+            &config.control_plane,
+            node,
+            public_key,
+            key,
+            command.command_id,
+            NodeCommandOutcome::Failed,
+            Some("no schedulable VFIO GPU group is available".to_owned()),
+            None,
+        )
+        .await;
+    };
+
+    let lease_id = command.lease_id.to_string();
+    let workspace_root = config.workspace_root.clone();
+    let state_root = config.state_root.clone();
+    let vfio_group = group.id;
+    let image = image.to_owned();
+    let program = program.to_owned();
+    let outcome = tokio::task::spawn_blocking(move || {
+        runtime::run_batch(runtime::BatchConfig {
+            image: &image,
+            lease_id: &lease_id,
+            command: &program,
+            workspace_root: &workspace_root,
+            state_root: &state_root,
+            vfio_group,
+            duration_seconds,
+        })
+    })
+    .await?;
+
+    match outcome {
+        Ok(result) => {
+            report_command(
+                client,
+                &config.control_plane,
+                node,
+                public_key,
+                key,
+                command.command_id,
+                NodeCommandOutcome::Completed,
+                None,
+                Some(result),
+            )
+            .await
+        }
+        Err(error) => {
+            report_command(
+                client,
+                &config.control_plane,
+                node,
+                public_key,
+                key,
+                command.command_id,
+                NodeCommandOutcome::Failed,
+                Some(format!("{error:#}")),
+                None,
+            )
+            .await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -890,6 +996,7 @@ async fn report_command(
     command_id: uuid::Uuid,
     outcome: NodeCommandOutcome,
     error: Option<String>,
+    result: Option<CommandResult>,
 ) -> anyhow::Result<()> {
     let endpoint = control_plane_endpoint(
         control_plane,
@@ -906,6 +1013,7 @@ async fn report_command(
                 outcome: outcome.clone(),
                 observed_at: Utc::now(),
                 error: error.clone(),
+                result: result.clone(),
             },
             key,
         )?;

@@ -6091,6 +6091,7 @@ mod tests {
             outcome: NodeCommandOutcome::Ready,
             observed_at: Utc::now(),
             error: None,
+            result: None,
             signature: "test".to_owned(),
         };
         store.report_command(&report).await.unwrap();

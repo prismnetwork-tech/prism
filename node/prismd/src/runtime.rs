@@ -718,6 +718,137 @@ impl Drop for DeviceReservation {
     }
 }
 
+/// A batch workload: the same Kata VM and exclusive GPU as an interactive
+/// lease, but it runs one command and exits. Nothing is published and no
+/// credentials are written, so there is no way in and nothing to leak.
+pub struct BatchConfig<'a> {
+    pub image: &'a str,
+    pub lease_id: &'a str,
+    pub command: &'a str,
+    pub workspace_root: &'a Path,
+    pub state_root: &'a Path,
+    pub vfio_group: u32,
+    pub duration_seconds: u32,
+}
+
+pub fn batch_command(config: &BatchConfig<'_>) -> anyhow::Result<Command> {
+    validate_batch_config(config)?;
+    let vfio_device = format!("/dev/vfio/{}", config.vfio_group);
+    let mut command = Command::new("nerdctl");
+    command.args([
+        "--namespace",
+        "prism",
+        "run",
+        "--rm",
+        "--pull",
+        "always",
+        "--runtime",
+        "io.containerd.kata.v2",
+        "--read-only",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--cap-drop",
+        "ALL",
+        "--pids-limit",
+        "2048",
+        "--user",
+        "0:0",
+        "--sysctl",
+        "net.ipv6.conf.all.disable_ipv6=1",
+        "--device",
+        "/dev/vfio/vfio",
+        "--device",
+        &vfio_device,
+        "--tmpfs",
+        "/run:rw,nosuid,nodev,mode=0755",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+        "--tmpfs",
+        "/workspace:rw,nosuid,nodev,mode=0700",
+        "--hostname",
+        config.lease_id,
+        "--entrypoint",
+        "/bin/sh",
+        "--name",
+        config.lease_id,
+        config.image,
+        "-c",
+        config.command,
+    ]);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    Ok(command)
+}
+
+/// Run the command to completion, or kill it when its paid duration runs out.
+/// Returns what it printed and the code it exited with; a command that fails is
+/// a result, not an error, because the renter still paid for the attempt.
+pub fn run_batch(config: BatchConfig<'_>) -> anyhow::Result<prism_protocol::CommandResult> {
+    validate_batch_config(&config)?;
+    let group = VfioGroup::from_system(config.vfio_group)?;
+    let _reservation = DeviceReservation::acquire(
+        Path::new(SYSTEM_LOCK_ROOT),
+        config.vfio_group,
+        config.lease_id,
+    )?;
+    fs::create_dir_all(config.workspace_root)?;
+    fs::create_dir_all(config.state_root)?;
+
+    let mut child = batch_command(&config)?
+        .spawn()
+        .context("failed to start the batch workload through nerdctl")?;
+
+    let deadline = Instant::now() + Duration::from_secs(u64::from(config.duration_seconds));
+    let timed_out = loop {
+        match child.try_wait()? {
+            Some(_) => break false,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = stop_container(config.lease_id);
+                break true;
+            }
+            None => thread::sleep(Duration::from_millis(250)),
+        }
+    };
+
+    let output = child
+        .wait_with_output()
+        .context("failed to collect batch output")?;
+    let _ = remove_egress_policy();
+    drop(group);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if timed_out {
+        stderr.push_str("\nprism: the command was still running when its paid duration ended\n");
+    }
+    let exit_code = match output.status.code() {
+        Some(code) if !timed_out => code,
+        // A killed process has no code of its own, and reporting 0 would tell
+        // the renter their command succeeded.
+        _ => 124,
+    };
+    Ok(prism_protocol::CommandResult::capture(
+        exit_code, &stdout, &stderr,
+    ))
+}
+
+fn validate_batch_config(config: &BatchConfig<'_>) -> anyhow::Result<()> {
+    validate_image_reference(config.image)?;
+    validate_lease_id(config.lease_id)?;
+    if config.duration_seconds == 0 || config.duration_seconds > MAX_LEASE_SECONDS {
+        anyhow::bail!("batch duration must be between one second and six hours");
+    }
+    if config.command.trim().is_empty() {
+        anyhow::bail!("batch command is empty");
+    }
+    if config.command.len() > 8 * 1024 {
+        anyhow::bail!("batch command is too long");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +894,79 @@ mod tests {
         assert!(validate_image_reference("localhost/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(validate_image_reference("10.0.0.5/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(validate_lease_id("../../outside").is_err());
+    }
+
+    /// A batch workload gets the same exclusive GPU as a lease and publishes
+    /// nothing: a forwarded port would be a way into a workspace that is not
+    /// supposed to have one.
+    #[test]
+    fn batch_command_takes_the_gpu_and_publishes_nothing() {
+        let root = temporary_directory("batch-command");
+        let config = BatchConfig {
+            image: "docker.io/library/debian@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            lease_id: "77",
+            command: "nvidia-smi -L",
+            workspace_root: &root,
+            state_root: &root,
+            vfio_group: 42,
+            duration_seconds: 600,
+        };
+        let command = batch_command(&config).unwrap();
+        let arguments = command
+            .get_args()
+            .map(OsStr::to_string_lossy)
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "nerdctl");
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--device", "/dev/vfio/42"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--runtime", "io.containerd.kata.v2"])
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--publish"));
+        assert_eq!(arguments.last().unwrap(), "nvidia-smi -L");
+    }
+
+    #[test]
+    fn batch_refuses_a_mutable_image_or_an_empty_command() {
+        let root = temporary_directory("batch-validate");
+        let pinned = "docker.io/library/debian@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let base = BatchConfig {
+            image: pinned,
+            lease_id: "77",
+            command: "true",
+            workspace_root: &root,
+            state_root: &root,
+            vfio_group: 1,
+            duration_seconds: 60,
+        };
+        assert!(validate_batch_config(&base).is_ok());
+        assert!(
+            validate_batch_config(&BatchConfig {
+                image: "docker.io/library/debian:latest",
+                ..base
+            })
+            .is_err()
+        );
+        assert!(
+            validate_batch_config(&BatchConfig {
+                command: "  ",
+                ..base
+            })
+            .is_err()
+        );
+        assert!(
+            validate_batch_config(&BatchConfig {
+                duration_seconds: 0,
+                ..base
+            })
+            .is_err()
+        );
     }
 
     #[test]
