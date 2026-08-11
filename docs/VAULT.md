@@ -1,15 +1,15 @@
 # Vault
 
-Prism used to have one answer for private data: don't bring it. That answer
-came from conflating two different things. A *workspace* is rented hardware
-someone else administers, and on today's capacity its operator can read
-anything in it. *Your data* is a separate question, and it does not have to
-live in the workspace to be useful.
+The vault stores cards, identity documents, API credentials and recovery codes
+encrypted under a key derived on the renter's machine. Prism holds ciphertext.
+It cannot read an item, and it cannot hand one to a host, because it never has
+the key.
 
-The vault is that separate place. Cards, identity documents, API credentials
-and recovery codes are stored encrypted under a key derived on your machine.
-Prism holds ciphertext. It cannot read an item, and it cannot hand one to a
-host, because it never has the key.
+This is separate from a workspace on purpose. A workspace is rented hardware
+someone else administers, and on today's capacity its operator can read
+anything in it. A renter's data does not have to live there to be useful, and
+the earlier guidance to keep private data off the network entirely came from
+treating those as one question.
 
 ## What holds it up
 
@@ -21,8 +21,7 @@ vault survives a lost laptop without Prism keeping a recovery copy. An optional
 passphrase is mixed into the HKDF salt, so a stolen signature alone is not
 enough.
 
-The interesting part is what is authenticated alongside the ciphertext. GCM's
-associated data binds four fields:
+GCM's associated data binds four fields alongside the ciphertext:
 
 ```
 prism.vault.v1\0<subject>\0<item_id>\0<version>\0<trust_floor>\0
@@ -58,10 +57,10 @@ decoration: it means storing a card and then asking an agent to use it inside a
 rented box fails loudly instead of leaking it. Lowering an item's floor is a
 deliberate act that reseals the item.
 
-This is the failure mode worth engineering against. A person who decrypts their
+The floor exists for the agent case specifically. A person who decrypts their
 own card and pastes it into their own GPU box has made a choice. An autonomous
 agent that does the same because a policy check was skipped has made a mistake,
-and the refusal is what turns that mistake into an error message.
+and the refusal turns that mistake into an error message.
 
 Every authorized release is recorded and readable at `GET /v1/vault/releases`,
 so a renter can see afterwards exactly what an agent exposed and where. A
@@ -70,8 +69,8 @@ refused release records nothing; only real exposure is logged.
 ## What it does not do
 
 The vault does not make a workspace confidential. Once an item is released into
-a lease, that lease's trust class is the whole story — which is why the floor
-exists and why the default puts every new item out of reach of `open` capacity.
+a lease, that lease's trust class governs what happens to it, which is why the
+default puts every new item out of reach of `open` capacity.
 
 It does not protect against a compromised client. The key is derived where your
 code runs; anything with that process's memory has the vault. Signing the vault

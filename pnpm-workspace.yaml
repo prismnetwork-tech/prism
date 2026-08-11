@@ -1,5 +1,6 @@
 packages:
   - apps/*
+  - sdk
 
 blockExoticSubdeps: true
 minimumReleaseAge: 10080

@@ -3,9 +3,11 @@
 // handed to Prism. There is no code path that sends a key anywhere, which is
 // the entire reason an agent can keep a card or an identity document in a
 // service it does not trust.
-import { webcrypto } from "node:crypto";
-
-const { subtle } = webcrypto;
+//
+// Runs unchanged in Node and in the browser, so an agent and the person who
+// owns it seal items identically. Two implementations would be two chances to
+// disagree, and disagreeing here means a vault that will not open.
+const { subtle } = globalThis.crypto;
 
 export const VAULT_ENVELOPE_DOMAIN = "prism.vault.v1\0";
 
@@ -32,14 +34,52 @@ const TRUST_ORDER = ["open", "isolated", "attested", "confidential"];
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
-const fromB64url = (value) => new Uint8Array(Buffer.from(value, "base64url"));
+// Chunked because a 160 KiB item would otherwise spread into more arguments
+// than an engine will accept in one call.
+function b64url(bytes) {
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromB64url(value) {
+  const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function fromHex(value) {
+  const digits = value.replace(/^0x/, "");
+  if (digits.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(digits)) {
+    throw new VaultError("invalid_signature_encoding");
+  }
+  const bytes = new Uint8Array(digits.length / 2);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(digits.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+/// The wallet address, lowercased. Casing varies by source — a checksummed
+/// address from one wallet and a lowercase one from another must not derive
+/// two different keys for the same vault.
+export function vaultWallet(address) {
+  if (typeof address !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new VaultError("invalid_wallet_address", { address });
+  }
+  return address.toLowerCase();
+}
 
 /// Mirrors `vault_associated_data` in prism-protocol byte for byte. A shared
 /// test vector pins both; if they drift, stored items stop opening.
-export function associatedData(subject, itemId, version, trustFloor) {
+export function associatedData(wallet, itemId, version, trustFloor) {
   return encoder.encode(
-    `${VAULT_ENVELOPE_DOMAIN}${subject}\0${itemId}\0${version}\0${trustFloor}\0`,
+    `${VAULT_ENVELOPE_DOMAIN}${wallet}\0${itemId}\0${version}\0${trustFloor}\0`,
   );
 }
 
@@ -59,17 +99,11 @@ function meetsFloor(floor, leaseClass) {
 // vault survives a lost laptop without Prism holding an escrow copy. A
 // passphrase, when given, is mixed into the salt, so a leaked signature alone
 // is not enough to open the vault.
-async function deriveRootKey(signature, subject, passphrase) {
-  const material = await subtle.importKey(
-    "raw",
-    Buffer.from(signature.replace(/^0x/, ""), "hex"),
-    "HKDF",
-    false,
-    ["deriveKey"],
-  );
+async function deriveRootKey(signature, wallet, passphrase) {
+  const material = await subtle.importKey("raw", fromHex(signature), "HKDF", false, ["deriveKey"]);
   const salt = await subtle.digest(
     "SHA-256",
-    encoder.encode(`prism.vault.kdf.v1\0${subject}\0${passphrase ?? ""}`),
+    encoder.encode(`prism.vault.kdf.v1\0${wallet}\0${passphrase ?? ""}`),
   );
   return subtle.deriveKey(
     { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(salt), info: encoder.encode("root") },
@@ -89,7 +123,7 @@ async function gcm(usages) {
 // instead of re-encrypting every card and passport in the vault.
 async function seal(rootKey, plaintext, aad) {
   const dataKey = await gcm(["encrypt", "decrypt"]);
-  const nonce = webcrypto.getRandomValues(new Uint8Array(12));
+  const nonce = globalThis.crypto.getRandomValues(new Uint8Array(12));
   const [ciphertext, wrapped] = await Promise.all([
     subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: aad }, dataKey, plaintext),
     subtle.wrapKey("raw", dataKey, rootKey, "AES-KW"),
@@ -132,7 +166,7 @@ async function unseal(rootKey, wrappedKey, nonce, ciphertext, aad) {
 export class PrismVault {
   #agent;
   #rootKey = null;
-  #subject = null;
+  #wallet = null;
 
   constructor(agent) {
     this.#agent = agent;
@@ -146,16 +180,22 @@ export class PrismVault {
   /// process; the signature itself is discarded once the key exists.
   async unlock({ passphrase = null } = {}) {
     if (!this.#agent.session) await this.#agent.authenticate();
-    const subject = `wallet:${this.#agent.address.toLowerCase()}`;
+    const wallet = vaultWallet(this.#agent.address);
     const signature = await this.#agent.signVaultStatement(VAULT_KEY_STATEMENT);
-    this.#rootKey = await deriveRootKey(signature, subject, passphrase);
-    this.#subject = subject;
+    this.#rootKey = await deriveRootKey(signature, wallet, passphrase);
+    this.#wallet = wallet;
     return this;
+  }
+
+  /// The wallet whose vault is open. One wallet, one vault, whether it is
+  /// reached from a browser or from an agent.
+  get wallet() {
+    return this.#wallet;
   }
 
   lock() {
     this.#rootKey = null;
-    this.#subject = null;
+    this.#wallet = null;
   }
 
   #require() {
@@ -178,10 +218,10 @@ export class PrismVault {
   async put(value, { itemId = null, replaces = null, trustFloor = DEFAULT_TRUST_FLOOR, label = "" } = {}) {
     this.#require();
     assertTrustFloor(trustFloor);
-    const id = replaces?.item_id ?? itemId ?? webcrypto.randomUUID();
+    const id = replaces?.item_id ?? itemId ?? globalThis.crypto.randomUUID();
     const version = replaces ? replaces.version + 1 : 1;
     const plaintext = encoder.encode(typeof value === "string" ? value : JSON.stringify(value));
-    const aad = associatedData(this.#subject, id, version, trustFloor);
+    const aad = associatedData(this.#wallet, id, version, trustFloor);
     const { nonce, ciphertext, wrappedKey } = await seal(this.#rootKey, plaintext, aad);
     return this.#agent.vaultRequest("PUT", ["items", id], {
       body: {
@@ -217,7 +257,7 @@ export class PrismVault {
       });
     }
     const aad = associatedData(
-      this.#subject,
+      this.#wallet,
       item.item_id,
       item.version,
       item.min_trust_class,

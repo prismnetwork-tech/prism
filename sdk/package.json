@@ -6,11 +6,15 @@
   "main": "prism.mjs",
   "exports": {
     ".": "./prism.mjs",
-    "./vault": "./vault.mjs"
+    "./vault": {
+      "types": "./vault.d.ts",
+      "default": "./vault.mjs"
+    }
   },
   "files": [
     "prism.mjs",
     "vault.mjs",
+    "vault.d.ts",
     "README.md"
   ],
   "engines": {

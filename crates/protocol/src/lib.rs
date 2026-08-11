@@ -754,22 +754,24 @@ pub fn vault_release_permitted(floor: TrustClass, lease: TrustClass) -> bool {
 }
 
 /// The bytes authenticated alongside every vault ciphertext. Binding the
-/// account, the slot, the version and the trust floor into GCM's associated
-/// data is what stops this service from moving an item between accounts,
+/// wallet, the slot, the version and the trust floor into GCM's associated
+/// data is what stops this service from moving an item between vaults,
 /// rolling one back to a superseded version, or quietly lowering the floor to
 /// leak it into an open box: any of those makes the renter's decrypt fail
 /// instead of succeeding with the wrong answer.
 ///
-/// Byte-for-byte identical in the SDK. A shared test vector pins both.
+/// `wallet` is the lowercase address, because casing varies by source and two
+/// spellings of one address must not derive two keys. Byte-for-byte identical
+/// in the SDK, and a shared test vector pins both.
 pub fn vault_associated_data(
-    subject: &str,
+    wallet: &str,
     item_id: Uuid,
     version: u32,
     floor: TrustClass,
 ) -> Vec<u8> {
     let mut aad = Vec::from(VAULT_ENVELOPE_DOMAIN);
     for field in [
-        subject,
+        wallet,
         &item_id.hyphenated().to_string(),
         &version.to_string(),
         floor.label(),
@@ -1273,7 +1275,7 @@ mod tests {
     #[test]
     fn vault_associated_data_matches_the_published_vector() {
         let aad = vault_associated_data(
-            "did:privy:cm123",
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
             Uuid::parse_str("018f3a2b-4c5d-7e8f-9012-3456789abcde").unwrap(),
             7,
             TrustClass::Confidential,
@@ -1283,7 +1285,7 @@ mod tests {
         // octal escape and would quietly change the vector.
         assert_eq!(
             aad,
-            b"prism.vault.v1\x00did:privy:cm123\x00018f3a2b-4c5d-7e8f-9012-3456789abcde\x007\x00confidential\x00"
+            b"prism.vault.v1\x000x1f9840a85d5af5bf1d1762f925bdaddc4201f984\x00018f3a2b-4c5d-7e8f-9012-3456789abcde\x007\x00confidential\x00"
         );
     }
 

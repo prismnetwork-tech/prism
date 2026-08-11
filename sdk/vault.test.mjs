@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { webcrypto } from "node:crypto";
 import { test } from "node:test";
 
 import {
@@ -8,6 +7,7 @@ import {
   VAULT_KEY_STATEMENT,
   VaultError,
   associatedData,
+  vaultWallet,
 } from "./vault.mjs";
 
 // Stands in for the control plane: it stores exactly what a real deployment
@@ -73,15 +73,17 @@ class FakeService {
 
 // A deterministic stand-in for a wallet. Real secp256k1 signing is deterministic
 // per RFC 6979, which is what lets the same wallet re-derive the same vault key.
-function fakeAgent(service, { address = "0xabc0000000000000000000000000000000000001" } = {}) {
+function fakeAgent(service, { address = "0xAbC0000000000000000000000000000000000001" } = {}) {
   return {
     address,
     session: "session",
     async authenticate() {},
     async signVaultStatement(statement) {
-      const digest = await webcrypto.subtle.digest(
+      // A real wallet signs the same bytes regardless of how the address was
+      // spelled, so key off the canonical form.
+      const digest = await crypto.subtle.digest(
         "SHA-256",
-        new TextEncoder().encode(`${address}\0${statement}`),
+        new TextEncoder().encode(`${address.toLowerCase()}\0${statement}`),
       );
       return `0x${Buffer.from(digest).toString("hex")}`;
     },
@@ -120,7 +122,7 @@ test("a different wallet cannot open another wallet's item", async () => {
   const stored = await owner.put("passport MZ8817264");
 
   const intruder = await unlockedVault(service, {
-    address: "0xdef0000000000000000000000000000000000002",
+    address: "0xDef0000000000000000000000000000000000002",
   });
   await assert.rejects(() => intruder.get(stored.item_id), (err) => {
     assert.ok(err instanceof VaultError);
@@ -159,7 +161,7 @@ test("moving an item into another account's slot makes it unreadable, not misrea
   const vault = await unlockedVault(service);
   const stored = await vault.put("bank token");
 
-  const smuggled = { ...stored, item_id: webcrypto.randomUUID() };
+  const smuggled = { ...stored, item_id: crypto.randomUUID() };
   await assert.rejects(() => vault.open(smuggled), /vault_authentication_failed/);
 });
 
@@ -238,7 +240,7 @@ test("an unknown trust floor is refused rather than coerced", async () => {
 // implementations must agree byte for byte or every stored item stops opening.
 test("associated data matches the protocol vector", () => {
   const aad = associatedData(
-    "did:privy:cm123",
+    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
     "018f3a2b-4c5d-7e8f-9012-3456789abcde",
     7,
     "confidential",
@@ -248,11 +250,40 @@ test("associated data matches the protocol vector", () => {
     Buffer.from(aad).toString("binary"),
     // Explicit \u0000 escapes: "\0" before a digit is an octal escape, which
     // would quietly change the vector.
-    "prism.vault.v1\u0000did:privy:cm123\u0000018f3a2b-4c5d-7e8f-9012-3456789abcde\u00007\u0000confidential\u0000",
+    "prism.vault.v1\u00000x1f9840a85d5af5bf1d1762f925bdaddc4201f984\u0000018f3a2b-4c5d-7e8f-9012-3456789abcde\u00007\u0000confidential\u0000",
   );
 });
 
 test("the key statement names its domain and warns what signing it grants", () => {
   assert.match(VAULT_KEY_STATEMENT, /prism\.vault\.kdf\.v1/);
   assert.match(VAULT_KEY_STATEMENT, /never sent/);
+});
+
+// A wallet address arrives checksummed from one source and lowercase from
+// another. Both must open the same vault.
+test("address casing does not fork the vault", async () => {
+  const service = new FakeService();
+  const upper = await unlockedVault(service, { address: "0xAbC0000000000000000000000000000000000001" });
+  const stored = await upper.put("same vault");
+
+  const lower = await unlockedVault(service, { address: "0xabc0000000000000000000000000000000000001" });
+  assert.equal(await lower.get(stored.item_id), "same vault");
+  assert.equal(upper.wallet, lower.wallet);
+});
+
+test("a malformed wallet address is refused", () => {
+  assert.throws(() => vaultWallet("not-an-address"), /invalid_wallet_address/);
+  assert.throws(() => vaultWallet("0x123"), /invalid_wallet_address/);
+  assert.equal(vaultWallet("0xAbC0000000000000000000000000000000000001"), "0xabc0000000000000000000000000000000000001");
+});
+
+// The item cap is 160 KiB of ciphertext; a realistic document has to survive
+// the base64 and chunking paths without corruption.
+test("a large item round trips", async () => {
+  const service = new FakeService();
+  const vault = await unlockedVault(service);
+  const document = "x".repeat(100_000);
+
+  const stored = await vault.put(document);
+  assert.equal(await vault.get(stored.item_id), document);
 });
