@@ -143,6 +143,18 @@ impl RpcClient {
         self.quantity("eth_chainId", serde_json::json!([])).await
     }
 
+    /// `eth_gasPrice` here answers with the current base fee rather than the
+    /// next block's, so a transaction priced at exactly what it suggests is
+    /// rejected as soon as the base fee ticks up. Double it. The surplus is
+    /// refunded, and settlement transactions that cannot be replaced are worth
+    /// far more than the headroom costs.
+    pub async fn suggested_gas_price(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .quantity("eth_gasPrice", serde_json::json!([]))
+            .await?
+            .saturating_mul(2))
+    }
+
     pub async fn prepare_transaction(
         &self,
         signer: &EthereumSigner,
@@ -158,10 +170,7 @@ impl RpcClient {
                 serde_json::json!([from, "pending"]),
             )
             .await?;
-        let gas_price = self
-            .quantity("eth_gasPrice", serde_json::json!([]))
-            .await?
-            .saturating_mul(2);
+        let gas_price = self.suggested_gas_price().await?;
         let gas_limit = self
             .quantity(
                 "eth_estimateGas",

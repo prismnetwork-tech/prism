@@ -602,9 +602,7 @@ async fn prepare_submission(
             serde_json::json!([from, "pending"]),
         )
         .await?;
-    let gas_price = chain
-        .quantity("eth_gasPrice", serde_json::json!([]))
-        .await?;
+    let gas_price = chain.suggested_gas_price().await?;
     let gas_limit = chain
         .quantity(
             "eth_estimateGas",
@@ -772,6 +770,18 @@ impl ChainClient {
             16,
         )
         .context("RPC quantity exceeds uint64")
+    }
+
+    /// `eth_gasPrice` here answers with the current base fee rather than the
+    /// next block's, so a transaction priced at exactly what it suggests is
+    /// rejected the moment the base fee ticks up. Double it, as the shared
+    /// chain client does. Lease 39 sat unsettled for nineteen hours because
+    /// this path did not.
+    async fn suggested_gas_price(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .quantity("eth_gasPrice", serde_json::json!([]))
+            .await?
+            .saturating_mul(2))
     }
 
     /// The escrow decides how long a proposal can be disputed. Reading it beats
