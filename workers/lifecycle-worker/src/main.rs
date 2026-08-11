@@ -179,6 +179,10 @@ struct OnchainLease {
 struct LeaseContext {
     lease: LeaseRecord,
     offer: NodeOffer,
+    /// What the renter actually asked for. The offer carries whatever class the
+    /// broker last sourced, which moves between refreshes and says nothing
+    /// about the promise this lease was sold on.
+    min_vram_mib: u32,
     connection_id: Option<String>,
     cuda_ready_at: Option<DateTime<Utc>>,
     gateway_ready_at: Option<DateTime<Utc>>,
@@ -896,10 +900,10 @@ impl Worker {
                 "{} with {} MiB is not a class this broker rents",
                 instance.gpu_name, instance.gpu_ram
             ))
-        } else if instance.gpu_ram < u64::from(context.offer.gpu.vram_mib) {
+        } else if instance.gpu_ram < u64::from(context.min_vram_mib) {
             Some(format!(
-                "{} MiB is short of the {} MiB advertised",
-                instance.gpu_ram, context.offer.gpu.vram_mib
+                "{} MiB is short of the {} MiB this lease asked for",
+                instance.gpu_ram, context.min_vram_mib
             ))
         } else if !instance.verification.eq_ignore_ascii_case("verified") {
             Some(format!("host is {}, not verified", instance.verification))
@@ -1461,14 +1465,17 @@ impl Worker {
                 Option<DateTime<Utc>>,
                 Option<DateTime<Utc>>,
                 Option<Uuid>,
+                i32,
             ),
         >(
             "SELECT l.document, o.document, lc.connection_id, \
                     lc.cuda_ready_at, lc.gateway_ready_at, lc.access_started_at, lc.access_ended_at, \
-                    lc.gateway_closed_at, lc.grant_token_id \
+                    lc.gateway_closed_at, lc.grant_token_id, \
+                    COALESCE((q.document->>'min_vram_mib')::int, 0) \
              FROM leases l \
              JOIN node_offers o ON o.node_id = l.document->>'node_id' \
              JOIN lease_lifecycle lc ON lc.lease_id = l.lease_id \
+             LEFT JOIN lease_quotes q ON q.quote_id = (l.document->>'quote_id')::uuid \
              WHERE l.lease_id = $1",
         )
         .bind(lease_id as i64)
@@ -1477,6 +1484,7 @@ impl Worker {
         Ok(LeaseContext {
             lease: row.0.0,
             offer: row.1.0,
+            min_vram_mib: u32::try_from(row.9).unwrap_or(0),
             connection_id: row.2,
             cuda_ready_at: row.3,
             gateway_ready_at: row.4,
