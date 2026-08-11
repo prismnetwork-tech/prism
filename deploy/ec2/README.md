@@ -64,11 +64,13 @@ value inline on the `docker compose` command line survives exactly one
 
 ### Images
 
-The `images` workflow builds each service on a native amd64 runner and pushes
+The `images` workflow builds each service and pushes
 `ghcr.io/prismnetwork-tech/prism/<binary>:<sha>` plus a moving `:main` tag, so a
-deploy is a pull rather than a local cross-build. Building these on an Apple
-Silicon laptop means emulating amd64, and `aws-lc-sys` reliably crashes the
-emulated compiler.
+deploy is a pull rather than a local build. The published images are
+**linux/arm64**, matching the host: `aws-lc-sys` reliably crashes the compiler
+under emulation, so every build runs on the architecture it targets. An amd64
+deployment needs a second native runner in that workflow, not a `--platform`
+flag.
 
 ```sh
 PRISM_LIFECYCLE_WORKER_IMAGE=ghcr.io/prismnetwork-tech/prism/prism-lifecycle-worker:main
