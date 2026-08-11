@@ -23,8 +23,10 @@ permissions:
   packages: write
 
 jobs:
+  # The control plane runs on arm64, and `aws-lc-sys` crashes the compiler when
+  # the other architecture is emulated, so build on the metal that will run it.
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     strategy:
       fail-fast: false
