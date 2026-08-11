@@ -77,6 +77,36 @@ PRISM_LIFECYCLE_WORKER_IMAGE=ghcr.io/prismnetwork-tech/prism/prism-lifecycle-wor
 docker compose pull lifecycle-worker && docker compose up -d lifecycle-worker
 ```
 
+### Alerts
+
+Services staying up is not the same as customers being served. The marketplace
+has run with no rentable capacity while every container reported healthy, and
+settlement has been dead for nineteen hours the same way. `prism-health.timer`
+runs `check-prism-health.py` every five minutes against outcomes instead:
+whether anything is rentable, whether leases reach their end state, whether the
+signers can still pay for the transactions that release money, and what the
+reconciliation monitor makes of the escrow.
+
+Install the script at `/usr/local/sbin/check-prism-health.py`, put the settings
+in `/opt/prism/alerts.env`, then `systemctl enable --now prism-health.timer`.
+
+```sh
+PRISM_ALERT_SIGNERS=settlement=0x...,lifecycle=0x...
+PRISM_ALERT_TELEGRAM_TOKEN=...
+PRISM_ALERT_TELEGRAM_CHAT=...
+VAST_API_KEY=...
+```
+
+With no channel configured the run still prints its findings and exits non-zero,
+so `systemctl status prism-health` and the journal hold the answer. That is a
+fallback, not a plan: nobody reads a journal they have no reason to open.
+
+Thresholds default to one rentable node, thirty minutes in `settlement_pending`,
+fifteen minutes to reach a customer, 0.0005 ETH per signer and $25 of provider
+credit, each overridable in the same file. An alarm repeats every six hours
+while it lasts and reports once when it clears. `--quiet` checks and prints
+without sending or recording anything.
+
 ### Gateway certificates
 
 The control plane signs node client certificates with `secrets/tls/ca.key`, and

@@ -1,0 +1,9 @@
+[Unit]
+Description=Check that Prism is still serving customers
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/prism/alerts.env
+ExecStart=/usr/local/sbin/check-prism-health.py
