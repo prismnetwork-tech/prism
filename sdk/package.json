@@ -21,7 +21,7 @@
     "node": ">=20"
   },
   "peerDependencies": {
-    "viem": "^2"
+    "viem": "^2.55.11"
   },
   "keywords": [
     "prism",
