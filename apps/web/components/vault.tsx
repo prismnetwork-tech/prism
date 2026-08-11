@@ -231,9 +231,9 @@ export function Vault() {
             {busy === "store" ? "Sealing…" : "Seal and store"}
           </button>
           <div className="safety-note">
-            <strong>All capacity today is open class.</strong>
-            An item kept at confidential stays in storage: no workspace on the network can receive
-            it, so an agent cannot expose it by mistake.
+            <strong>Every workspace available today can be read by the company hosting it.</strong>
+            An item left at confidential stays in storage, where no workspace can receive it, so an
+            agent cannot expose it by mistake.
           </div>
         </article>
       </div>
