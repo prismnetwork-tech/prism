@@ -1,0 +1,69 @@
+name: deploy web
+
+# Render is configured to deploy this repository automatically, but the
+# integration that delivers push events disappeared: the repository has no
+# webhooks at all, so autoDeploy sat enabled and idle while the site served a
+# four-day-old build. Nothing reported it, because a deploy that is never
+# requested has no failure to report. Requesting it here means a broken deploy
+# is a red check instead of silence.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Request a deploy of this commit
+        id: request
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+          response=$(curl --fail --silent --show-error -X POST \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"clearCache":"do_not_clear"}' \
+            "https://api.render.com/v1/services/$SERVICE_ID/deploys")
+          deploy=$(printf '%s' "$response" | jq -r '.id')
+          if [ -z "$deploy" ] || [ "$deploy" = "null" ]; then
+            printf 'Render did not return a deploy id: %s\n' "$response" >&2
+            exit 1
+          fi
+          printf 'deploy=%s\n' "$deploy" >> "$GITHUB_OUTPUT"
+          printf 'requested %s\n' "$deploy"
+
+      - name: Wait for it to go live
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
+          DEPLOY_ID: ${{ steps.request.outputs.deploy }}
+        run: |
+          set -euo pipefail
+          # A deploy that is requested but never succeeds is the failure this
+          # workflow exists to surface, so the job only passes once it is live.
+          for _ in $(seq 1 100); do
+            status=$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID" \
+              | jq -r '.status')
+            printf '%s\n' "$status"
+            case "$status" in
+              live) exit 0 ;;
+              build_failed|update_failed|canceled|pre_deploy_failed) exit 1 ;;
+            esac
+            sleep 15
+          done
+          printf 'deploy %s did not finish in time\n' "$DEPLOY_ID" >&2
+          exit 1
