@@ -1801,6 +1801,14 @@ async fn set_lease_state_in(
     .bind(lease_id as i64)
     .fetch_one(&mut **transaction)
     .await?;
+    // The escrow has the last word on the money. Once a lease has refunded or
+    // finalized, a straggler action giving up afterwards cannot make it a
+    // failure: lease 38 refunded correctly and then read `failed` to its renter.
+    if matches!(state, LeaseState::Failed)
+        && matches!(lease.state, LeaseState::Finalized | LeaseState::Refunded)
+    {
+        return Ok(());
+    }
     lease.state = state;
     lease.updated_at = Utc::now();
     query("UPDATE leases SET document = $2, state = $3, updated_at = NOW() WHERE lease_id = $1")
