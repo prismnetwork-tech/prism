@@ -51,7 +51,9 @@ jobs:
         with:
           context: .
           file: deploy/Dockerfile.rust
-          build-args: BINARY=${{ matrix.binary }}
+          build-args: |
+            BINARY=${{ matrix.binary }}
+            GIT_SHA=${{ github.sha }}
           push: true
           provenance: false
           labels: |

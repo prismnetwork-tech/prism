@@ -771,6 +771,24 @@ impl CredentialCipher {
     }
 }
 
+/// The commit a service was built from, stamped into its image by CI. Services
+/// record this on startup so a host running behind the repository is visible in
+/// one query rather than by inspecting image digests by hand.
+pub fn build_version() -> String {
+    std::env::var("PRISM_BUILD_SHA")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Kept here rather than repeated per service: three services record their
+/// version, and a fix applied to one copy of a duplicated statement is how a
+/// settlement worker ended up signing transactions the chain would not take.
+pub const RECORD_SERVICE_VERSION_SQL: &str = "INSERT INTO service_versions (service, version, started_at) \
+     VALUES ($1, $2, NOW()) \
+     ON CONFLICT (service) DO UPDATE \
+     SET version = EXCLUDED.version, started_at = EXCLUDED.started_at";
+
 pub fn node_id(device_public_key: &VerifyingKey) -> String {
     let digest = Sha256::digest(device_public_key.as_bytes());
     format!("0x{}", hex::encode(digest))
