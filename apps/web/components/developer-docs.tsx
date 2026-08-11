@@ -508,7 +508,7 @@ export function DeveloperDocs() {
               <Endpoint method="GET" path="/v1/vault/releases" auth="Bearer" description="Read which items were released into which leases." />
             </div>
             <CodeBlock label="@prismnetwork/agent-sdk" code={vaultExample} />
-            <h3 className="docs-subheading">Guarantees</h3>
+            <h3 className="docs-subheading">Properties and limits</h3>
             <ul className="docs-list">
               <li>The account, item, version, and trust floor are authenticated into the ciphertext, so relocating an item, replaying an old version, or lowering its floor produces a failed decrypt rather than a wrong answer.</li>
               <li>Writes are compare-and-set. Omitting <code>previous_version</code> creates and fails on an occupied item, so concurrent writers cannot silently drop one another.</li>

@@ -162,7 +162,7 @@ export function LandingPage() {
             </p>
             <div className="security-disclosure">
               <span>Security scope</span>
-              <p>A rented workspace is a separate matter. All capacity today is open class, so its operator can read what runs there, and new vault items start out of reach of it. Stronger classes are earned from hardware attestation, never from a supplier&rsquo;s own claim.</p>
+              <p>A rented workspace is a separate matter. Every machine available today can be read by the company hosting it, so new vault items start out of reach of one. Stronger isolation is earned from hardware attestation, never from a supplier&rsquo;s own claim.</p>
             </div>
           </div>
         </section>
