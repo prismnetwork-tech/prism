@@ -53,11 +53,28 @@ curl https://api.prismnetwork.tech/v1/offers?min_trust=isolated
 The class is derived by the control plane from evidence it can check, never
 asserted by a supplier, and it is clamped to what the network can currently
 verify. All capacity live today is `open`, which means the host operator can
-read anything the workload touches: keep secrets, regulated data and valuable
-model weights off it. Reaching `confidential` requires hardware the network
-does not have yet, not a software change. See
+read anything the workload touches. Reaching `confidential` requires hardware
+the network does not have yet, not a software change. See
 [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for what each class does and
 does not promise.
+
+Private data does not have to live in a workspace to be useful. Cards, identity
+documents and credentials go in the vault, sealed on your machine under a key
+derived from a wallet signature and never sent, so Prism stores ciphertext and
+holds no way to read it:
+
+```js
+await agent.vault.unlock();
+const card = await agent.vault.put({ pan: "4111111111111111" }, { label: "billing" });
+```
+
+Every item carries the weakest class of workspace it may be shown to, and new
+items default to `confidential` — above what the network can serve — so handing
+one to today's capacity is refused rather than quietly allowed. The account,
+version and trust floor are authenticated into the ciphertext, which makes
+moving an item, replaying an old version, or lowering its floor a failed
+decrypt instead of a successful lie. [docs/VAULT.md](docs/VAULT.md) has the
+construction and its limits.
 
 ## Mainnet contracts
 
@@ -146,9 +163,10 @@ only renter routes.
 - [`mcp`](mcp/README.md) — `@prismnetwork/mcp`, the same leasing exposed as Model Context Protocol tools.
 - [`x402`](x402/README.md) — `@prismnetwork/x402`, pay-per-job GPU execution over HTTP 402.
 
-All three are published on npm under the `@prismnetwork` scope. The
-data-classification limits above apply unchanged. An agent workspace
-is a disposable environment, not confidential computing.
+All three are published on npm under the `@prismnetwork` scope. An agent
+workspace is still a disposable environment, not confidential computing;
+anything an agent needs to keep private belongs in its vault, which the same
+SDK reaches through `agent.vault`.
 
 ## Verification
 

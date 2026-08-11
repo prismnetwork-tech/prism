@@ -88,6 +88,28 @@ Attestation evidence is carried end to end but is not yet verified, so
 the ceiling requires a verifier, not a configuration change. All capacity live
 today is `open`.
 
+## Private data
+
+A trust class describes a workspace. It does not have to describe where a
+renter's data lives, and treating those as the same question is what produced
+the old advice to keep anything valuable off the network entirely.
+
+Private data belongs in the vault instead. Items are sealed on the renter's
+machine under a key derived from a wallet signature and never transmitted, so
+the control plane holds ciphertext and no means of reading it. The account,
+slot, version and trust floor are authenticated into GCM's associated data,
+which makes moving an item between accounts, replaying a superseded version, or
+lowering an item's trust floor a failed decrypt rather than a successful lie.
+
+Each item carries the weakest class of workspace it may be shown to, and new
+items default to `confidential` — above `MAX_VERIFIABLE_TRUST_CLASS`, so above
+anything the network can currently serve. Releasing an item into a lease below
+its floor is refused by the control plane and recorded when it is allowed. The
+guarantee is therefore precise: storage is confidential today, and use inside a
+workspace stays gated on the hardware problem below.
+
+[docs/VAULT.md](VAULT.md) covers the construction and its limits.
+
 ## Why confidentiality is a hardware problem
 
 Zero-knowledge proofs establish that a computation was performed correctly.

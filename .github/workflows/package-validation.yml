@@ -8,6 +8,7 @@ on:
       - "mcp/**"
       - "python-sdk/**"
       - "scripts/canary/**"
+      - "sdk/**"
       - "scripts/validate-mcp-package.mjs"
       - "scripts/validate-python-packages.py"
   push:
@@ -18,6 +19,7 @@ on:
       - "mcp/**"
       - "python-sdk/**"
       - "scripts/canary/**"
+      - "sdk/**"
       - "scripts/validate-mcp-package.mjs"
       - "scripts/validate-python-packages.py"
   workflow_dispatch:
@@ -77,6 +79,18 @@ jobs:
             "$archive" | sha256sum --check
           tar -xzf "$archive" -C "$RUNNER_TEMP" mcp-publisher
       - run: '"$RUNNER_TEMP/mcp-publisher" validate mcp/server.json'
+
+  sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - run: node --test sdk/vault.test.mjs
 
   canary:
     runs-on: ubuntu-24.04

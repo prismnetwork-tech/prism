@@ -29,6 +29,42 @@ agent.endLease(lease);
 
 `image` must be an immutable digest-pinned reference (`repo@sha256:...`). `DEFAULT_IMAGE` is one; a plain tag is rejected.
 
+## Vault
+
+Cards, identity documents, API credentials and recovery codes go in the vault
+rather than on a leased box. Items are sealed here, on your machine, under a
+key derived from a wallet signature that is never transmitted, so Prism stores
+ciphertext and holds no way to read it.
+
+```js
+await agent.vault.unlock();
+
+const card = await agent.vault.put({ pan: "4111111111111111" }, { label: "billing" });
+const value = await agent.vault.get(card.item_id, { json: true });
+```
+
+`unlock()` derives the key from a signature over a fixed statement. Ethereum's
+ECDSA is deterministic, so the same wallet reproduces the same vault on any
+machine — no recovery copy is held anywhere. Pass `{ passphrase }` to require a
+second factor beyond the wallet.
+
+Every item carries the weakest workspace trust class it may ever be released
+into. New items default to `confidential`, which is above anything the network
+serves today, so `releaseInto` refuses rather than exposing a secret to a host
+that can read it:
+
+```js
+await agent.vault.releaseInto(lease, card.item_id, { json: true }); // throws on open capacity
+```
+
+Lowering an item's floor is deliberate and reseals the item. Allowed releases
+are recorded and readable with `agent.vault.releases()`.
+
+The account, item slot, version and trust floor are authenticated into the
+ciphertext, so a service that moved an item between accounts, replayed an older
+version, or lowered its floor would produce a failed decrypt rather than a
+plausible wrong answer. See [docs/VAULT.md](../docs/VAULT.md).
+
 ## Auth
 
 `authenticate()` fetches a challenge (`GET /api/agent/challenge`), signs the message with the wallet, and exchanges it for a session (`POST /api/agent/session`). The session is a bearer token used on every `/api/agent/proxy/*` call. No shared secret, no cookie. The wallet is the identity (`subject = wallet:0x...`).

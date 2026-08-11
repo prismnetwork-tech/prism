@@ -21,7 +21,7 @@ type MarketplaceOffer = {
 const trustCopy: Record<TrustClass, { label: string; detail: string }> = {
   open: {
     label: "Open",
-    detail: "The host operator can read anything this workload touches. Keep credentials, private datasets and model weights off it.",
+    detail: "The host operator can read anything this workload touches. Keep credentials in your vault, where they stay sealed, rather than on the box.",
   },
   isolated: {
     label: "Isolated",

@@ -22,9 +22,11 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as Ecdsa
 use prism_protocol::{
     Account, CredentialCipher, EncryptedSecret, LeaseAccess, LeaseQuote, LeaseRecord, LeaseRequest,
     LeaseState, MAX_ESCROW_BASE_UNITS, MAX_LEASE_SECONDS, MAX_NETWORK_LEASES,
+    MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT, MAX_VAULT_LABEL_BYTES,
     NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
     NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture,
-    NodeTelemetry, SettlementEvidence, TrustClass, node_id, verifying_key,
+    NodeTelemetry, SettlementEvidence, TrustClass, VaultEnvelope, VaultItem, VaultRelease,
+    VaultWrite, node_id, vault_release_permitted, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -229,6 +231,8 @@ struct MemoryMarketplace {
     suspended_nodes: BTreeSet<String>,
     operator_actions: BTreeSet<Uuid>,
     operator_audit: Vec<OperatorAuditEvent>,
+    vault_items: BTreeMap<Uuid, (String, VaultItem)>,
+    vault_releases: Vec<(String, VaultRelease)>,
 }
 
 struct MemoryCommand {
@@ -303,6 +307,19 @@ enum StoreError {
     InvalidOperatorAction,
     #[error("stored state is invalid: {0}")]
     InvalidStoredState(String),
+    #[error("vault item not found")]
+    VaultItemNotFound,
+    #[error("vault item was modified by another writer")]
+    VaultVersionConflict,
+    #[error("vault item limit reached")]
+    VaultFull,
+    #[error("lease trust class {lease} is below the item's floor {floor}")]
+    VaultTrustFloorUnmet {
+        floor: &'static str,
+        lease: &'static str,
+    },
+    #[error("lease is not active for this account")]
+    VaultLeaseUnavailable,
     #[error("storage failure")]
     Storage(#[source] SqlError),
 }
@@ -311,6 +328,51 @@ enum StoreError {
 struct Health {
     status: &'static str,
     service: &'static str,
+}
+
+/// item_id, version, wrapped_key, nonce, ciphertext, min_trust_class, label,
+/// created_at, updated_at.
+type VaultRow = (
+    Uuid,
+    i32,
+    String,
+    String,
+    String,
+    String,
+    String,
+    chrono::DateTime<Utc>,
+    chrono::DateTime<Utc>,
+);
+
+fn vault_item_from_row(row: VaultRow) -> Result<VaultItem, StoreError> {
+    let (item_id, version, wrapped_key, nonce, ciphertext, floor, label, created_at, updated_at) =
+        row;
+    Ok(VaultItem {
+        item_id,
+        version: u32::try_from(version)
+            .map_err(|_| StoreError::InvalidStoredState("invalid vault version".into()))?,
+        envelope: VaultEnvelope {
+            wrapped_key,
+            nonce,
+            ciphertext,
+        },
+        min_trust_class: parse_trust_class(&floor)?,
+        label,
+        created_at,
+        updated_at,
+    })
+}
+
+fn parse_trust_class(value: &str) -> Result<TrustClass, StoreError> {
+    match value {
+        "open" => Ok(TrustClass::Open),
+        "isolated" => Ok(TrustClass::Isolated),
+        "attested" => Ok(TrustClass::Attested),
+        "confidential" => Ok(TrustClass::Confidential),
+        other => Err(StoreError::InvalidStoredState(format!(
+            "unknown trust class {other}"
+        ))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -323,6 +385,11 @@ struct ConfirmLeaseRequest {
     quote_id: Uuid,
     transaction_hash: String,
     ssh_authorized_key: String,
+}
+
+#[derive(Deserialize)]
+struct VaultReleaseRequest {
+    lease_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -631,6 +698,18 @@ async fn main() -> anyhow::Result<()> {
             get(create_wallet_challenge),
         )
         .route("/v1/account/wallets/link", post(link_account_wallet))
+        .route("/v1/vault/items", get(list_vault_items))
+        .route(
+            "/v1/vault/items/{item_id}",
+            get(get_vault_item)
+                .put(put_vault_item)
+                .delete(delete_vault_item),
+        )
+        .route(
+            "/v1/vault/items/{item_id}/release",
+            post(release_vault_item),
+        )
+        .route("/v1/vault/releases", get(list_vault_releases))
         .route("/v1/supplier/summary", get(get_supplier_summary))
         .route("/v1/operator/controls", post(apply_operator_control))
         .route("/v1/operator/audit", get(list_operator_audit))
@@ -3006,6 +3085,348 @@ impl MarketplaceStore {
         }
     }
 
+    async fn list_vault_items(&self, subject: &str) -> Result<Vec<VaultItem>, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let mut items = market
+                    .read()
+                    .await
+                    .vault_items
+                    .values()
+                    .filter(|(owner, _)| owner == subject)
+                    .map(|(_, item)| item.clone())
+                    .collect::<Vec<_>>();
+                items.sort_by_key(|item| Reverse(item.updated_at));
+                Ok(items)
+            }
+            Self::Postgres(pool) => query_as::<_, VaultRow>(
+                "SELECT item_id, version, wrapped_key, nonce, ciphertext, min_trust_class, \
+                        label, created_at, updated_at \
+                 FROM vault_items WHERE subject = $1 ORDER BY updated_at DESC",
+            )
+            .bind(subject)
+            .fetch_all(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            .into_iter()
+            .map(vault_item_from_row)
+            .collect(),
+        }
+    }
+
+    async fn vault_item(
+        &self,
+        subject: &str,
+        item_id: Uuid,
+    ) -> Result<Option<VaultItem>, StoreError> {
+        match self {
+            Self::Memory(market) => Ok(market
+                .read()
+                .await
+                .vault_items
+                .get(&item_id)
+                .filter(|(owner, _)| owner == subject)
+                .map(|(_, item)| item.clone())),
+            Self::Postgres(pool) => query_as::<_, VaultRow>(
+                "SELECT item_id, version, wrapped_key, nonce, ciphertext, min_trust_class, \
+                        label, created_at, updated_at \
+                 FROM vault_items WHERE subject = $1 AND item_id = $2",
+            )
+            .bind(subject)
+            .bind(item_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            .map(vault_item_from_row)
+            .transpose(),
+        }
+    }
+
+    /// Creates when `previous_version` is absent, otherwise replaces exactly
+    /// that version. The compare-and-set is what keeps two agents writing the
+    /// same slot from silently dropping one of the writes.
+    async fn write_vault_item(
+        &self,
+        subject: &str,
+        item_id: Uuid,
+        write: VaultWrite,
+    ) -> Result<VaultItem, StoreError> {
+        let now = Utc::now();
+        let version = write.previous_version.map_or(1, |previous| previous + 1);
+        let item = VaultItem {
+            item_id,
+            version,
+            envelope: write.envelope,
+            min_trust_class: write.min_trust_class,
+            label: write.label,
+            created_at: now,
+            updated_at: now,
+        };
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                match (market.vault_items.get(&item_id), write.previous_version) {
+                    (Some((owner, _)), _) if owner != subject => {
+                        return Err(StoreError::VaultItemNotFound);
+                    }
+                    (Some((_, existing)), Some(previous)) if existing.version != previous => {
+                        return Err(StoreError::VaultVersionConflict);
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(StoreError::VaultVersionConflict);
+                    }
+                    (None, None)
+                        if market
+                            .vault_items
+                            .values()
+                            .filter(|(owner, _)| owner == subject)
+                            .count()
+                            >= MAX_VAULT_ITEMS_PER_ACCOUNT =>
+                    {
+                        return Err(StoreError::VaultFull);
+                    }
+                    _ => {}
+                }
+                let created_at = market
+                    .vault_items
+                    .get(&item_id)
+                    .map_or(now, |(_, existing)| existing.created_at);
+                let item = VaultItem { created_at, ..item };
+                market
+                    .vault_items
+                    .insert(item_id, (subject.to_owned(), item.clone()));
+                Ok(item)
+            }
+            Self::Postgres(pool) => {
+                let Some(previous) = write.previous_version else {
+                    let inserted = query_as::<_, VaultRow>(
+                        "INSERT INTO vault_items \
+                             (item_id, subject, version, wrapped_key, nonce, ciphertext, \
+                              min_trust_class, label) \
+                         SELECT $1, $2, 1, $3, $4, $5, $6, $7 \
+                         WHERE (SELECT COUNT(*) FROM vault_items WHERE subject = $2) < $8 \
+                         ON CONFLICT (item_id) DO NOTHING \
+                         RETURNING item_id, version, wrapped_key, nonce, ciphertext, \
+                                   min_trust_class, label, created_at, updated_at",
+                    )
+                    .bind(item_id)
+                    .bind(subject)
+                    .bind(&item.envelope.wrapped_key)
+                    .bind(&item.envelope.nonce)
+                    .bind(&item.envelope.ciphertext)
+                    .bind(item.min_trust_class.label())
+                    .bind(&item.label)
+                    .bind(MAX_VAULT_ITEMS_PER_ACCOUNT as i64)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                    // No row means either the slot was taken or the account is
+                    // at its limit. Distinguish them so the caller can tell a
+                    // retryable conflict from a hard stop.
+                    return match inserted {
+                        Some(row) => vault_item_from_row(row),
+                        None if self.vault_item(subject, item_id).await?.is_some()
+                            || self.vault_item_exists(item_id).await? =>
+                        {
+                            Err(StoreError::VaultVersionConflict)
+                        }
+                        None => Err(StoreError::VaultFull),
+                    };
+                };
+                query_as::<_, VaultRow>(
+                    "UPDATE vault_items \
+                     SET version = $3, wrapped_key = $4, nonce = $5, ciphertext = $6, \
+                         min_trust_class = $7, label = $8, updated_at = NOW() \
+                     WHERE item_id = $1 AND subject = $2 AND version = $9 \
+                     RETURNING item_id, version, wrapped_key, nonce, ciphertext, \
+                               min_trust_class, label, created_at, updated_at",
+                )
+                .bind(item_id)
+                .bind(subject)
+                .bind(version as i32)
+                .bind(&item.envelope.wrapped_key)
+                .bind(&item.envelope.nonce)
+                .bind(&item.envelope.ciphertext)
+                .bind(item.min_trust_class.label())
+                .bind(&item.label)
+                .bind(previous as i32)
+                .fetch_optional(pool)
+                .await
+                .map_err(StoreError::Storage)?
+                .ok_or(StoreError::VaultVersionConflict)
+                .and_then(vault_item_from_row)
+            }
+        }
+    }
+
+    async fn vault_item_exists(&self, item_id: Uuid) -> Result<bool, StoreError> {
+        match self {
+            Self::Memory(market) => Ok(market.read().await.vault_items.contains_key(&item_id)),
+            Self::Postgres(pool) => {
+                query_scalar::<_, i64>("SELECT COUNT(*) FROM vault_items WHERE item_id = $1")
+                    .bind(item_id)
+                    .fetch_one(pool)
+                    .await
+                    .map(|count| count > 0)
+                    .map_err(StoreError::Storage)
+            }
+        }
+    }
+
+    async fn delete_vault_item(&self, subject: &str, item_id: Uuid) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                match market.vault_items.get(&item_id) {
+                    Some((owner, _)) if owner == subject => {
+                        market.vault_items.remove(&item_id);
+                        Ok(())
+                    }
+                    _ => Err(StoreError::VaultItemNotFound),
+                }
+            }
+            Self::Postgres(pool) => {
+                let deleted = query("DELETE FROM vault_items WHERE item_id = $1 AND subject = $2")
+                    .bind(item_id)
+                    .bind(subject)
+                    .execute(pool)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                if deleted.rows_affected() == 0 {
+                    return Err(StoreError::VaultItemNotFound);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Authorizes an item to be carried into a running lease, and refuses when
+    /// the lease's trust class sits below the floor the renter sealed into the
+    /// item. The refusal is the point: it is what stops an autonomous agent
+    /// from posting its owner's card to a host that can read it.
+    async fn release_vault_item(
+        &self,
+        subject: &str,
+        item_id: Uuid,
+        lease_id: u64,
+    ) -> Result<VaultRelease, StoreError> {
+        let item = self
+            .vault_item(subject, item_id)
+            .await?
+            .ok_or(StoreError::VaultItemNotFound)?;
+        let lease_trust_class = self
+            .active_lease_trust_class(subject, lease_id)
+            .await?
+            .ok_or(StoreError::VaultLeaseUnavailable)?;
+        if !vault_release_permitted(item.min_trust_class, lease_trust_class) {
+            return Err(StoreError::VaultTrustFloorUnmet {
+                floor: item.min_trust_class.label(),
+                lease: lease_trust_class.label(),
+            });
+        }
+        let release = VaultRelease {
+            item_id,
+            lease_id,
+            item_version: item.version,
+            lease_trust_class,
+            released_at: Utc::now(),
+        };
+        match self {
+            Self::Memory(market) => market
+                .write()
+                .await
+                .vault_releases
+                .push((subject.to_owned(), release.clone())),
+            Self::Postgres(pool) => {
+                query(
+                    "INSERT INTO vault_releases \
+                         (subject, item_id, lease_id, item_version, lease_trust_class, released_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(subject)
+                .bind(item_id)
+                .bind(lease_id as i64)
+                .bind(release.item_version as i32)
+                .bind(lease_trust_class.label())
+                .bind(release.released_at)
+                .execute(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+            }
+        }
+        Ok(release)
+    }
+
+    async fn active_lease_trust_class(
+        &self,
+        subject: &str,
+        lease_id: u64,
+    ) -> Result<Option<TrustClass>, StoreError> {
+        match self {
+            Self::Memory(market) => Ok(market
+                .read()
+                .await
+                .leases
+                .get(&lease_id)
+                .filter(|(owner, lease)| owner == subject && lease.state == LeaseState::Active)
+                .map(|(_, lease)| lease.trust_class)),
+            // Read the one field rather than the whole record: this gate must
+            // not start returning 500s because some unrelated part of a lease
+            // document changed shape.
+            Self::Postgres(pool) => query_scalar::<_, Option<String>>(
+                "SELECT document->>'trust_class' FROM leases \
+                 WHERE lease_id = $1 AND subject = $2 AND state = 'active'",
+            )
+            .bind(lease_id as i64)
+            .bind(subject)
+            .fetch_optional(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            // A lease predating trust classes is `open`, matching the serde
+            // default, which is the weakest class and so fails closed.
+            .map(|class| class.map_or(Ok(TrustClass::Open), |class| parse_trust_class(&class)))
+            .transpose(),
+        }
+    }
+
+    async fn list_vault_releases(&self, subject: &str) -> Result<Vec<VaultRelease>, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let mut releases = market
+                    .read()
+                    .await
+                    .vault_releases
+                    .iter()
+                    .filter(|(owner, _)| owner == subject)
+                    .map(|(_, release)| release.clone())
+                    .collect::<Vec<_>>();
+                releases.sort_by_key(|release| Reverse(release.released_at));
+                Ok(releases)
+            }
+            Self::Postgres(pool) => query_as::<_, (Uuid, i64, i32, String, chrono::DateTime<Utc>)>(
+                "SELECT item_id, lease_id, item_version, lease_trust_class, released_at \
+                 FROM vault_releases WHERE subject = $1 ORDER BY released_at DESC LIMIT 200",
+            )
+            .bind(subject)
+            .fetch_all(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            .into_iter()
+            .map(
+                |(item_id, lease_id, item_version, trust_class, released_at)| {
+                    Ok(VaultRelease {
+                        item_id,
+                        lease_id: lease_id as u64,
+                        item_version: item_version as u32,
+                        lease_trust_class: parse_trust_class(&trust_class)?,
+                        released_at,
+                    })
+                },
+            )
+            .collect(),
+        }
+    }
+
     async fn claim_command(
         &self,
         node_id: &str,
@@ -3724,6 +4145,144 @@ async fn link_account_wallet(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_vault_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<VaultItem>>, (StatusCode, Json<ApiError>)> {
+    let account = require_account(&state, &headers, "GET", "/v1/vault/items", &[]).await?;
+    state
+        .store
+        .list_vault_items(&account.subject)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
+async fn get_vault_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<VaultItem>, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/vault/items/{item_id}");
+    let account = require_account(&state, &headers, "GET", &path, &[]).await?;
+    state
+        .store
+        .vault_item(&account.subject, item_id)
+        .await
+        .map_err(store_error)?
+        .map(Json)
+        .ok_or_else(|| {
+            not_found(
+                "vault_item_not_found",
+                "no such vault item for this account",
+            )
+        })
+}
+
+async fn put_vault_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<VaultItem>), (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/vault/items/{item_id}");
+    let account = require_account(&state, &headers, "PUT", &path, &body).await?;
+    let write: VaultWrite = serde_json::from_slice(&body)
+        .map_err(|_| bad_request("invalid_json", "request body is not valid JSON"))?;
+    validate_vault_write(&write)?;
+    let created = write.previous_version.is_none();
+    let item = state
+        .store
+        .write_vault_item(&account.subject, item_id, write)
+        .await
+        .map_err(store_error)?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(item)))
+}
+
+async fn delete_vault_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/vault/items/{item_id}");
+    let account = require_account(&state, &headers, "DELETE", &path, &[]).await?;
+    state
+        .store
+        .delete_vault_item(&account.subject, item_id)
+        .await
+        .map_err(store_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn release_vault_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultRelease>, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/vault/items/{item_id}/release");
+    let account = require_account(&state, &headers, "POST", &path, &body).await?;
+    let request: VaultReleaseRequest = serde_json::from_slice(&body)
+        .map_err(|_| bad_request("invalid_json", "request body is not valid JSON"))?;
+    state
+        .store
+        .release_vault_item(&account.subject, item_id, request.lease_id)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
+async fn list_vault_releases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<VaultRelease>>, (StatusCode, Json<ApiError>)> {
+    let account = require_account(&state, &headers, "GET", "/v1/vault/releases", &[]).await?;
+    state
+        .store
+        .list_vault_releases(&account.subject)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
+fn validate_vault_write(write: &VaultWrite) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let envelope = &write.envelope;
+    let malformed = envelope.ciphertext.is_empty()
+        || envelope.ciphertext.len() > MAX_VAULT_CIPHERTEXT_BYTES
+        || envelope.wrapped_key.is_empty()
+        || envelope.wrapped_key.len() > 1_024
+        || envelope.nonce.is_empty()
+        || envelope.nonce.len() > 64
+        || write.label.len() > MAX_VAULT_LABEL_BYTES
+        || !is_base64url(&envelope.ciphertext)
+        || !is_base64url(&envelope.wrapped_key)
+        || !is_base64url(&envelope.nonce);
+    if malformed {
+        return Err(bad_request(
+            "invalid_vault_item",
+            "vault envelope must be base64url and within the size limit",
+        ));
+    }
+    if write.previous_version.is_some_and(|version| version == 0) {
+        return Err(bad_request(
+            "invalid_vault_item",
+            "previous_version must be at least 1",
+        ));
+    }
+    Ok(())
+}
+
+fn is_base64url(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 async fn get_supplier_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4280,6 +4839,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0010_service_versions.sql")),
                 false,
             ),
+            Migration::new(
+                11,
+                Cow::Borrowed("renter vault"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0011_vault.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
@@ -4632,6 +5198,27 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
             "invalid_operator_action",
             "operator action is invalid for the requested target state",
         ),
+        StoreError::VaultItemNotFound => not_found(
+            "vault_item_not_found",
+            "no such vault item for this account",
+        ),
+        StoreError::VaultVersionConflict => conflict(
+            "vault_version_conflict",
+            "the vault item was created or modified by another writer; re-read it and retry",
+        ),
+        StoreError::VaultFull => conflict(
+            "vault_full",
+            "this account is holding the maximum number of vault items",
+        ),
+        StoreError::VaultTrustFloorUnmet { .. } => forbidden(
+            "vault_trust_floor_unmet",
+            "the lease's trust class is below the floor sealed into this item; \
+             lower the floor deliberately or wait for capacity that qualifies",
+        ),
+        StoreError::VaultLeaseUnavailable => not_found(
+            "vault_lease_unavailable",
+            "the lease does not exist, is not active, or does not belong to this account",
+        ),
         StoreError::InvalidStoredState(message) => {
             tracing::error!(%message, "invalid stored marketplace state");
             internal_error(StoreError::InvalidStoredState(message))
@@ -4773,7 +5360,7 @@ async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_protocol::{GpuSpec, IsolationMode, NodePosture};
+    use prism_protocol::{DEFAULT_VAULT_TRUST_FLOOR, GpuSpec, IsolationMode, NodePosture};
 
     fn offer(node_id: &str, rate_per_second: u64, benchmark_score: u32) -> NodeOffer {
         NodeOffer {
@@ -5514,5 +6101,302 @@ mod tests {
         let market = market.read().await;
         assert_eq!(market.leases.get(&7).unwrap().1.state, LeaseState::Ready);
         assert_eq!(market.commands.get(&command_id).unwrap().status, "ready");
+    }
+
+    fn envelope(ciphertext: &str) -> VaultEnvelope {
+        VaultEnvelope {
+            wrapped_key: "d3JhcHBlZA".to_owned(),
+            nonce: "bm9uY2UtMTIzNA".to_owned(),
+            ciphertext: ciphertext.to_owned(),
+        }
+    }
+
+    fn vault_write(ciphertext: &str, floor: TrustClass) -> VaultWrite {
+        VaultWrite {
+            envelope: envelope(ciphertext),
+            min_trust_class: floor,
+            label: "card".to_owned(),
+            previous_version: None,
+        }
+    }
+
+    async fn store_with_active_lease(subject: &str, trust_class: TrustClass) -> MarketplaceStore {
+        let mut market = MemoryMarketplace::default();
+        market.leases.insert(
+            9,
+            (
+                subject.to_owned(),
+                LeaseRecord {
+                    lease_id: 9,
+                    quote_id: Uuid::now_v7(),
+                    node_id: "node".to_owned(),
+                    renter_wallet: "0x1".to_owned(),
+                    image: "registry.example/runtime@sha256:abc".to_owned(),
+                    duration_seconds: 60,
+                    rate_per_second: 100,
+                    maximum_escrow: 6_000,
+                    trust_class,
+                    funding_transaction_hash: "0xabc".to_owned(),
+                    state: LeaseState::Active,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ),
+        );
+        MarketplaceStore::Memory(Arc::new(RwLock::new(market)))
+    }
+
+    #[tokio::test]
+    async fn a_vault_item_is_invisible_to_every_other_account() {
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(MemoryMarketplace::default())));
+        let item_id = Uuid::now_v7();
+        store
+            .write_vault_item(
+                "owner",
+                item_id,
+                vault_write("c2VjcmV0", TrustClass::Confidential),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .vault_item("intruder", item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_vault_items("intruder").await.unwrap().is_empty());
+        assert!(matches!(
+            store.delete_vault_item("intruder", item_id).await,
+            Err(StoreError::VaultItemNotFound)
+        ));
+        // The intruder must not be able to overwrite the slot either, which
+        // would destroy the owner's item without ever reading it.
+        assert!(matches!(
+            store
+                .write_vault_item(
+                    "intruder",
+                    item_id,
+                    vault_write("b3RoZXI", TrustClass::Open)
+                )
+                .await,
+            Err(StoreError::VaultItemNotFound)
+        ));
+        assert_eq!(
+            store
+                .vault_item("owner", item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .envelope
+                .ciphertext,
+            "c2VjcmV0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vault_write_that_lost_the_race_is_rejected_rather_than_merged() {
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(MemoryMarketplace::default())));
+        let item_id = Uuid::now_v7();
+        let created = store
+            .write_vault_item(
+                "owner",
+                item_id,
+                vault_write("dg", TrustClass::Confidential),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.version, 1);
+
+        let second = store
+            .write_vault_item(
+                "owner",
+                item_id,
+                VaultWrite {
+                    previous_version: Some(1),
+                    ..vault_write("djI", TrustClass::Confidential)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.version, 2);
+        assert_eq!(second.created_at, created.created_at);
+
+        // A writer still holding version 1 must not clobber version 2.
+        assert!(matches!(
+            store
+                .write_vault_item(
+                    "owner",
+                    item_id,
+                    VaultWrite {
+                        previous_version: Some(1),
+                        ..vault_write("c3RhbGU", TrustClass::Confidential)
+                    },
+                )
+                .await,
+            Err(StoreError::VaultVersionConflict)
+        ));
+        // And a create against an occupied slot is a conflict, not a silent replace.
+        assert!(matches!(
+            store
+                .write_vault_item(
+                    "owner",
+                    item_id,
+                    vault_write("bmV3", TrustClass::Confidential)
+                )
+                .await,
+            Err(StoreError::VaultVersionConflict)
+        ));
+        assert_eq!(
+            store
+                .vault_item("owner", item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .envelope
+                .ciphertext,
+            "djI"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_into_a_weaker_lease_is_refused() {
+        let store = store_with_active_lease("owner", TrustClass::Open).await;
+        let item_id = Uuid::now_v7();
+        store
+            .write_vault_item(
+                "owner",
+                item_id,
+                vault_write("Y2FyZA", DEFAULT_VAULT_TRUST_FLOOR),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.release_vault_item("owner", item_id, 9).await,
+            Err(StoreError::VaultTrustFloorUnmet { .. })
+        ));
+        // A refused release leaves no audit row; only real exposure is recorded.
+        assert!(store.list_vault_releases("owner").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn releasing_into_a_qualifying_lease_is_recorded() {
+        let store = store_with_active_lease("owner", TrustClass::Isolated).await;
+        let item_id = Uuid::now_v7();
+        store
+            .write_vault_item(
+                "owner",
+                item_id,
+                vault_write("dG9rZW4", TrustClass::Isolated),
+            )
+            .await
+            .unwrap();
+
+        let release = store.release_vault_item("owner", item_id, 9).await.unwrap();
+        assert_eq!(release.lease_id, 9);
+        assert_eq!(release.item_version, 1);
+        assert_eq!(release.lease_trust_class, TrustClass::Isolated);
+
+        let audit = store.list_vault_releases("owner").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].item_id, item_id);
+        assert!(
+            store
+                .list_vault_releases("intruder")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_needs_an_active_lease_owned_by_the_caller() {
+        let store = store_with_active_lease("owner", TrustClass::Confidential).await;
+        let item_id = Uuid::now_v7();
+        store
+            .write_vault_item("owner", item_id, vault_write("dG9rZW4", TrustClass::Open))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.release_vault_item("owner", item_id, 404).await,
+            Err(StoreError::VaultLeaseUnavailable)
+        ));
+        // Someone else's lease is not a venue for this account's items, even
+        // when that lease would clear the floor.
+        store
+            .write_vault_item(
+                "intruder",
+                Uuid::now_v7(),
+                vault_write("eA", TrustClass::Open),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.release_vault_item("intruder", item_id, 9).await,
+            Err(StoreError::VaultItemNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_vault_stops_accepting_new_items_at_the_cap() {
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(MemoryMarketplace::default())));
+        for _ in 0..MAX_VAULT_ITEMS_PER_ACCOUNT {
+            store
+                .write_vault_item("owner", Uuid::now_v7(), vault_write("eA", TrustClass::Open))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            store
+                .write_vault_item("owner", Uuid::now_v7(), vault_write("eA", TrustClass::Open))
+                .await,
+            Err(StoreError::VaultFull)
+        ));
+        // The cap is per account, so one full vault cannot starve anyone else.
+        assert!(
+            store
+                .write_vault_item("other", Uuid::now_v7(), vault_write("eA", TrustClass::Open))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_vault_write_must_be_base64url_and_within_the_size_cap() {
+        assert!(validate_vault_write(&vault_write("Y2FyZA", TrustClass::Open)).is_ok());
+
+        let padded = vault_write("Y2FyZA==", TrustClass::Open);
+        assert!(validate_vault_write(&padded).is_err());
+
+        let oversized = vault_write(
+            &"a".repeat(MAX_VAULT_CIPHERTEXT_BYTES + 1),
+            TrustClass::Open,
+        );
+        assert!(validate_vault_write(&oversized).is_err());
+
+        let empty = vault_write("", TrustClass::Open);
+        assert!(validate_vault_write(&empty).is_err());
+
+        let long_label = VaultWrite {
+            label: "l".repeat(MAX_VAULT_LABEL_BYTES + 1),
+            ..vault_write("Y2FyZA", TrustClass::Open)
+        };
+        assert!(validate_vault_write(&long_label).is_err());
+    }
+
+    // Absent trust class means the strongest floor, never the weakest. A client
+    // that forgets the field must not end up storing a card at "open".
+    #[test]
+    fn a_vault_write_without_a_trust_class_defaults_to_the_strongest_floor() {
+        let write: VaultWrite = serde_json::from_value(serde_json::json!({
+            "envelope": {"wrapped_key": "dw", "nonce": "bg", "ciphertext": "Yw"}
+        }))
+        .unwrap();
+
+        assert_eq!(write.min_trust_class, DEFAULT_VAULT_TRUST_FLOOR);
+        assert!(write.previous_version.is_none());
     }
 }

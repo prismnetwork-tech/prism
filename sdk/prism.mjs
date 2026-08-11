@@ -14,6 +14,9 @@ import {
   stringToBytes,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { PrismVault } from "./vault.mjs";
+
+export { PrismVault, VaultError, DEFAULT_TRUST_FLOOR, VAULT_KEY_STATEMENT } from "./vault.mjs";
 
 export const robinhoodChain = defineChain({
   id: 4663,
@@ -90,10 +93,21 @@ export class PrismAgent {
     this.publicClient = createPublicClient({ chain: robinhoodChain, transport });
     this.walletClient = createWalletClient({ account: this.account, chain: robinhoodChain, transport });
     this.session = null;
+    this.vault = new PrismVault(this);
   }
 
   get address() {
     return this.account.address;
+  }
+
+  // The vault key is derived from this signature on the caller's machine. It is
+  // returned to the vault client and never sent anywhere.
+  async signVaultStatement(statement) {
+    return this.account.signMessage({ message: statement });
+  }
+
+  async vaultRequest(method, segments, { body = null } = {}) {
+    return this.#proxy(method, ["vault", ...segments], { body });
   }
 
   async authenticate() {

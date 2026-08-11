@@ -466,11 +466,16 @@ export function DeveloperDocs() {
               <InfoCard title="Wallet as identity">
                 <p>The signing wallet is the subject of every request. The agent boundary reaches only renter routes; operator, node, and gateway surfaces are rejected.</p>
               </InfoCard>
+              <InfoCard title="Vault">
+                <p>Cards, identity documents and credentials sealed under a wallet-derived key that never leaves your machine. Each item names the weakest workspace class it may be released into, and a lease below that floor is refused.</p>
+              </InfoCard>
             </div>
             <Callout kind="warning" title="Workspace data">
-              The agent packages are on npm under the @prismnetwork scope. The
-              data-classification limits above apply unchanged. An agent workspace is a
-              disposable environment, not confidential computing.
+              An agent workspace is a disposable environment, not confidential computing, so
+              anything an agent needs to keep private belongs in its vault rather than on the
+              box. New vault items default to a trust floor above what the network can serve
+              today, which means releasing one into current capacity is refused, not allowed
+              quietly.
             </Callout>
           </DocsSection>
 

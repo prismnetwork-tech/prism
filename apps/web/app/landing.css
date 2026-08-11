@@ -579,6 +579,22 @@
   font-weight: 400;
 }
 
+/* Sits at the origin of the access line, outside the host frame, because that
+   is where a sealed item actually lives. */
+.vault-marker {
+  position: absolute;
+  left: 8%;
+  bottom: calc(11% + 10px);
+  padding: 5px 9px;
+  border: 1px solid rgba(204, 255, 0, 0.35);
+  background: rgba(204, 255, 0, 0.06);
+  color: #ccff00;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  white-space: nowrap;
+}
+
 .tunnel-line {
   position: absolute;
   left: 8%;

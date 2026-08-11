@@ -39,8 +39,10 @@ export default function AboutPage() {
         <p>Maximum cost is escrowed up front. Confirmed runtime is charged and unused escrow is returned.</p>
         <h3>Privacy-preserving records</h3>
         <p>Public receipts prove settlement state without publishing wallet identity, terminal contents, notebooks, or files.</p>
+        <h3>Renter-held encryption</h3>
+        <p>Vault items are sealed under a key derived on the renter&apos;s machine and never sent. Prism stores ciphertext and holds no means of reading it.</p>
         <h3>Defined security scope</h3>
-        <p>The service uses fresh container workspaces, not confidential computing. The infrastructure provider remains inside the trust boundary.</p>
+        <p>Workspaces are fresh containers, not confidential computing, so the infrastructure provider remains inside their trust boundary. Each vault item names the weakest workspace class it may be released into, and the default is above what the network can currently serve.</p>
       </InformationSection>
 
       <InformationSection index="03" title="Open-source infrastructure">
