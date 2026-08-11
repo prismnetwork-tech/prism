@@ -1670,10 +1670,13 @@ impl Worker {
     async fn recently_rejected_machines(&self) -> anyhow::Result<Vec<i64>> {
         Ok(query_scalar::<_, i64>(
             "SELECT machine_id FROM cloud_machine_rejections \
-             WHERE last_rejected_at > NOW() - make_interval(hours => $1) \
+             WHERE last_rejected_at > NOW() - make_interval(secs => $1) \
              ORDER BY last_rejected_at DESC",
         )
-        .bind(MACHINE_REJECTION_MEMORY_HOURS as f64)
+        // secs, not hours: make_interval's hours argument is an int, and binding a
+        // float to it fails at runtime rather than at compile time. Every call
+        // errored, start_access failed with it, and every lease refunded.
+        .bind((MACHINE_REJECTION_MEMORY_HOURS * 3600) as f64)
         .fetch_all(&self.pool)
         .await?)
     }
