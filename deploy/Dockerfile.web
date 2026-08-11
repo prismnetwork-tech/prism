@@ -3,8 +3,12 @@ WORKDIR /workspace
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_OPTIONS=--max-old-space-size=1024
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# The web application depends on the SDK through the workspace, so its manifest
+# has to be present for the lockfile to resolve and its sources for the build.
 COPY apps/web/package.json apps/web/package.json
+COPY sdk/package.json sdk/package.json
 RUN corepack enable && pnpm install --frozen-lockfile
+COPY sdk sdk
 COPY apps/web apps/web
 ARG NEXT_PUBLIC_PRISM_PRIVY_APP_ID
 ARG NEXT_PUBLIC_PRISM_SITE_URL=https://prismnetwork.tech
