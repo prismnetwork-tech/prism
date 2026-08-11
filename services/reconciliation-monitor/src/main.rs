@@ -482,6 +482,10 @@ struct Report {
     stuck_closing: i64,
     finalized_without_receipt: i64,
     orphan_receipts: i64,
+    /// Distinct builds across deployed services. Above one is a partial
+    /// deployment: the case where a settlement worker sat six days behind the
+    /// services either side of it and nothing said so.
+    distinct_service_versions: i64,
 }
 
 impl Report {
@@ -494,6 +498,12 @@ impl Report {
     }
 
     fn log_breaches(&self) {
+        if self.distinct_service_versions > 1 {
+            tracing::error!(
+                versions = self.distinct_service_versions,
+                "deployed services are running different builds"
+            );
+        }
         if !self.solvency_ok() {
             tracing::error!(
                 balance = self.escrow_usdg_balance,
@@ -558,6 +568,14 @@ async fn reconcile(pool: &PgPool, chain: Option<&ChainReader>) -> anyhow::Result
     )
     .fetch_one(pool)
     .await?;
+
+    // unwrap_or(0) so a monitor running ahead of the migration reports nothing
+    // rather than failing the whole reconciliation pass.
+    report.distinct_service_versions =
+        query_scalar::<_, i64>("SELECT COUNT(DISTINCT version)::bigint FROM service_versions")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
 
     let Some(chain) = chain else {
         return Ok(report);
@@ -764,6 +782,12 @@ fn render_metrics(report: &Report) -> String {
         "prism_reconcile_orphan_receipts",
         "Proof receipts whose lease is not finalized or refunded.",
         &report.orphan_receipts.to_string(),
+    );
+    gauge(
+        &mut out,
+        "prism_reconcile_distinct_service_versions",
+        "Distinct build versions across deployed services. Above one is a partial deployment.",
+        &report.distinct_service_versions.to_string(),
     );
     out
 }

@@ -230,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("connect lifecycle database")?;
     verify_schema(&pool).await?;
+    record_service_version(&pool, "lifecycle-worker").await?;
 
     let chain = RpcClient::new(&required_env("PRISM_RPC_URL")?)?;
     if chain.chain_id().await? != ROBINHOOD_CHAIN_ID {
@@ -1946,6 +1947,19 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
 
 fn required_env(key: &str) -> anyhow::Result<String> {
     env::var(key).with_context(|| format!("{key} is required"))
+}
+
+/// Recorded on startup so a service running behind the repository shows up in
+/// one query instead of an image-digest comparison done by hand.
+async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<()> {
+    let version = prism_protocol::build_version();
+    tracing::info!(service, %version, "recording build version");
+    query(prism_protocol::RECORD_SERVICE_VERSION_SQL)
+        .bind(service)
+        .bind(&version)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

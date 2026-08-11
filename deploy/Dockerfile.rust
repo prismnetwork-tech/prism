@@ -19,6 +19,11 @@ RUN useradd --system --create-home --uid 10001 prism \
     && rm -rf /var/lib/apt/lists/*
 ARG BINARY
 RUN test -n "${BINARY}"
+# The commit this image was built from. Services record it so a deployment that
+# has fallen behind the repository is visible without inspecting image digests
+# by hand, which is how a worker once ran six-day-old code unnoticed.
+ARG GIT_SHA=unknown
+ENV PRISM_BUILD_SHA=${GIT_SHA}
 COPY --from=build /workspace/prism-service /usr/local/bin/prism-service
 USER prism
 ENTRYPOINT ["/usr/local/bin/prism-service"]

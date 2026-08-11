@@ -194,6 +194,7 @@ async fn run_database(database_url: &str) -> anyhow::Result<()> {
     if present.is_none() {
         anyhow::bail!("control-plane settlement migrations have not been applied");
     }
+    record_service_version(&pool, "settlement-worker").await?;
     let escrow = address(&required_env("PRISM_LEASE_ESCROW_ADDRESS")?)?;
     let chain = ChainClient::new(secure_url(&required_env("PRISM_RPC_URL")?)?)?;
     if chain.quantity("eth_chainId", serde_json::json!([])).await? != ROBINHOOD_CHAIN_ID {
@@ -992,6 +993,19 @@ fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+/// Recorded on startup so a service running behind the repository shows up in
+/// one query instead of an image-digest comparison done by hand.
+async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<()> {
+    let version = prism_protocol::build_version();
+    tracing::info!(service, %version, "recording build version");
+    query(prism_protocol::RECORD_SERVICE_VERSION_SQL)
+        .bind(service)
+        .bind(&version)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

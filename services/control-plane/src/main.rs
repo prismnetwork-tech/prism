@@ -1324,6 +1324,7 @@ impl MarketplaceStore {
             .run(&pool)
             .await
             .context("migrate control-plane database")?;
+        record_service_version(&pool, "control-plane").await?;
         Ok(Self::Postgres(pool))
     }
 
@@ -4272,6 +4273,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0009_machine_rejections.sql")),
                 false,
             ),
+            Migration::new(
+                10,
+                Cow::Borrowed("service versions"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0010_service_versions.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
@@ -4747,6 +4755,19 @@ async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "failed to install shutdown signal");
     }
+}
+
+/// Recorded on startup so a service running behind the repository shows up in
+/// one query instead of an image-digest comparison done by hand.
+async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<()> {
+    let version = prism_protocol::build_version();
+    tracing::info!(service, %version, "recording build version");
+    query(prism_protocol::RECORD_SERVICE_VERSION_SQL)
+        .bind(service)
+        .bind(&version)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
