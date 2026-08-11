@@ -36,6 +36,10 @@ const MAX_REJECTED_MACHINES: usize = 4;
 /// unlikely to make the window, and burning the whole window on it refunds a
 /// lease that a different machine would have served.
 const HOST_BOOT_BUDGET_SECONDS: i64 = 180;
+/// How long a machine stays on the shared rejection list. A host that reserves
+/// no forwarded ports is usually misconfigured rather than busy, but hosts do
+/// get fixed, so the list forgets rather than banning anyone permanently.
+const MACHINE_REJECTION_MEMORY_HOURS: i64 = 6;
 /// Ranked offers tried per provisioning pass. Retries supply the rest of the
 /// breadth, and a pass that spends the whole window is a refund.
 const CREATES_PER_PASS: usize = 2;
@@ -810,7 +814,27 @@ impl Worker {
             None => match self.adopt_labelled(vast, &label).await? {
                 Some(instance_id) => (instance_id, None),
                 None => {
-                    let candidates = vast.ranked(CREATES_PER_PASS, &rejected, retail).await?;
+                    // Machines this lease has already refused, plus the ones other
+                    // leases refused recently. Without the second set every lease
+                    // spends its attempts rediscovering the same broken hosts.
+                    let mut avoided = rejected.clone();
+                    for machine in self.recently_rejected_machines().await? {
+                        if !avoided.contains(&machine) {
+                            avoided.push(machine);
+                        }
+                    }
+                    let mut candidates = vast.ranked(CREATES_PER_PASS, &avoided, retail).await?;
+                    if candidates.is_empty() && avoided.len() > rejected.len() {
+                        // The shared list is an optimisation, not a gate. If honouring
+                        // it leaves nothing rentable, a known-bad host still beats
+                        // refunding the renter without trying.
+                        tracing::warn!(
+                            lease_id,
+                            avoided = avoided.len(),
+                            "no candidate outside the shared rejection list, falling back"
+                        );
+                        candidates = vast.ranked(CREATES_PER_PASS, &rejected, retail).await?;
+                    }
                     if candidates.is_empty() {
                         anyhow::bail!(
                             "no verified {} is available under the cost ceiling",
@@ -961,6 +985,8 @@ impl Worker {
                 .await?;
                 anyhow::bail!("every candidate Vast host was refused, last: {refusal}");
             }
+            self.remember_rejected_machine(instance.machine_id as i64, &refusal)
+                .await?;
             query(
                 "UPDATE cloud_instances SET provider_instance_id = NULL, \
                      provider_offer_id = NULL, ssh_key_attached_at = NULL, \
@@ -1635,6 +1661,34 @@ impl Worker {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Machines other leases refused recently. Shared because a host that
+    /// reserved no forwarded ports will reserve none for the next lease either.
+    async fn recently_rejected_machines(&self) -> anyhow::Result<Vec<i64>> {
+        Ok(query_scalar::<_, i64>(
+            "SELECT machine_id FROM cloud_machine_rejections \
+             WHERE last_rejected_at > NOW() - make_interval(hours => $1) \
+             ORDER BY last_rejected_at DESC",
+        )
+        .bind(MACHINE_REJECTION_MEMORY_HOURS as f64)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn remember_rejected_machine(&self, machine_id: i64, reason: &str) -> anyhow::Result<()> {
+        query(
+            "INSERT INTO cloud_machine_rejections (machine_id, reason) VALUES ($1, $2) \
+             ON CONFLICT (machine_id) DO UPDATE \
+             SET reason = EXCLUDED.reason, \
+                 rejections = cloud_machine_rejections.rejections + 1, \
+                 last_rejected_at = NOW()",
+        )
+        .bind(machine_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

@@ -4265,6 +4265,13 @@ fn embedded_migrator() -> Migrator {
                 )),
                 false,
             ),
+            Migration::new(
+                9,
+                Cow::Borrowed("machine rejections"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0009_machine_rejections.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
