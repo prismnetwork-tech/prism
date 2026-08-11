@@ -11,7 +11,7 @@ const maxRequestBytes = 256 * 1_024;
 
 // This boundary vouches for any wallet, so it may only reach the renter surface.
 // Operator, node, gateway, and supplier routes are off limits here.
-const renterRoutes = new Set(["offers", "leases"]);
+const renterRoutes = new Set(["offers", "leases", "vault"]);
 
 async function proxy(request: NextRequest, context: RouteContext) {
   const requestId = randomUUID();
@@ -44,14 +44,18 @@ async function proxy(request: NextRequest, context: RouteContext) {
   const isMutation = !["GET", "HEAD"].includes(request.method);
   let body: ArrayBuffer | undefined;
   if (isMutation) {
-    if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
-      return error(415, "unsupported_media_type", requestId);
-    }
     if (Number(request.headers.get("content-length") ?? "0") > maxRequestBytes) {
       return error(413, "request_too_large", requestId);
     }
     body = await request.arrayBuffer();
     if (body.byteLength > maxRequestBytes) return error(413, "request_too_large", requestId);
+    // A DELETE carries no body and so has no content type to declare.
+    if (
+      body.byteLength > 0 &&
+      !request.headers.get("content-type")?.toLowerCase().startsWith("application/json")
+    ) {
+      return error(415, "unsupported_media_type", requestId);
+    }
   }
 
   const headers = new Headers({ Accept: "application/json", "x-request-id": requestId });

@@ -5,7 +5,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { DEFAULT_IMAGE, PrismAgent, TRUST_CLASSES } from "@prismnetwork/agent-sdk";
+import { DEFAULT_IMAGE, DEFAULT_TRUST_FLOOR, PrismAgent, TRUST_CLASSES } from "@prismnetwork/agent-sdk";
 
 const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 
@@ -80,7 +80,7 @@ const TOOLS = [
   },
   {
     name: "prism_list_gpus",
-    description: "List GPUs currently available to lease on Prism Network, with model, VRAM, price per second in USDG, and trust class. Trust class runs open < isolated < attested < confidential; on an 'open' supplier the host operator can read anything the workload touches, so never send secrets, credentials or private model weights to one.",
+    description: "List GPUs currently available to lease on Prism Network, with model, VRAM, price per second in USDG, and trust class. Trust class runs open < isolated < attested < confidential; on an 'open' supplier the host operator can read anything the workload touches. Keep secrets and credentials in prism_vault_store rather than on the box, and raise min_trust when the workload itself must not be readable.",
     inputSchema: {
       type: "object",
       properties: {
@@ -146,6 +146,58 @@ const TOOLS = [
       type: "object",
       properties: { lease_id: { type: "integer" } },
       required: ["lease_id"],
+    },
+  },
+  {
+    name: "prism_vault_store",
+    description: "Store private data — a card, an identity document, an API credential — encrypted under a key derived from this agent's wallet on this machine. Prism receives ciphertext only and cannot read it. Use this instead of writing a secret into a workspace or a file. Returns an item_id; the value is not recoverable without the wallet.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        value: { type: "string", description: "The data to seal. Encrypted before it leaves this process." },
+        label: { type: "string", description: "Optional plain-text name so the item is findable. Stored unencrypted, so keep it non-revealing (e.g. 'billing card', not the number)." },
+        trust_floor: {
+          type: "string",
+          enum: TRUST_CLASSES,
+          description: "The weakest workspace this item may ever be released into. Defaults to 'confidential', which is above anything the network serves today, so the item cannot reach a rented GPU at all. Only lower it deliberately.",
+        },
+      },
+      required: ["value"],
+    },
+  },
+  {
+    name: "prism_vault_list",
+    description: "List the agent's sealed vault items: item_id, label, version and trust floor. Values are not returned and are not readable by Prism.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "prism_vault_read",
+    description: "Decrypt and return one vault item, in this process, using the wallet-derived key. The plaintext exists only here — do not echo it into a leased workspace, a log, or a message.",
+    inputSchema: {
+      type: "object",
+      properties: { item_id: { type: "string", description: "The item_id from prism_vault_store or prism_vault_list." } },
+      required: ["item_id"],
+    },
+  },
+  {
+    name: "prism_vault_delete",
+    description: "Permanently delete a vault item. The ciphertext is removed and the value cannot be recovered.",
+    inputSchema: {
+      type: "object",
+      properties: { item_id: { type: "string" } },
+      required: ["item_id"],
+    },
+  },
+  {
+    name: "prism_vault_release",
+    description: "Authorize a vault item into a lease you hold and return its plaintext for use there. Refused when the lease's trust class is below the item's trust floor, which is what stops a secret reaching a host that can read it. Every allowed release is recorded against the account.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        item_id: { type: "string" },
+        lease_id: { type: "integer", description: "A lease from prism_lease." },
+      },
+      required: ["item_id", "lease_id"],
     },
   },
 ];
@@ -215,6 +267,57 @@ async function handle(name, args) {
       leases.delete(id);
     }
     return { lease_id: id, released: Boolean(lease) };
+  }
+  if (name.startsWith("prism_vault_")) return handleVault(name, args);
+  throw new Error(`unknown tool ${name}`);
+}
+
+// The vault key is derived here from the wallet signature and stays in this
+// process. Nothing in this function sends a key or a plaintext to Prism.
+async function handleVault(name, args) {
+  const vault = requireWallet(name).vault;
+  await ensureAuth();
+  if (!vault.unlocked) await vault.unlock();
+
+  if (name === "prism_vault_store") {
+    if (typeof args.value !== "string" || args.value.length === 0) {
+      throw new Error("value is required");
+    }
+    const item = await vault.put(args.value, {
+      label: args.label ?? "",
+      trustFloor: args.trust_floor ?? DEFAULT_TRUST_FLOOR,
+    });
+    return {
+      item_id: item.item_id,
+      version: item.version,
+      label: item.label,
+      trust_floor: item.min_trust_class,
+      stored: "sealed on this machine; Prism holds ciphertext only",
+    };
+  }
+  if (name === "prism_vault_list") {
+    const items = await vault.list();
+    return {
+      count: items.length,
+      items: items.map((item) => ({
+        item_id: item.item_id,
+        label: item.label,
+        version: item.version,
+        trust_floor: item.min_trust_class,
+        updated_at: item.updated_at,
+      })),
+    };
+  }
+  if (name === "prism_vault_read") {
+    return { item_id: args.item_id, value: await vault.get(args.item_id) };
+  }
+  if (name === "prism_vault_delete") {
+    await vault.remove(args.item_id);
+    return { item_id: args.item_id, deleted: true };
+  }
+  if (name === "prism_vault_release") {
+    const id = leaseId(args.lease_id);
+    return { item_id: args.item_id, lease_id: id, value: await vault.releaseInto(id, args.item_id) };
   }
   throw new Error(`unknown tool ${name}`);
 }

@@ -17,6 +17,7 @@ const sections = [
   ["operations", "Operations"],
   ["errors", "Errors"],
   ["agent", "Agent access"],
+  ["vault", "Vault"],
 ] as const;
 
 const contracts = [
@@ -108,6 +109,17 @@ const lease = await agent.lease({ image: DEFAULT_IMAGE, durationSeconds: 900, mi
 const out = await agent.run(lease, "nvidia-smi");
 console.log(out.stdout);
 agent.endLease(lease);`;
+
+const vaultExample = `await agent.vault.unlock();
+
+const card = await agent.vault.put(
+  { pan: "4111111111111111", exp: "09/29" },
+  { label: "billing card" },
+);
+
+// Sealed at the default floor, so this is refused on open capacity
+// rather than exposing the card to a host that can read it.
+await agent.vault.releaseInto(lease, card.item_id, { json: true });`;
 
 export function DeveloperDocs() {
   return (
@@ -466,12 +478,44 @@ export function DeveloperDocs() {
               <InfoCard title="Wallet as identity">
                 <p>The signing wallet is the subject of every request. The agent boundary reaches only renter routes; operator, node, and gateway surfaces are rejected.</p>
               </InfoCard>
+              <InfoCard title="Vault">
+                <p>Cards, identity documents and credentials sealed under a wallet-derived key that never leaves your machine. Each item names the weakest workspace class it may be released into, and a lease below that floor is refused.</p>
+              </InfoCard>
             </div>
             <Callout kind="warning" title="Workspace data">
-              The agent packages are on npm under the @prismnetwork scope. The
-              data-classification limits above apply unchanged. An agent workspace is a
-              disposable environment, not confidential computing.
+              An agent workspace is a disposable environment, not confidential computing, so
+              anything an agent needs to keep private belongs in its vault rather than on the
+              box. New vault items default to a trust floor above what the network can serve
+              today, which means releasing one into current capacity is refused, not allowed
+              quietly.
             </Callout>
+          </DocsSection>
+
+          <DocsSection id="vault" index="14" eyebrow="Renter-held encryption" title="Vault">
+            <p>
+              A workspace is administered by someone else, so anything that must stay private
+              belongs in the vault instead. Items are sealed under a key derived from a wallet
+              signature on the renter&apos;s own machine and never transmitted, which leaves the
+              control plane holding ciphertext and no means of reading it. The browser and the
+              agent SDK run the same client, so one wallet opens one vault from either.
+            </p>
+            <div className="endpoint-list">
+              <Endpoint method="GET" path="/v1/vault/items" auth="Bearer" description="List sealed items with their version and trust floor. Values are never returned in a listing." />
+              <Endpoint method="PUT" path="/v1/vault/items/{item_id}" auth="Bearer" description="Create an item, or replace one by naming the version being replaced." />
+              <Endpoint method="GET" path="/v1/vault/items/{item_id}" auth="Bearer" description="Fetch one sealed item for the caller to decrypt locally." />
+              <Endpoint method="DELETE" path="/v1/vault/items/{item_id}" auth="Bearer" description="Delete an item and its ciphertext." />
+              <Endpoint method="POST" path="/v1/vault/items/{item_id}/release" auth="Bearer" description="Authorize an item into a lease that meets its trust floor." />
+              <Endpoint method="GET" path="/v1/vault/releases" auth="Bearer" description="Read which items were released into which leases." />
+            </div>
+            <CodeBlock label="@prismnetwork/agent-sdk" code={vaultExample} />
+            <h3 className="docs-subheading">Guarantees</h3>
+            <ul className="docs-list">
+              <li>The account, item, version, and trust floor are authenticated into the ciphertext, so relocating an item, replaying an old version, or lowering its floor produces a failed decrypt rather than a wrong answer.</li>
+              <li>Writes are compare-and-set. Omitting <code>previous_version</code> creates and fails on an occupied item, so concurrent writers cannot silently drop one another.</li>
+              <li>Every item names the weakest workspace class it may be released into. New items default to <code>confidential</code>, above what the network can serve, so a release into current capacity is refused.</li>
+              <li>Signatures are deterministic, so the same wallet reproduces the same key on any machine. No recovery copy is held anywhere; losing the wallet loses the vault.</li>
+              <li>Ciphertext is capped at 160 KiB per item, with 512 items per account.</li>
+            </ul>
           </DocsSection>
 
         </main>

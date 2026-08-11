@@ -23,6 +23,11 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 | `prism_lease` | yes |
 | `prism_run` | yes |
 | `prism_end_lease` | yes |
+| `prism_vault_store` | yes |
+| `prism_vault_list` | yes |
+| `prism_vault_read` | yes |
+| `prism_vault_delete` | yes |
+| `prism_vault_release` | yes |
 
 - `prism_wallet`: the agent's address and USDG/ETH balances.
 - `prism_list_gpus`: GPUs available to lease, with price per second and per hour.
@@ -30,6 +35,24 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 - `prism_lease`: lease a GPU and keep it; returns a `lease_id` and SSH access.
 - `prism_run`: run a command on an existing lease.
 - `prism_end_lease`: release a lease.
+- `prism_vault_store`: seal private data under the wallet-derived key.
+- `prism_vault_list`: list sealed items; values are never returned.
+- `prism_vault_read`: decrypt one item in this process.
+- `prism_vault_delete`: permanently delete an item.
+- `prism_vault_release`: authorize an item into a lease that clears its trust floor.
+
+## Vault
+
+An agent that handles a card, an identity document or a credential should not
+write it into a leased workspace. `prism_vault_store` seals it under a key
+derived from the agent's wallet inside this server process; Prism receives
+ciphertext and holds no way to read it.
+
+Each item names the weakest workspace trust class it may ever be released into,
+and new items default to `confidential` — above anything the network serves
+today. `prism_vault_release` is therefore refused on current capacity instead of
+handing a secret to a host that can read it. Lowering an item's floor is a
+deliberate act, and allowed releases are recorded against the account.
 
 ## Configure
 

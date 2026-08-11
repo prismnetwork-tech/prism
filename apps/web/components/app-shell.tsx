@@ -9,6 +9,7 @@ import { docsUrl } from "@/lib/site";
 const navigation = [
   ["Compute", "/compute"],
   ["Leases", "/leases"],
+  ["Vault", "/vault"],
   ["Nodes", "/nodes"],
   ["Earnings", "/earnings"],
   ["Wallets", "/wallets"],

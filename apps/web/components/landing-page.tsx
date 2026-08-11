@@ -148,20 +148,21 @@ export function LandingPage() {
                 </div>
               </div>
             </div>
+            <div className="vault-marker">YOUR VAULT · SEALED</div>
             <div className="tunnel-line"><i /><span>TEMPORARY ACCESS</span></div>
           </div>
           <div className="security-copy">
-            <p className="section-index">04 / Isolation</p>
-            <h2>Every offer states what it protects.</h2>
+            <p className="section-index">04 / Private data</p>
+            <h2>Your secrets stay yours.</h2>
             <p>
-              Each cloud lease starts in a fresh container with temporary credentials, and workspace
-              storage is destroyed when the instance closes. What differs between suppliers is how much
-              the host can see, so every offer carries a trust class and agents can refuse anything below
-              the level they need.
+              Cards, identity documents and credentials go in your vault, sealed on your machine
+              under a key derived from your wallet and never sent. Prism stores the ciphertext and
+              holds no way to read it. Each item names the weakest class of workspace it may ever be
+              shown to, and an agent that asks for more is refused.
             </p>
             <div className="security-disclosure">
               <span>Security scope</span>
-              <p>Today&rsquo;s capacity is open class: the host operator remains inside the trust boundary, so keep private keys, production credentials and model weights off it. Stronger classes are earned from hardware attestation, never from a supplier&rsquo;s own claim.</p>
+              <p>A rented workspace is a separate matter. All capacity today is open class, so its operator can read what runs there, and new vault items start out of reach of it. Stronger classes are earned from hardware attestation, never from a supplier&rsquo;s own claim.</p>
             </div>
           </div>
         </section>

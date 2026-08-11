@@ -723,6 +723,109 @@ pub struct EncryptedSecret {
     pub ciphertext: String,
 }
 
+/// Envelope-encrypted renter data. The control plane stores these and can read
+/// none of them: the key that unwraps `wrapped_key` is derived on the renter's
+/// machine and is never sent, so there is no column, cache or log line here that
+/// could hold it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultEnvelope {
+    /// The item's data key, sealed to the renter's vault root key.
+    pub wrapped_key: String,
+    /// AES-256-GCM nonce for `ciphertext`, base64url, 12 bytes.
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
+pub const VAULT_ENVELOPE_DOMAIN: &[u8] = b"prism.vault.v1\0";
+/// Ciphertext cap. The web boundary already caps a request body at 256 KiB and
+/// base64 costs a third, so this is what survives the round trip.
+pub const MAX_VAULT_CIPHERTEXT_BYTES: usize = 160 * 1_024;
+pub const MAX_VAULT_ITEMS_PER_ACCOUNT: usize = 512;
+pub const MAX_VAULT_LABEL_BYTES: usize = 64;
+
+/// New items are sealed against every trust class the network can serve today,
+/// so an agent cannot hand one to a rented box until attested capacity exists.
+/// Storing and reading back on the renter's own machine is unaffected.
+pub const DEFAULT_VAULT_TRUST_FLOOR: TrustClass = TrustClass::Confidential;
+
+/// Whether a lease is allowed to be shown an item's plaintext.
+pub fn vault_release_permitted(floor: TrustClass, lease: TrustClass) -> bool {
+    lease >= floor
+}
+
+/// The bytes authenticated alongside every vault ciphertext. Binding the
+/// wallet, the slot, the version and the trust floor into GCM's associated
+/// data is what stops this service from moving an item between vaults,
+/// rolling one back to a superseded version, or quietly lowering the floor to
+/// leak it into an open box: any of those makes the renter's decrypt fail
+/// instead of succeeding with the wrong answer.
+///
+/// `wallet` is the lowercase address, because casing varies by source and two
+/// spellings of one address must not derive two keys. Byte-for-byte identical
+/// in the SDK, and a shared test vector pins both.
+pub fn vault_associated_data(
+    wallet: &str,
+    item_id: Uuid,
+    version: u32,
+    floor: TrustClass,
+) -> Vec<u8> {
+    let mut aad = Vec::from(VAULT_ENVELOPE_DOMAIN);
+    for field in [
+        wallet,
+        &item_id.hyphenated().to_string(),
+        &version.to_string(),
+        floor.label(),
+    ] {
+        aad.extend_from_slice(field.as_bytes());
+        aad.push(0);
+    }
+    aad
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultItem {
+    pub item_id: Uuid,
+    /// Increments on every write. The renter compares it against what they last
+    /// stored, so a served-you-an-older-copy answer is visible rather than silent.
+    pub version: u32,
+    /// Opaque to everyone but the renter's client.
+    pub envelope: VaultEnvelope,
+    pub min_trust_class: TrustClass,
+    /// Unencrypted, because the renter chose it as the one thing they are happy
+    /// to be listable by. Empty is fine.
+    #[serde(default)]
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultWrite {
+    pub envelope: VaultEnvelope,
+    #[serde(default = "default_vault_floor")]
+    pub min_trust_class: TrustClass,
+    #[serde(default)]
+    pub label: String,
+    /// The version the writer believes it is replacing. Absent creates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<u32>,
+}
+
+fn default_vault_floor() -> TrustClass {
+    DEFAULT_VAULT_TRUST_FLOOR
+}
+
+/// Recorded whenever an item is authorized into a lease, so a renter can see
+/// after the fact exactly what an agent exposed and where.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultRelease {
+    pub item_id: Uuid,
+    pub lease_id: u64,
+    pub item_version: u32,
+    pub lease_trust_class: TrustClass,
+    pub released_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct CredentialCipher(Aes256Gcm);
 
@@ -1164,5 +1267,81 @@ mod tests {
         assert!(report.verify(&key.verifying_key()).is_ok());
         report.command_id = Uuid::now_v7();
         assert!(report.verify(&key.verifying_key()).is_err());
+    }
+
+    // The SDK reproduces this exact byte string in JavaScript. If either side
+    // drifts, every stored item stops opening, so pin it with a literal rather
+    // than by calling the function twice.
+    #[test]
+    fn vault_associated_data_matches_the_published_vector() {
+        let aad = vault_associated_data(
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+            Uuid::parse_str("018f3a2b-4c5d-7e8f-9012-3456789abcde").unwrap(),
+            7,
+            TrustClass::Confidential,
+        );
+
+        // Separators are spelled `\x00`: a `\0` before a digit reads as an
+        // octal escape and would quietly change the vector.
+        assert_eq!(
+            aad,
+            b"prism.vault.v1\x000x1f9840a85d5af5bf1d1762f925bdaddc4201f984\x00018f3a2b-4c5d-7e8f-9012-3456789abcde\x007\x00confidential\x00"
+        );
+    }
+
+    #[test]
+    fn vault_associated_data_separates_every_field() {
+        let item = Uuid::now_v7();
+        let base = vault_associated_data("a", item, 1, TrustClass::Open);
+
+        assert_ne!(base, vault_associated_data("b", item, 1, TrustClass::Open));
+        assert_ne!(
+            base,
+            vault_associated_data("a", Uuid::now_v7(), 1, TrustClass::Open)
+        );
+        assert_ne!(base, vault_associated_data("a", item, 2, TrustClass::Open));
+        assert_ne!(
+            base,
+            vault_associated_data("a", item, 1, TrustClass::Isolated)
+        );
+    }
+
+    // Concatenation without the separator would let a crafted subject absorb the
+    // next field and collide with a different account's binding.
+    #[test]
+    fn vault_associated_data_resists_field_smuggling() {
+        let item = Uuid::now_v7();
+        assert_ne!(
+            vault_associated_data(&format!("a\0{item}"), item, 1, TrustClass::Open),
+            vault_associated_data("a", item, 1, TrustClass::Open)
+        );
+    }
+
+    #[test]
+    fn vault_release_needs_a_lease_at_or_above_the_floor() {
+        assert!(vault_release_permitted(TrustClass::Open, TrustClass::Open));
+        assert!(vault_release_permitted(
+            TrustClass::Isolated,
+            TrustClass::Attested
+        ));
+        assert!(!vault_release_permitted(
+            TrustClass::Isolated,
+            TrustClass::Open
+        ));
+        assert!(!vault_release_permitted(
+            TrustClass::Confidential,
+            TrustClass::Attested
+        ));
+    }
+
+    // The default floor has to sit above anything the network can actually
+    // serve, or a stored card could reach a host that reads it.
+    #[test]
+    fn the_default_floor_is_out_of_reach_of_servable_capacity() {
+        assert!(DEFAULT_VAULT_TRUST_FLOOR > MAX_VERIFIABLE_TRUST_CLASS);
+        assert!(!vault_release_permitted(
+            DEFAULT_VAULT_TRUST_FLOOR,
+            MAX_VERIFIABLE_TRUST_CLASS
+        ));
     }
 }
