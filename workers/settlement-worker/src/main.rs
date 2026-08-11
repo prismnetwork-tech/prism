@@ -22,6 +22,10 @@ use sqlx_core::{
 use sqlx_postgres::{PgPool, PgPoolOptions};
 use tracing_subscriber::EnvFilter;
 
+/// Rebuild a settlement proposal rather than resubmit it after this many
+/// failed attempts, so a transaction priced below the base fee cannot strand
+/// the lease and hold its node until the retry limit runs out.
+const RESIGN_AFTER_ATTEMPTS: i16 = 5;
 const MAX_EVIDENCE_BYTES: u64 = 20_000_000;
 const MAX_EVIDENCE_RECORDS: usize = 1_000;
 const MAX_LEASE_SECONDS: u64 = 21_600;
@@ -365,11 +369,17 @@ async fn prepare_durable_submission(
         .execute(&mut *connection)
         .await?;
     let result = async {
+        // Reusing the stored submission is what makes settlement idempotent, but
+        // those bytes carry the gas price they were signed at. If the chain has
+        // rejected them repeatedly they can never land, and resubmitting until
+        // the attempt limit strands the lease and holds its node the whole time.
+        // Past a few failures the proposal is rebuilt at the current price.
         if let Some(SqlJson(existing)) = query_scalar::<_, SqlJson<Submission>>(
             "SELECT proposal FROM settlement_jobs \
-                 WHERE lease_id = $1 AND proposal IS NOT NULL",
+                 WHERE lease_id = $1 AND proposal IS NOT NULL AND attempts < $2",
         )
         .bind(evidence.lease_id as i64)
+        .bind(RESIGN_AFTER_ATTEMPTS)
         .fetch_optional(&mut *connection)
         .await?
         {
