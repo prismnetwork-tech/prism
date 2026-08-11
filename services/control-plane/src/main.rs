@@ -2645,7 +2645,7 @@ impl MarketplaceStore {
                      WHERE consumed_at IS NULL AND expires_at > NOW() \
                        AND created_at > NOW() - make_interval(secs => $1) \
                      UNION SELECT document->>'node_id' FROM leases \
-                     WHERE state IN ('funded', 'provisioning', 'ready', 'active', 'closing')",
+                     WHERE state NOT IN ('finalized', 'refunded', 'failed')",
                 )
                 .bind(QUOTE_HOLD_SECONDS as f64)
                 .fetch_all(&mut *transaction)
@@ -3449,14 +3449,15 @@ fn valid_command_transition(current: &str, next: &str) -> bool {
 /// Whether a lease still holds its machine. Settlement runs for a further 24
 /// hours after access closes, and the node is schedulable again long before
 /// that bookkeeping finishes.
+/// The escrow holds a node's `activeLeaseId` until the lease finalizes or
+/// refunds, so anything short of a terminal state still occupies it. Listing
+/// the states that free a node rather than the ones that hold it means a new
+/// non-terminal state reserves by default instead of silently letting the
+/// scheduler quote a node the registry will reject with `LeaseNotReady`.
 fn occupies_node(lease: &LeaseRecord) -> bool {
-    matches!(
+    !matches!(
         lease.state,
-        LeaseState::Funded
-            | LeaseState::Provisioning
-            | LeaseState::Ready
-            | LeaseState::Active
-            | LeaseState::Closing
+        LeaseState::Finalized | LeaseState::Refunded | LeaseState::Failed
     )
 }
 
@@ -4769,6 +4770,36 @@ mod tests {
     }
 
     #[test]
+    fn a_lease_awaiting_settlement_still_occupies_its_node() {
+        let lease = |state| LeaseRecord {
+            lease_id: 1,
+            quote_id: Uuid::now_v7(),
+            node_id: "node".to_owned(),
+            renter_wallet: "0x1".to_owned(),
+            image: "registry.example/runtime@sha256:abc".to_owned(),
+            duration_seconds: 60,
+            rate_per_second: 100,
+            maximum_escrow: 6_000,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: "0x2".to_owned(),
+            state,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // The escrow keeps activeLeaseId set until finalize or refund, so
+        // quoting a node in these states reverts with LeaseNotReady.
+        assert!(occupies_node(&lease(LeaseState::Active)));
+        assert!(occupies_node(&lease(LeaseState::Closing)));
+        assert!(occupies_node(&lease(LeaseState::SettlementPending)));
+        assert!(occupies_node(&lease(LeaseState::Disputed)));
+
+        assert!(!occupies_node(&lease(LeaseState::Finalized)));
+        assert!(!occupies_node(&lease(LeaseState::Refunded)));
+        assert!(!occupies_node(&lease(LeaseState::Failed)));
+    }
+
+    #[test]
     fn matching_prefers_price_then_reliability_then_benchmark() {
         let slower = offer("slower", 100, 5_000);
         let faster = offer("faster", 100, 8_000);
@@ -5181,7 +5212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lease_awaiting_settlement_releases_its_node() {
+    async fn a_node_is_released_once_its_lease_settles_not_before() {
         let now = Utc::now();
         let mut market = MemoryMarketplace::default();
         market
@@ -5223,7 +5254,20 @@ mod tests {
         let MarketplaceStore::Memory(market) = &store else {
             unreachable!()
         };
+        // #83 released the node here, on the reasoning that its machine was
+        // already gone. The escrow disagrees: it holds activeLeaseId until
+        // finalize or refund, so quoting now reverts with LeaseNotReady. That
+        // optimisation existed because finalize was hardcoded 24h out; #96 made
+        // it read DISPUTE_WINDOW, so settling costs about five minutes and
+        // waiting for it is cheap.
         market.write().await.leases.get_mut(&27).unwrap().1.state = LeaseState::SettlementPending;
+
+        assert!(matches!(
+            store.quote("renter", &request).await,
+            Err(StoreError::CapacityReserved)
+        ));
+
+        market.write().await.leases.get_mut(&27).unwrap().1.state = LeaseState::Finalized;
 
         assert_eq!(
             store.quote("renter", &request).await.unwrap().node_id,
