@@ -385,6 +385,26 @@ struct MatchRequest {
     request: LeaseRequest,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct PriceIndexEntry {
+    gpu_model: String,
+    sourced_low_micros_per_hour: Option<i64>,
+    sourced_high_micros_per_hour: Option<i64>,
+    sourced_median_micros_per_hour: Option<i64>,
+    sourced_observations: i64,
+    settled_mean_micros_per_hour: Option<i64>,
+    settled_leases: i64,
+    last_observed_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PriceIndex {
+    currency: &'static str,
+    unit: &'static str,
+    generated_at: chrono::DateTime<Utc>,
+    gpus: Vec<PriceIndexEntry>,
+}
+
 #[derive(Deserialize)]
 struct ConfirmLeaseRequest {
     quote_id: Uuid,
@@ -679,6 +699,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/offers", get(list_offers))
+        .route("/v1/price-index", get(price_index))
         .route("/v1/nodes/enroll", post(enroll_node))
         .route(
             "/v1/nodes/{node_id}/certificates",
@@ -2431,6 +2452,65 @@ impl MarketplaceStore {
         }
     }
 
+    /// What GPU time has actually cleared at, per class. Two series: what the
+    /// supply side charged us, and what renters paid on leases that settled
+    /// onchain. Public because a price nobody can check is a quote, not a price.
+    async fn price_index(&self) -> Result<Vec<PriceIndexEntry>, StoreError> {
+        match self {
+            // The in-memory store exists for tests and carries no price history.
+            Self::Memory(_) => Ok(Vec::new()),
+            Self::Postgres(pool) => {
+                let rows = query_as::<_, (String, Option<i64>, Option<i64>, Option<i64>, i64, Option<f64>, Option<i64>, Option<chrono::DateTime<Utc>>)>(
+                    "WITH sourced AS ( \
+                         SELECT gpu_model, \
+                                min(hourly_cost_micros) AS low, \
+                                max(hourly_cost_micros) AS high, \
+                                (percentile_cont(0.5) WITHIN GROUP (ORDER BY hourly_cost_micros))::bigint AS median, \
+                                count(*)::bigint AS observations, \
+                                max(observed_at) AS latest \
+                         FROM capacity_prices \
+                         WHERE observed_at >= NOW() - INTERVAL '30 days' \
+                         GROUP BY gpu_model \
+                     ), settled AS ( \
+                         SELECT document->>'gpu_model' AS gpu_model, \
+                                avg((document->>'charged_base_units')::numeric \
+                                    / NULLIF((document->>'runtime_seconds')::numeric, 0) * 3600)::float8 AS paid, \
+                                count(*)::bigint AS leases \
+                         FROM proof_receipts \
+                         WHERE document->>'outcome' = 'finalized' \
+                           AND (document->>'runtime_seconds')::numeric > 0 \
+                         GROUP BY 1 \
+                     ) \
+                     SELECT COALESCE(s.gpu_model, t.gpu_model), s.low, s.high, s.median, \
+                            COALESCE(s.observations, 0), t.paid, t.leases, s.latest \
+                     FROM sourced s FULL OUTER JOIN settled t ON t.gpu_model = s.gpu_model \
+                     ORDER BY 1",
+                )
+                .fetch_all(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                Ok(rows
+                    .into_iter()
+                    .map(
+                        |(gpu_model, low, high, median, observations, paid, leases, latest)| {
+                            PriceIndexEntry {
+                                gpu_model,
+                                sourced_low_micros_per_hour: low,
+                                sourced_high_micros_per_hour: high,
+                                sourced_median_micros_per_hour: median,
+                                sourced_observations: observations,
+                                settled_mean_micros_per_hour: paid
+                                    .map(|value| value.round() as i64),
+                                settled_leases: leases.unwrap_or(0),
+                                last_observed_at: latest,
+                            }
+                        },
+                    )
+                    .collect())
+            }
+        }
+    }
+
     async fn list_offers(&self) -> Result<Vec<NodeOffer>, StoreError> {
         let cutoff = Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS);
         match self {
@@ -4103,6 +4183,21 @@ struct OfferFilter {
     min_trust: TrustClass,
 }
 
+/// A public price for compute. The sourced series is what providers charged
+/// this network; the settled series is what renters paid on leases that
+/// finished onchain. Both are in USDG micros per GPU hour.
+async fn price_index(
+    State(state): State<AppState>,
+) -> Result<Json<PriceIndex>, (StatusCode, Json<ApiError>)> {
+    let entries = state.store.price_index().await.map_err(internal_error)?;
+    Ok(Json(PriceIndex {
+        currency: "USDG",
+        unit: "micros_per_gpu_hour",
+        generated_at: Utc::now(),
+        gpus: entries,
+    }))
+}
+
 async fn list_offers(
     State(state): State<AppState>,
     Query(filter): Query<OfferFilter>,
@@ -5077,6 +5172,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("batch results"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0012_batch_results.sql")),
+                false,
+            ),
+            Migration::new(
+                13,
+                Cow::Borrowed("capacity prices"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0013_capacity_prices.sql")),
                 false,
             ),
         ]),

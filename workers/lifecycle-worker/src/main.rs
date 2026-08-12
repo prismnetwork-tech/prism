@@ -606,6 +606,55 @@ impl Worker {
             .bind(hourly_micros)
             .execute(&self.pool)
             .await?;
+        if let (Some(offer), Some(hourly)) = (offer, hourly_micros) {
+            self.record_price(node_id, offer, hourly).await?;
+        }
+        Ok(())
+    }
+
+    /// The upsert above keeps only the current price, so what a host cleared at
+    /// survives one refresh. Append the observation as well: across providers
+    /// and over time it is the only public record of what GPU time actually
+    /// costs, and it cannot be reconstructed later.
+    ///
+    /// Written only when the price or the host changes. Recording every poll
+    /// would measure the polling interval rather than the market.
+    async fn record_price(
+        &self,
+        node_id: &str,
+        offer: &vast::Offer,
+        hourly_micros: i64,
+    ) -> anyhow::Result<()> {
+        let offer_id = i64::try_from(offer.id)?;
+        let unchanged: bool = query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM capacity_prices \
+                 WHERE node_id = $1 \
+                   AND hourly_cost_micros = $2 \
+                   AND provider_offer_id IS NOT DISTINCT FROM $3 \
+                   AND id = (SELECT max(id) FROM capacity_prices WHERE node_id = $1) \
+             )",
+        )
+        .bind(node_id)
+        .bind(hourly_micros)
+        .bind(offer_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if unchanged {
+            return Ok(());
+        }
+        query(
+            "INSERT INTO capacity_prices \
+                 (node_id, provider, gpu_model, vram_mib, provider_offer_id, hourly_cost_micros) \
+             VALUES ($1, 'vast', $2, $3, $4, $5)",
+        )
+        .bind(node_id)
+        .bind(&offer.gpu_name)
+        .bind(i32::try_from(offer.gpu_ram)?)
+        .bind(offer_id)
+        .bind(hourly_micros)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
