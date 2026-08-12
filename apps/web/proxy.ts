@@ -22,10 +22,21 @@ export function publicPageRewrite(hostname: string, pathname: string) {
     : null;
 }
 
+/// The JSON-LD block is identical on every request, so it is allowed by hash
+/// rather than by the per-request nonce. Reading the nonce would force every
+/// page that renders it to be dynamic, which is the whole cost this avoids.
+/// `structured-data.test.ts` recomputes this from the rendered string and fails
+/// if they drift, because a stale hash silently drops the markup.
+export const STRUCTURED_DATA_HASHES = [
+  "sha256-jVGYQAc+tNEHWR50wru54Z/ENBpv0mX6gqRil1B94js=",
+  "sha256-xfqqkR9qeR8HHQrxYZfaLL1hsK/TlvisSSKjHpmJrUI=",
+] as const;
+
 export function contentSecurityPolicy(nonce: string, development: boolean) {
   const script = [
     "'self'",
     `'nonce-${nonce}'`,
+    ...STRUCTURED_DATA_HASHES.map((hash) => `'${hash}'`),
     "'strict-dynamic'",
     development ? "'unsafe-eval'" : "",
   ].filter(Boolean).join(" ");

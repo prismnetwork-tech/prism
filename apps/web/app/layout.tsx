@@ -10,8 +10,6 @@ import "./legal.css";
 import "./information.css";
 import "./public-footer.css";
 
-export const dynamic = "force-dynamic";
-
 const description =
   "GPU compute your agents can rent with a wallet. Lease NVIDIA capacity, pay per second in USDG, and settle every lease onchain with a public receipt.";
 
