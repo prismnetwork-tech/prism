@@ -6,7 +6,7 @@ export const faq = [
   {
     question: "What payment methods do you accept?",
     answer:
-      "Stablecoins, not cards or bank transfer. A lease is funded in USDG on Robinhood Chain, and one-off jobs over x402 accept USDC on Base or USDG on Robinhood Chain. You also need a small amount of native ETH on Robinhood Chain for gas, which is separate from the compute cost.",
+      "Stablecoins. We do not take cards or bank transfer. A lease is funded in USDG on Robinhood Chain, and one-off jobs over x402 accept USDC on Base or USDG on Robinhood Chain. You also need a small amount of native ETH on Robinhood Chain for gas, which is separate from the compute cost.",
   },
   {
     question: "Do I need the PRISM token to use the network?",
@@ -31,7 +31,7 @@ export const faq = [
   {
     question: "What is a trust class?",
     answer:
-      "A statement of what a supplier protects, running open, isolated, attested and confidential from weakest to strongest. The class is derived by the network from evidence it can check rather than claimed by the supplier, and a request can require a minimum instead of hoping.",
+      "A statement of what a supplier protects, running open, isolated, attested and confidential from weakest to strongest. The network works the class out from evidence it can check, and a request can require a minimum.",
   },
   {
     question: "How does the vault keep data private?",
