@@ -264,7 +264,7 @@ export function DeveloperDocs() {
             </div>
             <CodeBlock label="POST /api/app/leases/match" code={quoteExample} />
             <CodeBlock label="201 quote response" code={quoteResponse} />
-            <h3 className="docs-subheading">Matching constraints</h3>
+            <Subheading id="matching-constraints">Matching constraints</Subheading>
             <ul className="docs-list">
               <li><code>image</code> must be public, whitespace-free, at most 512 characters, and end in a complete <code>@sha256:</code> digest.</li>
               <li><code>duration_seconds</code> must be between 1 and 21,600 seconds.</li>
@@ -319,7 +319,7 @@ export function DeveloperDocs() {
               <RuntimeRow label="Evidence" cloud="Provider instance and hourly cost" physical="Device-signed telemetry and gateway timing" />
               <RuntimeRow label="Availability" cloud="Live" physical="Planned; not available for production leases" />
             </div>
-            <h3 className="docs-subheading">Container requirements</h3>
+            <Subheading id="container-requirements">Container requirements</Subheading>
             <ul className="docs-list">
               <li>Publicly pullable Linux/amd64 OCI image.</li>
               <li>Immutable registry digest; tags alone are rejected.</li>
@@ -345,7 +345,7 @@ export function DeveloperDocs() {
               <div><dt>Maximum lease</dt><dd>6 hours</dd></div>
               <div><dt>Maximum escrow</dt><dd>50 USDG</dd></div>
               <div><dt>Provision timeout</dt><dd>10 minutes</dd></div>
-              <div><dt>Dispute window</dt><dd>24 hours</dd></div>
+              <div><dt>Dispute window</dt><dd>5 minutes</dd></div>
               <div><dt>Platform fee</dt><dd>10%</dd></div>
               <div><dt>Network concurrency</dt><dd>25 active leases</dd></div>
             </dl>
@@ -365,7 +365,7 @@ export function DeveloperDocs() {
             <ol className="docs-steps compact">
               <li><span>01</span><div><h3>Observe</h3><p>Clamp confirmed runtime to the funded duration and preserve provider or physical-node execution evidence.</p></div></li>
               <li><span>02</span><div><h3>Propose</h3><p>Submit an EIP-712 settlement carrying usage seconds, receipt hash, nonce, and deadline.</p></div></li>
-              <li><span>03</span><div><h3>Dispute</h3><p>Hold finalization for 24 hours. A renter can dispute; the governance Safe resolves disputed outcomes.</p></div></li>
+              <li><span>03</span><div><h3>Dispute</h3><p>Hold finalization for the escrow dispute window, currently 5 minutes. A renter can dispute; the governance Safe resolves disputed outcomes.</p></div></li>
               <li><span>04</span><div><h3>Finalize</h3><p>Pay 90% of the charge to the provider, route the 10% platform fee, and refund unused escrow.</p></div></li>
               <li><span>05</span><div><h3>Publish</h3><p>Verify the final chain event and expose a sanitized, canonical receipt in the public proof feed.</p></div></li>
             </ol>
@@ -401,7 +401,7 @@ export function DeveloperDocs() {
                 </ul>
               </InfoCard>
             </div>
-            <h3 className="docs-subheading">Report a vulnerability</h3>
+            <Subheading id="report-a-vulnerability">Report a vulnerability</Subheading>
             <p>
               Do not publish an exploitable vulnerability in a public issue. Use this
               repository&apos;s GitHub private vulnerability reporting or email{" "}
@@ -426,7 +426,7 @@ export function DeveloperDocs() {
                 <p>Use the response request ID to correlate web, control-plane, provider, and chain records. Public proof publication remains decoupled from financial settlement.</p>
               </InfoCard>
             </div>
-            <h3 className="docs-subheading">Production availability</h3>
+            <Subheading id="production-availability">Production availability</Subheading>
             <p>
               Prism expands public capacity after end-to-end production validation covers quoting,
               funding, provisioning, readiness, teardown, settlement, refunds, provider payment,
@@ -482,6 +482,30 @@ export function DeveloperDocs() {
                 <p>Cards, identity documents and credentials sealed under a wallet-derived key that never leaves your machine. Each item names the weakest workspace class it may be released into, and a lease below that floor is refused.</p>
               </InfoCard>
             </div>
+            <Subheading id="clients">Clients</Subheading>
+            <p>
+              Four packages reach the same renter surface, so the choice is only which
+              runtime you are already in. Every one of them reads offers without a wallet;
+              a key is needed to lease, never to look.
+            </p>
+            <dl className="docs-facts">
+              <div>
+                <dt>Node</dt>
+                <dd><code>npm i @prismnetwork/agent-sdk</code> · lease, run over SSH, release</dd>
+              </div>
+              <div>
+                <dt>Python</dt>
+                <dd><code>pip install prismnetwork</code> · the same lifecycle from a script</dd>
+              </div>
+              <div>
+                <dt>Coinbase AgentKit</dt>
+                <dd><code>pip install prism-agentkit</code> · an action provider, so a LangGraph agent rents its own GPU</dd>
+              </div>
+              <div>
+                <dt>MCP</dt>
+                <dd><code>claude mcp add prism -- npx -y @prismnetwork/mcp</code> · eleven tools in any MCP client</dd>
+              </div>
+            </dl>
             <Callout kind="warning" title="Workspace data">
               An agent workspace is a disposable environment, not confidential computing, so
               anything an agent needs to keep private belongs in its vault rather than on the
@@ -508,7 +532,7 @@ export function DeveloperDocs() {
               <Endpoint method="GET" path="/v1/vault/releases" auth="Bearer" description="Read which items were released into which leases." />
             </div>
             <CodeBlock label="@prismnetwork/agent-sdk" code={vaultExample} />
-            <h3 className="docs-subheading">Properties and limits</h3>
+            <Subheading id="properties-and-limits">Properties and limits</Subheading>
             <ul className="docs-list">
               <li>The account, item, version, and trust floor are authenticated into the ciphertext, so relocating an item, replaying an old version, or lowering its floor produces a failed decrypt rather than a wrong answer.</li>
               <li>Writes are compare-and-set. Omitting <code>previous_version</code> creates and fails on an occupied item, so concurrent writers cannot silently drop one another.</li>
@@ -522,6 +546,14 @@ export function DeveloperDocs() {
       </div>
       <PublicFooter />
     </div>
+  );
+}
+
+function AnchorLink({ id, label }: { id: string; label: string }) {
+  return (
+    <a className="docs-anchor" href={`#${id}`} aria-label={`Link to ${label}`}>
+      #
+    </a>
   );
 }
 
@@ -542,10 +574,19 @@ function DocsSection({
     <section className="docs-section" id={id}>
       <header>
         <span>{index}</span>
-        <div><p>{eyebrow}</p><h2>{title}</h2></div>
+        <div><p>{eyebrow}</p><h2>{title}<AnchorLink id={id} label={title} /></h2></div>
       </header>
       <div className="docs-section-body">{children}</div>
     </section>
+  );
+}
+
+function Subheading({ id, children }: { id: string; children: string }) {
+  return (
+    <h3 className="docs-subheading" id={id}>
+      {children}
+      <AnchorLink id={id} label={children} />
+    </h3>
   );
 }
 

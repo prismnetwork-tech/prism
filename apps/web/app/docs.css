@@ -736,3 +736,34 @@
   .error-table > div { grid-template-columns: 46px minmax(0, 1fr); gap: 10px; }
   .error-table p { grid-column: 2; }
 }
+
+/* Deep links. Hidden until the heading is hovered or the link is focused, so
+   the page reads clean but a section is always addressable. */
+.docs-anchor {
+  margin-left: .5ch;
+  color: inherit;
+  text-decoration: none;
+  opacity: 0;
+  font-weight: 300;
+  transition: opacity .12s ease;
+}
+
+.docs-section header h2:hover .docs-anchor,
+.docs-subheading:hover .docs-anchor,
+.docs-anchor:focus-visible {
+  opacity: .45;
+}
+
+.docs-anchor:hover {
+  opacity: .9;
+}
+
+/* Landing on an anchor should not tuck the heading under the sticky header. */
+.docs-section,
+.docs-subheading {
+  scroll-margin-top: 96px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .docs-anchor { transition: none; }
+}
