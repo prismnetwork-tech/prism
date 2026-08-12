@@ -29,7 +29,7 @@ contract Deploy {
 
         VM.startBroadcast();
         timelock = new AdminTimelockV1(admin);
-        registry = new NodeRegistryV1(IERC20(USDG), treasury);
+        registry = new NodeRegistryV1(IERC20(VM.envAddress("PRISM_BOND_TOKEN")), treasury, VM.envUint("PRISM_MIN_BOND"));
         escrow = new LeaseEscrowV1(
             IERC20(USDG), registry, address(timelock), gateway, attestor, treasury, admin, admin
         );

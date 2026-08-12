@@ -173,7 +173,7 @@ contract LeaseEscrowInvariantTest {
         provider = VM.addr(PROVIDER_KEY);
         treasury = address(0xCAFE);
         usd = new InvariantUsd();
-        registry = new NodeRegistryV1(usd, treasury);
+        registry = new NodeRegistryV1(usd, treasury, 1_000_000);
         handler = new LeaseLifecycleHandler();
         escrow = new LeaseEscrowV1(
             usd,

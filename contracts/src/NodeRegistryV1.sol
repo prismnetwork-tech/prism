@@ -7,7 +7,11 @@ import { TokenTransfers } from "./lib/TokenTransfers.sol";
 contract NodeRegistryV1 {
     using TokenTransfers for IERC20;
 
-    uint256 public constant MIN_BOND = 1_000_000;
+    /// Bond size, set at deployment. It was a constant of 1_000_000, which is
+    /// one unit of a six decimal stablecoin. The bond token is now chosen at
+    /// deployment and may have any number of decimals, so baking the amount in
+    /// silently changes what a bond is worth when the token changes.
+    uint256 public immutable minBond;
     uint256 public constant DAY = 24 hours;
     uint256 private constant SECP256K1N_DIV_2 =
         0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
@@ -66,7 +70,9 @@ contract NodeRegistryV1 {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event TreasurySet(address indexed treasury);
 
-    IERC20 public immutable usd;
+    /// The token a node bonds to join. Separate from what renters pay with:
+    /// capacity is staked in one asset and compute is billed in another.
+    IERC20 public immutable bondToken;
     address public owner;
     address public escrow;
     address public treasury;
@@ -74,11 +80,13 @@ contract NodeRegistryV1 {
     mapping(bytes32 nodeId => Node node) private nodes;
     mapping(address operator => uint256 nonce) public enrollmentNonces;
 
-    constructor(IERC20 usd_, address treasury_) {
-        if (address(usd_) == address(0) || treasury_ == address(0)) {
+    constructor(IERC20 bondToken_, address treasury_, uint256 minBond_) {
+        if (minBond_ == 0 || minBond_ > type(uint128).max) revert InvalidRate();
+        if (address(bondToken_) == address(0) || treasury_ == address(0)) {
             revert InvalidAddress();
         }
-        usd = usd_;
+        bondToken = bondToken_;
+        minBond = minBond_;
         owner = msg.sender;
         treasury = treasury_;
     }
@@ -171,14 +179,14 @@ contract NodeRegistryV1 {
             activeLeaseId: 0,
             status: NodeStatus.Active
         });
-        usd.pull(msg.sender, required);
+        bondToken.pull(msg.sender, required);
         emit NodeRegistered(nodeId, msg.sender, payout, ratePerSecond);
     }
 
     function topUpBond(bytes32 nodeId, uint128 amount) external nonReentrant {
         Node storage node = _operatorNode(nodeId);
         if (amount == 0) revert InvalidNode();
-        usd.pull(msg.sender, amount);
+        bondToken.pull(msg.sender, amount);
         node.bond += amount;
         emit NodeBonded(nodeId, amount, node.bond);
     }
@@ -202,7 +210,7 @@ contract NodeRegistryV1 {
             _requireBond(node.ratePerSecond, remaining);
         }
         node.bond -= amount;
-        usd.push(msg.sender, amount);
+        bondToken.push(msg.sender, amount);
         emit NodeWithdrawn(nodeId, amount, remaining);
     }
 
@@ -232,7 +240,7 @@ contract NodeRegistryV1 {
             node.status = NodeStatus.Suspended;
             emit NodeStatusChanged(nodeId, NodeStatus.Suspended);
         }
-        usd.push(treasury, amount);
+        bondToken.push(treasury, amount);
         emit NodeSlashed(nodeId, amount, evidenceHash);
     }
 
@@ -257,8 +265,8 @@ contract NodeRegistryV1 {
             && node.bond >= requiredBond(node.ratePerSecond);
     }
 
-    function requiredBond(uint128) public pure returns (uint256) {
-        return MIN_BOND;
+    function requiredBond(uint128) public view returns (uint256) {
+        return minBond;
     }
 
     function domainSeparator() public view returns (bytes32) {
@@ -303,7 +311,7 @@ contract NodeRegistryV1 {
         if (node.status == NodeStatus.None) revert InvalidNode();
     }
 
-    function _requireBond(uint128 ratePerSecond, uint256 bond) private pure {
+    function _requireBond(uint128 ratePerSecond, uint256 bond) private view {
         uint256 required = requiredBond(ratePerSecond);
         if (bond < required) revert InsufficientBond(required, bond);
     }
