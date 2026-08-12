@@ -38,6 +38,7 @@ const columns = [
     title: "Developers",
     links: [
       ["Documentation", docsUrl.href, false],
+      ["Questions", new URL("/faq", siteUrl).href, false],
       ["API reference", new URL("/#api", docsUrl).href, false],
       ["Architecture", new URL("/#architecture", docsUrl).href, false],
       ["Security model", new URL("/#security", docsUrl).href, false],

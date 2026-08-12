@@ -63,6 +63,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.4,
     },
     {
+      url: new URL("/faq", siteUrl).href,
+      changeFrequency: "monthly",
+      priority: 0.7,
+    },
+    {
       url: new URL("/roadmap", siteUrl).href,
       changeFrequency: "monthly",
       priority: 0.5,
