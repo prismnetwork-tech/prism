@@ -80,10 +80,22 @@
   border-top: 1px solid rgba(230, 237, 220, .14);
 }
 
+/* Two addresses stack on a narrow screen rather than squeezing the copyright
+   off the row. */
+.public-footer-contracts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 28px;
+}
+
 .public-footer-contract {
   display: flex;
   align-items: center;
   gap: 18px;
+}
+
+.public-footer-contract > span:first-child {
+  min-width: 74px;
 }
 
 .public-footer-contract > span {
