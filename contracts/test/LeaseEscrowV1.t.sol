@@ -58,7 +58,7 @@ contract LeaseEscrowV1Test {
 
     function setUp() public {
         usd = new MockUsd();
-        registry = new NodeRegistryV1(usd, address(this));
+        registry = new NodeRegistryV1(usd, address(this), 1_000_000);
         escrow = new LeaseEscrowV1(
             usd,
             registry,
@@ -365,6 +365,42 @@ contract LeaseEscrowV1Test {
         return escrow.createLease(
             NODE_ID, duration, keccak256(abi.encode("quote", escrow.leaseCount() + 1))
         );
+    }
+
+    /// Capacity is staked in one asset and compute is billed in another. The
+    /// bond amount is also a deployment parameter now, because the old constant
+    /// of 1_000_000 means one unit of a six decimal stablecoin and a millionth
+    /// of a millionth of an eighteen decimal token.
+    function test_bondTokenIsSeparateFromThePaymentToken() public {
+        MockUsd bondToken = new MockUsd();
+        uint256 stake = 1e18;
+        NodeRegistryV1 staked = new NodeRegistryV1(bondToken, address(this), stake);
+
+        require(address(staked.bondToken()) == address(bondToken), "bond token is the staked asset");
+        require(staked.minBond() == stake, "bond size is a deployment parameter");
+        require(staked.requiredBond(3_000) == stake, "required bond follows the parameter");
+
+        bondToken.mint(PROVIDER, stake);
+        VM.prank(PROVIDER);
+        bondToken.approve(address(staked), type(uint256).max);
+
+        uint256 paymentBefore = usd.balanceOf(PROVIDER);
+        bytes32 nodeId = keccak256("staked-device");
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 digest = staked.enrollmentDigest(
+            nodeId, nodeId, PROVIDER, PROVIDER, 3_000, keccak256("offer"),
+            staked.enrollmentNonces(PROVIDER), deadline
+        );
+        (uint8 v, bytes32 r, bytes32 s) = VM.sign(PROVIDER_KEY, digest);
+        VM.prank(PROVIDER);
+        staked.register(
+            nodeId, nodeId, PROVIDER, 3_000, keccak256("offer"), deadline, abi.encodePacked(r, s, v)
+        );
+
+        // The stake left the bond token and the payment balance is untouched.
+        require(bondToken.balanceOf(PROVIDER) == 0, "stake was pulled from the bond token");
+        require(bondToken.balanceOf(address(staked)) == stake, "registry holds the stake");
+        require(usd.balanceOf(PROVIDER) == paymentBefore, "payment balance was untouched");
     }
 
     function _registerNode() private {
