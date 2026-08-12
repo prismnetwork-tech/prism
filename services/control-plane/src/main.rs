@@ -4941,6 +4941,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0011_vault.sql")),
                 false,
             ),
+            Migration::new(
+                12,
+                Cow::Borrowed("batch results"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0012_batch_results.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
@@ -6566,6 +6573,36 @@ mod tests {
         assert!(write.previous_version.is_none());
     }
 }
+/// Migrations are a hand-written list, not a directory scan, so a new .sql file
+/// that nobody registered is silently never applied. Migration 0012 reached
+/// production that way and the column it adds simply was not there.
+#[test]
+fn every_migration_file_is_registered() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut on_disk = std::fs::read_dir(&directory)
+        .expect("migrations directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let (version, _) = name.split_once('_')?;
+            version.parse::<i64>().ok()
+        })
+        .collect::<Vec<_>>();
+    on_disk.sort_unstable();
+
+    let mut registered = embedded_migrator()
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    registered.sort_unstable();
+
+    assert_eq!(
+        on_disk, registered,
+        "a migration file exists that embedded_migrator does not include"
+    );
+}
+
 /// The broker path is provisioned by the lifecycle worker and never polls
 /// for commands, so a batch request that matched one would bill the renter
 /// for a box their command never ran on.
