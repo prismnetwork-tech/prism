@@ -4965,6 +4965,12 @@ fn quote_for_offers<'a>(
         .filter(|offer| offer.updated_at >= cutoff)
         .filter(|offer| offer.gpu.vram_mib >= request.min_vram_mib)
         .filter(|offer| offer.trust_class >= request.min_trust_class)
+        // Only a node that takes work through the signed command channel can
+        // run a batch command, and the broker path does not: it is provisioned
+        // by the lifecycle worker and nothing there polls for commands. Matching
+        // a batch request to one would take the renter's money and hand back an
+        // interactive box their command never ran on.
+        .filter(|offer| request.command.is_none() || offer.trust_class >= TrustClass::Isolated)
         .filter(|offer| {
             request
                 .preferred_node_id
@@ -6559,4 +6565,61 @@ mod tests {
         assert_eq!(write.min_trust_class, DEFAULT_VAULT_TRUST_FLOOR);
         assert!(write.previous_version.is_none());
     }
+}
+/// The broker path is provisioned by the lifecycle worker and never polls
+/// for commands, so a batch request that matched one would bill the renter
+/// for a box their command never ran on.
+#[test]
+fn a_batch_request_never_matches_a_broker_node() {
+    use prism_protocol::GpuSpec;
+
+    let offer = |node_id: &str, trust_class| NodeOffer {
+        node_id: node_id.to_owned(),
+        operator_wallet: "0xop".to_owned(),
+        payout_wallet: "0xpay".to_owned(),
+        device_public_key: "key".to_owned(),
+        gpu: GpuSpec {
+            model: "L40S".to_owned(),
+            vram_mib: 46_068,
+            cuda_major: 12,
+        },
+        rate_per_second: 222,
+        reliability_bps: 0,
+        benchmark_score: 10_000,
+        bonded: true,
+        online: true,
+        public_image_only: true,
+        trust_class,
+        updated_at: Utc::now(),
+    };
+    let broker = offer("0xbroker", TrustClass::Open);
+    let isolated = offer("0xisolated", TrustClass::Isolated);
+    let request = |command: Option<&str>| LeaseRequest {
+        image: "docker.io/library/debian@sha256:1".to_owned(),
+        duration_seconds: 600,
+        min_vram_mib: 16_000,
+        preferred_node_id: None,
+        min_trust_class: TrustClass::Open,
+        command: command.map(str::to_owned),
+    };
+    let reserved = BTreeSet::new();
+
+    // An interactive lease is happy with the broker.
+    let interactive = quote_for_offers(&request(None), [&broker], &reserved).unwrap();
+    assert_eq!(interactive.node_id, "0xbroker");
+
+    // A batch lease is not, even though the broker is cheaper and online.
+    assert!(matches!(
+        quote_for_offers(&request(Some("nvidia-smi")), [&broker], &reserved),
+        Err(StoreError::NoMatch)
+    ));
+
+    let batch = quote_for_offers(
+        &request(Some("nvidia-smi")),
+        [&broker, &isolated],
+        &reserved,
+    )
+    .unwrap();
+    assert_eq!(batch.node_id, "0xisolated");
+    assert_eq!(batch.command.as_deref(), Some("nvidia-smi"));
 }
