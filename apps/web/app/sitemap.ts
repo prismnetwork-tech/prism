@@ -1,4 +1,5 @@
 import type { MetadataRoute } from "next";
+import { explainers } from "@/lib/explainers";
 import { docsUrl, siteUrl } from "@/lib/site";
 
 export default function sitemap(): MetadataRoute.Sitemap {
@@ -62,6 +63,16 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "monthly",
       priority: 0.4,
     },
+    {
+      url: new URL("/learn", siteUrl).href,
+      changeFrequency: "monthly",
+      priority: 0.7,
+    },
+    ...explainers.map((entry) => ({
+      url: new URL(`/learn/${entry.slug}`, siteUrl).href,
+      changeFrequency: "monthly" as const,
+      priority: 0.6,
+    })),
     {
       url: new URL("/faq", siteUrl).href,
       changeFrequency: "monthly",

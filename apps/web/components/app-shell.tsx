@@ -32,6 +32,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     || pathname === "/security"
     || pathname === "/contact"
     || pathname === "/faq"
+    || pathname.startsWith("/learn")
   ) return <>{children}</>;
 
   return (

@@ -256,3 +256,52 @@
     gap: 12px;
   }
 }
+
+.learn-list {
+  padding: clamp(50px, 6vw, 80px) 0 clamp(70px, 8vw, 110px);
+  display: grid;
+  gap: 0;
+}
+
+.learn-item {
+  display: grid;
+  gap: 10px;
+  padding: clamp(28px, 3vw, 40px) 0;
+  border-bottom: 1px solid rgba(230, 237, 220, .14);
+  transition: opacity .16s ease;
+}
+
+.learn-item:first-child {
+  border-top: 1px solid rgba(230, 237, 220, .14);
+}
+
+.learn-item:hover {
+  opacity: .72;
+}
+
+.learn-item h2 {
+  margin: 0;
+  /* The card is a link, so the heading would otherwise take the accent colour
+     that .information-content gives anchors. */
+  color: #f4f7ef;
+  max-width: 24ch;
+  font-size: clamp(22px, 2.4vw, 30px);
+  font-weight: 400;
+  line-height: 1.12;
+  letter-spacing: -.035em;
+}
+
+.learn-item p {
+  margin: 0;
+  max-width: 66ch;
+  color: #a0a79c;
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.learn-item span {
+  color: #ccff00;
+  font-size: 11px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
