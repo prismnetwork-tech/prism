@@ -25,8 +25,9 @@ use prism_protocol::{
     MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
     MAX_VAULT_LABEL_BYTES, NodeCertificateBundle, NodeCertificateRequest, NodeCommand,
     NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment,
-    NodeOffer, NodePosture, NodeTelemetry, SettlementEvidence, TrustClass, VaultEnvelope,
-    VaultItem, VaultRelease, VaultWrite, node_id, vault_release_permitted, verifying_key,
+    NodeOffer, NodePosture, NodeTelemetry, STANDARD_RATE_PER_SECOND, SettlementEvidence,
+    TrustClass, VaultEnvelope, VaultItem, VaultRelease, VaultWrite, discounted_rate, node_id,
+    stake_discount_bps, vault_release_permitted, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -91,6 +92,7 @@ struct AppState {
     public_relay_port: u16,
     certificate_authority: Arc<CertificateAuthority>,
     require_node_certificates: bool,
+    stake: StakeReader,
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +674,7 @@ async fn main() -> anyhow::Result<()> {
         public_relay_port,
         certificate_authority,
         require_node_certificates,
+        stake: StakeReader::from_environment()?,
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -1056,6 +1059,103 @@ impl ChainVerifier {
                 decode_funding_event(&receipt.logs, escrow_address, quote)
             }
         }
+    }
+}
+
+/// Reads how much PRISM a renter has had locked long enough to count. The
+/// escrow charges a node's registered rate, so this cannot discount a quote;
+/// it decides which rates the renter is allowed to be matched against.
+/// keccak256("eligibleStakeOf(address)")[..4]. Pinned by a test, because a
+/// wrong selector reads as "nobody has staked anything" rather than as an
+/// error, and every staker would quietly lose their discount.
+const ELIGIBLE_STAKE_SELECTOR: &str = "fc786d81";
+
+#[derive(Clone)]
+enum StakeReader {
+    /// No contract configured. Every renter prices at the published rate,
+    /// which is the correct answer when staking is not deployed yet.
+    Disabled,
+    Rpc {
+        client: reqwest::Client,
+        rpc_url: Arc<String>,
+        stake_address: Arc<String>,
+        /// Divisor from the token's smallest unit to whole tokens.
+        token_scale: u128,
+    },
+}
+
+impl StakeReader {
+    fn from_environment() -> anyhow::Result<Self> {
+        let Some(stake_address) = env::var("PRISM_STAKE_ADDRESS")
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
+            tracing::warn!("PRISM_STAKE_ADDRESS unset, pricing every renter at the published rate");
+            return Ok(Self::Disabled);
+        };
+        if !is_address(&stake_address) {
+            anyhow::bail!("PRISM_STAKE_ADDRESS is not an address");
+        }
+        let rpc_url = env::var("PRISM_RPC_URL").context("PRISM_RPC_URL for stake reads")?;
+        let decimals: u32 = env::var("PRISM_STAKE_TOKEN_DECIMALS")
+            .ok()
+            .map_or(Ok(18), |value| value.parse())
+            .context("PRISM_STAKE_TOKEN_DECIMALS")?;
+        if decimals > 36 {
+            anyhow::bail!("PRISM_STAKE_TOKEN_DECIMALS is out of range");
+        }
+        Ok(Self::Rpc {
+            client: reqwest::Client::new(),
+            rpc_url: Arc::new(rpc_url),
+            stake_address: Arc::new(stake_address),
+            token_scale: 10_u128.pow(decimals),
+        })
+    }
+
+    /// Whole tokens, floored. A read that fails prices the renter at the
+    /// published rate rather than failing the quote: an RPC blip should cost a
+    /// discount, never the ability to rent a GPU.
+    async fn eligible_whole_tokens(&self, wallets: &[String]) -> u64 {
+        let Self::Rpc {
+            client,
+            rpc_url,
+            stake_address,
+            token_scale,
+        } = self
+        else {
+            return 0;
+        };
+        let mut best = 0;
+        for wallet in wallets {
+            let call_data = format!(
+                "0x{ELIGIBLE_STAKE_SELECTOR}000000000000000000000000{}",
+                &wallet[2..]
+            );
+            let response = client
+                .post(rpc_url.as_str())
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_call",
+                    "params": [{ "to": stake_address.as_str(), "data": call_data }, "latest"],
+                }))
+                .send()
+                .await;
+            let Ok(response) = response else {
+                tracing::warn!("stake read failed, pricing at the published rate");
+                continue;
+            };
+            let Ok(body) = response.json::<RpcResponse<String>>().await else {
+                continue;
+            };
+            let Some(result) = body.result else { continue };
+            let Ok(raw) = u128::from_str_radix(result.trim_start_matches("0x"), 16) else {
+                continue;
+            };
+            let whole = u64::try_from(raw / token_scale).unwrap_or(u64::MAX);
+            best = best.max(whole);
+        }
+        best
     }
 }
 
@@ -2611,7 +2711,12 @@ impl MarketplaceStore {
         }
     }
 
-    async fn quote(&self, subject: &str, request: &LeaseRequest) -> Result<LeaseQuote, StoreError> {
+    async fn quote(
+        &self,
+        subject: &str,
+        request: &LeaseRequest,
+        staked_whole_tokens: u64,
+    ) -> Result<LeaseQuote, StoreError> {
         match self {
             Self::Memory(market) => {
                 let mut market = market.write().await;
@@ -2683,7 +2788,8 @@ impl MarketplaceStore {
                         offer
                     })
                     .collect::<Vec<_>>();
-                let quote = quote_for_offers(request, offers.iter(), &reserved)?;
+                let quote =
+                    quote_for_offers(request, offers.iter(), &reserved, staked_whole_tokens)?;
                 market
                     .quote_subjects
                     .insert(quote.quote_id, subject.to_owned());
@@ -2767,7 +2873,8 @@ impl MarketplaceStore {
                         offer
                     })
                     .collect();
-                let quote = quote_for_offers(request, offers.iter(), &reserved)?;
+                let quote =
+                    quote_for_offers(request, offers.iter(), &reserved, staked_whole_tokens)?;
                 query(
                     "INSERT INTO lease_quotes \
                          (quote_id, node_id, document, expires_at, subject) \
@@ -4069,6 +4176,7 @@ async fn enroll_node(
         online: false,
         public_image_only: true,
         trust_class: TrustClass::Open,
+        staker_only: false,
         updated_at: Utc::now(),
     };
     offer.bonded = state
@@ -4636,6 +4744,25 @@ async fn verify_command_poll(
     Ok(())
 }
 
+/// Wallets whose stake counts for this account: the one it authenticated as,
+/// plus any it has verified. An account cannot borrow a stranger's stake
+/// because it never proved control of that wallet.
+fn renter_wallets(account: &Account) -> Vec<String> {
+    let mut wallets: Vec<String> = account
+        .linked_wallets
+        .iter()
+        .map(|wallet| wallet.to_ascii_lowercase())
+        .collect();
+    if let Some(wallet) = account.subject.strip_prefix("wallet:") {
+        let wallet = wallet.to_ascii_lowercase();
+        if is_address(&wallet) && !wallets.contains(&wallet) {
+            wallets.push(wallet);
+        }
+    }
+    wallets.retain(|wallet| is_address(wallet));
+    wallets
+}
+
 async fn match_lease(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4693,9 +4820,13 @@ async fn match_lease(
             "preferred node must be a 32-byte hex node id",
         ));
     }
+    let staked = state
+        .stake
+        .eligible_whole_tokens(&renter_wallets(&account))
+        .await;
     state
         .store
-        .quote(&account.subject, &payload.request)
+        .quote(&account.subject, &payload.request, staked)
         .await
         .map(Json)
         .map_err(store_error)
@@ -4960,11 +5091,24 @@ fn holds_node(quote: &LeaseQuote) -> bool {
     Utc::now() < issued_at + Duration::seconds(QUOTE_HOLD_SECONDS)
 }
 
+/// The cheapest staker-only rate this renter may reach. The escrow charges a
+/// node's registered rate, not anything this service quotes, so a discount
+/// cannot be written into the quote: it has to decide which capacity a renter
+/// is allowed to match against. Locking PRISM unlocks the cheaper pool.
+fn rate_floor_for_stake(staked_whole_tokens: u64) -> u64 {
+    discounted_rate(
+        STANDARD_RATE_PER_SECOND,
+        stake_discount_bps(staked_whole_tokens),
+    )
+}
+
 fn quote_for_offers<'a>(
     request: &LeaseRequest,
     offers: impl IntoIterator<Item = &'a NodeOffer>,
     reserved: &BTreeSet<String>,
+    staked_whole_tokens: u64,
 ) -> Result<LeaseQuote, StoreError> {
+    let rate_floor = rate_floor_for_stake(staked_whole_tokens);
     let cutoff = Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS);
     let mut compatible = offers
         .into_iter()
@@ -4972,6 +5116,10 @@ fn quote_for_offers<'a>(
         .filter(|offer| offer.updated_at >= cutoff)
         .filter(|offer| offer.gpu.vram_mib >= request.min_vram_mib)
         .filter(|offer| offer.trust_class >= request.min_trust_class)
+        // Capacity set aside for stakers, unlocked by having enough locked long
+        // enough. Gating on the offer's own flag rather than on its price keeps
+        // a cheap independent node visible to everybody.
+        .filter(|offer| !offer.staker_only || offer.rate_per_second >= rate_floor)
         // Only a node that takes work through the signed command channel can
         // run a batch command, and the broker path does not: it is provisioned
         // by the lifecycle worker and nothing there polls for commands. Matching
@@ -5469,7 +5617,19 @@ async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_protocol::{DEFAULT_VAULT_TRUST_FLOOR, GpuSpec, IsolationMode, NodePosture};
+    use prism_protocol::{
+        DEFAULT_VAULT_TRUST_FLOOR, GpuSpec, IsolationMode, MAX_STAKE_DISCOUNT_BPS, NodePosture,
+    };
+
+    /// Most scheduler tests are about matching, not pricing, so they ask as a
+    /// renter with no stake.
+    fn quote_for_offers_unstaked<'a>(
+        request: &LeaseRequest,
+        offers: impl IntoIterator<Item = &'a NodeOffer>,
+        reserved: &BTreeSet<String>,
+    ) -> Result<LeaseQuote, StoreError> {
+        quote_for_offers(request, offers, reserved, 0)
+    }
 
     fn offer(node_id: &str, rate_per_second: u64, benchmark_score: u32) -> NodeOffer {
         NodeOffer {
@@ -5489,6 +5649,7 @@ mod tests {
             online: true,
             public_image_only: true,
             trust_class: TrustClass::Open,
+            staker_only: false,
             updated_at: Utc::now(),
         }
     }
@@ -5575,7 +5736,7 @@ mod tests {
         let slower = offer("slower", 100, 5_000);
         let faster = offer("faster", 100, 8_000);
         let expensive = offer("expensive", 101, 10_000);
-        let quote = quote_for_offers(
+        let quote = quote_for_offers_unstaked(
             &LeaseRequest {
                 image: "registry.example/runtime@sha256:abc".to_owned(),
                 duration_seconds: 60,
@@ -5608,7 +5769,7 @@ mod tests {
             min_trust_class,
         };
 
-        let cheapest = quote_for_offers(
+        let cheapest = quote_for_offers_unstaked(
             &request(TrustClass::Open),
             [&broker, &isolated],
             &BTreeSet::new(),
@@ -5616,7 +5777,7 @@ mod tests {
         .unwrap();
         assert_eq!(cheapest.node_id, "broker");
 
-        let guarded = quote_for_offers(
+        let guarded = quote_for_offers_unstaked(
             &request(TrustClass::Isolated),
             [&broker, &isolated],
             &BTreeSet::new(),
@@ -5626,7 +5787,7 @@ mod tests {
         assert_eq!(guarded.trust_class, TrustClass::Isolated);
 
         assert!(matches!(
-            quote_for_offers(
+            quote_for_offers_unstaked(
                 &request(TrustClass::Confidential),
                 [&broker, &isolated],
                 &BTreeSet::new()
@@ -5666,7 +5827,7 @@ mod tests {
     #[test]
     fn matching_rejects_escrow_above_the_contract_limit() {
         let offer = offer("node", 3_000, 10_000);
-        let result = quote_for_offers(
+        let result = quote_for_offers_unstaked(
             &LeaseRequest {
                 image: "registry.example/runtime@sha256:abc".to_owned(),
                 duration_seconds: MAX_LEASE_SECONDS,
@@ -5688,7 +5849,7 @@ mod tests {
         let mut stale = offer("stale", 90, 10_000);
         stale.updated_at = Utc::now() - Duration::minutes(5);
         let available = offer("available", 110, 10_000);
-        let quote = quote_for_offers(
+        let quote = quote_for_offers_unstaked(
             &LeaseRequest {
                 image: format!("registry.example/runtime@sha256:{}", "a".repeat(64)),
                 duration_seconds: 60,
@@ -5723,11 +5884,11 @@ mod tests {
         };
 
         assert!(matches!(
-            quote_for_offers(&request, [&only], &BTreeSet::from(["only".to_owned()])),
+            quote_for_offers_unstaked(&request, [&only], &BTreeSet::from(["only".to_owned()])),
             Err(StoreError::CapacityReserved)
         ));
         assert!(matches!(
-            quote_for_offers(&request, [&undersized], &BTreeSet::new()),
+            quote_for_offers_unstaked(&request, [&undersized], &BTreeSet::new()),
             Err(StoreError::NoMatch)
         ));
     }
@@ -5891,7 +6052,7 @@ mod tests {
             let store = store.clone();
             let request = request.clone();
             tasks.push(tokio::spawn(async move {
-                store.quote(&format!("subject-{index}"), &request).await
+                store.quote(&format!("subject-{index}"), &request, 0).await
             }));
         }
         let mut nodes = BTreeSet::new();
@@ -5900,7 +6061,7 @@ mod tests {
         }
         assert_eq!(nodes.len(), MAX_NETWORK_LEASES);
         assert!(matches!(
-            store.quote("subject-over-cap", &request).await,
+            store.quote("subject-over-cap", &request, 0).await,
             Err(StoreError::NetworkCapacity)
         ));
     }
@@ -5925,13 +6086,13 @@ mod tests {
             command: None,
         };
 
-        let first = store.quote("renter", &request).await.unwrap();
-        let second = store.quote("renter", &request).await.unwrap();
+        let first = store.quote("renter", &request, 0).await.unwrap();
+        let second = store.quote("renter", &request, 0).await.unwrap();
         assert_eq!(second.node_id, "only");
         assert_ne!(second.quote_id, first.quote_id);
 
         assert!(matches!(
-            store.quote("other-renter", &request).await,
+            store.quote("other-renter", &request, 0).await,
             Err(StoreError::CapacityReserved)
         ));
     }
@@ -5958,9 +6119,9 @@ mod tests {
             command: None,
         };
 
-        let abandoned = store.quote("renter", &request).await.unwrap();
+        let abandoned = store.quote("renter", &request, 0).await.unwrap();
         assert!(matches!(
-            store.quote("other-renter", &request).await,
+            store.quote("other-renter", &request, 0).await,
             Err(StoreError::CapacityReserved)
         ));
 
@@ -5979,7 +6140,11 @@ mod tests {
             - Duration::seconds(QUOTE_HOLD_SECONDS + 1);
 
         assert_eq!(
-            store.quote("other-renter", &request).await.unwrap().node_id,
+            store
+                .quote("other-renter", &request, 0)
+                .await
+                .unwrap()
+                .node_id,
             "only"
         );
         assert!(
@@ -6028,7 +6193,7 @@ mod tests {
         };
 
         assert!(matches!(
-            store.quote("renter", &request).await,
+            store.quote("renter", &request, 0).await,
             Err(StoreError::CapacityReserved)
         ));
 
@@ -6044,14 +6209,14 @@ mod tests {
         market.write().await.leases.get_mut(&27).unwrap().1.state = LeaseState::SettlementPending;
 
         assert!(matches!(
-            store.quote("renter", &request).await,
+            store.quote("renter", &request, 0).await,
             Err(StoreError::CapacityReserved)
         ));
 
         market.write().await.leases.get_mut(&27).unwrap().1.state = LeaseState::Finalized;
 
         assert_eq!(
-            store.quote("renter", &request).await.unwrap().node_id,
+            store.quote("renter", &request, 0).await.unwrap().node_id,
             "only"
         );
     }
@@ -6572,6 +6737,126 @@ mod tests {
         assert_eq!(write.min_trust_class, DEFAULT_VAULT_TRUST_FLOOR);
         assert!(write.previous_version.is_none());
     }
+
+    #[test]
+    fn staker_capacity_needs_enough_stake_to_reach() {
+        let mut discounted = offer("cheap", 190, 10_000);
+        discounted.staker_only = true;
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1_024,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: None,
+        };
+
+        // 190 sits below the floor for an unstaked renter, so it is invisible.
+        assert!(matches!(
+            quote_for_offers(&request, [&discounted], &BTreeSet::new(), 0),
+            Err(StoreError::NoMatch)
+        ));
+
+        // 10k PRISM buys 10%, a floor of 199, which still does not reach it.
+        assert!(matches!(
+            quote_for_offers(&request, [&discounted], &BTreeSet::new(), 10_000),
+            Err(StoreError::NoMatch)
+        ));
+
+        // 250k buys the full 20%, a floor of 177, and the node becomes matchable.
+        let quote = quote_for_offers(&request, [&discounted], &BTreeSet::new(), 250_000)
+            .expect("top tier should reach discounted capacity");
+        assert_eq!(quote.rate_per_second, 190);
+        assert_eq!(quote.maximum_escrow, 190 * 60);
+    }
+
+    // Ordinary capacity has to stay reachable by everyone, or staking would
+    // gate access to the network rather than to a cheaper pool. That includes
+    // an independent operator who simply prices below the published rate.
+    #[test]
+    fn ordinary_capacity_is_reachable_without_any_stake() {
+        let listed = offer("listed", STANDARD_RATE_PER_SECOND, 10_000);
+        let cheap_independent = offer("independent", 150, 10_000);
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "cd".repeat(32)),
+            duration_seconds: 30,
+            min_vram_mib: 1_024,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: None,
+        };
+
+        for staked in [0, 1_000, 250_000, u64::MAX] {
+            let quote = quote_for_offers(&request, [&listed], &BTreeSet::new(), staked)
+                .expect("the published rate must always be matchable");
+            assert_eq!(quote.rate_per_second, STANDARD_RATE_PER_SECOND);
+
+            let quote = quote_for_offers(&request, [&cheap_independent], &BTreeSet::new(), staked)
+                .expect("an unmarked cheap node must never be hidden");
+            assert_eq!(quote.rate_per_second, 150);
+        }
+    }
+
+    #[test]
+    fn the_rate_floor_falls_as_stake_rises_and_never_passes_the_ceiling() {
+        assert_eq!(rate_floor_for_stake(0), STANDARD_RATE_PER_SECOND);
+        assert!(rate_floor_for_stake(1_000) < rate_floor_for_stake(0));
+        assert!(rate_floor_for_stake(250_000) < rate_floor_for_stake(50_000));
+        assert_eq!(
+            rate_floor_for_stake(u64::MAX),
+            discounted_rate(STANDARD_RATE_PER_SECOND, MAX_STAKE_DISCOUNT_BPS),
+            "no stake may price below the ceiling",
+        );
+    }
+
+    // Stake counts only for wallets the account actually proved it controls.
+    #[test]
+    fn renter_wallets_cover_the_authenticated_and_verified_wallets() {
+        let agent = Account {
+            subject: "wallet:0xAbC0000000000000000000000000000000000001".to_owned(),
+            linked_wallets: Vec::new(),
+            risk_hold: false,
+        };
+        assert_eq!(
+            renter_wallets(&agent),
+            vec!["0xabc0000000000000000000000000000000000001".to_owned()]
+        );
+
+        let browser = Account {
+            subject: "did:privy:abc".to_owned(),
+            linked_wallets: vec!["0xDEF0000000000000000000000000000000000002".to_owned()],
+            risk_hold: false,
+        };
+        assert_eq!(
+            renter_wallets(&browser),
+            vec!["0xdef0000000000000000000000000000000000002".to_owned()]
+        );
+
+        // A subject that is not a wallet contributes nothing to price against.
+        let neither = Account {
+            subject: "wallet:not-an-address".to_owned(),
+            linked_wallets: Vec::new(),
+            risk_hold: false,
+        };
+        assert!(renter_wallets(&neither).is_empty());
+    }
+
+    // A wrong selector reads as "no stake" instead of erroring, so every
+    // staker would silently lose their discount. Pin it.
+    #[test]
+    fn the_stake_selector_matches_the_contract() {
+        let digest = Keccak256::digest(b"eligibleStakeOf(address)");
+        assert_eq!(hex::encode(&digest[..4]), ELIGIBLE_STAKE_SELECTOR);
+    }
+
+    // With no contract deployed, everyone prices at the published rate rather
+    // than the quote failing.
+    #[tokio::test]
+    async fn a_disabled_stake_reader_reports_no_stake() {
+        let reader = StakeReader::Disabled;
+        let wallets = vec!["0xabc0000000000000000000000000000000000001".to_owned()];
+        assert_eq!(reader.eligible_whole_tokens(&wallets).await, 0);
+    }
 }
 /// Migrations are a hand-written list, not a directory scan, so a new .sql file
 /// that nobody registered is silently never applied. Migration 0012 reached
@@ -6627,6 +6912,7 @@ fn a_batch_request_never_matches_a_broker_node() {
         online: true,
         public_image_only: true,
         trust_class,
+        staker_only: false,
         updated_at: Utc::now(),
     };
     let broker = offer("0xbroker", TrustClass::Open);
@@ -6642,12 +6928,12 @@ fn a_batch_request_never_matches_a_broker_node() {
     let reserved = BTreeSet::new();
 
     // An interactive lease is happy with the broker.
-    let interactive = quote_for_offers(&request(None), [&broker], &reserved).unwrap();
+    let interactive = quote_for_offers(&request(None), [&broker], &reserved, 0).unwrap();
     assert_eq!(interactive.node_id, "0xbroker");
 
     // A batch lease is not, even though the broker is cheaper and online.
     assert!(matches!(
-        quote_for_offers(&request(Some("nvidia-smi")), [&broker], &reserved),
+        quote_for_offers(&request(Some("nvidia-smi")), [&broker], &reserved, 0),
         Err(StoreError::NoMatch)
     ));
 
@@ -6655,6 +6941,7 @@ fn a_batch_request_never_matches_a_broker_node() {
         &request(Some("nvidia-smi")),
         [&broker, &isolated],
         &reserved,
+        0,
     )
     .unwrap();
     assert_eq!(batch.node_id, "0xisolated");

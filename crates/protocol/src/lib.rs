@@ -16,6 +16,49 @@ pub const USDG_MAINNET: &str = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
 pub const MAX_ESCROW_BASE_UNITS: u64 = 50_000_000;
 pub const MAX_LEASE_SECONDS: u32 = 21_600;
 pub const MAX_NETWORK_LEASES: usize = 25;
+
+/// PRISM staked long enough to count, mapped to what it takes off the quoted
+/// rate. Locking the token is what earns cheaper compute; nothing else about a
+/// lease changes, and a node is never paid less because a renter staked.
+///
+/// Thresholds are in whole tokens. The ceiling is deliberate: the discount is
+/// funded out of the network's own margin, so it has to stay well inside it.
+pub const STAKE_DISCOUNT_TIERS: [(u64, u16); 4] = [
+    (1_000, 500),
+    (10_000, 1_000),
+    (50_000, 1_500),
+    (250_000, 2_000),
+];
+
+/// No amount of stake may take more than this off a quote.
+pub const MAX_STAKE_DISCOUNT_BPS: u16 = 2_000;
+
+/// The published rate every renter can reach without staking, in USDG micros
+/// per second. Capacity registered below this is reserved for stakers.
+pub const STANDARD_RATE_PER_SECOND: u64 = 222;
+
+/// What a staked balance takes off the quoted rate, in basis points.
+pub fn stake_discount_bps(staked_whole_tokens: u64) -> u16 {
+    let mut discount = 0;
+    for (threshold, bps) in STAKE_DISCOUNT_TIERS {
+        if staked_whole_tokens >= threshold {
+            discount = bps;
+        }
+    }
+    discount.min(MAX_STAKE_DISCOUNT_BPS)
+}
+
+/// Applies a discount to a rate, rounding in the renter's favour but never to
+/// zero: a free lease still has to reserve a machine, and a rate of zero would
+/// make the escrow's maximum meaningless.
+pub fn discounted_rate(rate_per_second: u64, discount_bps: u16) -> u64 {
+    let discount_bps = discount_bps.min(MAX_STAKE_DISCOUNT_BPS) as u64;
+    if discount_bps == 0 || rate_per_second == 0 {
+        return rate_per_second;
+    }
+    let reduced = rate_per_second.saturating_mul(10_000 - discount_bps) / 10_000;
+    reduced.max(1)
+}
 const ENROLLMENT_SIGNATURE_DOMAIN: &[u8] = b"prism.node-enrollment.v1\0";
 const TELEMETRY_SIGNATURE_DOMAIN: &[u8] = b"prism.node-telemetry.v1\0";
 const TUNNEL_SIGNATURE_DOMAIN: &[u8] = b"prism.node-tunnel.v1\0";
@@ -158,6 +201,11 @@ pub struct NodeOffer {
     pub public_image_only: bool,
     #[serde(default)]
     pub trust_class: TrustClass,
+    /// Capacity set aside for renters who stake PRISM. Marked explicitly by
+    /// whoever enrolls it rather than inferred from price, so an independent
+    /// operator who simply prices low is never hidden from ordinary renters.
+    #[serde(default)]
+    pub staker_only: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1495,5 +1543,57 @@ mod tests {
             DEFAULT_VAULT_TRUST_FLOOR,
             MAX_VERIFIABLE_TRUST_CLASS
         ));
+    }
+
+    #[test]
+    fn stake_tiers_rise_with_the_stake_and_stop_at_the_ceiling() {
+        assert_eq!(stake_discount_bps(0), 0);
+        assert_eq!(stake_discount_bps(999), 0);
+        assert_eq!(stake_discount_bps(1_000), 500);
+        assert_eq!(stake_discount_bps(9_999), 500);
+        assert_eq!(stake_discount_bps(10_000), 1_000);
+        assert_eq!(stake_discount_bps(50_000), 1_500);
+        assert_eq!(stake_discount_bps(250_000), 2_000);
+        assert_eq!(stake_discount_bps(u64::MAX), MAX_STAKE_DISCOUNT_BPS);
+    }
+
+    // The tiers are read in order and the last match wins, so an unsorted or
+    // duplicated table would silently mis-price every quote.
+    #[test]
+    fn stake_tiers_are_sorted_and_within_the_ceiling() {
+        let mut previous = (0, 0);
+        for (threshold, bps) in STAKE_DISCOUNT_TIERS {
+            assert!(threshold > previous.0, "thresholds must ascend");
+            assert!(bps > previous.1, "discounts must ascend");
+            assert!(bps <= MAX_STAKE_DISCOUNT_BPS, "tier exceeds the ceiling");
+            previous = (threshold, bps);
+        }
+    }
+
+    #[test]
+    fn a_discount_never_reaches_zero_or_exceeds_the_ceiling() {
+        assert_eq!(discounted_rate(222, 0), 222);
+        assert_eq!(discounted_rate(222, 500), 210);
+        assert_eq!(discounted_rate(222, 2_000), 177);
+        // Asking for more than the ceiling gets the ceiling, not more.
+        assert_eq!(
+            discounted_rate(222, 9_000),
+            discounted_rate(222, MAX_STAKE_DISCOUNT_BPS)
+        );
+        assert_eq!(discounted_rate(1, 2_000), 1, "a rate must stay payable");
+        assert_eq!(discounted_rate(0, 2_000), 0);
+    }
+
+    // A discount that could ever raise a price would be a pricing bug pointed
+    // at the customer, so pin the direction across the whole range.
+    #[test]
+    fn a_discount_only_ever_lowers_a_rate() {
+        for rate in [1_u64, 2, 7, 222, 1_000, 999_999, u64::MAX / 10_000] {
+            for bps in [0_u16, 1, 500, 1_000, 1_500, 2_000, u16::MAX] {
+                let out = discounted_rate(rate, bps);
+                assert!(out <= rate, "rate {rate} at {bps}bps went up to {out}");
+                assert!(out >= 1, "rate {rate} at {bps}bps hit zero");
+            }
+        }
     }
 }
