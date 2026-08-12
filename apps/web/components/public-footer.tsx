@@ -2,6 +2,17 @@ import Link from "next/link";
 import { docsUrl, siteUrl } from "@/lib/site";
 
 const escrowAddress = "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD";
+const tokenAddress = "0x0A1e0Cc751f77C2C93760FC957CC8E4E779b2bC8";
+
+const explorer = (address: string) =>
+  `https://robinhoodchain.blockscout.com/address/${address}`;
+
+// Both live on Robinhood Chain, and the address is the only thing that tells a
+// reader which token is actually ours. Publish it where they already are.
+const contracts = [
+  ["$PRISM", tokenAddress],
+  ["Lease escrow", escrowAddress],
+] as const;
 
 const columns = [
   {
@@ -54,8 +65,6 @@ const columns = [
 ] as const;
 
 export function PublicFooter() {
-  const explorerUrl = `https://robinhoodchain.blockscout.com/address/${escrowAddress}`;
-
   return (
     <footer className="public-footer">
       <div className="public-footer-grid">
@@ -83,12 +92,16 @@ export function PublicFooter() {
       </div>
 
       <div className="public-footer-bottom">
-        <div className="public-footer-contract">
-          <span>Lease escrow</span>
-          <a href={explorerUrl} target="_blank" rel="noopener noreferrer">
-            <code>{escrowAddress}</code>
-            <span>View on Blockscout ↗</span>
-          </a>
+        <div className="public-footer-contracts">
+          {contracts.map(([label, address]) => (
+            <div className="public-footer-contract" key={label}>
+              <span>{label}</span>
+              <a href={explorer(address)} target="_blank" rel="noopener noreferrer">
+                <code>{address}</code>
+                <span>View on Blockscout ↗</span>
+              </a>
+            </div>
+          ))}
         </div>
         <p>© 2026 Prism Network. All rights reserved.</p>
       </div>
