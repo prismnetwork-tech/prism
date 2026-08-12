@@ -22,8 +22,11 @@ Prism has two execution paths:
   evidence; it does not provide Kata/VFIO isolation, the Prism gateway, or
   Jupyter access.
 
-Only interactive raw GPU leases are in scope today. Batch containers and
-managed inference are not implemented.
+Interactive raw GPU leases are what the network serves today. A lease can also
+carry a single command instead of a session, which runs on an independent node
+and reports back what it printed, but no independent node has completed the
+hardware canary yet, so nothing has run that path in production. Managed
+inference is not implemented.
 
 ## Current state
 
@@ -36,7 +39,8 @@ Verified on 2026-07-20:
 | Vast execution | Implemented and locally lifecycle-tested; a funded mainnet canary has not been completed |
 | Independent Kata nodes | Daemon, gateway, certificates, commands, tunnel and workspace lifecycle are implemented and integration-tested without physical GPU hardware |
 | Settlement and proof | Workers and local end-to-end flows are implemented; no public mainnet settlement receipt exists yet |
-| Batch and inference | Planned, not implemented |
+| Batch commands | Implemented on the independent-node path; never executed on physical hardware |
+| Managed inference | Planned, not implemented |
 
 This is an unaudited pre-production system, so do not put production traffic or
 serious money on it yet.
