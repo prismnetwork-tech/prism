@@ -3,7 +3,7 @@ import { InformationPage, InformationSection } from "@/components/information-pa
 
 export const metadata: Metadata = {
   title: "Pricing",
-  description: "Prism L40S pricing, escrow limits, billing terms, and provider economics.",
+  description: "What GPU capacity costs on Prism: per-second USDG billing from $0.80 an hour, the 50 USDG escrow ceiling, what providers earn, and when billing starts.",
   alternates: { canonical: "/pricing" },
 };
 

@@ -3,7 +3,7 @@ import { ProofFeed } from "@/components/proof-feed";
 
 export const metadata: Metadata = {
   title: "Receipts",
-  description: "Onchain settlement receipts for GPU leases on Prism Network.",
+  description: "Every settled GPU lease on Prism leaves an onchain receipt: the GPU, the runtime, and the USDG charged. Public feed, updated as leases finalize.",
   alternates: { canonical: "/proof" },
 };
 

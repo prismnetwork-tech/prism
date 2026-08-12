@@ -3,7 +3,7 @@ import { InformationPage, InformationSection } from "@/components/information-pa
 
 export const metadata: Metadata = {
   title: "Contact",
-  description: "Contact Prism Network for product, technical, security, and conduct matters.",
+  description: "Reach Prism about renting GPU capacity, supplying infrastructure, or security disclosure. Written channels, with the security address listed separately.",
   alternates: { canonical: "/contact" },
 };
 
