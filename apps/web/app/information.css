@@ -320,3 +320,50 @@
   letter-spacing: .12em;
   text-transform: uppercase;
 }
+
+/* Live price index. Wide on desktop, scrollable rather than squashed on a
+   phone, because the numbers are the point. */
+.price-index {
+  margin: 24px 0 0;
+  overflow-x: auto;
+}
+
+.price-index table {
+  width: 100%;
+  min-width: 460px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-index th,
+.price-index td {
+  padding: 10px 12px;
+  text-align: right;
+  border-bottom: 1px solid rgba(230, 237, 220, .12);
+}
+
+.price-index thead th {
+  font-weight: 300;
+  font-size: 13px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  opacity: .6;
+}
+
+.price-index th:first-child,
+.price-index td:first-child,
+.price-index tbody th {
+  text-align: left;
+  font-weight: 400;
+}
+
+.price-index tbody tr:last-child th,
+.price-index tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.price-index-note {
+  margin: 14px 0 0;
+  font-size: 14px;
+  opacity: .75;
+}
