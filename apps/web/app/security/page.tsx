@@ -3,7 +3,7 @@ import { InformationPage, InformationSection } from "@/components/information-pa
 
 export const metadata: Metadata = {
   title: "Security",
-  description: "Prism Network security controls, trust boundaries, and vulnerability reporting.",
+  description: "Prism security controls and trust boundaries: what each workspace class protects, how renter data stays encrypted, and how to report a vulnerability.",
   alternates: { canonical: "/security" },
 };
 

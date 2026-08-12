@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { AppShell } from "@/components/app-shell";
 import { Providers } from "@/components/providers";
+import { StructuredData } from "@/components/structured-data";
 import { siteUrl } from "@/lib/site";
 import "./globals.css";
 import "./landing.css";
@@ -11,24 +12,39 @@ import "./public-footer.css";
 
 export const dynamic = "force-dynamic";
 
+const description =
+  "GPU compute your agents can rent with a wallet. Lease NVIDIA capacity, pay per second in USDG, and settle every lease onchain with a public receipt.";
+
 export const metadata: Metadata = {
   metadataBase: siteUrl,
   title: {
-    default: "Prism Network",
-    template: "%s · Prism Network",
+    // The home page carries the brand and what it is. A bare wordmark tells a
+    // search engine nothing, and this is the one title that has to earn a click
+    // from someone who has never heard of us.
+    default: "prism. · GPU compute your agents can rent with a wallet",
+    template: "%s · prism.",
   },
-  description: "GPU compute your agents can rent with a wallet. Lease NVIDIA GPU capacity, pay per second in USDG, settle every lease onchain.",
-  applicationName: "Prism Network",
+  description,
+  applicationName: "prism.",
+  // Titles set per page flow into the social cards too, so a shared link shows
+  // the page rather than the site name over and over.
   openGraph: {
     type: "website",
-    siteName: "Prism Network",
-    title: "Prism Network",
-    description: "GPU compute your agents can rent with a wallet. Lease NVIDIA GPU capacity, pay per second in USDG, settle every lease onchain.",
+    siteName: "prism.",
+    locale: "en_US",
+    description,
   },
   twitter: {
     card: "summary_large_image",
-    title: "Prism Network",
-    description: "GPU compute your agents can rent with a wallet. Lease NVIDIA GPU capacity, pay per second in USDG, settle every lease onchain.",
+    site: "@useprismnetwork",
+    creator: "@useprismnetwork",
+    description,
+  },
+  alternates: { canonical: "/" },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: { index: true, follow: true, "max-image-preview": "large", "max-snippet": -1 },
   },
   manifest: "/manifest.webmanifest",
   icons: {
@@ -50,6 +66,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   return (
     <html data-theme="dark" lang="en" suppressHydrationWarning>
       <body>
+        <StructuredData />
         <a className="skip-link" href="#main-content">Skip to content</a>
         <Providers>
           <AppShell>{children}</AppShell>

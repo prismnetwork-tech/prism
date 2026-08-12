@@ -3,7 +3,7 @@ import { InformationPage, InformationSection } from "@/components/information-pa
 
 export const metadata: Metadata = {
   title: "About",
-  description: "Prism Network provides metered GPU infrastructure for autonomous agents, rented with a wallet.",
+  description: "How Prism runs metered GPU infrastructure for agents: readiness-based billing, usage-based settlement, renter-held encryption, and a stated security scope.",
   alternates: { canonical: "/about" },
 };
 

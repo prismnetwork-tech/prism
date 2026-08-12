@@ -2,7 +2,11 @@ import type { MetadataRoute } from "next";
 import { docsUrl, siteUrl } from "@/lib/site";
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  return [
+  // Crawlers use this to decide what is worth re-fetching, so it has to move
+  // when the site does rather than sit at a hardcoded date.
+  const lastModified = new Date();
+
+  const routes: MetadataRoute.Sitemap = [
     {
       url: siteUrl.href,
       changeFrequency: "weekly",
@@ -58,5 +62,17 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "monthly",
       priority: 0.4,
     },
+    {
+      url: new URL("/roadmap", siteUrl).href,
+      changeFrequency: "monthly",
+      priority: 0.5,
+    },
+    {
+      url: new URL("/activity", siteUrl).href,
+      changeFrequency: "daily",
+      priority: 0.6,
+    },
   ];
+
+  return routes.map((entry) => ({ ...entry, lastModified }));
 }
