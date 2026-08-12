@@ -49,6 +49,20 @@ const escrowAbi = parseAbi([
   "function createLease(bytes32 nodeId, uint32 duration, bytes32 clientReference) returns (uint256)",
 ]);
 
+// Matches the limit the control plane and the node both enforce, so a command
+// that cannot run is rejected here rather than after an escrow is funded.
+const MAX_COMMAND_BYTES = 8 * 1024;
+
+function assertCommand(value) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new PrismError(400, "invalid_command", { hint: "a batch command cannot be empty" });
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_COMMAND_BYTES) {
+    throw new PrismError(400, "invalid_command", { hint: "a batch command cannot exceed 8 KiB" });
+  }
+  return value;
+}
+
 function assertTrustClass(value) {
   if (!TRUST_CLASSES.includes(value)) {
     throw new PrismError(400, "invalid_trust_class", { expected: TRUST_CLASSES });
@@ -150,7 +164,7 @@ export class PrismAgent {
     }
   }
 
-  async quote({ image, durationSeconds, minVramMib = 16000, preferredNodeId = null, minTrustClass = "open" } = {}) {
+  async quote({ image, durationSeconds, minVramMib = 16000, preferredNodeId = null, minTrustClass = "open", command = null } = {}) {
     if (typeof image !== "string" || !/@sha256:[0-9a-f]{64}$/.test(image)) {
       throw new PrismError(400, "image_must_be_digest_pinned", { hint: "use ollama@sha256:... or DEFAULT_IMAGE" });
     }
@@ -164,6 +178,7 @@ export class PrismAgent {
           min_vram_mib: minVramMib,
           preferred_node_id: preferredNodeId,
           min_trust_class: assertTrustClass(minTrustClass),
+          ...(command === null ? {} : { command: assertCommand(command) }),
         },
       },
     });
@@ -229,6 +244,22 @@ export class PrismAgent {
     return this.#proxy("GET", ["leases", String(leaseId), "access"]);
   }
 
+  /// The output of a batch lease, once its node has reported.
+  async result(leaseId) {
+    return this.#proxy("GET", ["leases", String(leaseId), "result"]);
+  }
+
+  async waitForResult(leaseId, { timeoutMs = 900_000, intervalMs = 10_000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const res = await this.#proxy("GET", ["leases", String(leaseId), "result"], { raw: true });
+      if (res.status === 200) return res.body;
+      if (res.status !== 404) throw new PrismError(res.status, res.body?.code ?? "result_failed", res.body);
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw new PrismError(408, "result_timeout");
+  }
+
   async waitForAccess(leaseId, { timeoutMs = 600_000, intervalMs = 10_000 } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -251,9 +282,17 @@ export class PrismAgent {
     preferredNodeId = null,
     maxDeposit = null,
     minTrustClass = "open",
+    command = null,
   } = {}) {
     if (!this.session) await this.authenticate();
-    const quote = await this.quote({ image, durationSeconds, minVramMib, preferredNodeId, minTrustClass });
+    const quote = await this.quote({
+      image,
+      durationSeconds,
+      minVramMib,
+      preferredNodeId,
+      minTrustClass,
+      command,
+    });
     if (maxDeposit != null && parseBaseUnits(quote.maximum_escrow, "maximum_escrow") > BigInt(maxDeposit)) {
       throw new PrismError(402, "cost_exceeds_max", { required: quote.maximum_escrow, max: String(maxDeposit) });
     }
@@ -266,6 +305,14 @@ export class PrismAgent {
         sshAuthorizedKey: key.publicKey,
       });
       if (!Number.isInteger(record?.lease_id)) throw new PrismError(502, "malformed_lease_record");
+      // A batch lease never hands out access, so waiting for it would block
+      // until the timeout and then report a failure that never happened. Wait
+      // for what the command printed instead.
+      if (command !== null) {
+        const result = await this.waitForResult(record.lease_id);
+        rmSync(key.dir, { recursive: true, force: true });
+        return { leaseId: record.lease_id, result, fundingHash: funded.hash, quote };
+      }
       const access = await this.waitForAccess(record.lease_id);
       return {
         leaseId: record.lease_id,
