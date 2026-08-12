@@ -407,6 +407,11 @@ pub struct LeaseRequest {
     pub preferred_node_id: Option<String>,
     #[serde(default)]
     pub min_trust_class: TrustClass,
+    /// Present when the renter wants one command run instead of a session they
+    /// log into. A batch lease is priced, escrowed and settled exactly like an
+    /// interactive one; only what happens on the node differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,6 +425,10 @@ pub struct LeaseQuote {
     pub maximum_escrow: u64,
     #[serde(default)]
     pub trust_class: TrustClass,
+    /// Carried from the request so the command a renter is quoted for is the
+    /// command that actually runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -452,6 +461,8 @@ pub struct LeaseRecord {
     pub trust_class: TrustClass,
     pub funding_transaction_hash: String,
     pub state: LeaseState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

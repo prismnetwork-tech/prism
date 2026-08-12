@@ -20,13 +20,13 @@ use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use prism_protocol::{
-    Account, CredentialCipher, EncryptedSecret, LeaseAccess, LeaseQuote, LeaseRecord, LeaseRequest,
-    LeaseState, MAX_ESCROW_BASE_UNITS, MAX_LEASE_SECONDS, MAX_NETWORK_LEASES,
-    MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT, MAX_VAULT_LABEL_BYTES,
-    NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
-    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture,
-    NodeTelemetry, SettlementEvidence, TrustClass, VaultEnvelope, VaultItem, VaultRelease,
-    VaultWrite, node_id, vault_release_permitted, verifying_key,
+    Account, CommandResult, CredentialCipher, EncryptedSecret, LeaseAccess, LeaseQuote,
+    LeaseRecord, LeaseRequest, LeaseState, MAX_ESCROW_BASE_UNITS, MAX_LEASE_SECONDS,
+    MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
+    MAX_VAULT_LABEL_BYTES, NodeCertificateBundle, NodeCertificateRequest, NodeCommand,
+    NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment,
+    NodeOffer, NodePosture, NodeTelemetry, SettlementEvidence, TrustClass, VaultEnvelope,
+    VaultItem, VaultRelease, VaultWrite, node_id, vault_release_permitted, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -64,6 +64,8 @@ const OFFER_MAX_AGE_SECONDS: i64 = 90;
 /// losing the race afterwards costs gas rather than the deposit, because
 /// createLease reverts as a whole when the node is no longer schedulable.
 const QUOTE_HOLD_SECONDS: i64 = 90;
+/// Mirrors the node's own limit, so the two agree on what it will accept.
+const MAX_BATCH_COMMAND_BYTES: usize = 8 * 1024;
 const QUOTE_TTL_MINUTES: i64 = 5;
 type HmacSha256 = Hmac<Sha256>;
 
@@ -239,6 +241,7 @@ struct MemoryCommand {
     command: NodeCommand,
     status: &'static str,
     lease_until: Option<chrono::DateTime<Utc>>,
+    result: Option<CommandResult>,
     updated_at: chrono::DateTime<Utc>,
 }
 
@@ -691,6 +694,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/leases/match", post(match_lease))
         .route("/v1/leases", get(list_account_leases))
         .route("/v1/leases/{lease_id}/access", get(get_lease_access))
+        .route("/v1/leases/{lease_id}/result", get(get_lease_result))
         .route("/v1/leases/confirm", post(confirm_lease))
         .route("/v1/account/session/revoke", post(revoke_account_session))
         .route(
@@ -2842,6 +2846,7 @@ impl MarketplaceStore {
             trust_class: quote.trust_class,
             funding_transaction_hash: transaction_hash.to_ascii_lowercase(),
             state: LeaseState::Funded,
+            command: quote.command.clone(),
             created_at: now,
             updated_at: now,
         };
@@ -2902,6 +2907,7 @@ impl MarketplaceStore {
                         command,
                         status: "queued",
                         lease_until: None,
+                        result: None,
                         updated_at: now,
                     },
                 );
@@ -3521,6 +3527,9 @@ impl MarketplaceStore {
                 }
                 entry.status = status;
                 entry.lease_until = None;
+                if report.result.is_some() {
+                    entry.result = report.result.clone();
+                }
                 entry.updated_at = now;
                 let lease_id = entry.command.lease_id;
                 if let Some((_, lease)) = market.leases.get_mut(&lease_id) {
@@ -3550,12 +3559,14 @@ impl MarketplaceStore {
                 }
                 query(
                     "UPDATE node_commands \
-                     SET status = $2, lease_until = NULL, last_error = $3, updated_at = NOW() \
+                     SET status = $2, lease_until = NULL, last_error = $3, \
+                         result = COALESCE($4, result), updated_at = NOW() \
                      WHERE command_id = $1",
                 )
                 .bind(report.command_id)
                 .bind(status)
                 .bind(&report.error)
+                .bind(report.result.as_ref().map(SqlJson))
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
@@ -3594,6 +3605,44 @@ impl MarketplaceStore {
                 .await
                 .map_err(StoreError::Storage)?;
                 transaction.commit().await.map_err(StoreError::Storage)
+            }
+        }
+    }
+
+    /// The output of a batch lease. Scoped to the renter who paid for it: the
+    /// command's result is theirs, not the operator's to hand out.
+    async fn lease_result(
+        &self,
+        subject: &str,
+        lease_id: u64,
+    ) -> Result<Option<CommandResult>, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let market = market.read().await;
+                let Some((owner, _)) = market.leases.get(&lease_id) else {
+                    return Ok(None);
+                };
+                if owner != subject {
+                    return Ok(None);
+                }
+                Ok(market
+                    .commands
+                    .values()
+                    .find(|entry| entry.command.lease_id == lease_id)
+                    .and_then(|entry| entry.result.clone()))
+            }
+            Self::Postgres(pool) => {
+                let stored: Option<Option<SqlJson<CommandResult>>> = query_scalar(
+                    "SELECT c.result FROM node_commands c \
+                     JOIN leases l ON l.lease_id = c.lease_id \
+                     WHERE c.lease_id = $1 AND l.subject = $2",
+                )
+                .bind(lease_id as i64)
+                .bind(subject)
+                .fetch_optional(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                Ok(stored.flatten().map(|SqlJson(result)| result))
             }
         }
     }
@@ -3898,24 +3947,36 @@ fn lease_state_name(state: &LeaseState) -> &'static str {
     }
 }
 
+/// A lease carrying a command runs it and reports what it printed; a lease
+/// without one hands back a session. The renter chose which at quote time, so
+/// the credentials for an interactive workspace are simply never used for a
+/// batch lease rather than being issued and left lying around.
 fn launch_command(
     lease: &LeaseRecord,
     ssh_authorized_key: &str,
     jupyter_token: &str,
 ) -> NodeCommand {
     let now = Utc::now();
+    let kind = match lease.command.as_deref() {
+        Some(command) => NodeCommandKind::Batch {
+            image: lease.image.clone(),
+            command: command.to_owned(),
+            duration_seconds: lease.duration_seconds,
+        },
+        None => NodeCommandKind::Launch {
+            image: lease.image.clone(),
+            duration_seconds: lease.duration_seconds,
+            ssh_authorized_key: ssh_authorized_key.to_owned(),
+            jupyter_token: jupyter_token.to_owned(),
+        },
+    };
     NodeCommand {
         command_id: Uuid::now_v7(),
         node_id: lease.node_id.clone(),
         lease_id: lease.lease_id,
         issued_at: now,
         expires_at: now + Duration::minutes(10),
-        kind: NodeCommandKind::Launch {
-            image: lease.image.clone(),
-            duration_seconds: lease.duration_seconds,
-            ssh_authorized_key: ssh_authorized_key.to_owned(),
-            jupyter_token: jupyter_token.to_owned(),
-        },
+        kind,
     }
 }
 
@@ -4605,6 +4666,22 @@ async fn match_lease(
             "minimum GPU memory must be non-zero",
         ));
     }
+    // Catch a doomed batch command here rather than after the renter has funded
+    // an escrow for a job the node will refuse.
+    if let Some(command) = payload.request.command.as_deref() {
+        if command.trim().is_empty() {
+            return Err(bad_request(
+                "invalid_command",
+                "a batch command cannot be empty",
+            ));
+        }
+        if command.len() > MAX_BATCH_COMMAND_BYTES {
+            return Err(bad_request(
+                "invalid_command",
+                "a batch command cannot exceed 8 KiB",
+            ));
+        }
+    }
     if payload
         .request
         .preferred_node_id
@@ -4635,6 +4712,24 @@ async fn list_account_leases(
         .await
         .map(Json)
         .map_err(store_error)
+}
+
+/// A batch lease reports what its command printed. Until the node reports, and
+/// for anyone who is not the renter, there is nothing here.
+async fn get_lease_result(
+    State(state): State<AppState>,
+    Path(lease_id): Path<u64>,
+    headers: HeaderMap,
+) -> Result<Json<CommandResult>, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/leases/{lease_id}/result");
+    let account = require_account(&state, &headers, "GET", &path, &[]).await?;
+    state
+        .store
+        .lease_result(&account.subject, lease_id)
+        .await
+        .map_err(internal_error)?
+        .map(Json)
+        .ok_or_else(|| not_found("result_not_ready", "this lease has no batch result yet"))
 }
 
 async fn get_lease_access(
@@ -4907,6 +5002,7 @@ fn quote_for_offers<'a>(
         rate_per_second: selected.rate_per_second,
         maximum_escrow,
         trust_class: selected.trust_class,
+        command: request.command.clone(),
         expires_at: Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES),
     })
 }
@@ -5384,6 +5480,52 @@ mod tests {
         }
     }
 
+    /// The renter chose at quote time whether they wanted a session or a
+    /// command. Issuing the wrong one either hands out a shell nobody asked for
+    /// or leaves a batch renter waiting on a workspace that never reports.
+    #[test]
+    fn a_lease_with_a_command_is_dispatched_as_batch() {
+        let base = LeaseRecord {
+            lease_id: 9,
+            quote_id: Uuid::now_v7(),
+            node_id: "0xabc".to_owned(),
+            renter_wallet: "0xrenter".to_owned(),
+            image: "docker.io/library/debian@sha256:1".to_owned(),
+            duration_seconds: 600,
+            rate_per_second: 222,
+            maximum_escrow: 133_200,
+            trust_class: TrustClass::Isolated,
+            funding_transaction_hash: "0x2".to_owned(),
+            state: LeaseState::Funded,
+            command: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let interactive = launch_command(&base, "ssh-ed25519 AAAA", "token");
+        assert!(matches!(interactive.kind, NodeCommandKind::Launch { .. }));
+
+        let batch = launch_command(
+            &LeaseRecord {
+                command: Some("nvidia-smi -L".to_owned()),
+                ..base
+            },
+            "ssh-ed25519 AAAA",
+            "token",
+        );
+        match batch.kind {
+            NodeCommandKind::Batch {
+                command,
+                duration_seconds,
+                ..
+            } => {
+                assert_eq!(command, "nvidia-smi -L");
+                assert_eq!(duration_seconds, 600);
+            }
+            other => panic!("expected a batch command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_lease_awaiting_settlement_still_occupies_its_node() {
         let lease = |state| LeaseRecord {
@@ -5398,6 +5540,7 @@ mod tests {
             trust_class: TrustClass::Open,
             funding_transaction_hash: "0x2".to_owned(),
             state,
+            command: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -5426,6 +5569,7 @@ mod tests {
                 min_vram_mib: 16_000,
                 preferred_node_id: None,
                 min_trust_class: TrustClass::Open,
+                command: None,
             },
             [&slower, &faster, &expensive],
             &BTreeSet::new(),
@@ -5443,6 +5587,7 @@ mod tests {
         let mut isolated = offer("isolated", 900, 1_000);
         isolated.trust_class = TrustClass::Isolated;
         let request = |min_trust_class| LeaseRequest {
+            command: None,
             image: "registry.example/runtime@sha256:abc".to_owned(),
             duration_seconds: 60,
             min_vram_mib: 16_000,
@@ -5515,6 +5660,7 @@ mod tests {
                 min_vram_mib: 1,
                 preferred_node_id: None,
                 min_trust_class: TrustClass::Open,
+                command: None,
             },
             [&offer],
             &BTreeSet::new(),
@@ -5536,6 +5682,7 @@ mod tests {
                 min_vram_mib: 1,
                 preferred_node_id: None,
                 min_trust_class: TrustClass::Open,
+                command: None,
             },
             [&reserved, &stale, &available],
             &BTreeSet::from(["reserved".to_owned()]),
@@ -5559,6 +5706,7 @@ mod tests {
             min_vram_mib: 16_000,
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
+            command: None,
         };
 
         assert!(matches!(
@@ -5723,6 +5871,7 @@ mod tests {
             min_vram_mib: 1,
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
+            command: None,
         };
         let mut tasks = Vec::new();
         for index in 0..MAX_NETWORK_LEASES {
@@ -5760,6 +5909,7 @@ mod tests {
             min_vram_mib: 1,
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
+            command: None,
         };
 
         let first = store.quote("renter", &request).await.unwrap();
@@ -5792,6 +5942,7 @@ mod tests {
             min_vram_mib: 1,
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
+            command: None,
         };
 
         let abandoned = store.quote("renter", &request).await.unwrap();
@@ -5846,6 +5997,7 @@ mod tests {
             trust_class: TrustClass::Open,
             funding_transaction_hash: format!("0x{:064x}", 27),
             state: LeaseState::Active,
+            command: None,
             created_at: now,
             updated_at: now,
         };
@@ -5859,6 +6011,7 @@ mod tests {
             min_vram_mib: 1,
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
+            command: None,
         };
 
         assert!(matches!(
@@ -5908,6 +6061,7 @@ mod tests {
                 trust_class: TrustClass::Open,
                 funding_transaction_hash: format!("0x{index:064x}"),
                 state: LeaseState::Funded,
+                command: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -5923,6 +6077,7 @@ mod tests {
                 command.command_id,
                 MemoryCommand {
                     command,
+                    result: None,
                     status: "queued",
                     lease_until: None,
                     updated_at: now,
@@ -5950,6 +6105,7 @@ mod tests {
     fn funding_event_is_bound_to_the_exact_quote() {
         let quote_id = Uuid::now_v7();
         let quote = LeaseQuote {
+            command: None,
             quote_id,
             node_id: format!("0x{}", "ab".repeat(32)),
             image: format!("registry.example/runtime@sha256:{}", "cd".repeat(32)),
@@ -6045,6 +6201,7 @@ mod tests {
             trust_class: TrustClass::Open,
             funding_transaction_hash: format!("0x{}", "cc".repeat(32)),
             state: LeaseState::Funded,
+            command: None,
             created_at: now,
             updated_at: now,
         };
@@ -6060,6 +6217,7 @@ mod tests {
                 command_id,
                 MemoryCommand {
                     command,
+                    result: None,
                     status: "queued",
                     lease_until: None,
                     updated_at: now,
@@ -6139,6 +6297,7 @@ mod tests {
                     trust_class,
                     funding_transaction_hash: "0xabc".to_owned(),
                     state: LeaseState::Active,
+                    command: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
