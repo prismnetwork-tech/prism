@@ -46,8 +46,12 @@ export default function RoadmapPage() {
           Every finalized lease publishes a settlement receipt that anyone can confirm on a block
           explorer.
         </p>
-        <h3>NVIDIA L40S capacity</h3>
-        <p>GPU supply sourced from vetted providers and matched to a lease on demand.</p>
+        <h3>Concurrent multi-class GPU capacity</h3>
+        <p>
+          Supply sourced from vetted providers across several NVIDIA classes, including L40S, RTX
+          A6000, RTX 6000 Ada and RTX 5880 Ada, and matched to a lease on demand. The network serves
+          nine leases at once rather than one at a time.
+        </p>
         <h3>A stated trust class per offer</h3>
         <p>
           Every offer, quote, lease, and receipt carries what the supplier protects, derived by the
@@ -72,7 +76,9 @@ export default function RoadmapPage() {
         <h3>Dependable on-demand provisioning</h3>
         <p>
           Matching a lease to live capacity across a volatile spot market, so a request placed at any
-          moment resolves to a running machine.
+          moment resolves to a running machine. A funded lease now reaches a shell in about ninety
+          seconds. The remaining work is holding that under load and when a provider hands back a
+          host that will not boot.
         </p>
         <h3>Independent node operators</h3>
         <p>
@@ -80,8 +86,6 @@ export default function RoadmapPage() {
           GPU can be leased rather than only registered. What remains is the hardware validation that
           lets such a node advertise a stronger trust class than brokered capacity.
         </p>
-        <h3>Broader capacity</h3>
-        <p>Additional GPU classes and more concurrent supply beyond a single machine type.</p>
       </InformationSection>
 
       <InformationSection index="03" title="Planned">
