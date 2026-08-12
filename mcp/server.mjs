@@ -331,7 +331,7 @@ function ensureAuth() {
   return authPromise;
 }
 
-const server = new Server({ name: "prism", version: "0.1.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "prism", version: "0.4.1" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
