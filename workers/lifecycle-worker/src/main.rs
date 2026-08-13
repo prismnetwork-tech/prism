@@ -1841,10 +1841,20 @@ impl Worker {
 
     /// Machines other leases refused recently. Shared because a host that
     /// reserved no forwarded ports will reserve none for the next lease either.
+    /// Machines that refused recently, with a repeat offender kept out longer.
+    ///
+    /// A host that reserves no forwarded ports is misconfigured, not briefly
+    /// busy, so it refuses again the next time it is picked. On a flat window
+    /// the same handful cycle back into the pool every few hours and a renter
+    /// pays for the discovery: three of them in a row exhausts the attempts and
+    /// the lease refunds without ever reaching a machine. Each further refusal
+    /// doubles the exile, to a month.
     async fn recently_rejected_machines(&self) -> anyhow::Result<Vec<i64>> {
         Ok(query_scalar::<_, i64>(
             "SELECT machine_id FROM cloud_machine_rejections \
-             WHERE last_rejected_at > NOW() - make_interval(secs => $1) \
+             WHERE last_rejected_at > NOW() - LEAST( \
+                     make_interval(secs => $1 * POWER(2, LEAST(rejections, 10) - 1)), \
+                     make_interval(days => 30)) \
              ORDER BY last_rejected_at DESC",
         )
         // secs, not hours: make_interval's hours argument is an int, and binding a
