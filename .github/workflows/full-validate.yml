@@ -57,6 +57,7 @@ jobs:
         run: |
           docker compose --env-file deploy/lightsail/.env.example -f deploy/lightsail/compose.yml config --quiet
           docker compose --env-file deploy/lightsail/.env.example -f deploy/ec2/compose.yml config --quiet
+          ./scripts/test-compose-env.sh
       - name: Build service images
         run: |
           docker build -f deploy/Dockerfile.web -t prism-web:test \
