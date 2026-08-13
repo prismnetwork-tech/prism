@@ -7,11 +7,17 @@ import { TokenTransfers } from "./lib/TokenTransfers.sol";
 contract NodeRegistryV1 {
     using TokenTransfers for IERC20;
 
-    /// Bond size, set at deployment. It was a constant of 1_000_000, which is
-    /// one unit of a six decimal stablecoin. The bond token is now chosen at
-    /// deployment and may have any number of decimals, so baking the amount in
-    /// silently changes what a bond is worth when the token changes.
-    uint256 public immutable minBond;
+    /// Stake per unit of advertised rate. A node charging more stakes more.
+    /// Adjustable, because the bond asset has a market price and this contract
+    /// cannot be redeployed without migrating every node on the network.
+    uint256 public bondPerRateUnit;
+
+    /// Hard bounds on what any adjustment can produce, fixed at deployment.
+    /// The owner steers the bond inside this band and cannot leave it, so a
+    /// compromised or careless owner can neither waive the bond nor set it high
+    /// enough to lock every operator out.
+    uint256 public immutable bondFloor;
+    uint256 public immutable bondCeiling;
     uint256 public constant DAY = 24 hours;
     uint256 private constant SECP256K1N_DIV_2 =
         0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
@@ -69,6 +75,7 @@ contract NodeRegistryV1 {
     event EscrowSet(address indexed escrow);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event TreasurySet(address indexed treasury);
+    event BondPerRateUnitSet(uint256 bondPerRateUnit);
 
     /// The token a node bonds to join. Separate from what renters pay with:
     /// capacity is staked in one asset and compute is billed in another.
@@ -80,13 +87,24 @@ contract NodeRegistryV1 {
     mapping(bytes32 nodeId => Node node) private nodes;
     mapping(address operator => uint256 nonce) public enrollmentNonces;
 
-    constructor(IERC20 bondToken_, address treasury_, uint256 minBond_) {
-        if (minBond_ == 0 || minBond_ > type(uint128).max) revert InvalidRate();
+    constructor(
+        IERC20 bondToken_,
+        address treasury_,
+        uint256 bondPerRateUnit_,
+        uint256 bondFloor_,
+        uint256 bondCeiling_
+    ) {
+        if (bondFloor_ == 0 || bondFloor_ > bondCeiling_ || bondCeiling_ > type(uint128).max) {
+            revert InvalidRate();
+        }
+        if (bondPerRateUnit_ == 0) revert InvalidRate();
         if (address(bondToken_) == address(0) || treasury_ == address(0)) {
             revert InvalidAddress();
         }
         bondToken = bondToken_;
-        minBond = minBond_;
+        bondPerRateUnit = bondPerRateUnit_;
+        bondFloor = bondFloor_;
+        bondCeiling = bondCeiling_;
         owner = msg.sender;
         treasury = treasury_;
     }
@@ -265,8 +283,22 @@ contract NodeRegistryV1 {
             && node.bond >= requiredBond(node.ratePerSecond);
     }
 
-    function requiredBond(uint128) public view returns (uint256) {
-        return minBond;
+    /// Scales with what the node charges, then clamps into the deployment band.
+    /// An overflow can only mean a figure far above the ceiling, so it returns
+    /// the ceiling rather than reverting and blocking registration.
+    function requiredBond(uint128 ratePerSecond) public view returns (uint256) {
+        if (ratePerSecond == 0) return bondFloor;
+        if (bondPerRateUnit > type(uint256).max / uint256(ratePerSecond)) return bondCeiling;
+        uint256 scaled = bondPerRateUnit * uint256(ratePerSecond);
+        if (scaled < bondFloor) return bondFloor;
+        if (scaled > bondCeiling) return bondCeiling;
+        return scaled;
+    }
+
+    function setBondPerRateUnit(uint256 value) external onlyOwner {
+        if (value == 0) revert InvalidRate();
+        bondPerRateUnit = value;
+        emit BondPerRateUnitSet(value);
     }
 
     function domainSeparator() public view returns (bytes32) {
