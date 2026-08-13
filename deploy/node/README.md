@@ -9,6 +9,9 @@ The daemon, systemd units, certificate flow, tunnel and simulated workspace
 lifecycle pass repository integration tests. They have not yet completed an
 end-to-end run on physical NVIDIA/Kata/VFIO hardware.
 
+Order of operations: preflight the host, create the device identity, bond it in
+the registry, enroll with the control plane, then install the services.
+
 ## Host baseline
 
 Install and configure:
@@ -56,8 +59,50 @@ sudo -u prismd prismd create-identity
 `/var/lib/prismd/device.json`. The current implementation uses a file-backed
 key; TPM-backed identity is not implemented.
 
-The operator and payout wallets, advertised rate, GPU inventory and on-chain
-bond must agree with the registry before the control plane accepts enrollment:
+## Bond
+
+The control plane will not schedule a node the registry has not bonded, so the
+stake goes up before enrollment. Bonds are posted in PRISM on Robinhood Chain
+and are returned when the node retires. Compute itself settles in USDG, so this
+is the only place the token is involved.
+
+The bond scales with the rate the node charges. Ask the registry what a rate
+costs before committing to one:
+
+```sh
+prismd register \
+  --identity /var/lib/prismd/device.json \
+  --rpc-url https://rpc.mainnet.chain.robinhood.com \
+  --registry 0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc \
+  --rate-per-second 222 \
+  --dry-run
+```
+
+The dry run signs the device binding, puts it to the registry, and reports what
+would happen without spending anything. It is the cheapest way to find a wrong
+wallet, an expired identity or a rate you cannot cover.
+
+Drop `--dry-run` to post the bond. The operator key stays on this host: it signs
+the binding between the wallet and the device, approves the registry to take the
+bond, and pays gas. Pass it in the environment rather than on the command line,
+where it would land in shell history:
+
+```sh
+PRISM_OPERATOR_KEY=0x… prismd register \
+  --identity /var/lib/prismd/device.json \
+  --rpc-url https://rpc.mainnet.chain.robinhood.com \
+  --registry 0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc \
+  --payout-wallet 0x… \
+  --rate-per-second 222
+```
+
+`--payout-wallet` defaults to the operator wallet. Set it when earnings should
+land somewhere the signing key cannot reach.
+
+## Enrollment
+
+The operator and payout wallets, advertised rate and GPU inventory must match
+the registration the registry now holds:
 
 ```sh
 sudo -u prismd prismd enroll \
@@ -72,9 +117,26 @@ sudo -u prismd prismd enroll \
   --benchmark-score 1000
 ```
 
-Replace every example value. The repository does not yet package a generic
-self-service transaction flow for supplier registration and bonding, so
-physical enrollment remains operator-assisted.
+Replace every example value. Enrollment is permissionless: the control plane
+accepts any node whose device key signs the request and whose registration the
+registry confirms, so nobody has to approve the host.
+
+## Earnings
+
+A lease pays 90% of confirmed usage to the payout wallet and 10% to the
+network. Payment follows the settlement receipt rather than the booking, so a
+lease that never admitted a workload pays nothing and refunds the renter.
+
+Rates are quoted in USDG base units per second. At 222, a full hour of use
+settles about 0.80 USDG, of which the payout wallet receives about 0.72.
+
+## Trust class
+
+A node reached over the outbound tunnel and reporting a Kata and VFIO posture is
+published above `open`, which is the tier renters can require for workloads they
+will not put on a host that can read guest memory. Capacity brokered from a
+public cloud cannot reach that tier, so this is where self-hosted hardware is
+worth more than resold hardware.
 
 ## Install services
 
