@@ -699,8 +699,11 @@ async fn register(request: Registration) -> anyhow::Result<()> {
         // dry run can never pass before the first approval.
         let expected = shortfall.is_some() || allowance < bond;
         if outcome.is_ok() || expected {
+            // The node ID came from create-identity and the node is named by
+            // --identity, so repeating 66 characters of it here only pushes
+            // the number the operator came for off the edge of the terminal.
             println!(
-                "registration is valid: {node} would stake {} PRISM at {rate_per_second} USDG base units per second",
+                "registration is valid: would stake {} PRISM at {rate_per_second} USDG base units per second",
                 format_token_required(bond)
             );
         }
