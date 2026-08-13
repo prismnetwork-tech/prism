@@ -35,7 +35,11 @@ console.log(`leased ${lease.leaseId} on ${lease.access.ssh_host}, funded in ${le
 
 const remote = [
   `printf %s ${renderScript} | base64 -d > /tmp/render.py`,
-  "python -m pip install --quiet 'diffusers>=0.31' transformers accelerate safetensors",
+  // Pinned, like the image digest above it. An open upper bound means the
+  // example installs whatever released this morning, and diffusers 0.36 needs
+  // a newer torch than this image ships, so it fails on import after the
+  // renter has already paid for the machine.
+  "python -m pip install --quiet 'diffusers==0.31.0' transformers accelerate safetensors",
   `PRISM_PROMPT=${shellQuote(prompt)} python /tmp/render.py`,
 ].join(" && ");
 

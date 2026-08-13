@@ -59,6 +59,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.5,
     },
     {
+      url: new URL("/status", siteUrl).href,
+      changeFrequency: "hourly",
+      priority: 0.6,
+    },
+    {
       url: new URL("/contact", siteUrl).href,
       changeFrequency: "monthly",
       priority: 0.4,

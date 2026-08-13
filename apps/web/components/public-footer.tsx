@@ -52,6 +52,7 @@ const columns = [
       ["Terms", new URL("/terms", siteUrl).href, false],
       ["Privacy", new URL("/privacy", siteUrl).href, false],
       ["Security", new URL("/security", siteUrl).href, false],
+      ["Status", new URL("/status", siteUrl).href, false],
     ],
   },
   {
