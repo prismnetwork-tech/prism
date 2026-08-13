@@ -74,7 +74,11 @@ export function NodeFleet() {
             </article>
           </>
         ) : (
-          <Empty title="No registered nodes" message="Verify the operator or payout wallet used during enrollment, then complete the host registration process." />
+          <Empty
+            title="No nodes on this account"
+            message="Nodes appear here once they are bonded and enrolled against a wallet you have verified. If a machine is already running, check that it was registered to one of your linked wallets."
+            action={<a className="button secondary" href={GUIDE} target="_blank" rel="noopener noreferrer">Read the setup guide</a>}
+          />
         )
       )}
 
