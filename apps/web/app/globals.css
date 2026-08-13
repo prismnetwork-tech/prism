@@ -131,7 +131,10 @@ a { color: inherit; text-decoration: none; }
 .form-notice { color: var(--muted); font-size: 12px; margin: -8px 0 0; }
 .quote-card { position: sticky; top: 30px; }
 .quote-card h2 { margin-bottom: 25px; }
-.quote-line, .quote-total { display: flex; justify-content: space-between; gap: 12px; padding: 13px 0; font-size: 13px; border-bottom: 1px solid var(--border); }
+/* Baseline, not the default stretch: the label and its value have different
+   type sizes, so stretching left them on staggered lines and a tier list read
+   as two columns instead of one row per tier. */
+.quote-line, .quote-total { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 13px 0; font-size: 13px; border-bottom: 1px solid var(--border); }
 .quote-line span, .quote-total span { color: var(--muted); }
 .quote-total { margin-top: 10px; border: 0; align-items: flex-end; }
 .quote-total strong { font-size: 25px; letter-spacing: -.04em; }
