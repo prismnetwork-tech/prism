@@ -42,8 +42,8 @@ contract RegisterCloudBroker {
         (uint8 v, bytes32 r, bytes32 s) = VM.sign(operatorKey, digest);
 
         VM.startBroadcast(operatorKey);
-        IERC20 usd = registry.usd();
-        usd.approve(address(registry), registry.requiredBond(RATE_PER_SECOND));
+        IERC20 bondToken = registry.bondToken();
+        bondToken.approve(address(registry), registry.requiredBond(RATE_PER_SECOND));
         registry.register(
             nodeId,
             nodeId,

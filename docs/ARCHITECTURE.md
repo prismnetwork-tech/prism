@@ -174,7 +174,7 @@ sequenceDiagram
     W-->>R: public proof receipt
 ```
 
-1. The supplier posts a USDG bond and registers a device hash onchain.
+1. The supplier stakes a PRISM bond and registers a device hash onchain.
 2. The renter receives a quote and deposits the maximum USDG cost.
 3. The control plane confirms the quote-bound funding event. A physical node
    launches a Kata sandbox with reserved VFIO; a cloud lease launches a

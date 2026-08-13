@@ -29,7 +29,7 @@
           "name": "PRISM_ESCROW",
           "description": "Prism LeaseEscrow contract address",
           "isRequired": false,
-          "default": "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD"
+          "default": "0x62C042265991bEa17B07229322A01850974626dA"
         }
       ]
     }

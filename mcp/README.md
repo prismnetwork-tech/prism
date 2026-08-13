@@ -66,7 +66,7 @@ Point your MCP client (Claude Desktop / Code) at the published server:
       "args": ["-y", "@prismnetwork/mcp"],
       "env": {
         "PRISM_AGENT_KEY": "0x<agent wallet private key>",
-        "PRISM_ESCROW": "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD"
+        "PRISM_ESCROW": "0x62C042265991bEa17B07229322A01850974626dA"
       }
     }
   }
@@ -79,7 +79,7 @@ Or add it to Claude Code in one line:
 
 ```sh
 claude mcp add prism \
-  --env PRISM_ESCROW=0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD \
+  --env PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
   --env PRISM_AGENT_KEY=0x<agent wallet private key> \
   -- npx -y @prismnetwork/mcp
 ```

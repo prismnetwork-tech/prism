@@ -13,7 +13,7 @@ Lightning, runs it, prints the output, and releases the lease.
 ```sh
 npm install
 PRISM_AGENT_KEY=0x<agent wallet private key> \
-PRISM_ESCROW=0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD \
+PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
 PRISM_IMAGE=<repo@sha256:...> \
 node lease-and-train.mjs
 ```

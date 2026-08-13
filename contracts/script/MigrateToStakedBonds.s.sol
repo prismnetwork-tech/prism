@@ -41,7 +41,6 @@ contract MigrateToStakedBonds {
         address gateway = VM.envAddress("PRISM_GATEWAY_SIGNER");
         address attestor = VM.envAddress("PRISM_ATTESTOR_ADDRESS");
         address treasury = VM.envAddress("PRISM_TREASURY_SAFE");
-        address timelock = VM.envAddress("PRISM_TIMELOCK_ADDRESS");
 
         require(bondToken.code.length != 0, "bond token has no code");
         require(bondToken != USDG, "bond token is still the payment token");
@@ -53,14 +52,19 @@ contract MigrateToStakedBonds {
         VM.startBroadcast(VM.envUint("PRISM_DEPLOYER_KEY"));
         registry = new NodeRegistryV1(IERC20(bondToken), treasury, perRateUnit, floor, ceiling);
         escrow = new LeaseEscrowV1(
-            IERC20(USDG), registry, timelock, gateway, attestor, treasury, admin, admin
+            IERC20(USDG), registry, admin, gateway, attestor, treasury, admin, admin
         );
         // One shot, and the escrow cannot be replaced afterwards.
         registry.setEscrow(address(escrow));
+        // The deployer owns the registry only long enough to wire the escrow.
+        // The live registry is held by the Safe and the replacement must not be
+        // weaker, so hand it over before the broadcast ends.
+        registry.transferOwnership(admin);
         VM.stopBroadcast();
 
         require(address(registry.bondToken()) == bondToken, "bond token did not take");
         require(address(escrow.usd()) == USDG, "compute must still settle in USDG");
         require(address(escrow.nodeRegistry()) == address(registry), "escrow points elsewhere");
+        require(registry.owner() == admin, "registry must end up with the Safe");
     }
 }

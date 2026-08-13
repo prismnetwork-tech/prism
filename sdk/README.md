@@ -17,7 +17,7 @@ import { PrismAgent, DEFAULT_IMAGE } from "@prismnetwork/agent-sdk";
 
 const agent = new PrismAgent({
   privateKey: process.env.AGENT_KEY,        // agent's wallet
-  escrow: "0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD",
+  escrow: "0x62C042265991bEa17B07229322A01850974626dA",
 });
 
 await agent.authenticate();
