@@ -1,4 +1,4 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -77,6 +77,7 @@ struct Worker {
     chain: RpcClient,
     signer: EthereumSigner,
     escrow: [u8; 20],
+    registry: [u8; 20],
     confirmations: u64,
     gateway: GatewayClient,
     cipher: CredentialCipher,
@@ -249,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         chain,
         signer: EthereumSigner::from_environment("PRISM_GATEWAY_KMS_KEY_ID").await?,
         escrow: address(&required_env("PRISM_LEASE_ESCROW_ADDRESS")?)?,
+        registry: address(&required_env("PRISM_NODE_REGISTRY_ADDRESS")?)?,
         confirmations,
         gateway: GatewayClient::from_environment()?,
         cipher: CredentialCipher::from_hex(&required_env("PRISM_ACCESS_CREDENTIAL_KEY")?)
@@ -425,6 +427,33 @@ impl Worker {
         Ok(u64::from_be_bytes(word))
     }
 
+    /// What the registry says this node charges. The escrow bills from this
+    /// number, so an offer advertising anything else quotes a price the chain
+    /// will not honour and funding is rejected against the quote.
+    async fn registered_rate(&self, node_id: &str) -> anyhow::Result<u64> {
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&selector("getNode(bytes32)"));
+        data.extend_from_slice(&word_bytes32(bytes32(node_id)?));
+        let encoded: String = self
+            .chain
+            .call(
+                "eth_call",
+                serde_json::json!([{
+                    "to": format!("0x{}", hex::encode(self.registry)),
+                    "data": format!("0x{}", hex::encode(data))
+                }, "latest"]),
+            )
+            .await?;
+        let bytes = hex::decode(encoded.strip_prefix("0x").unwrap_or(&encoded))?;
+        // operator, payout, deviceHash, metadataHash, ratePerSecond, ...
+        let rate = bytes
+            .get(128..160)
+            .context("registry returned a short node record")?;
+        let mut word = [0_u8; 8];
+        word.copy_from_slice(&rate[24..32]);
+        Ok(u64::from_be_bytes(word))
+    }
+
     async fn lease_summary(&self, lease_id: u64) -> anyhow::Result<OnchainLease> {
         let mut data = Vec::with_capacity(36);
         data.extend_from_slice(&selector("getLease(uint256)"));
@@ -516,13 +545,34 @@ impl Worker {
         .bind(vast.node_ids.as_slice())
         .fetch_all(&self.pool)
         .await?;
-        let Some(rate) = offers
-            .first()
-            .map(|(_, SqlJson(offer))| offer.rate_per_second)
-        else {
+        if offers.is_empty() {
             tracing::warn!("no Vast broker node is enrolled; cloud capacity is disabled");
             return Ok(());
-        };
+        }
+
+        // Rates come from the registry, never from the stored document. An
+        // operator can reprice a node on chain at any time, and the escrow bills
+        // from that number: an offer carrying a stale rate quotes a price the
+        // chain will not honour, and confirmation rejects the funding.
+        let mut rates: BTreeMap<String, u64> = BTreeMap::new();
+        for (node_id, _) in &offers {
+            match self.registered_rate(node_id).await {
+                Ok(rate) if rate > 0 => {
+                    rates.insert(node_id.clone(), rate);
+                }
+                Ok(_) => tracing::warn!(node_id, "registry reports a zero rate; skipping"),
+                Err(error) => tracing::warn!(node_id, %error, "could not read the registered rate"),
+            }
+        }
+        if rates.is_empty() {
+            tracing::warn!("no broker node has a readable rate; cloud capacity is disabled");
+            return Ok(());
+        }
+
+        // Source against the cheapest node in the pool. A host affordable for
+        // the lowest rate is affordable for every other, whereas sourcing at the
+        // highest would buy machines the cheap nodes cannot cover.
+        let rate = rates.values().copied().min().unwrap_or_default();
 
         // One search for the whole pool. Advertise as many slots as there are
         // distinct hosts to fill them with, so the market never lists capacity
@@ -537,7 +587,11 @@ impl Worker {
             let Some((_, SqlJson(offer))) = offers.iter().find(|(id, _)| id == *node_id) else {
                 continue;
             };
+            let Some(registered) = rates.get(*node_id).copied() else {
+                continue;
+            };
             let mut offer = offer.clone();
+            offer.rate_per_second = registered;
             // Advertise the class that will actually be handed over, not the one
             // the broker enrolled with.
             offer.gpu.model = host.gpu_name.clone();
@@ -2014,6 +2068,13 @@ async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<
     Ok(())
 }
 
+fn bytes32(value: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("node id must contain 32 bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2119,5 +2180,40 @@ mod tests {
         assert!(private_gateway_host("fd00::2"));
         assert!(!private_gateway_host("gateway.example.com"));
         assert!(!private_gateway_host("203.0.113.6"));
+    }
+
+    // getNode returns operator, payout, deviceHash, metadataHash, ratePerSecond,
+    // bond, activeLeaseId, status. Reading the wrong word gives a number that
+    // looks like a rate: the bond decodes as an enormous one and the lease id as
+    // zero, and neither errors. Pin the offset against a hand-built record.
+    #[test]
+    fn the_registered_rate_is_read_from_the_right_word() {
+        let mut record = Vec::new();
+        let mut word = |value: u128| {
+            let mut w = [0_u8; 32];
+            w[16..].copy_from_slice(&value.to_be_bytes());
+            record.extend_from_slice(&w);
+        };
+        word(0x1111); // operator
+        word(0x2222); // payout
+        word(0x3333); // deviceHash
+        word(0x4444); // metadataHash
+        word(177); // ratePerSecond
+        word(39_864_000_000); // bond
+        word(0); // activeLeaseId
+        word(1); // status
+
+        let rate = record.get(128..160).expect("record covers the rate word");
+        let mut value = [0_u8; 8];
+        value.copy_from_slice(&rate[24..32]);
+
+        assert_eq!(u64::from_be_bytes(value), 177);
+    }
+
+    #[test]
+    fn a_short_registry_record_is_an_error_not_a_zero_rate() {
+        let truncated = [0_u8; 96];
+
+        assert!(truncated.get(128..160).is_none());
     }
 }
