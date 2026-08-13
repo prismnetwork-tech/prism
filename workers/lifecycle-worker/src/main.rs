@@ -877,7 +877,30 @@ impl Worker {
             return self.refresh_grant(&action).await;
         }
         if action.kind == ActionKind::StartAccess && action.transaction.is_none() {
-            self.probe(&action).await?;
+            // Funded is the only status a lease can still be started from.
+            // Without this check a refunded lease keeps renting machines for a
+            // renter who has already been paid back, and every attempt puts the
+            // lease back into a state that holds its node out of the market. One
+            // such lease sat in `provisioning` for hours after the escrow had
+            // refunded it, retrying start_access forty-six times.
+            match self.lease_status(action.chain_lease_id).await? {
+                LEASE_STATUS_FUNDED => self.probe(&action).await?,
+                settled @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
+                    self.adopt_settled_lease(&action, settled).await?;
+                    return self.skip_action(&action).await;
+                }
+                // Already started, or disputed. Either way this action has
+                // nothing left to do, and guessing a settlement here would
+                // publish an outcome the chain never reached.
+                status => {
+                    tracing::warn!(
+                        lease_id = action.lease_id,
+                        status,
+                        "skipping start_access for a lease the escrow has moved past"
+                    );
+                    return self.skip_action(&action).await;
+                }
+            }
         }
         if action.kind == ActionKind::CloseAccess && action.transaction.is_none() {
             self.revoke_access(action.lease_id).await?;
