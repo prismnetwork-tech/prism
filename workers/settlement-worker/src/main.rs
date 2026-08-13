@@ -34,7 +34,12 @@ const TELEMETRY_EDGE_TOLERANCE_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SettlementProposal {
+    /// Internal id, for storage and joins.
     lease_id: u64,
+    /// The escrow's id. The signature and the calldata are bound to this, so
+    /// signing the internal id would produce a settlement the escrow rejects.
+    #[serde(default)]
+    chain_lease_id: u64,
     usage_seconds: u64,
     receipt_hash: String,
     nonce: u128,
@@ -494,7 +499,7 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         .context("settlement charge overflow")?;
     let mut receipt = PublicReceipt {
         receipt_id: uuid::Uuid::from_bytes(receipt_id),
-        lease_id: evidence.lease_id.to_string(),
+        lease_id: evidence.chain_lease_id.to_string(),
         node_id_hash: format!(
             "0x{}",
             hex::encode(Sha256::digest(evidence.node_id.as_bytes()))
@@ -513,6 +518,7 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
     receipt.receipt_hash = receipt_hash(&receipt)?;
     Ok(SettlementProposal {
         lease_id: evidence.lease_id,
+        chain_lease_id: evidence.chain_lease_id,
         usage_seconds,
         receipt_hash: receipt.receipt_hash.clone(),
         nonce: evidence.lease_nonce,
@@ -675,7 +681,7 @@ fn settlement_digest(
     let receipt_hash = bytes32(&proposal.receipt_hash)?;
     let mut settlement = Vec::with_capacity(32 * 6);
     settlement.extend_from_slice(&settlement_typehash);
-    settlement.extend_from_slice(&word_u128(u128::from(proposal.lease_id)));
+    settlement.extend_from_slice(&word_u128(u128::from(proposal.chain_lease_id)));
     settlement.extend_from_slice(&word_u128(u128::from(proposal.usage_seconds)));
     settlement.extend_from_slice(&receipt_hash);
     settlement.extend_from_slice(&word_u128(proposal.nonce));
@@ -695,7 +701,7 @@ fn proposal_calldata(
     let selector = Keccak256::digest(b"proposeSettlement(uint256,uint64,bytes32,uint256,bytes)");
     let mut calldata = Vec::with_capacity(4 + 32 * 9);
     calldata.extend_from_slice(&selector[..4]);
-    calldata.extend_from_slice(&word_u128(u128::from(proposal.lease_id)));
+    calldata.extend_from_slice(&word_u128(u128::from(proposal.chain_lease_id)));
     calldata.extend_from_slice(&word_u128(u128::from(proposal.usage_seconds)));
     calldata.extend_from_slice(&bytes32(&proposal.receipt_hash)?);
     calldata.extend_from_slice(&word_u128(u128::from(proposal.deadline)));
@@ -1046,6 +1052,7 @@ mod tests {
             .collect();
         SettlementEvidence {
             lease_id: 1,
+            chain_lease_id: 1,
             lease_nonce: 1,
             node_id: node,
             device_public_key: URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),

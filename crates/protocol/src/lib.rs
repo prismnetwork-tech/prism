@@ -498,6 +498,14 @@ pub enum LeaseState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeaseRecord {
     pub lease_id: u64,
+    /// What the escrow numbered this lease. A counter restarts whenever the
+    /// escrow is replaced, so it is only unique alongside `escrow_address`, and
+    /// `lease_id` is what everything internal keys on. Every chain call about
+    /// this lease has to use this value, never `lease_id`.
+    #[serde(default)]
+    pub chain_lease_id: u64,
+    #[serde(default)]
+    pub escrow_address: String,
     pub quote_id: Uuid,
     pub node_id: String,
     pub renter_wallet: String,
@@ -751,7 +759,12 @@ pub struct PublicReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SettlementEvidence {
+    /// Internal id. Use it for storage and joins, never for a chain call.
     pub lease_id: u64,
+    /// The id the escrow issued, which is what the settlement signature is
+    /// bound to and what `proposeSettlement` must carry.
+    #[serde(default)]
+    pub chain_lease_id: u64,
     pub lease_nonce: u128,
     pub node_id: String,
     pub device_public_key: String,
