@@ -2,7 +2,7 @@
 // and read the metered result — no browser, no dashboard.
 //
 //   PRISM_AGENT_KEY=0x<agent wallet private key> \
-//   PRISM_ESCROW=0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD \
+//   PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
 //   node quickstart.mjs
 //
 // The wallet needs USDG and native Robinhood-Chain gas. Set PRISM_RUN_LEASE=1 to

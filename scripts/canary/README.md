@@ -16,7 +16,7 @@ Preflight first (authenticates, checks balances and a live offer, spends nothing
 ```sh
 npm install
 PRISM_AGENT_KEY=0x<funded agent wallet> \
-PRISM_ESCROW=0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD \
+PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
 npm start
 ```
 

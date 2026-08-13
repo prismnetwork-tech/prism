@@ -12,8 +12,8 @@ set -euo pipefail
 RPC="${PRISM_RPC_URL:-https://rpc.mainnet.chain.robinhood.com}"
 
 targets=(
-  "NodeRegistryV1:0xe3b7eF730637763ed46542d41a6C3f83AfC78f01"
-  "LeaseEscrowV1:0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD"
+  "NodeRegistryV1:0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc"
+  "LeaseEscrowV1:0x62C042265991bEa17B07229322A01850974626dA"
 )
 
 forge build >/dev/null 2>&1

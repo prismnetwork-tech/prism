@@ -48,7 +48,7 @@ export function Earnings() {
           </article>
         </>
       )}
-      <article className="panel proof-disclosure"><p className="eyebrow">Settlement policy</p><h2>Settled earnings</h2><p>Provider earnings include finalized settlement receipts only. Pending settlements, escrow deposits, and USDG bonds are excluded.</p></article>
+      <article className="panel proof-disclosure"><p className="eyebrow">Settlement policy</p><h2>Settled earnings</h2><p>Provider earnings include finalized settlement receipts only. Pending settlements, escrow deposits, and PRISM bonds are excluded.</p></article>
     </section>
   );
 }
