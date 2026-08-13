@@ -90,6 +90,10 @@ struct Worker {
 struct Action {
     action_id: Uuid,
     lease_id: u64,
+    /// What the escrow numbered this lease. Escrow counters restart on
+    /// redeployment, so this differs from `lease_id` and is the only value a
+    /// chain call may carry.
+    chain_lease_id: u64,
     kind: ActionKind,
     transaction: Option<PreparedTransaction>,
 }
@@ -719,23 +723,25 @@ impl Worker {
             (
                 Uuid,
                 i64,
+                i64,
                 String,
                 Option<String>,
                 Option<String>,
                 Option<i64>,
             ),
         >(
-            "SELECT action_id, lease_id, kind, raw_transaction, transaction_hash, transaction_nonce \
-             FROM lifecycle_outbox \
-             WHERE attempts < 100 AND available_at <= NOW() \
-               AND (status IN ('queued', 'submitted') \
-                    OR (status = 'processing' AND lease_until <= NOW())) \
-             ORDER BY available_at, created_at LIMIT 1 \
-             FOR UPDATE SKIP LOCKED",
+            "SELECT o.action_id, o.lease_id, l.chain_lease_id, o.kind, \
+                    o.raw_transaction, o.transaction_hash, o.transaction_nonce \
+             FROM lifecycle_outbox o JOIN leases l ON l.lease_id = o.lease_id \
+             WHERE o.attempts < 100 AND o.available_at <= NOW() \
+               AND (o.status IN ('queued', 'submitted') \
+                    OR (o.status = 'processing' AND o.lease_until <= NOW())) \
+             ORDER BY o.available_at, o.created_at LIMIT 1 \
+             FOR UPDATE OF o SKIP LOCKED",
         )
         .fetch_optional(&mut *transaction)
         .await?;
-        let Some((action_id, lease_id, kind, raw, hash, nonce)) = row else {
+        let Some((action_id, lease_id, chain_lease_id, kind, raw, hash, nonce)) = row else {
             transaction.commit().await?;
             return Ok(None);
         };
@@ -763,6 +769,7 @@ impl Worker {
             Ok(Action {
                 action_id,
                 lease_id: u64::try_from(lease_id)?,
+                chain_lease_id: u64::try_from(chain_lease_id)?,
                 kind: ActionKind::parse(&kind)?,
                 transaction,
             })
@@ -1164,7 +1171,7 @@ impl Worker {
                     transaction_hash,
                 });
             }
-            let data = action.kind.calldata(action.lease_id);
+            let data = action.kind.calldata(action.chain_lease_id);
             let prepared = self
                 .chain
                 .prepare_transaction(&self.signer, self.escrow, &data, ROBINHOOD_CHAIN_ID)
@@ -1583,6 +1590,7 @@ impl Worker {
         };
         Ok(SettlementEvidence {
             lease_id,
+            chain_lease_id: context.lease.chain_lease_id,
             lease_nonce: 1,
             node_id: context.lease.node_id,
             device_public_key: context.offer.device_public_key,

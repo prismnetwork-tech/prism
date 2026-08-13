@@ -55,6 +55,13 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const SCHEDULER_LOCK_KEY: i64 = 4_663;
+/// Stands in for a deployed escrow when the store runs without a chain, so a
+/// development lease still carries the same shape of identity as a real one.
+const DEVELOPMENT_ESCROW_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+/// Internal lease ids start here so they can never be mistaken for, or collide
+/// with, an id a superseded escrow handed out. Kept in step with the sequence
+/// floor in `0014_escrow_generation.sql`.
+const INTERNAL_LEASE_ID_FLOOR: u64 = 1_000;
 const AUTH_MAX_AGE_SECONDS: i64 = 60;
 const NODE_MESSAGE_MAX_AGE_SECONDS: i64 = 300;
 const OFFER_MAX_AGE_SECONDS: i64 = 90;
@@ -187,7 +194,10 @@ struct ChainLog {
 }
 
 struct ConfirmedFunding {
+    /// The id the escrow assigned. Unique only within the escrow that issued
+    /// it, which is why the address travels with it.
     lease_id: u64,
+    escrow_address: String,
     renter_wallet: String,
 }
 
@@ -1040,6 +1050,7 @@ impl ChainVerifier {
                     .max(1);
                 Ok(ConfirmedFunding {
                     lease_id,
+                    escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
                     renter_wallet: format!(
                         "0x{}",
                         &transaction_hash[transaction_hash.len() - 40..]
@@ -1293,6 +1304,7 @@ fn decode_funding_event(
         }
         return Ok(ConfirmedFunding {
             lease_id,
+            escrow_address: escrow_address.to_ascii_lowercase(),
             renter_wallet: format!("0x{}", hex::encode(&renter_word[12..])),
         });
     }
@@ -3074,8 +3086,12 @@ impl MarketplaceStore {
             encrypted_jupyter_token,
         } = confirmation;
         let now = Utc::now();
+        // `lease_id` is allocated below, per store, from a space that no
+        // superseded escrow ever used. What the chain issued is kept separately.
         let mut lease = LeaseRecord {
-            lease_id: funding.lease_id,
+            lease_id: 0,
+            chain_lease_id: funding.lease_id,
+            escrow_address: funding.escrow_address.to_ascii_lowercase(),
             quote_id: quote.quote_id,
             node_id: quote.node_id.clone(),
             renter_wallet: funding.renter_wallet.to_ascii_lowercase(),
@@ -3105,7 +3121,14 @@ impl MarketplaceStore {
                 {
                     return Err(StoreError::QuoteUnavailable);
                 }
-                if let Some((owner, current)) = market.leases.get(&lease.lease_id) {
+                // Identity is the escrow plus the id it issued. Matching on the
+                // id alone treats a fresh escrow's lease 3 as a replay of a
+                // superseded escrow's lease 3 and rejects a renter who has
+                // already paid.
+                if let Some((owner, current)) = market.leases.values().find(|(_, current)| {
+                    current.escrow_address == lease.escrow_address
+                        && current.chain_lease_id == lease.chain_lease_id
+                }) {
                     return if owner == subject
                         && current.funding_transaction_hash == lease.funding_transaction_hash
                     {
@@ -3119,6 +3142,14 @@ impl MarketplaceStore {
                 }) {
                     return Err(StoreError::FundingMismatch);
                 }
+                lease.lease_id = market
+                    .leases
+                    .keys()
+                    .copied()
+                    .max()
+                    .unwrap_or(INTERNAL_LEASE_ID_FLOOR)
+                    .saturating_add(1)
+                    .max(INTERNAL_LEASE_ID_FLOOR);
                 if market
                     .leases
                     .values()
@@ -3160,10 +3191,17 @@ impl MarketplaceStore {
                     .execute(&mut *transaction)
                     .await
                     .map_err(StoreError::Storage)?;
+                // Identity is the escrow plus the id it issued. Matching on the
+                // id alone treats a fresh escrow's lease 3 as a replay of a
+                // superseded escrow's lease 3 and rejects a renter who has
+                // already paid.
                 if let Some(SqlJson(current)) = query_scalar::<_, SqlJson<LeaseRecord>>(
-                    "SELECT document FROM leases WHERE lease_id = $1 OR funding_transaction_hash = $2",
+                    "SELECT document FROM leases \
+                     WHERE (escrow_address = $1 AND chain_lease_id = $2) \
+                        OR funding_transaction_hash = $3",
                 )
-                .bind(lease.lease_id as i64)
+                .bind(&lease.escrow_address)
+                .bind(lease.chain_lease_id as i64)
                 .bind(&lease.funding_transaction_hash)
                 .fetch_optional(&mut *transaction)
                 .await
@@ -3177,6 +3215,10 @@ impl MarketplaceStore {
                         Err(StoreError::FundingMismatch)
                     };
                 }
+                lease.lease_id = query_scalar::<_, i64>("SELECT nextval('leases_internal_id_seq')")
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)? as u64;
                 let node_busy = query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
@@ -3235,10 +3277,13 @@ impl MarketplaceStore {
                 }
                 query(
                     "INSERT INTO leases \
-                         (lease_id, quote_id, subject, renter_wallet, funding_transaction_hash, document, state) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                         (lease_id, escrow_address, chain_lease_id, quote_id, subject, \
+                          renter_wallet, funding_transaction_hash, document, state) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 )
                 .bind(lease.lease_id as i64)
+                .bind(&lease.escrow_address)
+                .bind(lease.chain_lease_id as i64)
                 .bind(quote.quote_id)
                 .bind(subject)
                 .bind(&lease.renter_wallet)
@@ -5234,6 +5279,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0013_capacity_prices.sql")),
                 false,
             ),
+            Migration::new(
+                14,
+                Cow::Borrowed("escrow generation"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0014_escrow_generation.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
@@ -5845,6 +5897,8 @@ mod tests {
     fn a_lease_with_a_command_is_dispatched_as_batch() {
         let base = LeaseRecord {
             lease_id: 9,
+            chain_lease_id: 9,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
             quote_id: Uuid::now_v7(),
             node_id: "0xabc".to_owned(),
             renter_wallet: "0xrenter".to_owned(),
@@ -5888,6 +5942,8 @@ mod tests {
     fn a_lease_awaiting_settlement_still_occupies_its_node() {
         let lease = |state| LeaseRecord {
             lease_id: 1,
+            chain_lease_id: 1,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
             quote_id: Uuid::now_v7(),
             node_id: "node".to_owned(),
             renter_wallet: "0x1".to_owned(),
@@ -6349,6 +6405,8 @@ mod tests {
         market.tunnels.insert("only".to_owned(), now);
         let lease = LeaseRecord {
             lease_id: 27,
+            chain_lease_id: 27,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
             quote_id: Uuid::now_v7(),
             node_id: "only".to_owned(),
             renter_wallet: format!("0x{}", "11".repeat(20)),
@@ -6413,6 +6471,8 @@ mod tests {
             let node_id = format!("node-{index}");
             let lease = LeaseRecord {
                 lease_id: index as u64 + 1,
+                chain_lease_id: index as u64 + 1,
+                escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
                 quote_id: Uuid::now_v7(),
                 node_id: node_id.clone(),
                 renter_wallet: format!("0x{}", "11".repeat(20)),
@@ -6535,6 +6595,81 @@ mod tests {
         ));
     }
 
+    /// Production regression. Replacing the escrow restarted its lease counter
+    /// at 1, so a fresh lease 3 arrived while a superseded escrow's lease 3 was
+    /// still on file. Confirm matched on the id alone, called it a replay, and
+    /// rejected a renter whose USDG had already moved on chain. Every id up to
+    /// the old high-water mark would have failed the same way.
+    #[tokio::test]
+    async fn a_reused_chain_lease_id_from_a_new_escrow_is_not_a_replay() {
+        let superseded = "0x71df0ef3bc81022cb3bec0b1a05f52f12bafcded";
+        let current = "0x62c042265991bea17b07229322a01850974626da";
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 222, 100_000));
+        market.tunnels.insert("only".to_owned(), Utc::now());
+        let history = LeaseRecord {
+            lease_id: 3,
+            chain_lease_id: 3,
+            escrow_address: superseded.to_owned(),
+            quote_id: Uuid::now_v7(),
+            node_id: "node".to_owned(),
+            renter_wallet: format!("0x{}", "11".repeat(20)),
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            rate_per_second: 222,
+            maximum_escrow: 13_320,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: format!("0x{}", "cc".repeat(32)),
+            state: LeaseState::Refunded,
+            command: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        market
+            .leases
+            .insert(3, ("someone-else".to_owned(), history));
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: None,
+        };
+        let quote = store.quote("renter", &request, 0).await.unwrap();
+        let confirmed = store
+            .confirm_funding(FundingConfirmation {
+                subject: "renter",
+                quote: &quote,
+                transaction_hash: &format!("0x{}", "dd".repeat(32)),
+                funding: ConfirmedFunding {
+                    lease_id: 3,
+                    escrow_address: current.to_owned(),
+                    renter_wallet: format!("0x{}", "22".repeat(20)),
+                },
+                ssh_authorized_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA",
+                jupyter_token: "token",
+                encrypted_jupyter_token: EncryptedSecret {
+                    nonce: "bm9uY2U".to_owned(),
+                    ciphertext: "Y2lwaGVy".to_owned(),
+                },
+            })
+            .await
+            .expect("a new escrow's lease 3 is a different lease, not a replay");
+
+        assert_eq!(confirmed.chain_lease_id, 3);
+        assert_eq!(confirmed.escrow_address, current);
+        assert_ne!(
+            confirmed.lease_id, 3,
+            "the internal id must not collide with the superseded record"
+        );
+        assert!(confirmed.lease_id >= INTERNAL_LEASE_ID_FLOOR);
+    }
+
     #[test]
     fn dispute_resolution_calldata_is_safe_ready() {
         let calldata =
@@ -6553,6 +6688,8 @@ mod tests {
         let now = Utc::now();
         let lease = LeaseRecord {
             lease_id: 7,
+            chain_lease_id: 7,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
             quote_id: Uuid::now_v7(),
             node_id: node.clone(),
             renter_wallet: format!("0x{}", "11".repeat(20)),
@@ -6649,6 +6786,8 @@ mod tests {
                 subject.to_owned(),
                 LeaseRecord {
                     lease_id: 9,
+                    chain_lease_id: 9,
+                    escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
                     quote_id: Uuid::now_v7(),
                     node_id: "node".to_owned(),
                     renter_wallet: "0x1".to_owned(),
