@@ -34,7 +34,7 @@ console.log("leased", lease.leaseId, "on", lease.access.ssh_host);
 // Write train.py onto the box, install Lightning (torch comes from the image), and run it.
 const remote = [
   `printf %s ${trainScript} | base64 -d > /tmp/train.py`,
-  "python -m pip install --quiet 'lightning>=2.2'",
+  "python -m pip install --quiet 'lightning==2.4.0'",
   "python /tmp/train.py",
 ].join(" && ");
 
