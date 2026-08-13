@@ -279,16 +279,16 @@ async fn main() -> anyhow::Result<()> {
             profile,
             dry_run,
         } => {
-            register(
-                &identity,
-                &rpc_url,
-                &registry,
-                payout_wallet.as_deref(),
+            register(Registration {
+                identity_path: identity,
+                rpc_url,
+                registry,
+                payout_wallet,
                 rate_per_second,
-                &operator_key,
-                &profile,
+                operator_key,
+                profile,
                 dry_run,
-            )
+            })
             .await
         }
         CommandName::Enroll {
@@ -547,16 +547,32 @@ fn create_identity(path: PathBuf) -> anyhow::Result<()> {
 /// perform from the daemon alone, which is why it lives here rather than in a
 /// deployment script: a node operator should never have to install a
 /// Solidity toolchain to join.
-async fn register(
-    identity_path: &Path,
-    rpc_url: &str,
-    registry: &str,
-    payout_wallet: Option<&str>,
+struct Registration {
+    identity_path: PathBuf,
+    rpc_url: String,
+    registry: String,
+    payout_wallet: Option<String>,
     rate_per_second: u128,
-    operator_key: &str,
-    profile: &str,
+    operator_key: String,
+    profile: String,
     dry_run: bool,
-) -> anyhow::Result<()> {
+}
+
+async fn register(request: Registration) -> anyhow::Result<()> {
+    let Registration {
+        identity_path,
+        rpc_url,
+        registry,
+        payout_wallet,
+        rate_per_second,
+        operator_key,
+        profile,
+        dry_run,
+    } = request;
+    let (rpc_url, registry, operator_key, profile) = (&rpc_url, &registry, &operator_key, &profile);
+    let payout_wallet = payout_wallet.as_deref();
+    let identity_path = identity_path.as_path();
+
     if rate_per_second == 0 || rate_per_second > u128::from(u64::MAX) {
         anyhow::bail!("rate must be a positive number of USDG base units per second");
     }
@@ -589,17 +605,18 @@ async fn register(
         &call_data("balanceOf(address)", &[word_address(operator)]),
     )
     .await?;
-    if balance < bond {
-        let shortfall = format!(
+    let shortfall = (balance < bond).then(|| {
+        format!(
             "operator 0x{} holds {} PRISM and the bond for this rate is {} PRISM",
             hex::encode(operator),
             format_token(balance),
             format_token_required(bond)
-        );
-        if !dry_run {
-            anyhow::bail!(shortfall);
-        }
-        println!("{shortfall}");
+        )
+    });
+    if let Some(shortfall) = &shortfall
+        && !dry_run
+    {
+        anyhow::bail!("{shortfall}");
     }
 
     let allowance = read_u256(
@@ -673,12 +690,20 @@ async fn register(
     );
 
     if dry_run {
-        simulate(&rpc, operator, registry_address, &data).await?;
-        println!(
-            "registration is valid: {node} would stake {} PRISM at {rate_per_second} USDG base units per second",
-            format_token_required(bond)
-        );
-        return Ok(());
+        let outcome = simulate(&rpc, operator, registry_address, &data).await;
+        // An unfunded wallet always fails on the bond transfer, and reporting
+        // that as a second failure on top of the balance line reads as two
+        // problems when there is one.
+        if outcome.is_ok() || shortfall.is_some() {
+            println!(
+                "registration is valid: {node} would stake {} PRISM at {rate_per_second} USDG base units per second",
+                format_token_required(bond)
+            );
+        }
+        return match shortfall {
+            Some(shortfall) => Err(anyhow::anyhow!(shortfall)),
+            None => outcome,
+        };
     }
 
     println!(
