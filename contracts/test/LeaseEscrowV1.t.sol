@@ -58,7 +58,7 @@ contract LeaseEscrowV1Test {
 
     function setUp() public {
         usd = new MockUsd();
-        registry = new NodeRegistryV1(usd, address(this), 1_000_000);
+        registry = new NodeRegistryV1(usd, address(this), 4_505, 1_000_000, 100_000_000);
         escrow = new LeaseEscrowV1(
             usd,
             registry,
@@ -80,10 +80,14 @@ contract LeaseEscrowV1Test {
         _registerNode();
     }
 
-    function testRequiredBondIsFlatMinimum() public view {
-        require(registry.requiredBond(1_000) == 1_000_000, "flat minimum applies");
+    function testRequiredBondScalesWithRateInsideTheBand() public view {
+        // 4_505 per unit of rate, floor 1_000_000, ceiling 100_000_000.
+        require(registry.requiredBond(1_000) == 4_505_000, "bond scales with the advertised rate");
+        require(registry.requiredBond(2_000) == 9_010_000, "twice the rate stakes twice as much");
+        require(registry.requiredBond(1) == 1_000_000, "the floor catches rates below it");
         require(
-            registry.requiredBond(type(uint128).max) == 1_000_000, "bond does not scale with rate"
+            registry.requiredBond(type(uint128).max) == 100_000_000,
+            "the ceiling caps an extreme rate rather than reverting"
         );
     }
 
@@ -244,7 +248,7 @@ contract LeaseEscrowV1Test {
         require(!registered, "registration accepted an invalid device binding");
     }
 
-    function testNodeRegistrationAcceptsExtremeRateUnderFlatBond() public {
+    function testNodeRegistrationAcceptsExtremeRateAtTheCeiling() public {
         bytes32 nodeId = keccak256("unbounded-rate-device");
         bytes32 metadataHash = keccak256("unbounded-rate-offer");
         uint128 rate = type(uint128).max;
@@ -276,8 +280,11 @@ contract LeaseEscrowV1Test {
                     )
                 )
             );
-        require(registered, "flat bond should accept any rate");
-        require(registry.getNode(nodeId).bond == 1_000_000, "bond should equal flat minimum");
+        require(registered, "a bounded bond should accept any rate");
+        require(
+            registry.getNode(nodeId).bond == 100_000_000,
+            "an extreme rate stakes the ceiling, not an unpayable figure"
+        );
     }
 
     function testRetiredNodeCanWithdrawItsEntireBond() public {
@@ -373,14 +380,23 @@ contract LeaseEscrowV1Test {
     /// of a millionth of an eighteen decimal token.
     function test_bondTokenIsSeparateFromThePaymentToken() public {
         MockUsd bondToken = new MockUsd();
-        uint256 stake = 1e18;
-        NodeRegistryV1 staked = new NodeRegistryV1(bondToken, address(this), stake);
+        // 50,000 whole tokens at the 222 unit rate the network charges today.
+        uint256 perRateUnit = 225_225_225_225_225_225_225;
+        uint256 stake = perRateUnit * 222;
+        NodeRegistryV1 staked =
+            new NodeRegistryV1(bondToken, address(this), perRateUnit, 1e18, 1_000_000e18);
 
         require(address(staked.bondToken()) == address(bondToken), "bond token is the staked asset");
-        require(staked.minBond() == stake, "bond size is a deployment parameter");
-        require(staked.requiredBond(3_000) == stake, "required bond follows the parameter");
+        require(staked.requiredBond(222) == stake, "bond scales with the advertised rate");
+        require(
+            staked.requiredBond(444) == stake * 2, "twice the rate stakes twice as much"
+        );
+        require(staked.requiredBond(0) == 1e18, "the floor applies when nothing scales");
+        require(
+            staked.requiredBond(type(uint128).max) == 1_000_000e18, "the ceiling caps the bond"
+        );
 
-        bondToken.mint(PROVIDER, stake);
+        bondToken.mint(PROVIDER, perRateUnit * 3_000);
         VM.prank(PROVIDER);
         bondToken.approve(address(staked), type(uint256).max);
 
@@ -398,8 +414,12 @@ contract LeaseEscrowV1Test {
         );
 
         // The stake left the bond token and the payment balance is untouched.
-        require(bondToken.balanceOf(PROVIDER) == 0, "stake was pulled from the bond token");
-        require(bondToken.balanceOf(address(staked)) == stake, "registry holds the stake");
+        uint256 required = staked.requiredBond(3_000);
+        require(bondToken.balanceOf(address(staked)) == required, "registry holds the stake");
+        require(
+            bondToken.balanceOf(PROVIDER) == perRateUnit * 3_000 - required,
+            "stake was pulled from the bond token"
+        );
         require(usd.balanceOf(PROVIDER) == paymentBefore, "payment balance was untouched");
     }
 

@@ -98,7 +98,7 @@ contract DeployLocal {
         address deployer = VM.addr(deployerKey);
         VM.startBroadcast(deployerKey);
         usd = new LocalUsd();
-        registry = new NodeRegistryV1(usd, deployer, 1_000_000);
+        registry = new NodeRegistryV1(usd, deployer, 4_505, 1_000_000, 100_000_000);
         escrow = new LeaseEscrowV1(
             usd,
             registry,
