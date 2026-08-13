@@ -875,12 +875,22 @@ impl Worker {
             self.revoke_access(action.lease_id).await?;
         }
         if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
-            // Funded is the only status expireProvision can act on, and in every
-            // other one the machine belongs to a renter who is using it.
-            if self.lease_status(action.chain_lease_id).await? != 1 {
-                return self.skip_action(&action).await;
+            match self.lease_status(action.chain_lease_id).await? {
+                1 => {
+                    self.destroy_cloud_instance(action.lease_id).await?;
+                }
+                // expireProvision is permissionless, so anyone may have already
+                // released this deposit. Skipping the action alone would leave
+                // the lease open in the database against an escrow that no
+                // longer holds anything for it, which reads as insolvency and
+                // keeps that alarm lit until someone edits the row by hand.
+                status @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
+                    self.destroy_cloud_instance(action.lease_id).await?;
+                    return self.adopt_settled_lease(&action, status).await;
+                }
+                // Anything else belongs to a renter who is still using it.
+                _ => return self.skip_action(&action).await,
             }
-            self.destroy_cloud_instance(action.lease_id).await?;
         }
         if action.kind == ActionKind::Finalize && action.transaction.is_none() {
             match self.lease_status(action.chain_lease_id).await? {
@@ -1831,10 +1841,20 @@ impl Worker {
 
     /// Machines other leases refused recently. Shared because a host that
     /// reserved no forwarded ports will reserve none for the next lease either.
+    /// Machines that refused recently, with a repeat offender kept out longer.
+    ///
+    /// A host that reserves no forwarded ports is misconfigured, not briefly
+    /// busy, so it refuses again the next time it is picked. On a flat window
+    /// the same handful cycle back into the pool every few hours and a renter
+    /// pays for the discovery: three of them in a row exhausts the attempts and
+    /// the lease refunds without ever reaching a machine. Each further refusal
+    /// doubles the exile, to a month.
     async fn recently_rejected_machines(&self) -> anyhow::Result<Vec<i64>> {
         Ok(query_scalar::<_, i64>(
             "SELECT machine_id FROM cloud_machine_rejections \
-             WHERE last_rejected_at > NOW() - make_interval(secs => $1) \
+             WHERE last_rejected_at > NOW() - LEAST( \
+                     make_interval(secs => $1 * POWER(2, LEAST(rejections, 10) - 1)), \
+                     make_interval(days => 30)) \
              ORDER BY last_rejected_at DESC",
         )
         // secs, not hours: make_interval's hours argument is an int, and binding a
