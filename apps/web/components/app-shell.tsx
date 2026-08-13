@@ -10,6 +10,7 @@ const navigation = [
   ["Compute", "/compute"],
   ["Leases", "/leases"],
   ["Vault", "/vault"],
+  ["Stake", "/stake"],
   ["Nodes", "/nodes"],
   ["Earnings", "/earnings"],
   ["Wallets", "/wallets"],
