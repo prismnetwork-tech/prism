@@ -101,8 +101,8 @@ LeaseEscrowV1  0x71Df…cDeD: executable code matches, metadata differs
 | Contract | Address |
 | --- | --- |
 | Canonical USDG | [`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`](https://robinhoodchain.blockscout.com/address/0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168) |
-| `NodeRegistryV1` | [`0xe3b7eF730637763ed46542d41a6C3f83AfC78f01`](https://robinhoodchain.blockscout.com/address/0xe3b7eF730637763ed46542d41a6C3f83AfC78f01) |
-| `LeaseEscrowV1` | [`0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD`](https://robinhoodchain.blockscout.com/address/0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD) |
+| `NodeRegistryV1` | [`0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc`](https://robinhoodchain.blockscout.com/address/0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc) |
+| `LeaseEscrowV1` | [`0x62C042265991bEa17B07229322A01850974626dA`](https://robinhoodchain.blockscout.com/address/0x62C042265991bEa17B07229322A01850974626dA) |
 | Governance Safe | [`0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a`](https://robinhoodchain.blockscout.com/address/0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a) |
 
 Administration, emergency pause and dispute resolution are held by a 2-of-2
@@ -141,7 +141,7 @@ The repository contains:
 - `services`: Rust control plane, access gateway and operations monitor.
 - `workers`: lifecycle, settlement and proof workers.
 - `node/prismd`: independent-node runtime and workspace supervisor.
-- `contracts`: USDG bond, escrow and administration contracts.
+- `contracts`: PRISM bond, USDG escrow and administration contracts.
 - `sdk`: headless agent SDK for wallet-signature USDG leasing.
 - `mcp`: Model Context Protocol server exposing leasing to MCP clients.
 - `x402`: pay-per-job GPU execution over HTTP 402.

@@ -3,7 +3,7 @@
 // a funded lease is always reported by id so it is never silently forgotten.
 //
 //   PRISM_AGENT_KEY=0x<funded agent wallet> \
-//   PRISM_ESCROW=0x71Df0eF3bc81022cB3bec0b1a05f52f12bAfcDeD \
+//   PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
 //   node canary.mjs
 //
 // Tunables (all optional): CANARY_DURATION=600  CANARY_MAX_USDG=0.5
