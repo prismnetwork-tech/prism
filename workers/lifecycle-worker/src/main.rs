@@ -236,8 +236,16 @@ fn candidate_refusal(
     if instance.status != "running" {
         return if stalled { timed_out() } else { None };
     }
+    // Vast fills the forwarded port in some seconds after it starts reporting
+    // the instance as running, so a missing port is only a fault once the host
+    // has had its whole budget to produce one. Machine 23779 was refused for
+    // this and served the very next lease it was offered.
     if instance.direct_port_start <= 0 {
-        return Some("host reserved no forwarded ports, so sshd is unreachable".to_owned());
+        return if stalled {
+            Some("host reserved no forwarded ports, so sshd is unreachable".to_owned())
+        } else {
+            None
+        };
     }
     if stalled { timed_out() } else { None }
 }
@@ -2325,10 +2333,18 @@ mod tests {
             "a timeout must be reported as a timeout, got: {refusal}"
         );
 
-        // Once it is up, the port is real and a missing one is a real fault.
+        // The port arrives some seconds after the instance starts reporting
+        // itself as running, so it is only a fault once the budget is spent.
+        // Machine 23779 was refused inside this gap and then served the very
+        // next lease it was offered.
         let running = booting_instance("running", -1);
-        let refusal = candidate_refusal(&running, true, 16_000, 640_000, &[], false)
-            .expect("a running host with no forwarded port is unusable");
+        assert_eq!(
+            candidate_refusal(&running, true, 16_000, 640_000, &[], false),
+            None,
+            "a host that just came up is still settling, not portless"
+        );
+        let refusal = candidate_refusal(&running, true, 16_000, 640_000, &[], true)
+            .expect("a running host with no port after its whole budget is unusable");
         assert!(refusal.contains("forwarded ports"), "got: {refusal}");
         assert_eq!(
             candidate_refusal(
