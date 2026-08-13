@@ -1802,7 +1802,7 @@ impl MarketplaceStore {
                     .linked_wallets
                     .entry(subject.to_owned())
                     .or_default()
-                    .insert(wallet_address.to_owned());
+                    .insert(wallet_address.to_ascii_lowercase());
                 Ok(())
             }
             Self::Postgres(pool) => {
@@ -1840,11 +1840,14 @@ impl MarketplaceStore {
         match self {
             Self::Memory(market) => {
                 let market = market.read().await;
-                let linked_wallets = market
+                let linked_wallets: BTreeSet<String> = market
                     .linked_wallets
                     .get(subject)
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|wallet| wallet.to_ascii_lowercase())
+                    .collect();
                 let nodes = market
                     .offers
                     .values()
@@ -1876,8 +1879,11 @@ impl MarketplaceStore {
                 })
             }
             Self::Postgres(pool) => {
+                // Offers are matched with LOWER() on the document side, so a
+                // stored address that is not already lowercase would match
+                // nothing and the operator would be told they have no nodes.
                 let linked_wallets = query_scalar::<_, String>(
-                    "SELECT wallet_address FROM account_wallets \
+                    "SELECT LOWER(wallet_address) FROM account_wallets \
                      WHERE subject = $1 AND verified_at IS NOT NULL ORDER BY wallet_address",
                 )
                 .bind(subject)
@@ -2408,7 +2414,7 @@ impl MarketplaceStore {
                     return Err(StoreError::AccountSuspended);
                 }
                 let linked_wallets = query_scalar(
-                    "SELECT wallet_address FROM account_wallets \
+                    "SELECT LOWER(wallet_address) FROM account_wallets \
                      WHERE subject = $1 AND verified_at IS NOT NULL ORDER BY wallet_address",
                 )
                 .bind(&identity.subject)
@@ -3209,7 +3215,7 @@ impl MarketplaceStore {
                      ON CONFLICT (subject, wallet_address) DO UPDATE SET verified_at = NOW()",
                 )
                 .bind(subject)
-                .bind(&lease.renter_wallet)
+                .bind(lease.renter_wallet.to_ascii_lowercase())
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
@@ -5801,6 +5807,35 @@ mod tests {
             staker_only: false,
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_checksummed_linked_wallet_still_finds_its_nodes() {
+        let checksummed = "0xAbC0000000000000000000000000000000000001";
+        let mut market = MemoryMarketplace::default();
+        let mut listing = offer("node-1", 100, 10_000);
+        listing.operator_wallet = checksummed.to_ascii_lowercase();
+        listing.payout_wallet = listing.operator_wallet.clone();
+        market.offers.insert("node-1".to_owned(), listing);
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market
+            .write()
+            .await
+            .linked_wallets
+            .entry("subject-1".to_owned())
+            .or_default()
+            .insert(checksummed.to_owned());
+
+        let summary = store.supplier_summary("subject-1").await.unwrap();
+        assert_eq!(
+            summary.nodes.len(),
+            1,
+            "a wallet is the same wallet in any casing"
+        );
     }
 
     /// The renter chose at quote time whether they wanted a session or a
