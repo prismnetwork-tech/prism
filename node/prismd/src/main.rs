@@ -691,19 +691,26 @@ async fn register(request: Registration) -> anyhow::Result<()> {
 
     if dry_run {
         let outcome = simulate(&rpc, operator, registry_address, &data).await;
-        // An unfunded wallet always fails on the bond transfer, and reporting
-        // that as a second failure on top of the balance line reads as two
-        // problems when there is one.
-        if outcome.is_ok() || shortfall.is_some() {
+        // The bond transfer is the last thing register() does, so it is also
+        // the first thing to fail for an operator who has not funded or
+        // approved yet. Neither says the registration is wrong: the real run
+        // approves, and a shortfall is already reported below. Treat a
+        // transfer failure as expected while either is outstanding, or the
+        // dry run can never pass before the first approval.
+        let expected = shortfall.is_some() || allowance < bond;
+        if outcome.is_ok() || expected {
             println!(
                 "registration is valid: {node} would stake {} PRISM at {rate_per_second} USDG base units per second",
                 format_token_required(bond)
             );
         }
-        return match shortfall {
-            Some(shortfall) => Err(anyhow::anyhow!(shortfall)),
-            None => outcome,
-        };
+        if let Some(shortfall) = shortfall {
+            anyhow::bail!("{shortfall}");
+        }
+        if allowance < bond {
+            println!("the registry is not approved to take the bond yet; the real run approves it");
+        }
+        return if expected { Ok(()) } else { outcome };
     }
 
     println!(
