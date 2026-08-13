@@ -35,7 +35,12 @@ const MAX_REJECTED_MACHINES: usize = 4;
 /// one. A healthy box is reachable inside two minutes; past this it is very
 /// unlikely to make the window, and burning the whole window on it refunds a
 /// lease that a different machine would have served.
-const HOST_BOOT_BUDGET_SECONDS: i64 = 180;
+/// How long a host gets to reach a usable state before the broker gives up on
+/// it and rents another. Measured against real Vast hosts: a cold image pull
+/// puts a healthy machine past three minutes, and the previous 180s budget was
+/// refusing hosts that were simply still booting. Half the provisioning window,
+/// so one bad host still leaves room to try a second.
+const HOST_BOOT_BUDGET_SECONDS: i64 = 300;
 /// How long a machine stays on the shared rejection list. A host that reserves
 /// no forwarded ports is usually misconfigured rather than busy, but hosts do
 /// get fixed, so the list forgets rather than banning anyone permanently.
@@ -183,6 +188,60 @@ impl std::error::Error for StillProvisioning {}
 /// once per instance right after it is created and cleared whenever one is
 /// dropped, which makes it the point this lease started waiting on this
 /// machine. No timestamp means nothing is booting yet, so nothing has stalled.
+/// Why this machine cannot serve the lease, or `None` to keep it.
+///
+/// Ordering matters more than it looks. Vast reports `direct_port_start` as -1
+/// until a host finishes booting, so reading the port before the boot budget
+/// expires condemns a healthy slow host as one that reserved no ports, and the
+/// broker then destroys and blacklists every candidate in turn. A host is only
+/// judged on its ports once it says it is running.
+fn candidate_refusal(
+    instance: &vast::Instance,
+    admits_class: bool,
+    min_vram_mib: u32,
+    ceiling: u64,
+    rejected: &[i64],
+    stalled: bool,
+) -> Option<String> {
+    let timed_out = || {
+        Some(format!(
+            "host was still {} after {HOST_BOOT_BUDGET_SECONDS}s of boot budget",
+            instance.status
+        ))
+    };
+    if !admits_class {
+        return Some(format!(
+            "{} with {} MiB is not a class this broker rents",
+            instance.gpu_name, instance.gpu_ram
+        ));
+    }
+    if instance.gpu_ram < u64::from(min_vram_mib) {
+        return Some(format!(
+            "{} MiB is short of the {} MiB this lease asked for",
+            instance.gpu_ram, min_vram_mib
+        ));
+    }
+    if !instance.verification.eq_ignore_ascii_case("verified") {
+        return Some(format!("host is {}, not verified", instance.verification));
+    }
+    if instance.hourly_micros > ceiling {
+        return Some(format!(
+            "{} micros/hr is over the {} ceiling",
+            instance.hourly_micros, ceiling
+        ));
+    }
+    if rejected.contains(&(instance.machine_id as i64)) {
+        return Some("this lease already rejected the machine".to_owned());
+    }
+    if instance.status != "running" {
+        return if stalled { timed_out() } else { None };
+    }
+    if instance.direct_port_start <= 0 {
+        return Some("host reserved no forwarded ports, so sshd is unreachable".to_owned());
+    }
+    if stalled { timed_out() } else { None }
+}
+
 fn boot_budget_exhausted(attached_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     attached_at.is_some_and(|attached| {
         now.signed_duration_since(attached).num_seconds() > HOST_BOOT_BUDGET_SECONDS
@@ -1069,41 +1128,14 @@ impl Worker {
             // Out of boot budget. Fall through so this machine is destroyed,
             // blacklisted for this lease and replaced, exactly as a refusal is.
         }
-        // A host that reserved no forwarded ports boots the container without a
-        // reachable sshd, and the renter's key is rejected at the Vast proxy. The
-        // machine advertises the ports it failed to hand out, so this is only
-        // knowable once the instance is up: drop it and try the next candidate
-        // rather than failing a paid lease over one bad host.
-        let refusal = if !vast.admits(&instance.gpu_name, instance.gpu_ram) {
-            Some(format!(
-                "{} with {} MiB is not a class this broker rents",
-                instance.gpu_name, instance.gpu_ram
-            ))
-        } else if instance.gpu_ram < u64::from(context.min_vram_mib) {
-            Some(format!(
-                "{} MiB is short of the {} MiB this lease asked for",
-                instance.gpu_ram, context.min_vram_mib
-            ))
-        } else if !instance.verification.eq_ignore_ascii_case("verified") {
-            Some(format!("host is {}, not verified", instance.verification))
-        } else if instance.hourly_micros > vast.ceiling(retail) {
-            Some(format!(
-                "{} micros/hr is over the {} ceiling",
-                instance.hourly_micros,
-                vast.ceiling(retail)
-            ))
-        } else if instance.direct_port_start <= 0 {
-            Some("host reserved no forwarded ports, so sshd is unreachable".to_owned())
-        } else if rejected.contains(&(instance.machine_id as i64)) {
-            Some("this lease already rejected the machine".to_owned())
-        } else if stalled {
-            Some(format!(
-                "host was still {} after {HOST_BOOT_BUDGET_SECONDS}s of boot budget",
-                instance.status
-            ))
-        } else {
-            None
-        };
+        let refusal = candidate_refusal(
+            &instance,
+            vast.admits(&instance.gpu_name, instance.gpu_ram),
+            context.min_vram_mib,
+            vast.ceiling(retail),
+            &rejected,
+            stalled,
+        );
         if let Some(refusal) = refusal {
             vast.destroy(instance_id).await?;
             if rejected.len() + 1 >= MAX_REJECTED_MACHINES {
@@ -2237,6 +2269,58 @@ mod tests {
         value.copy_from_slice(&rate[24..32]);
 
         assert_eq!(u64::from_be_bytes(value), 177);
+    }
+
+    fn booting_instance(status: &str, direct_port_start: i64) -> vast::Instance {
+        vast::Instance {
+            status: status.to_owned(),
+            gpu_name: "RTX A6000".to_owned(),
+            gpu_ram: 49_140,
+            verification: "verified".to_owned(),
+            hourly_micros: 400_000,
+            ssh_host: Some("ssh7.vast.ai".to_owned()),
+            ssh_port: Some(21_238),
+            direct_port_start,
+            machine_id: 37_509,
+        }
+    }
+
+    /// Production regression. Vast reports `direct_port_start` as -1 until a
+    /// host finishes booting. Reading the port before the boot budget expired
+    /// condemned healthy hosts as having reserved no ports, so the broker
+    /// destroyed and blacklisted every candidate in turn and no lease could be
+    /// provisioned at all.
+    #[test]
+    fn a_host_that_is_still_booting_is_not_blamed_for_its_ports() {
+        let loading = booting_instance("loading", -1);
+        assert_eq!(
+            candidate_refusal(&loading, true, 16_000, 640_000, &[], false),
+            None,
+            "a host inside its boot budget is kept, whatever port it reports"
+        );
+        let refusal = candidate_refusal(&loading, true, 16_000, 640_000, &[], true)
+            .expect("a host past its budget is refused");
+        assert!(
+            refusal.contains("boot budget"),
+            "a timeout must be reported as a timeout, got: {refusal}"
+        );
+
+        // Once it is up, the port is real and a missing one is a real fault.
+        let running = booting_instance("running", -1);
+        let refusal = candidate_refusal(&running, true, 16_000, 640_000, &[], false)
+            .expect("a running host with no forwarded port is unusable");
+        assert!(refusal.contains("forwarded ports"), "got: {refusal}");
+        assert_eq!(
+            candidate_refusal(
+                &booting_instance("running", 19_300),
+                true,
+                16_000,
+                640_000,
+                &[],
+                false
+            ),
+            None
+        );
     }
 
     #[test]
