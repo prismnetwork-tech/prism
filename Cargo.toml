@@ -30,7 +30,7 @@ aws-sdk-s3 = { version = "1.138.1", default-features = false, features = ["behav
 axum = "0.8.4"
 base64 = "0.22.1"
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.41", features = ["derive"] }
+clap = { version = "4.5.41", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "serde"] }
 futures = "0.3.31"
 hex = "0.4.3"

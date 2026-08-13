@@ -86,6 +86,10 @@ struct RpcResponse {
 struct RpcError {
     code: i64,
     message: String,
+    /// Revert payload. Without it every failed call is an indistinguishable
+    /// "execution reverted", which hides the contract's own error.
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -125,7 +129,14 @@ impl RpcClient {
             .json::<RpcResponse>()
             .await?;
         if let Some(error) = response.error {
-            anyhow::bail!("RPC {method} failed with {}: {}", error.code, error.message);
+            match error.data {
+                Some(data) => anyhow::bail!(
+                    "RPC {method} failed with {}: {} ({data})",
+                    error.code,
+                    error.message
+                ),
+                None => anyhow::bail!("RPC {method} failed with {}: {}", error.code, error.message),
+            }
         }
         serde_json::from_value(response.result).context("RPC response contains an invalid result")
     }
@@ -296,6 +307,13 @@ impl EthereumSigner {
         Ok(Self::Kms(
             KmsSigner::new(KmsClient::new(&config), key_id).await?,
         ))
+    }
+
+    /// Sign with a key held on the machine. Prism's own services sign through
+    /// KMS, but a node operator runs on hardware they own and has nowhere to
+    /// put a KMS key, so operator-side tools take the private key directly.
+    pub fn local(private_key: &str) -> anyhow::Result<Self> {
+        Ok(Self::Local(LocalSigner::new(private_key)?))
     }
 
     pub fn address(&self) -> [u8; 20] {

@@ -11,6 +11,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
+use prism_chain::{
+    EthereumSigner, Finality, RpcClient, address as chain_address, selector, word_u128,
+};
 use prism_protocol::{
     CommandResult, GpuSpec, IsolationMode, NodeCertificateBundle, NodeCertificateRequest,
     NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport,
@@ -20,10 +23,45 @@ use prism_protocol::{
 use rand::RngCore;
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest as _, Keccak256};
 use tracing_subscriber::EnvFilter;
 
 mod runtime;
 mod tunnel;
+
+/// How long the signed device binding stays valid. Long enough to survive a
+/// slow block, short enough that an abandoned signature cannot be replayed.
+const REGISTRATION_WINDOW_SECONDS: u128 = 3_600;
+/// Seven static words precede the signature in register()'s calldata.
+const SIGNATURE_OFFSET: u128 = 7 * 32;
+const CONFIRMATION_ATTEMPTS: u32 = 40;
+
+/// The registry reverts with custom errors, which reach the operator as a bare
+/// four-byte selector inside an RPC message. Translate the ones a registration
+/// can actually hit.
+const REGISTRY_REVERTS: &[(&str, &str)] = &[
+    (
+        "3a81d6fc",
+        "this device is already registered; retire it before registering again",
+    ),
+    (
+        "30812d42",
+        "the node identity or payout wallet is not acceptable to the registry",
+    ),
+    ("6a43f8d1", "the registry rejected this rate"),
+    (
+        "70793649",
+        "the registration window closed before the transaction landed; run it again",
+    ),
+    (
+        "0c00084b",
+        "the operator key did not sign this device binding",
+    ),
+    (
+        "045c4b02",
+        "the registration is valid but the bond could not be pulled; fund the operator wallet with PRISM and approve the registry",
+    ),
+];
 
 #[derive(Parser)]
 #[command(name = "prismd", about = "Prism Network GPU node daemon")]
@@ -38,6 +76,28 @@ enum CommandName {
     CreateIdentity {
         #[arg(long, default_value = "/var/lib/prismd/device.json")]
         path: PathBuf,
+    },
+    Register {
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long, env = "PRISM_RPC_URL")]
+        rpc_url: String,
+        #[arg(long, env = "PRISM_NODE_REGISTRY_ADDRESS")]
+        registry: String,
+        /// Wallet that receives provider payouts. Defaults to the operator.
+        #[arg(long)]
+        payout_wallet: Option<String>,
+        #[arg(long)]
+        rate_per_second: u128,
+        /// Hex-encoded key of the wallet that posts the bond. It signs the
+        /// device binding and pays gas, and it stays on this machine.
+        #[arg(long, env = "PRISM_OPERATOR_KEY", hide_env_values = true)]
+        operator_key: String,
+        #[arg(long, default_value = "prism.node.v1")]
+        profile: String,
+        /// Check the registration against the chain without spending anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     Enroll {
         #[arg(long)]
@@ -209,6 +269,28 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         CommandName::Preflight => preflight(),
         CommandName::CreateIdentity { path } => create_identity(path),
+        CommandName::Register {
+            identity,
+            rpc_url,
+            registry,
+            payout_wallet,
+            rate_per_second,
+            operator_key,
+            profile,
+            dry_run,
+        } => {
+            register(
+                &identity,
+                &rpc_url,
+                &registry,
+                payout_wallet.as_deref(),
+                rate_per_second,
+                &operator_key,
+                &profile,
+                dry_run,
+            )
+            .await
+        }
         CommandName::Enroll {
             identity,
             control_plane,
@@ -454,6 +536,157 @@ fn create_identity(path: PathBuf) -> anyhow::Result<()> {
     fs::write(&path, serde_json::to_string(&identity)?)?;
 
     println!("{}", node_id(&key.verifying_key()));
+    Ok(())
+}
+
+/// Post the bond that makes this device schedulable.
+///
+/// The registry will not accept an enrollment the operator has not signed, and
+/// the control plane will not accept a node the registry has not bonded, so
+/// this has to happen before `enroll`. It is the one step an operator cannot
+/// perform from the daemon alone, which is why it lives here rather than in a
+/// deployment script: a node operator should never have to install a
+/// Solidity toolchain to join.
+async fn register(
+    identity_path: &Path,
+    rpc_url: &str,
+    registry: &str,
+    payout_wallet: Option<&str>,
+    rate_per_second: u128,
+    operator_key: &str,
+    profile: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if rate_per_second == 0 || rate_per_second > u128::from(u64::MAX) {
+        anyhow::bail!("rate must be a positive number of USDG base units per second");
+    }
+    let identity = load_identity(identity_path)?;
+    let device_key = signing_key(&identity)?;
+    let node = node_id(&device_key.verifying_key());
+    let node_word = bytes32(&node)?;
+
+    let rpc = RpcClient::new(rpc_url)?;
+    let signer = EthereumSigner::local(operator_key)?;
+    let operator = signer.address();
+    let payout = match payout_wallet {
+        Some(value) => chain_address(value)?,
+        None => operator,
+    };
+    let registry_address = chain_address(registry)?;
+    let chain_id = rpc.chain_id().await?;
+
+    let bond_token = read_address(&rpc, registry_address, &call_data("bondToken()", &[])).await?;
+    let bond = read_u256(
+        &rpc,
+        registry_address,
+        &call_data("requiredBond(uint128)", &[word_u128(rate_per_second)]),
+    )
+    .await?;
+
+    let balance = read_u256(
+        &rpc,
+        bond_token,
+        &call_data("balanceOf(address)", &[word_address(operator)]),
+    )
+    .await?;
+    if balance < bond {
+        let shortfall = format!(
+            "operator 0x{} holds {} PRISM and the bond for this rate is {} PRISM",
+            hex::encode(operator),
+            format_token(balance),
+            format_token_required(bond)
+        );
+        if !dry_run {
+            anyhow::bail!(shortfall);
+        }
+        println!("{shortfall}");
+    }
+
+    let allowance = read_u256(
+        &rpc,
+        bond_token,
+        &call_data(
+            "allowance(address,address)",
+            &[word_address(operator), word_address(registry_address)],
+        ),
+    )
+    .await?;
+    if allowance < bond && !dry_run {
+        println!(
+            "approving {} PRISM for the registry",
+            format_token_required(bond)
+        );
+        send(
+            &rpc,
+            &signer,
+            bond_token,
+            &call_data(
+                "approve(address,uint256)",
+                &[word_address(registry_address), word_u256(bond)],
+            ),
+            chain_id,
+        )
+        .await?;
+    }
+
+    let nonce = read_u256(
+        &rpc,
+        registry_address,
+        &call_data("enrollmentNonces(address)", &[word_address(operator)]),
+    )
+    .await?;
+    let head = rpc
+        .quantity("eth_blockNumber", serde_json::json!([]))
+        .await?;
+    let deadline = u128::from(rpc.block_timestamp(head).await?) + REGISTRATION_WINDOW_SECONDS;
+    let metadata = keccak(profile.as_bytes());
+
+    // Ask the registry for the digest rather than rebuilding EIP-712 here. The
+    // domain separator is bound to the deployed contract, so recomputing it
+    // locally is a second place to get the migration wrong.
+    let digest = read_word(
+        &rpc,
+        registry_address,
+        &call_data(
+            "enrollmentDigest(bytes32,bytes32,address,address,uint128,bytes32,uint256,uint256)",
+            &[
+                node_word,
+                node_word,
+                word_address(operator),
+                word_address(payout),
+                word_u128(rate_per_second),
+                metadata,
+                word_u256(nonce),
+                word_u256(deadline),
+            ],
+        ),
+    )
+    .await?;
+    let signature = signer.sign_digest(&digest).await?;
+    let data = register_calldata(
+        node_word,
+        payout,
+        rate_per_second,
+        metadata,
+        deadline,
+        &signature,
+    );
+
+    if dry_run {
+        simulate(&rpc, operator, registry_address, &data).await?;
+        println!(
+            "registration is valid: {node} would stake {} PRISM at {rate_per_second} USDG base units per second",
+            format_token_required(bond)
+        );
+        return Ok(());
+    }
+
+    println!(
+        "staking {} PRISM against {node}",
+        format_token_required(bond)
+    );
+    let hash = send(&rpc, &signer, registry_address, &data, chain_id).await?;
+    println!("{hash}");
     Ok(())
 }
 
@@ -1032,6 +1265,175 @@ async fn report_command(
     }
 }
 
+/// `register` is the only call here with a dynamic argument, so it is the only
+/// one where a hand-rolled encoding can be wrong in a way that still submits.
+fn register_calldata(
+    node: [u8; 32],
+    payout: [u8; 20],
+    rate_per_second: u128,
+    metadata: [u8; 32],
+    deadline: u128,
+    signature: &[u8; 65],
+) -> Vec<u8> {
+    let mut data = call_data(
+        "register(bytes32,bytes32,address,uint128,bytes32,uint256,bytes)",
+        &[
+            node,
+            node,
+            word_address(payout),
+            word_u128(rate_per_second),
+            metadata,
+            word_u256(deadline),
+            word_u256(SIGNATURE_OFFSET),
+        ],
+    );
+    data.extend_from_slice(&word_u256(signature.len() as u128));
+    data.extend_from_slice(signature);
+    data.extend_from_slice(&[0_u8; 32 - (65 % 32)]);
+    data
+}
+
+fn call_data(signature: &str, words: &[[u8; 32]]) -> Vec<u8> {
+    let mut data = selector(signature).to_vec();
+    for word in words {
+        data.extend_from_slice(word);
+    }
+    data
+}
+
+async fn read_word(rpc: &RpcClient, to: [u8; 20], data: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let result: String = rpc
+        .call(
+            "eth_call",
+            serde_json::json!([{
+                "to": format!("0x{}", hex::encode(to)),
+                "data": format!("0x{}", hex::encode(data)),
+            }, "latest"]),
+        )
+        .await?;
+    let bytes = hex::decode(
+        result
+            .strip_prefix("0x")
+            .context("call result is not hex")?,
+    )?;
+    bytes
+        .get(..32)
+        .context("call returned fewer than 32 bytes")?
+        .try_into()
+        .map_err(Into::into)
+}
+
+/// Run the call without submitting it. The registry checks the operator
+/// signature before it moves any tokens, so a revert here separates a
+/// registration that is wrong from one that is merely unfunded.
+async fn simulate(
+    rpc: &RpcClient,
+    from: [u8; 20],
+    to: [u8; 20],
+    data: &[u8],
+) -> anyhow::Result<()> {
+    let result: anyhow::Result<String> = rpc
+        .call(
+            "eth_call",
+            serde_json::json!([{
+                "from": format!("0x{}", hex::encode(from)),
+                "to": format!("0x{}", hex::encode(to)),
+                "data": format!("0x{}", hex::encode(data)),
+            }, "latest"]),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            for (selector, reason) in REGISTRY_REVERTS {
+                if message.contains(selector) {
+                    anyhow::bail!("{reason}");
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn read_u256(rpc: &RpcClient, to: [u8; 20], data: &[u8]) -> anyhow::Result<u128> {
+    let word = read_word(rpc, to, data).await?;
+    if word[..16].iter().any(|byte| *byte != 0) {
+        anyhow::bail!("chain returned a value larger than this tool can represent");
+    }
+    Ok(u128::from_be_bytes(word[16..].try_into()?))
+}
+
+async fn read_address(rpc: &RpcClient, to: [u8; 20], data: &[u8]) -> anyhow::Result<[u8; 20]> {
+    let word = read_word(rpc, to, data).await?;
+    word[12..].try_into().map_err(Into::into)
+}
+
+async fn send(
+    rpc: &RpcClient,
+    signer: &EthereumSigner,
+    to: [u8; 20],
+    data: &[u8],
+    chain_id: u64,
+) -> anyhow::Result<String> {
+    let transaction = rpc.prepare_transaction(signer, to, data, chain_id).await?;
+    rpc.submit(&transaction).await?;
+    for _ in 0..CONFIRMATION_ATTEMPTS {
+        match rpc.finality(&transaction.transaction_hash, 1).await? {
+            Finality::Confirmed { .. } => return Ok(transaction.transaction_hash),
+            Finality::Reverted { .. } => {
+                anyhow::bail!("{} reverted on chain", transaction.transaction_hash)
+            }
+            Finality::Pending => tokio::time::sleep(Duration::from_secs(3)).await,
+        }
+    }
+    anyhow::bail!(
+        "{} did not confirm in time; check it before retrying so the bond is not posted twice",
+        transaction.transaction_hash
+    )
+}
+
+fn bytes32(value: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{value} is not 32 bytes"))
+}
+
+fn word_address(value: [u8; 20]) -> [u8; 32] {
+    let mut word = [0_u8; 32];
+    word[12..].copy_from_slice(&value);
+    word
+}
+
+fn word_u256(value: u128) -> [u8; 32] {
+    word_u128(value)
+}
+
+fn keccak(value: &[u8]) -> [u8; 32] {
+    Keccak256::digest(value).into()
+}
+
+/// Whole tokens with the fractional part trimmed, for messages an operator
+/// reads. Never use this to decide anything.
+fn format_token(value: u128) -> String {
+    let whole = value / 10_u128.pow(18);
+    let fraction = (value % 10_u128.pow(18)) / 10_u128.pow(14);
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction:04}")
+    }
+}
+
+/// Same, rounded up. A required amount displayed with its remainder trimmed is
+/// a figure that does not actually cover the requirement, and the operator
+/// finds out by having the transaction revert.
+fn format_token_required(value: u128) -> String {
+    let unit = 10_u128.pow(14);
+    format_token(value.div_ceil(unit).saturating_mul(unit))
+}
+
 fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -1161,4 +1563,50 @@ async fn require_success(response: reqwest::Response) -> anyhow::Result<()> {
     let message = response.text().await.unwrap_or_default();
     let message: String = message.chars().take(512).collect();
     anyhow::bail!("control plane returned {status}: {message}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fixture from `cast calldata "register(bytes32,bytes32,address,uint128,
+    /// bytes32,uint256,bytes)" …`. A dynamic argument encoded with the wrong
+    /// offset or padding still forms a submittable transaction, so the bond
+    /// would be spent on a revert.
+    #[test]
+    fn register_calldata_matches_the_abi() {
+        let encoded = register_calldata(
+            [0x11; 32],
+            [0x22; 20],
+            222,
+            keccak(b"prism.node.v1"),
+            1_786_000_000,
+            &[0xab; 65],
+        );
+        assert_eq!(
+            hex::encode(encoded),
+            concat!(
+                "72823952",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "0000000000000000000000002222222222222222222222222222222222222222",
+                "00000000000000000000000000000000000000000000000000000000000000de",
+                "bb5d358fded812560c14b46b7578c469283069d2892aecc7fd5680b29557255f",
+                "000000000000000000000000000000000000000000000000000000006a743280",
+                "00000000000000000000000000000000000000000000000000000000000000e0",
+                "0000000000000000000000000000000000000000000000000000000000000041",
+                "abababababababababababababababababababababababababababababababab",
+                "abababababababababababababababababababababababababababababababab",
+                "ab000000000000000000000000000000000000000000000000000000000000",
+                "00",
+            )
+        );
+    }
+
+    #[test]
+    fn token_amounts_render_for_humans() {
+        assert_eq!(format_token(50_000 * 10_u128.pow(18)), "50000");
+        assert_eq!(format_token(1_500_000_000_000_000_000), "1.5000");
+        assert_eq!(format_token(0), "0");
+    }
 }
