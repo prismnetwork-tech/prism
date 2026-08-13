@@ -5,7 +5,7 @@ use std::{
     env, fs,
     net::SocketAddr,
     path::Path as FilePath,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::Context;
@@ -1090,6 +1090,44 @@ impl ChainVerifier {
 /// wrong selector reads as "nobody has staked anything" rather than as an
 /// error, and every staker would quietly lose their discount.
 const ELIGIBLE_STAKE_SELECTOR: &str = "fc786d81";
+
+/// Node ids set aside for renters who stake, read once at startup from
+/// `PRISM_STAKER_NODE_IDS`. Marking capacity here rather than at enrolment
+/// means the pool can be changed by restarting the service, and a node that
+/// leaves the list goes straight back to serving everyone.
+static STAKER_NODE_IDS: OnceLock<BTreeSet<String>> = OnceLock::new();
+
+fn staker_node_ids() -> &'static BTreeSet<String> {
+    STAKER_NODE_IDS.get_or_init(|| {
+        let ids: BTreeSet<String> = env::var("PRISM_STAKER_NODE_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|id| id.trim().to_ascii_lowercase())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            tracing::info!(
+                "no staker-only capacity configured; every renter prices at the published rate"
+            );
+        } else {
+            tracing::info!(count = ids.len(), "staker-only capacity configured");
+        }
+        ids
+    })
+}
+
+/// Applied when offers are read so the pool reflects current configuration
+/// rather than whatever was true when a node enrolled.
+fn mark_staker_capacity(mut offers: Vec<NodeOffer>) -> Vec<NodeOffer> {
+    let staker = staker_node_ids();
+    if staker.is_empty() {
+        return offers;
+    }
+    for offer in &mut offers {
+        offer.staker_only = staker.contains(&offer.node_id.to_ascii_lowercase());
+    }
+    offers
+}
 
 #[derive(Clone)]
 enum StakeReader {
@@ -2511,7 +2549,12 @@ impl MarketplaceStore {
         }
     }
 
+    /// Offers as served, with the staker pool marked from configuration.
     async fn list_offers(&self) -> Result<Vec<NodeOffer>, StoreError> {
+        self.raw_offers().await.map(mark_staker_capacity)
+    }
+
+    async fn raw_offers(&self) -> Result<Vec<NodeOffer>, StoreError> {
         let cutoff = Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS);
         match self {
             Self::Memory(market) => {
@@ -2868,6 +2911,9 @@ impl MarketplaceStore {
                         offer
                     })
                     .collect::<Vec<_>>();
+                // The matcher reads offers directly, so the staker pool has to
+                // be marked here too: this is where the gate actually runs.
+                let offers = mark_staker_capacity(offers);
                 let quote =
                     quote_for_offers(request, offers.iter(), &reserved, staked_whole_tokens)?;
                 market
@@ -2953,6 +2999,7 @@ impl MarketplaceStore {
                         offer
                     })
                     .collect();
+                let offers = mark_staker_capacity(offers);
                 let quote =
                     quote_for_offers(request, offers.iter(), &reserved, staked_whole_tokens)?;
                 query(
@@ -6838,6 +6885,49 @@ mod tests {
 
         assert_eq!(write.min_trust_class, DEFAULT_VAULT_TRUST_FLOOR);
         assert!(write.previous_version.is_none());
+    }
+
+    // Marking has to happen wherever offers are read for matching. An earlier
+    // cut applied it only in list_offers, which the matcher does not use, so
+    // the pool would have been advertised and then ignored at the gate.
+    #[test]
+    fn configured_capacity_is_marked_and_the_rest_is_left_alone() {
+        let pool = offer("0xPOOL", 177, 10_000);
+        let ordinary = offer("0xother", 222, 10_000);
+        assert!(
+            !pool.staker_only && !ordinary.staker_only,
+            "flag is off by default"
+        );
+
+        // Set from configuration, matched case-insensitively.
+        let marked = {
+            let ids: BTreeSet<String> = ["0xpool".to_owned()].into_iter().collect();
+            let mut offers = vec![pool.clone(), ordinary.clone()];
+            for entry in &mut offers {
+                entry.staker_only = ids.contains(&entry.node_id.to_ascii_lowercase());
+            }
+            offers
+        };
+        assert!(marked[0].staker_only, "configured node was not marked");
+        assert!(!marked[1].staker_only, "an unconfigured node was marked");
+
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ef".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1_024,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: None,
+        };
+
+        // Unstaked renters get the ordinary node and never the pool.
+        let quote = quote_for_offers(&request, marked.iter(), &BTreeSet::new(), 0).unwrap();
+        assert_eq!(quote.node_id, "0xother");
+
+        // The top tier reaches the pool and pays the lower rate.
+        let quote = quote_for_offers(&request, marked.iter(), &BTreeSet::new(), 250_000).unwrap();
+        assert_eq!(quote.node_id, "0xPOOL");
+        assert_eq!(quote.rate_per_second, 177);
     }
 
     #[test]
