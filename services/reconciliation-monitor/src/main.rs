@@ -542,8 +542,9 @@ impl Report {
 async fn reconcile(pool: &PgPool, chain: Option<&ChainReader>) -> anyhow::Result<Report> {
     let mut report = Report::default();
 
+    // chain_lease_id, because every value here is handed straight to getLease.
     let open_leases = query_as::<_, (i64, String)>(
-        "SELECT lease_id, state FROM leases \
+        "SELECT chain_lease_id, state FROM leases \
          WHERE state NOT IN ('finalized', 'refunded', 'failed') ORDER BY lease_id",
     )
     .fetch_all(pool)

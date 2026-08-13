@@ -86,6 +86,19 @@ struct Worker {
     last_orphan_sweep: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
+/// An id the escrow issued. Kept distinct from the internal `lease_id` in the
+/// type system because the escrow's counter restarts whenever it is redeployed,
+/// and passing the wrong one addresses a chain call to another lease or to none
+/// at all. Both mistakes have reached production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainLeaseId(u64);
+
+impl ChainLeaseId {
+    fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 struct Action {
     action_id: Uuid,
@@ -93,7 +106,7 @@ struct Action {
     /// What the escrow numbered this lease. Escrow counters restart on
     /// redeployment, so this differs from `lease_id` and is the only value a
     /// chain call may carry.
-    chain_lease_id: u64,
+    chain_lease_id: ChainLeaseId,
     kind: ActionKind,
     transaction: Option<PreparedTransaction>,
 }
@@ -388,17 +401,24 @@ impl Worker {
             return Ok(());
         }
         let floor = highest.saturating_sub(ORPHAN_SCAN_DEPTH).max(1);
-        let known: Vec<i64> = query_scalar("SELECT lease_id FROM leases WHERE lease_id >= $1")
-            .bind(floor as i64)
-            .fetch_all(&self.pool)
-            .await?;
+        // Ids from the escrow, compared against ids the escrow issued. Reading
+        // the internal key here would make every recorded lease look orphaned
+        // and refund leases that are running.
+        let known: Vec<i64> = query_scalar(
+            "SELECT chain_lease_id FROM leases \
+             WHERE escrow_address = $1 AND chain_lease_id >= $2",
+        )
+        .bind(format!("0x{}", hex::encode(self.escrow)))
+        .bind(floor as i64)
+        .fetch_all(&self.pool)
+        .await?;
         let now = Utc::now().timestamp() as u64;
 
         for lease_id in floor..=highest {
             if known.contains(&(lease_id as i64)) {
                 continue;
             }
-            let lease = self.lease_summary(lease_id).await?;
+            let lease = self.lease_summary(ChainLeaseId(lease_id)).await?;
             if !expirable(lease, now) {
                 continue;
             }
@@ -406,7 +426,8 @@ impl Worker {
                 lease_id,
                 "expiring a lease the escrow holds and this control plane never recorded"
             );
-            self.expire_provision_onchain(lease_id).await?;
+            self.expire_provision_onchain(ChainLeaseId(lease_id))
+                .await?;
         }
         Ok(())
     }
@@ -458,10 +479,10 @@ impl Worker {
         Ok(u64::from_be_bytes(word))
     }
 
-    async fn lease_summary(&self, lease_id: u64) -> anyhow::Result<OnchainLease> {
+    async fn lease_summary(&self, lease_id: ChainLeaseId) -> anyhow::Result<OnchainLease> {
         let mut data = Vec::with_capacity(36);
         data.extend_from_slice(&selector("getLease(uint256)"));
-        data.extend_from_slice(&word_u128(u128::from(lease_id)));
+        data.extend_from_slice(&word_u128(u128::from(lease_id.get())));
         let encoded: String = self
             .chain
             .call(
@@ -476,13 +497,13 @@ impl Worker {
         decode_lease(&bytes)
     }
 
-    async fn expire_provision_onchain(&self, lease_id: u64) -> anyhow::Result<()> {
+    async fn expire_provision_onchain(&self, lease_id: ChainLeaseId) -> anyhow::Result<()> {
         let reason: [u8; 32] =
             Keccak256::digest(b"prism: funded on chain, never confirmed to the control plane")
                 .into();
         let mut data = Vec::with_capacity(68);
         data.extend_from_slice(&selector("expireProvision(uint256,bytes32)"));
-        data.extend_from_slice(&word_u128(u128::from(lease_id)));
+        data.extend_from_slice(&word_u128(u128::from(lease_id.get())));
         data.extend_from_slice(&word_bytes32(reason));
 
         let mut connection = self.pool.acquire().await?;
@@ -505,7 +526,7 @@ impl Worker {
             .await;
         unlock?;
         let hash = result?;
-        tracing::warn!(lease_id, %hash, "refunded an unrecorded lease and released its node");
+        tracing::warn!(lease_id = lease_id.get(), %hash, "refunded an unrecorded lease and released its node");
         Ok(())
     }
 
@@ -769,7 +790,7 @@ impl Worker {
             Ok(Action {
                 action_id,
                 lease_id: u64::try_from(lease_id)?,
-                chain_lease_id: u64::try_from(chain_lease_id)?,
+                chain_lease_id: ChainLeaseId(u64::try_from(chain_lease_id)?),
                 kind: ActionKind::parse(&kind)?,
                 transaction,
             })
@@ -797,13 +818,13 @@ impl Worker {
         if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
             // Funded is the only status expireProvision can act on, and in every
             // other one the machine belongs to a renter who is using it.
-            if self.lease_status(action.lease_id).await? != 1 {
+            if self.lease_status(action.chain_lease_id).await? != 1 {
                 return self.skip_action(&action).await;
             }
             self.destroy_cloud_instance(action.lease_id).await?;
         }
         if action.kind == ActionKind::Finalize && action.transaction.is_none() {
-            match self.lease_status(action.lease_id).await? {
+            match self.lease_status(action.chain_lease_id).await? {
                 4 => {
                     self.mark_disputed(&action).await?;
                     return Ok(());
@@ -1661,10 +1682,10 @@ impl Worker {
         })
     }
 
-    async fn lease_status(&self, lease_id: u64) -> anyhow::Result<u8> {
+    async fn lease_status(&self, lease_id: ChainLeaseId) -> anyhow::Result<u8> {
         let mut data = Vec::with_capacity(36);
         data.extend_from_slice(&selector("getLease(uint256)"));
-        data.extend_from_slice(&word_u128(u128::from(lease_id)));
+        data.extend_from_slice(&word_u128(u128::from(lease_id.get())));
         let encoded: String = self
             .chain
             .call(
@@ -1877,7 +1898,7 @@ impl ActionKind {
         }
     }
 
-    fn calldata(self, lease_id: u64) -> Vec<u8> {
+    fn calldata(self, lease_id: ChainLeaseId) -> Vec<u8> {
         let (signature, reason) = match self {
             Self::StartAccess => ("startAccess(uint256)", None),
             Self::CloseAccess => ("closeAccess(uint256)", None),
@@ -1890,7 +1911,7 @@ impl ActionKind {
         };
         let mut data = Vec::with_capacity(68);
         data.extend_from_slice(&selector(signature));
-        data.extend_from_slice(&word_u128(u128::from(lease_id)));
+        data.extend_from_slice(&word_u128(u128::from(lease_id.get())));
         if let Some(reason) = reason {
             data.extend_from_slice(&reason);
         }
@@ -2118,11 +2139,11 @@ mod tests {
 
     #[test]
     fn lifecycle_calldata_uses_exact_contract_selectors() {
-        let data = ActionKind::StartAccess.calldata(7);
+        let data = ActionKind::StartAccess.calldata(ChainLeaseId(7));
         assert_eq!(&data[..4], &selector("startAccess(uint256)"));
         assert_eq!(&data[4..], &word_u128(7));
 
-        let expiry = ActionKind::ExpireProvision.calldata(7);
+        let expiry = ActionKind::ExpireProvision.calldata(ChainLeaseId(7));
         assert_eq!(&expiry[..4], &selector("expireProvision(uint256,bytes32)"));
         assert_eq!(expiry.len(), 68);
     }
