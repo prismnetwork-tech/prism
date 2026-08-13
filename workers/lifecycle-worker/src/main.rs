@@ -875,12 +875,22 @@ impl Worker {
             self.revoke_access(action.lease_id).await?;
         }
         if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
-            // Funded is the only status expireProvision can act on, and in every
-            // other one the machine belongs to a renter who is using it.
-            if self.lease_status(action.chain_lease_id).await? != 1 {
-                return self.skip_action(&action).await;
+            match self.lease_status(action.chain_lease_id).await? {
+                1 => {
+                    self.destroy_cloud_instance(action.lease_id).await?;
+                }
+                // expireProvision is permissionless, so anyone may have already
+                // released this deposit. Skipping the action alone would leave
+                // the lease open in the database against an escrow that no
+                // longer holds anything for it, which reads as insolvency and
+                // keeps that alarm lit until someone edits the row by hand.
+                status @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
+                    self.destroy_cloud_instance(action.lease_id).await?;
+                    return self.adopt_settled_lease(&action, status).await;
+                }
+                // Anything else belongs to a renter who is still using it.
+                _ => return self.skip_action(&action).await,
             }
-            self.destroy_cloud_instance(action.lease_id).await?;
         }
         if action.kind == ActionKind::Finalize && action.transaction.is_none() {
             match self.lease_status(action.chain_lease_id).await? {
