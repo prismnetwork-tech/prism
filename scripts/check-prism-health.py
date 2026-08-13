@@ -117,6 +117,46 @@ def check_stuck(alarms, container, settlement_seconds, provisioning_seconds):
         )
 
 
+def check_unconfirmed(alarms, rpc_url, escrow, grace_seconds, depth):
+    """Ask the escrow, not our database, whether anyone has paid and got nothing.
+
+    The stuck-lease checks read the leases table, so they can only see leases we
+    managed to record. When confirmation itself is what breaks, the renter's
+    money moves on chain and no row is ever written, and every database-shaped
+    check stays green through a total outage. That is not hypothetical: lease
+    IDs from a redeployed escrow collided with a previous deployment's history,
+    confirmation rejected every one of them, and nothing here noticed.
+    """
+    if not escrow:
+        alarms.append(
+            Alarm("unconfigured", "PRISM_LEASE_ESCROW_ADDRESS is empty, so nothing watches funding")
+        )
+        return
+
+    def call(data):
+        return rpc(rpc_url, "eth_call", [{"to": escrow, "data": data}, "latest"])
+
+    count = int(call("0xb4c0498b"), 16)
+    now = int(time.time())
+    abandoned = []
+    for lease_id in range(count, max(count - depth, 0), -1):
+        words = call(f"0x9f44657c{lease_id:064x}")[2:]
+        status = int(words[13 * 64 : 14 * 64], 16)
+        created_at = int(words[6 * 64 : 7 * 64], 16)
+        # Funded, and past the point where provisioning should have moved it on.
+        if status == 1 and now - created_at > grace_seconds:
+            abandoned.append(lease_id)
+
+    if abandoned:
+        alarms.append(
+            Alarm(
+                "unconfirmed",
+                f"escrow lease(s) {', '.join(str(one) for one in sorted(abandoned))} were funded "
+                f"over {grace_seconds // 60} minutes ago and never started",
+            )
+        )
+
+
 def check_signers(alarms, rpc_url, signers, floor_wei):
     """A signer that cannot pay for gas stops releasing money, and the leases it
     abandons look fine in every other way."""
@@ -236,6 +276,11 @@ def main():
     minimum_supply = int(os.environ.get("PRISM_ALERT_MIN_RENTABLE", "1"))
     settlement_seconds = int(os.environ.get("PRISM_ALERT_SETTLEMENT_SECONDS", "1800"))
     provisioning_seconds = int(os.environ.get("PRISM_ALERT_PROVISIONING_SECONDS", "900"))
+    escrow = os.environ.get("PRISM_LEASE_ESCROW_ADDRESS", "").strip()
+    # The escrow refunds an unprovisioned lease after ten minutes, so anything
+    # still funded past that was abandoned rather than merely slow.
+    unconfirmed_seconds = int(os.environ.get("PRISM_ALERT_UNCONFIRMED_SECONDS", "900"))
+    unconfirmed_depth = int(os.environ.get("PRISM_ALERT_UNCONFIRMED_DEPTH", "25"))
     gas_floor = int(float(os.environ.get("PRISM_ALERT_GAS_FLOOR_ETH", "0.0005")) * 1e18)
     credit_floor = float(os.environ.get("PRISM_ALERT_CREDIT_FLOOR_USD", "25"))
     signers = parse_signers(os.environ.get("PRISM_ALERT_SIGNERS", ""))
@@ -244,6 +289,7 @@ def main():
     probes = (
         ("supply", lambda: check_supply(alarms, arguments.container, minimum_supply)),
         ("stuck", lambda: check_stuck(alarms, arguments.container, settlement_seconds, provisioning_seconds)),
+        ("unconfirmed", lambda: check_unconfirmed(alarms, rpc_url, escrow, unconfirmed_seconds, unconfirmed_depth)),
         ("signers", lambda: check_signers(alarms, rpc_url, signers, gas_floor)),
         ("credit", lambda: check_provider_credit(alarms, os.environ.get("VAST_API_KEY"), credit_floor)),
         ("reconcile", lambda: check_reconciliation(alarms, metrics_url)),
