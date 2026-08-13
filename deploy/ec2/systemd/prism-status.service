@@ -1,0 +1,9 @@
+[Unit]
+Description=Record and publish the Prism status history
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/prism/alerts.env
+ExecStart=/usr/local/sbin/publish-status.py

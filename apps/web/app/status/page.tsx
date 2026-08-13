@@ -1,161 +1,162 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { InformationPage, InformationSection } from "@/components/information-page";
-import { controlPlaneUrl } from "@/lib/control-plane";
-import { isPublicProofIndex } from "@/lib/proof";
-import { type Capacity, type LatestSettlement, incidents, since, summarize } from "@/lib/status";
-import { siteUrl } from "@/lib/site";
+import { PublicFooter } from "@/components/public-footer";
+import { docsUrl, siteUrl } from "@/lib/site";
+import {
+  type StatusComponent,
+  type StatusIndex,
+  STATUS_LABEL,
+  formatUptime,
+  headline,
+  incidents,
+  isStatusIndex,
+  overall,
+  strip,
+  uptime,
+} from "@/lib/status";
+import "./status.css";
 
 export const metadata: Metadata = {
   title: "Status",
   description:
-    "What Prism Network can do right now: capacity available to rent, the most recent settled lease, and a record of every incident that affected customers.",
+    "Live status of the Prism Network marketplace, leasing, settlement and onchain contracts, with a daily record and every incident that affected customers.",
   alternates: { canonical: "/status" },
 };
 
-// The page reports what is true at the moment it is asked. Caching it would
-// make it report what was true earlier, which is the one thing a status page
-// must never do.
+// A status page that reports what was true earlier is the one thing it must
+// never do.
 export const dynamic = "force-dynamic";
 
-async function readCapacity(): Promise<Capacity | null> {
-  const base = process.env.PRISM_API_BASE_URL;
-  if (!base) return null;
-  const target = controlPlaneUrl(base, ["offers"]);
-  if (!target) return null;
-  try {
-    const response = await fetch(target, { cache: "no-store", signal: AbortSignal.timeout(5_000) });
-    if (!response.ok) return null;
-    const offers: unknown = await response.json();
-    if (!Array.isArray(offers)) return null;
-    const models = new Set<string>();
-    for (const offer of offers) {
-      const model = (offer as { gpu?: { model?: unknown } })?.gpu?.model;
-      if (typeof model === "string" && model.length > 0 && model.length <= 64) models.add(model);
-    }
-    return { offers: offers.length, gpuModels: [...models].sort() };
-  } catch {
-    return null;
-  }
-}
+const HISTORY_DAYS = 90;
 
-async function readLatestSettlement(): Promise<LatestSettlement | null> {
-  const source = process.env.PRISM_PROOF_INDEX_URL;
+async function readStatus(): Promise<StatusIndex | null> {
+  const source = process.env.PRISM_STATUS_INDEX_URL;
   if (!source) return null;
   try {
     const response = await fetch(source, { cache: "no-store", signal: AbortSignal.timeout(5_000) });
     if (!response.ok) return null;
-    const index: unknown = await response.json();
-    if (!isPublicProofIndex(index)) return null;
-    const last = index.receipts.at(-1);
-    if (!last) return null;
-    return {
-      observedAt: index.generated_at,
-      gpuModel: last.gpu_model,
-      transactionHash: last.transaction_hash,
-    };
+    const payload: unknown = await response.json();
+    return isStatusIndex(payload) ? payload : null;
   } catch {
     return null;
   }
 }
 
+function Bars({ component, index }: { component: StatusComponent; index: StatusIndex }) {
+  const cells = strip(index.history, component.key, HISTORY_DAYS, new Date());
+  return (
+    <div className="status-bars" role="img" aria-label={`${HISTORY_DAYS} day history for ${component.name}`}>
+      {cells.map((day) => {
+        const reading = day.statuses[component.key] ?? "unknown";
+        return <span key={day.date} className={`status-bar ${reading}`} title={`${day.date}: ${STATUS_LABEL[reading]}`} />;
+      })}
+    </div>
+  );
+}
+
 export default async function StatusPage() {
-  const [capacity, latest] = await Promise.all([readCapacity(), readLatestSettlement()]);
-  const now = Date.now();
-  const open = incidents.filter((incident) => incident.resolved === null);
+  const index = await readStatus();
+  const components = index?.components ?? [];
+  const state = overall(components);
+  const groups = [...new Set(components.map((component) => component.group))];
 
   return (
-    <InformationPage
-      eyebrow="Network / Status"
-      title="What the network can do right now."
-      description={summarize(capacity, latest)}
-    >
-      <InformationSection index="01" title="Right now">
-        {open.length > 0 && (
-          <p>
-            <strong>There is an open incident.</strong> Details are in the record below.
-          </p>
-        )}
-        <h3>Capacity you can rent</h3>
-        {capacity === null ? (
-          <p>
-            Live capacity could not be read just now. That is a fault in this page rather than a
-            statement about the network, so treat it as unknown rather than as an outage.
-          </p>
-        ) : capacity.offers === 0 ? (
-          <p>
-            No machines are available to rent at the moment. Supply is drawn from providers as
-            demand arrives, so an empty marketplace is normal at quiet times and is not by itself a
-            fault.
-          </p>
-        ) : (
-          <p>
-            {capacity.offers} {capacity.offers === 1 ? "machine" : "machines"} available across{" "}
-            {capacity.gpuModels.join(", ")}. Availability changes minute to minute as leases start
-            and end.
-          </p>
-        )}
+    <div className="information-page">
+      <header className="information-header">
+        <Link className="landing-brand" href="/" aria-label="prism. home">
+          <img src="/brand/prism-logo.svg" alt="" width="32" height="32" />
+          <span>prism.</span>
+        </Link>
+        <nav aria-label="Public page navigation">
+          <Link href="/pricing">Pricing</Link>
+          <Link href={docsUrl.href}>Docs</Link>
+          <Link className="information-console-link" href="/compute">Open console ↗</Link>
+        </nav>
+      </header>
 
-        <h3>Most recent settled lease</h3>
-        {latest === null ? (
-          <p>The settlement record could not be read just now.</p>
-        ) : (
-          <p>
-            Published {since(latest.observedAt, now)}, on {latest.gpuModel}. Every finalized lease
-            leaves a receipt anyone can check on a block explorer, and the full list is on the{" "}
-            <Link href={new URL("/proof", siteUrl).href}>receipts page</Link>. A quiet period here
-            means no leases have finished recently, which is not the same as the network being
-            unable to serve one.
-          </p>
-        )}
-      </InformationSection>
+      <main id="main-content" tabIndex={-1} className="status-main">
+        <section className={`status-headline ${index ? state : "unknown"}`}>
+          <span className="status-dot" aria-hidden="true" />
+          <div>
+            <h1>{index ? headline(state, components.length) : "Status is unavailable"}</h1>
+            <p>
+              {index
+                ? `Last updated ${new Date(index.generated_at).toUTCString().replace("GMT", "UTC")}`
+                : "This page could not read the network just now, which is a fault in the page rather than a statement about the network."}
+            </p>
+          </div>
+        </section>
 
-      <InformationSection index="02" title="Incident record">
-        <p>
-          Every incident that affected a customer is listed here, including the ones nobody
-          reported. Entries are kept in the public source of this site, so the history is reviewed
-          like any other change and cannot be quietly revised later.
-        </p>
-        {incidents.length === 0 ? (
-          <p>No incidents recorded.</p>
-        ) : (
-          incidents.map((incident) => (
-            <div key={incident.started}>
-              <h3>{incident.title}</h3>
-              <p>
-                <strong>
-                  {new Date(incident.started).toISOString().slice(0, 16).replace("T", " ")} UTC
+        {groups.map((group) => (
+          <section className="status-group" key={group}>
+            <h2>{group}</h2>
+            {components
+              .filter((component) => component.group === group)
+              .map((component) => (
+                <article className="status-component" key={component.key}>
+                  <div className="status-component-head">
+                    <div>
+                      <h3>{component.name}</h3>
+                      <p>{component.detail}</p>
+                    </div>
+                    <span className={`status-pill ${component.status}`}>{STATUS_LABEL[component.status]}</span>
+                  </div>
+                  {index && <Bars component={component} index={index} />}
+                  <div className="status-scale">
+                    <span>{HISTORY_DAYS} days ago</span>
+                    <span>{formatUptime(uptime(index?.history ?? [], component.key))}</span>
+                    <span>Today</span>
+                  </div>
+                </article>
+              ))}
+          </section>
+        ))}
+
+        <section className="status-group">
+          <h2>Past incidents</h2>
+          {incidents.length === 0 ? (
+            <p className="status-empty">No incidents recorded.</p>
+          ) : (
+            incidents.map((incident) => (
+              <article className="status-incident" key={incident.started}>
+                <h3>{incident.title}</h3>
+                <p className="status-incident-when">
+                  {new Date(incident.started).toUTCString().replace("GMT", "UTC")}
                   {incident.resolved
-                    ? ` to ${new Date(incident.resolved).toISOString().slice(11, 16)} UTC, resolved`
-                    : ", open"}
-                </strong>
-              </p>
-              <p>
-                <strong>Effect.</strong> {incident.effect}
-              </p>
-              <p>
-                <strong>Cause.</strong> {incident.cause}
-              </p>
-              <p>
-                <strong>Fix.</strong> {incident.fix}
-              </p>
-            </div>
-          ))
-        )}
-      </InformationSection>
+                    ? `, resolved after ${Math.round(
+                        (Date.parse(incident.resolved) - Date.parse(incident.started)) / 3_600_000,
+                      )} hours`
+                    : ", ongoing"}
+                </p>
+                <p>
+                  <strong>Effect.</strong> {incident.effect}
+                </p>
+                <p>
+                  <strong>Cause.</strong> {incident.cause}
+                </p>
+                <p>
+                  <strong>Fix.</strong> {incident.fix}
+                </p>
+              </article>
+            ))
+          )}
+        </section>
 
-      <InformationSection index="03" title="What this page does not promise">
-        <p>
-          Prism does not offer an availability commitment. Capacity is sourced as demand arrives, so
-          the number above can fall to zero without anything being broken, and a lease that cannot
-          be matched returns the deposit rather than waiting.
-        </p>
-        <p>
-          The figures here are read live from the network each time this page loads. They are not
-          cached, averaged, or smoothed, and no uptime percentage is published, because a single
-          number would hide exactly the failures this page exists to disclose.
-        </p>
-      </InformationSection>
-    </InformationPage>
+        <section className="status-note">
+          <p>
+            Readings are taken every five minutes. A day shows the worst reading it recorded, because
+            averaging an outage across a day produces a number that looks like a good day. Days
+            before recording began are marked unknown rather than counted as healthy.
+          </p>
+          <p>
+            Prism publishes no single uptime figure and offers no availability commitment. Capacity
+            is sourced as demand arrives, so an empty marketplace at a quiet hour is normal and is
+            not counted as an outage. Settled leases are listed on the{" "}
+            <Link href={new URL("/proof", siteUrl).href}>receipts page</Link>.
+          </p>
+        </section>
+      </main>
+      <PublicFooter />
+    </div>
   );
 }

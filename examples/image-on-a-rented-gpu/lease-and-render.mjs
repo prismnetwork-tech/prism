@@ -42,7 +42,13 @@ const remote = [
   // ships, and current transformers has dropped a symbol diffusers 0.31
   // imports. Pinning one library only moves the break to the next one.
   "python -m pip install --quiet 'diffusers==0.31.0' 'transformers==4.46.3' 'accelerate==1.1.1' 'safetensors==0.4.5'",
-  `PRISM_PROMPT=${shellQuote(prompt)} python /tmp/render.py`,
+  [
+    `PRISM_PROMPT=${shellQuote(prompt)}`,
+    ...["PRISM_MODEL", "PRISM_STEPS", "PRISM_GUIDANCE", "PRISM_SIZE"]
+      .filter((name) => process.env[name])
+      .map((name) => `${name}=${shellQuote(process.env[name])}`),
+    "python /tmp/render.py",
+  ].join(" "),
 ].join(" && ");
 
 console.log(`rendering "${prompt}"...`);
