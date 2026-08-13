@@ -1,0 +1,153 @@
+.status-main {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.status-headline {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding: 1.75rem;
+  border: 1px solid var(--line, #23261f);
+  border-radius: 14px;
+  margin-bottom: 2.5rem;
+}
+
+.status-headline h1 {
+  font-size: clamp(1.4rem, 3.2vw, 2rem);
+  font-weight: 400;
+  margin: 0 0 0.35rem;
+}
+
+.status-headline p {
+  margin: 0;
+  color: var(--muted, #8f968a);
+  font-size: 0.9rem;
+}
+
+.status-dot {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 50%;
+  flex: none;
+}
+
+.status-headline.operational .status-dot { background: #ccff00; }
+.status-headline.degraded .status-dot { background: #ffd166; }
+.status-headline.outage .status-dot { background: #ff6b6b; }
+.status-headline.unknown .status-dot { background: #687064; }
+
+.status-group {
+  margin-bottom: 2.5rem;
+}
+
+.status-group h2 {
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 400;
+  color: var(--muted, #8f968a);
+  margin: 0 0 0.9rem;
+}
+
+.status-component,
+.status-incident {
+  border: 1px solid var(--line, #23261f);
+  border-radius: 12px;
+  padding: 1.25rem;
+  margin-bottom: 0.75rem;
+}
+
+.status-component-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.status-component h3,
+.status-incident h3 {
+  font-size: 1rem;
+  font-weight: 400;
+  margin: 0 0 0.25rem;
+}
+
+.status-component p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted, #8f968a);
+}
+
+.status-pill {
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.3rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid;
+  white-space: nowrap;
+  flex: none;
+}
+
+.status-pill.operational { color: #ccff00; border-color: #3d4a12; background: #1b2204; }
+.status-pill.degraded { color: #ffd166; border-color: #4a3f12; background: #221c04; }
+.status-pill.outage { color: #ff6b6b; border-color: #4a1d1d; background: #220808; }
+.status-pill.unknown { color: #8f968a; border-color: #2b2f28; background: #16180f; }
+
+/* One cell per day. They shrink rather than wrap, so the strip is always
+   ninety days wide and a gap is visible as a gap. */
+.status-bars {
+  display: flex;
+  gap: 2px;
+  height: 2rem;
+  margin-bottom: 0.5rem;
+}
+
+.status-bar {
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 2px;
+}
+
+.status-bar.operational { background: #ccff00; }
+.status-bar.degraded { background: #ffd166; }
+.status-bar.outage { background: #ff6b6b; }
+.status-bar.unknown { background: #23261f; }
+
+.status-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  color: var(--muted, #8f968a);
+}
+
+.status-incident-when {
+  font-size: 0.8rem;
+  color: var(--muted, #8f968a);
+  margin: 0 0 0.75rem;
+}
+
+.status-incident p {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.status-note p {
+  font-size: 0.85rem;
+  color: var(--muted, #8f968a);
+  line-height: 1.6;
+  margin: 0 0 0.75rem;
+}
+
+.status-empty {
+  color: var(--muted, #8f968a);
+  font-size: 0.9rem;
+}
+
+@media (max-width: 640px) {
+  .status-bars { height: 1.5rem; }
+  .status-component-head { flex-direction: column; }
+}

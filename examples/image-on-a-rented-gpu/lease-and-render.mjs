@@ -35,12 +35,20 @@ console.log(`leased ${lease.leaseId} on ${lease.access.ssh_host}, funded in ${le
 
 const remote = [
   `printf %s ${renderScript} | base64 -d > /tmp/render.py`,
-  // Pinned, like the image digest above it. An open upper bound means the
-  // example installs whatever released this morning, and diffusers 0.36 needs
-  // a newer torch than this image ships, so it fails on import after the
-  // renter has already paid for the machine.
-  "python -m pip install --quiet 'diffusers==0.31.0' transformers accelerate safetensors",
-  `PRISM_PROMPT=${shellQuote(prompt)} python /tmp/render.py`,
+  // Every version pinned, like the image digest above it. An open bound means
+  // the example installs whatever released this morning, and it fails on
+  // import after the renter has already paid for the machine. Both halves of
+  // that happened here: diffusers 0.36 wants a newer torch than this image
+  // ships, and current transformers has dropped a symbol diffusers 0.31
+  // imports. Pinning one library only moves the break to the next one.
+  "python -m pip install --quiet 'diffusers==0.31.0' 'transformers==4.46.3' 'accelerate==1.1.1' 'safetensors==0.4.5'",
+  [
+    `PRISM_PROMPT=${shellQuote(prompt)}`,
+    ...["PRISM_MODEL", "PRISM_STEPS", "PRISM_GUIDANCE", "PRISM_SIZE"]
+      .filter((name) => process.env[name])
+      .map((name) => `${name}=${shellQuote(process.env[name])}`),
+    "python /tmp/render.py",
+  ].join(" "),
 ].join(" && ");
 
 console.log(`rendering "${prompt}"...`);
