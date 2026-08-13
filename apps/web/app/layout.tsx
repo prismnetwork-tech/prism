@@ -13,6 +13,12 @@ import "./public-footer.css";
 const description =
   "GPU compute your agents can rent with a wallet. Lease NVIDIA capacity, pay per second in USDG, and settle every lease onchain with a public receipt.";
 
+// Next only stamps its scripts with the CSP nonce while rendering per request.
+// Prerendered HTML carries no nonce, and `strict-dynamic` makes the browser
+// ignore `'self'`, so every script on a static page is refused and nothing
+// hydrates. Removing this served dead HTML sitewide.
+export const dynamic = "force-dynamic";
+
 export const metadata: Metadata = {
   metadataBase: siteUrl,
   title: {
