@@ -2304,13 +2304,15 @@ impl MarketplaceStore {
                     _,
                     (
                         i64,
+                        i64,
                         String,
                         SqlJson<SettlementEvidence>,
                         Option<SqlJson<StoredSettlementSubmission>>,
                         chrono::DateTime<Utc>,
                     ),
                 >(
-                    "SELECT j.lease_id, l.document->>'node_id', j.evidence, j.proposal, j.updated_at \
+                    "SELECT j.lease_id, l.chain_lease_id, l.document->>'node_id', \
+                            j.evidence, j.proposal, j.updated_at \
                      FROM settlement_jobs j JOIN leases l ON l.lease_id = j.lease_id \
                      WHERE j.status = 'disputed' AND l.state = 'disputed' \
                      ORDER BY j.updated_at, j.lease_id LIMIT 200",
@@ -2320,9 +2322,18 @@ impl MarketplaceStore {
                 .map_err(StoreError::Storage)?;
                 rows.into_iter()
                     .map(
-                        |(lease_id, node_id, SqlJson(evidence), proposal, updated_at)| {
+                        |(
+                            lease_id,
+                            chain_lease_id,
+                            node_id,
+                            SqlJson(evidence),
+                            proposal,
+                            updated_at,
+                        )| {
                             operator_dispute(
                                 u64::try_from(lease_id)
+                                    .map_err(|_| StoreError::InvalidOperatorAction)?,
+                                u64::try_from(chain_lease_id)
                                     .map_err(|_| StoreError::InvalidOperatorAction)?,
                                 node_id,
                                 evidence,
@@ -5404,8 +5415,11 @@ fn is_hash(value: &str) -> bool {
         && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// `chain_lease_id` is the escrow's id and the only one that may reach
+/// calldata; the internal id addresses a different lease, or none at all.
 fn operator_dispute(
     lease_id: u64,
+    chain_lease_id: u64,
     node_id: String,
     evidence: SettlementEvidence,
     proposal: Option<StoredSettlementSubmission>,
@@ -5448,7 +5462,7 @@ fn operator_dispute(
                 to: escrow_address.to_ascii_lowercase(),
                 value: "0".to_owned(),
                 data: resolve_dispute_calldata(
-                    lease_id,
+                    chain_lease_id,
                     submission.proposal.usage_seconds,
                     &submission.proposal.receipt_hash,
                 )?,
