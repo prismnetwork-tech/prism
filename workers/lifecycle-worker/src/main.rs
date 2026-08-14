@@ -1300,7 +1300,8 @@ impl Worker {
         query(
             "UPDATE cloud_instances SET hourly_cost_micros = $2, ssh_host = $3, ssh_port = $4, \
                  status = 'running', started_at = COALESCE(started_at, $5), \
-                 last_error = NULL, updated_at = NOW() WHERE lease_id = $1",
+                 last_error = NULL, observed_at = NOW(), updated_at = NOW() \
+             WHERE lease_id = $1",
         )
         .bind(lease_id as i64)
         .bind(i64::try_from(instance.hourly_micros)?)
