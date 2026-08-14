@@ -16,7 +16,7 @@ npm install @prismnetwork/agent-sdk viem
 import { PrismAgent, DEFAULT_IMAGE } from "@prismnetwork/agent-sdk";
 
 const agent = new PrismAgent({
-  privateKey: process.env.AGENT_KEY,        // agent's wallet
+  privateKey: process.env.PRISM_AGENT_KEY,  // agent's wallet
   escrow: "0x62C042265991bEa17B07229322A01850974626dA",
 });
 
@@ -32,12 +32,14 @@ agent.endLease(lease);
 ## Toolset
 
 `@prismnetwork/agent-sdk/toolset` exports `PrismToolset`, the framework-neutral
-tool surface the MCP server and the framework plugins (elizaOS, Virtuals GAME)
-wrap: `wallet`, `listGpus`, `leaseAndRun`, `run`, `endLease`, each returning a
-human-readable string. It holds the wallet, the open leases and the per-lease
-spending cap in one place, reads `PRISM_AGENT_KEY`/`PRISM_ESCROW` from the
-environment by default, and answers the read-only questions from the public API
-when no wallet is configured.
+tool surface the framework plugins (elizaOS, Virtuals GAME) wrap: `wallet`,
+`listGpus`, `leaseAndRun`, `run`, `endLease`, each resolving to a
+human-readable string, including on failure. It holds the wallet, the open
+leases and the per-lease spending cap in one place, reads `PRISM_AGENT_KEY`,
+`PRISM_ESCROW`, `PRISM_API_BASE` and `PRISM_RPC_URL` from the environment by
+default (`agentFromEnv` accepts a getter for hosts with their own settings
+store), and answers the read-only questions from the public API when no wallet
+is configured.
 
 ## Vault
 
@@ -55,7 +57,7 @@ const value = await agent.vault.get(card.item_id, { json: true });
 
 `unlock()` derives the key from a signature over a fixed statement. Ethereum's
 ECDSA is deterministic, so the same wallet reproduces the same vault on any
-machine — no recovery copy is held anywhere. Pass `{ passphrase }` to require a
+machine; no recovery copy is held anywhere. Pass `{ passphrase }` to require a
 second factor beyond the wallet.
 
 Every item carries the weakest workspace trust class it may ever be released
@@ -148,4 +150,4 @@ The wallet needs two balances on Robinhood Chain (id 4663): USDG (`0x5fc5360D040
 Node >= 20, `viem` ^2 (peer), and `ssh` + `ssh-keygen` on PATH for `run()` and
 for workspace save and restore.
 
-See `example.mjs` for a full run.
+See [example.mjs](https://github.com/prismnetwork-tech/prism/blob/main/sdk/example.mjs) for a full run.

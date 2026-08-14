@@ -42,10 +42,11 @@ compute with venues reachable from code alone.
 
 ## Configuration, everywhere
 
-`PRISM_AGENT_KEY` — private key of a wallet holding USDG and gas on Robinhood
-Chain (chain id 4663). `PRISM_ESCROW` — optional, defaults to the live lease
-escrow. Reading capacity and prices needs no wallet in the MCP server, the
-elizaOS plugin, and the GAME plugin.
+`PRISM_AGENT_KEY`: private key of a wallet holding USDG and gas on Robinhood
+Chain (chain id 4663, RPC rpc.mainnet.chain.robinhood.com). `PRISM_ESCROW`:
+optional, defaults to the live lease escrow. Reading capacity and prices needs
+no wallet on any surface; the money tools explain what is missing instead of
+failing.
 
 Prism is pre-production and unaudited. Do not lease with a wallet or workload
 you cannot lose.

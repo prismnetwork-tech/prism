@@ -44,10 +44,11 @@ agent = AssistantAgent(name="gpu_agent", model_client=..., tools=prism_tools())
 
 ## Configuration
 
-`PRISM_AGENT_KEY` — private key of a wallet holding USDG and gas on Robinhood
-Chain (chain id 4663). `PRISM_ESCROW` — optional; defaults to the live lease
-escrow. `prism_lease_and_run` takes `max_usdg` (default 1.0), a hard cap on what
-a single lease may cost.
+`PRISM_AGENT_KEY`: private key of a wallet holding USDG and gas on Robinhood
+Chain (chain id 4663, RPC rpc.mainnet.chain.robinhood.com). `PRISM_ESCROW`:
+optional; defaults to the live lease escrow. Without a key the read-only tools
+still answer from the public API. `prism_lease_and_run` takes `max_usdg`
+(default 1.0), a hard cap on what a single lease may cost.
 
 Trust classes run open < isolated < attested < confidential. On an `open`
 supplier the host operator can read anything the workload touches; raise

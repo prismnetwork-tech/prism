@@ -104,9 +104,16 @@ class PrismAgent:
                  api_base: str = "https://prismnetwork.tech", rpc_url: str = ROBINHOOD_RPC):
         if not escrow:
             raise ValueError("escrow address is required")
+        if not isinstance(private_key, str) or not private_key.strip():
+            raise ValueError("private_key is required: a 32-byte hex key, with or without 0x "
+                             "(most surfaces read it from PRISM_AGENT_KEY)")
         self.api_base = api_base.rstrip("/")
         self.escrow = Web3.to_checksum_address(escrow)
-        self.account = Account.from_key(private_key)
+        try:
+            self.account = Account.from_key(private_key.strip())
+        except Exception as e:
+            raise ValueError(f"private_key is not a valid key: {e}. Expected 32 bytes of hex, "
+                             "with or without the 0x prefix.") from e
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
         self._usdg = self.w3.eth.contract(address=USDG, abi=_ERC20)
         self._escrow = self.w3.eth.contract(address=self.escrow, abi=_ESCROW)
@@ -173,14 +180,39 @@ class PrismAgent:
 
     def wait_for_result(self, lease_id, timeout: int = 900, interval: int = 10) -> dict:
         deadline = time.time() + timeout
+        checked = 0
         while time.time() < deadline:
             status, body = self._proxy("GET", ["leases", str(lease_id), "result"], raw=True)
             if status == 200:
                 return body
-            if status != 404:
+            # The control plane keeps answering 404 for a batch whose node died
+            # without reporting, so a 404 alone cannot distinguish "still
+            # running" from "never coming". Check the lease state occasionally
+            # and stop waiting once it is terminal.
+            if status == 404:
+                checked += 1
+                if checked % 6 == 0 and (state := self._terminal_state(lease_id)):
+                    status2, body2 = self._proxy("GET", ["leases", str(lease_id), "result"], raw=True)
+                    if status2 == 200:
+                        return body2
+                    raise PrismError(502, "batch_no_result", {"lease_id": lease_id, "state": state})
+            elif status != 429 and status < 500:
                 raise PrismError(status, (body or {}).get("code", "result_failed"), body)
             time.sleep(interval)
-        raise PrismError(408, "result_timeout")
+        raise PrismError(408, "result_timeout", {"lease_id": lease_id})
+
+    def _terminal_state(self, lease_id) -> str | None:
+        try:
+            leases = self.leases()
+        except PrismError:
+            return None
+        for lease in leases:
+            if lease.get("lease_id") == lease_id:
+                state = lease.get("state", "")
+                if state in ("closing", "settlement_pending", "finalized", "refunded", "failed"):
+                    return state
+                return None
+        return None
 
     def wait_for_access(self, lease_id, timeout: int = 600, interval: int = 10) -> dict:
         deadline = time.time() + timeout
@@ -188,42 +220,74 @@ class PrismAgent:
             status, body = self._proxy("GET", ["leases", str(lease_id), "access"], raw=True)
             if status == 200:
                 return body
-            if status != 404:
-                raise PrismError(status, (body or {}).get("error", "access_error"))
+            # 429 and 5xx are transient (proxy rate limit, control-plane blip);
+            # aborting a paid wait on one would strand the deposit.
+            if status != 404 and status != 429 and status < 500:
+                raise PrismError(status, (body or {}).get("error", "access_error"), body)
             time.sleep(interval)
-        raise PrismError(408, "access_timeout")
+        raise PrismError(408, "access_timeout", {"lease_id": lease_id})
 
     def lease(self, image: str, duration_seconds: int, min_vram_mib: int = 16000,
               preferred_node_id: str | None = None, max_deposit: int | None = None,
               min_trust_class: str = "open", command: str | None = None) -> Lease | BatchLease:
         if not self.session:
             self.authenticate()
+        # A wallet with no balance at all cannot fund anything, and a doomed
+        # quote still holds capacity against other renters until it expires.
+        # Refuse before quoting.
+        b = self.balances()
+        if int(b["usdg"]) == 0 or int(b["eth"]) == 0:
+            raise PrismError(402, "wallet_unfunded", {
+                "address": self.address, "usdg": int(b["usdg"]), "eth_wei": int(b["eth"]),
+                "hint": "the wallet needs USDG for the deposit and native ETH for gas "
+                        "on Robinhood Chain (id 4663) before it can lease",
+            })
         quote = self.quote(image, duration_seconds, min_vram_mib, preferred_node_id,
                            min_trust_class, command)
         if max_deposit is not None and int(quote["maximum_escrow"]) > int(max_deposit):
             raise PrismError(402, "cost_exceeds_max",
                              {"required": quote["maximum_escrow"], "max": str(max_deposit)})
         key = self._generate_ssh_key()
+        funding = None
+        lease_id = None
         try:
             funding = self._fund(quote)
             record = self.confirm(quote["quote_id"], funding, key["public_key"])
-            lease_id = record["lease_id"]
+            lease_id = record.get("lease_id")
+            if not isinstance(lease_id, int):
+                raise PrismError(502, "malformed_lease_record", {"funding_hash": funding})
             # A batch lease never hands out access, so waiting for it would block
             # until the timeout and then report a failure that never happened.
             # Wait for what the command printed instead.
             if command is not None:
-                result = self.wait_for_result(lease_id)
+                result = self.wait_for_result(lease_id, timeout=duration_seconds + 900)
                 shutil.rmtree(key["dir"], ignore_errors=True)
                 return BatchLease(lease_id, result, funding, quote)
             return Lease(lease_id, self.wait_for_access(lease_id),
                          key["key_path"], key["dir"], key["public_key"], funding, quote)
-        except Exception:
-            shutil.rmtree(key["dir"], ignore_errors=True)
-            raise
+        except Exception as e:
+            # Before funding, the key opens nothing; discard it. After funding
+            # it is the only way into a machine that is being paid for, so it
+            # stays on disk and the error says where everything is.
+            if funding is None:
+                shutil.rmtree(key["dir"], ignore_errors=True)
+                raise
+            detail = {"funding_hash": funding, "lease_id": lease_id, "key_path": key["key_path"]}
+            if isinstance(e, PrismError):
+                e.body = {**(e.body or {}), **detail}
+                raise
+            raise PrismError(502, "lease_failed_after_funding", {**detail, "cause": str(e)}) from e
 
     def run(self, lease: Lease, command: str, timeout: int = 120,
-            connect_retries: int = 24, connect_delay: int = 10) -> dict:
+            connect_retries: int = 24, connect_delay: int = 10,
+            stdin: str | None = None) -> dict:
         a = lease.access
+        # Physical nodes hand out gateway access, which has no ssh endpoint.
+        # Fail as a PrismError rather than a KeyError so callers holding a paid
+        # lease see what they are dealing with.
+        if not a.get("ssh_host") or not a.get("ssh_port"):
+            raise PrismError(400, "ssh_access_unavailable",
+                             {"mode": a.get("mode"), "lease_id": lease.lease_id})
         args = ["ssh", "-i", lease.key_path, "-p", str(a["ssh_port"]),
                 "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
@@ -231,7 +295,8 @@ class PrismAgent:
         last = None
         for attempt in range(connect_retries + 1):
             try:
-                p = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 20)
+                p = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 20,
+                                   input=stdin if stdin is not None else "")
                 res = {"code": p.returncode, "stdout": p.stdout.strip(), "stderr": p.stderr.strip()}
             except subprocess.TimeoutExpired:
                 res = {"code": -1, "stdout": "", "stderr": "timed out"}
@@ -266,12 +331,20 @@ class PrismAgent:
         })
         signed = self.account.sign_transaction(tx)
         h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(h)
+        # Once broadcast, the hash is the one thing the caller must not lose.
+        try:
+            receipt = self.w3.eth.wait_for_transaction_receipt(h, timeout=180)
+        except Exception as e:
+            raise PrismError(504, "confirmation_timeout",
+                             {"hash": h.hex(), "cause": str(e)}) from e
         if receipt.status != 1:
             raise PrismError(402, "tx_reverted", {"hash": h.hex()})
         if confirmations > 1:
             target = receipt.blockNumber + confirmations - 1
+            deadline = time.time() + 180
             while self.w3.eth.block_number < target:
+                if time.time() > deadline:
+                    raise PrismError(504, "confirmation_timeout", {"hash": h.hex()})
                 time.sleep(2)
         return h.hex()
 

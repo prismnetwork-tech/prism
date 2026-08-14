@@ -87,7 +87,9 @@ assert agent.ended == [7]
 import prism_autogen
 import prism_crewai
 import prism_langchain
-from prismnetwork import PrismToolset
+from prismnetwork import BatchLease, PrismToolset  # noqa: F401
+from prismnetwork._agent import MAX_COMMAND_BYTES, _command
+from prismnetwork.toolkit import NO_WALLET
 
 
 class FakeToolsetAgent(FakeAgent):
@@ -99,6 +101,14 @@ assert version("prism-langchain") == prism_langchain.__version__
 assert version("prism-crewai") == prism_crewai.__version__
 assert version("prism-autogen") == prism_autogen.__version__
 
+assert _command("nvidia-smi") == "nvidia-smi"
+for bad in ("", "  ", "x" * (MAX_COMMAND_BYTES + 1)):
+    try:
+        _command(bad)
+        raise AssertionError(f"command validator let through {bad[:10]!r}")
+    except prismnetwork.PrismError as e:
+        assert e.code == "invalid_command"
+
 toolset = PrismToolset(agent=FakeToolsetAgent())
 listed = toolset.list_gpus()
 assert "Test GPU" in listed and "isolated" in listed
@@ -106,19 +116,36 @@ assert "lease 7 funded onchain" in toolset.lease_and_run("nvidia-smi", max_usdg=
 assert toolset.run(7, "echo ready").endswith("7:echo ready")
 assert toolset.end_lease(7) == "released lease 7"
 
+guard = PrismToolset(agent=FakeToolsetAgent())
+assert "command is required" in guard.lease_and_run("")
+assert "8 KiB" in guard.lease_and_run("x" * (MAX_COMMAND_BYTES + 1))
+assert "must be one of" in guard.lease_and_run("ok", min_trust_class="banana")
+assert guard.agent.last_lease is None
+
+keyless = PrismToolset(agent=None)
+assert keyless.wallet() == NO_WALLET
+assert keyless.lease_and_run("nvidia-smi") == NO_WALLET
+
 expected = ["prism_wallet", "prism_list_gpus", "prism_lease_and_run", "prism_run", "prism_end_lease"]
 
 lc_tools = prism_langchain.get_prism_tools(PrismToolset(agent=FakeToolsetAgent()))
 assert [t.name for t in lc_tools] == expected
-assert "Test GPU" in lc_tools[1].invoke({"min_trust": "open"})
+assert "Test GPU" in lc_tools[1].invoke({"min_trust_class": "open"})
+assert "lease 7 funded onchain" in lc_tools[2].invoke({"command": "nvidia-smi", "max_usdg": 0.25})
 
-crew_tools = prism_crewai.prism_tools(PrismToolset(agent=FakeToolsetAgent()))
-assert len(crew_tools) == 5 and all(t.args_schema is not None for t in crew_tools)
-assert "Test GPU" in crew_tools[1].run(min_trust="open")
+crew_agent = FakeToolsetAgent()
+crew_tools = prism_crewai.prism_tools(PrismToolset(agent=crew_agent))
+assert [t.name for t in crew_tools] == expected
+assert "Test GPU" in crew_tools[1].run(min_trust_class="open")
+assert "lease 7 funded onchain" in crew_tools[2].run(command="nvidia-smi", max_usdg=0.25)
+assert crew_agent.last_lease["max_deposit"] == 250_000
 
-ag_tools = prism_autogen.prism_tools(PrismToolset(agent=FakeToolsetAgent()))
+ag_agent = FakeToolsetAgent()
+ag_tools = prism_autogen.prism_tools(PrismToolset(agent=ag_agent))
 assert [f.__name__ for f in ag_tools] == expected
 assert all(f.__doc__ for f in ag_tools)
 assert "Test GPU" in ag_tools[1]("open")
+assert "lease 7 funded onchain" in ag_tools[2]("nvidia-smi", max_usdg=0.25)
+assert ag_agent.last_lease["max_deposit"] == 250_000
 
 print("Python SDK, AgentKit and integration wheels are importable and their tools are callable")

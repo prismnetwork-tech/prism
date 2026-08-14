@@ -29,19 +29,30 @@ task = Task(
 Crew(agents=[researcher], tasks=[task]).kickoff()
 ```
 
+The crew's agent needs an LLM the usual CrewAI way (`OPENAI_API_KEY`, or an
+explicit `llm=` on the `Agent`); the Prism tools themselves need none.
+
 ## Tools
 
-`prism_tools()` returns five tools sharing one wallet and lease table: wallet
-balances, live GPU listings, lease-and-run, run-on-open-lease, and end-lease.
-The lease tool takes `max_usdg` (default 1.0), a hard cap on what a single lease
-may cost.
+| Tool | What it does |
+| --- | --- |
+| `prism_wallet` | wallet address, USDG and gas balances |
+| `prism_list_gpus` | live capacity: model, VRAM, price per hour, trust class |
+| `prism_lease_and_run` | rent a GPU, run one command, keep the lease open |
+| `prism_run` | run another command on an open lease |
+| `prism_end_lease` | release a lease |
+
+All five share one wallet and lease table, so a lease opened by one is visible
+to the rest. `prism_lease_and_run` takes `max_usdg` (default 1.0), a hard cap
+on what a single lease may cost.
 
 ## Configuration
 
-`PRISM_AGENT_KEY` — private key of a wallet holding USDG and gas on Robinhood
-Chain (chain id 4663). `PRISM_ESCROW` — optional; defaults to the live lease
-escrow. Or build `PrismToolset(agent=PrismAgent(...))` yourself and pass it to
-`prism_tools`.
+`PRISM_AGENT_KEY`: private key of a wallet holding USDG and gas on Robinhood
+Chain (chain id 4663, RPC rpc.mainnet.chain.robinhood.com). `PRISM_ESCROW`:
+optional; defaults to the live lease escrow. Without a key the read-only tools
+still answer from the public API. Or build
+`PrismToolset(agent=PrismAgent(...))` yourself and pass it to `prism_tools`.
 
 Trust classes run open < isolated < attested < confidential. On an `open`
 supplier the host operator can read anything the workload touches; raise

@@ -3,9 +3,9 @@ funding carry per Lighter market, run on a Prism-leased GPU.
 
 Reads the dataset agent.py ships over SSH, resamples each market's settled
 hourly funding into 200k week-long paths on the GPU, and prints one JSON line
-the agent parses back out of stdout. Rates are per-8-hour units settled hourly,
-so an hour's payment is rate / 8; the studied position is the side that
-receives funding at the current rate.
+the agent parses back out of stdout. History rates arrive already converted to
+signed hourly fractions (positive when longs pay); the studied position is the
+side that receives funding at the current rate.
 """
 
 import json
@@ -21,7 +21,7 @@ def study(market, device):
     rates = torch.tensor([h["rate"] for h in market["history"]], dtype=torch.float64, device=device)
     side = 1.0 if market["current_rate_8h"] > 0 else -1.0
     idx = torch.randint(len(rates), (PATHS, HORIZON_HOURS), device=device)
-    outcomes = side * rates[idx].sum(dim=1) / 8
+    outcomes = side * rates[idx].sum(dim=1)
     return {
         "carry_week_mean": float(outcomes.mean()),
         "carry_week_p05": float(torch.quantile(outcomes, 0.05)),
