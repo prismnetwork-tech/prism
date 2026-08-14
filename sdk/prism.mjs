@@ -15,8 +15,15 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { PrismVault } from "./vault.mjs";
+import { PrismWorkspace } from "./workspace.mjs";
 
 export { PrismVault, VaultError, DEFAULT_TRUST_FLOOR, VAULT_KEY_STATEMENT } from "./vault.mjs";
+export {
+  PrismWorkspace,
+  WorkspaceError,
+  DEFAULT_WORKSPACE_TRUST_FLOOR,
+  WORKSPACE_KEY_STATEMENT,
+} from "./workspace.mjs";
 
 export const robinhoodChain = defineChain({
   id: 4663,
@@ -108,20 +115,26 @@ export class PrismAgent {
     this.walletClient = createWalletClient({ account: this.account, chain: robinhoodChain, transport });
     this.session = null;
     this.vault = new PrismVault(this);
+    this.workspace = new PrismWorkspace(this);
   }
 
   get address() {
     return this.account.address;
   }
 
-  // The vault key is derived from this signature on the caller's machine. It is
-  // returned to the vault client and never sent anywhere.
+  // The vault and workspace keys are derived from this signature on the
+  // caller's machine. It is returned to the client that asked and never sent
+  // anywhere.
   async signVaultStatement(statement) {
     return this.account.signMessage({ message: statement });
   }
 
   async vaultRequest(method, segments, { body = null } = {}) {
     return this.#proxy(method, ["vault", ...segments], { body });
+  }
+
+  async workspaceRequest(method, segments, { body = null } = {}) {
+    return this.#proxy(method, ["workspaces", ...segments], { body });
   }
 
   async authenticate() {
@@ -331,8 +344,9 @@ export class PrismAgent {
 
   // Run a command in the remote login shell over SSH (so pipes, redirects, and
   // $(...) all evaluate on the GPU). Retries through the host's sshd warmup, which
-  // can lag a few minutes after the box reports ready.
-  async run(lease, command, { timeoutMs = 120_000, connectRetries = 24, connectDelayMs = 10_000 } = {}) {
+  // can lag a few minutes after the box reports ready. `stdin` feeds the command
+  // its input, which keeps anything sensitive out of the remote process table.
+  async run(lease, command, { timeoutMs = 120_000, connectRetries = 24, connectDelayMs = 10_000, stdin = null } = {}) {
     if (!lease?.access?.ssh_host || !lease.access.ssh_port || !lease.keyPath) {
       throw new PrismError(400, "invalid_lease_handle");
     }
@@ -345,7 +359,7 @@ export class PrismAgent {
     };
     let last;
     for (let attempt = 0; attempt <= connectRetries; attempt++) {
-      const res = await this.#ssh(target, command, timeoutMs);
+      const res = await this.#ssh(target, command, timeoutMs, stdin);
       if (!isSshWarmup(res)) return res;
       last = res;
       if (attempt < connectRetries) await sleep(connectDelayMs);
@@ -376,7 +390,7 @@ export class PrismAgent {
     }
   }
 
-  #ssh(target, command, timeoutMs) {
+  #ssh(target, command, timeoutMs, stdin = null) {
     const args = [
       "-i", target.keyPath,
       "-p", String(target.port),
@@ -398,6 +412,12 @@ export class PrismAgent {
       }, timeoutMs);
       child.stdout.on("data", (d) => (stdout += d));
       child.stderr.on("data", (d) => (stderr += d));
+      if (stdin !== null) {
+        // A command that exits before reading its input closes the pipe, which
+        // is a normal end to the transfer and not a failure to report.
+        child.stdin.on("error", () => {});
+        child.stdin.end(stdin);
+      }
       child.on("close", (code) => {
         clearTimeout(timer);
         resolve({ code: code ?? -1, stdout: stdout.trim(), stderr: stderr.trim(), timedOut });

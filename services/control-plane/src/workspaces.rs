@@ -12,7 +12,9 @@
 use std::{env, time::Duration};
 
 use anyhow::Context;
-use aws_sdk_s3::{Client as S3Client, presigning::PresigningConfig};
+use aws_sdk_s3::{
+    Client as S3Client, operation::head_object::HeadObjectError, presigning::PresigningConfig,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -64,6 +66,12 @@ impl WorkspaceStorage {
             // declared, so the cap checked at request time is the cap storage
             // enforces rather than a number we hoped they would respect.
             .content_length(size_bytes)
+            // Write once. A presigned PUT lives for fifteen minutes, so a
+            // stalled upload can land after the renter gave up, retried and
+            // committed, replacing the bytes the committed metadata describes
+            // and leaving that version permanently unreadable. The straggler
+            // now fails instead.
+            .if_none_match("*")
             .presigned(PresigningConfig::expires_in(PRESIGNED_TTL)?)
             .await
             .context("presign workspace upload")?;
@@ -80,6 +88,30 @@ impl WorkspaceStorage {
             .await
             .context("presign workspace download")?;
         Ok(request.uri().to_owned())
+    }
+
+    /// What storage actually holds, against what the renter says it uploaded.
+    /// `None` when the object is not there at all, which is the difference
+    /// between a snapshot that can be restored and a row that only claims one.
+    pub async fn object_size(&self, key: &str) -> anyhow::Result<Option<i64>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(head) => Ok(head.content_length()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(HeadObjectError::is_not_found) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::Error::new(error).context("head workspace object")),
+        }
     }
 
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {

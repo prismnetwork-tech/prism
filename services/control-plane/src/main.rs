@@ -16,20 +16,21 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use prism_protocol::{
-    Account, CommandResult, CredentialCipher, EncryptedSecret, LeaseAccess, LeaseQuote,
-    LeaseRecord, LeaseRequest, LeaseState, MAX_ESCROW_BASE_UNITS, MAX_LEASE_SECONDS,
-    MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
-    MAX_VAULT_LABEL_BYTES, NodeCertificateBundle, NodeCertificateRequest, NodeCommand,
+    Account, CommandResult, CredentialCipher, DEFAULT_WORKSPACE_TRUST_FLOOR, EncryptedSecret,
+    LeaseAccess, LeaseQuote, LeaseRecord, LeaseRequest, LeaseState, MAX_ESCROW_BASE_UNITS,
+    MAX_LEASE_SECONDS, MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
+    MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_NAME_BYTES,
+    MAX_WORKSPACES_PER_ACCOUNT, NodeCertificateBundle, NodeCertificateRequest, NodeCommand,
     NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment,
     NodeOffer, NodePosture, NodeTelemetry, STANDARD_RATE_PER_SECOND, SettlementEvidence,
-    TrustClass, VaultEnvelope, VaultItem, VaultRelease, VaultWrite, discounted_rate, node_id,
-    stake_discount_bps, vault_release_permitted, verifying_key,
+    TrustClass, VaultEnvelope, VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot,
+    discounted_rate, node_id, stake_discount_bps, vault_release_permitted, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -77,6 +78,10 @@ const QUOTE_HOLD_SECONDS: i64 = 90;
 /// Mirrors the node's own limit, so the two agree on what it will accept.
 const MAX_BATCH_COMMAND_BYTES: usize = 8 * 1024;
 const QUOTE_TTL_MINUTES: i64 = 5;
+/// A single presigned PUT is all object storage accepts in one request, and it
+/// stops well below `MAX_WORKSPACE_BYTES`. Refusing here is better than minting
+/// a URL that the upload fails against after the renter has sent gigabytes.
+const MAX_SNAPSHOT_UPLOAD_BYTES: u64 = 5 * 1_024 * 1_024 * 1_024;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Broker-backed capacity reaches renters over direct SSH with no tunnel and
@@ -102,6 +107,7 @@ struct AppState {
     certificate_authority: Arc<CertificateAuthority>,
     require_node_certificates: bool,
     stake: StakeReader,
+    workspaces: Option<Arc<workspaces::WorkspaceStorage>>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +255,7 @@ struct MemoryMarketplace {
     operator_audit: Vec<OperatorAuditEvent>,
     vault_items: BTreeMap<Uuid, (String, VaultItem)>,
     vault_releases: Vec<(String, VaultRelease)>,
+    workspaces: BTreeMap<Uuid, (String, Workspace)>,
 }
 
 struct MemoryCommand {
@@ -337,6 +344,14 @@ enum StoreError {
     },
     #[error("lease is not active for this account")]
     VaultLeaseUnavailable,
+    #[error("workspace not found")]
+    WorkspaceNotFound,
+    #[error("workspace name is already in use")]
+    WorkspaceNameTaken,
+    #[error("workspace snapshot was superseded by another writer")]
+    WorkspaceVersionConflict,
+    #[error("workspace limit reached")]
+    WorkspaceFull,
     #[error("storage failure")]
     Storage(#[source] SqlError),
 }
@@ -375,6 +390,56 @@ fn vault_item_from_row(row: VaultRow) -> Result<VaultItem, StoreError> {
         },
         min_trust_class: parse_trust_class(&floor)?,
         label,
+        created_at,
+        updated_at,
+    })
+}
+
+/// workspace_id, name, version, wrapped_key, nonce, ciphertext_digest,
+/// size_bytes, min_trust_class, created_at, updated_at.
+type WorkspaceRow = (
+    Uuid,
+    String,
+    i32,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    chrono::DateTime<Utc>,
+    chrono::DateTime<Utc>,
+);
+
+fn workspace_from_row(row: WorkspaceRow) -> Result<Workspace, StoreError> {
+    let (
+        workspace_id,
+        name,
+        version,
+        wrapped_key,
+        nonce,
+        ciphertext_digest,
+        size_bytes,
+        floor,
+        created_at,
+        updated_at,
+    ) = row;
+    let version = u32::try_from(version)
+        .map_err(|_| StoreError::InvalidStoredState("invalid workspace version".into()))?;
+    let size_bytes = u64::try_from(size_bytes)
+        .map_err(|_| StoreError::InvalidStoredState("invalid workspace size".into()))?;
+    Ok(Workspace {
+        workspace_id,
+        name,
+        version,
+        // Version zero is a workspace that exists and holds nothing, so the
+        // envelope columns are still at their defaults and mean nothing.
+        snapshot: (version > 0).then_some(WorkspaceSnapshot {
+            wrapped_key,
+            nonce,
+            ciphertext_digest,
+            size_bytes,
+        }),
+        min_trust_class: parse_trust_class(&floor)?,
         created_at,
         updated_at,
     })
@@ -426,6 +491,54 @@ struct ConfirmLeaseRequest {
 
 #[derive(Deserialize)]
 struct VaultReleaseRequest {
+    lease_id: u64,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceRequest {
+    name: String,
+    #[serde(default = "default_workspace_floor")]
+    min_trust_class: TrustClass,
+}
+
+fn default_workspace_floor() -> TrustClass {
+    DEFAULT_WORKSPACE_TRUST_FLOOR
+}
+
+#[derive(Deserialize)]
+struct SnapshotUploadRequest {
+    size_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct SnapshotCommitRequest {
+    version: u32,
+    #[serde(flatten)]
+    snapshot: WorkspaceSnapshot,
+}
+
+/// The renter uploads straight to storage, so this is the whole of what the
+/// control plane hands over: where to put the bytes, and which version they
+/// have to be committed as.
+#[derive(Serialize)]
+struct SnapshotUpload {
+    url: String,
+    version: u32,
+    key: String,
+}
+
+#[derive(Serialize)]
+struct SnapshotDownload {
+    url: String,
+    version: u32,
+    #[serde(flatten)]
+    snapshot: WorkspaceSnapshot,
+}
+
+/// A restore names the lease it is landing on, so the trust floor can be
+/// checked against real capacity rather than taken on the client's word.
+#[derive(Deserialize)]
+struct SnapshotDownloadRequest {
     lease_id: u64,
 }
 
@@ -707,6 +820,9 @@ async fn main() -> anyhow::Result<()> {
         certificate_authority,
         require_node_certificates,
         stake: StakeReader::from_environment()?,
+        workspaces: workspaces::WorkspaceStorage::from_environment()
+            .await?
+            .map(Arc::new),
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -750,6 +866,23 @@ async fn main() -> anyhow::Result<()> {
             post(release_vault_item),
         )
         .route("/v1/vault/releases", get(list_vault_releases))
+        .route(
+            "/v1/workspaces",
+            get(list_workspaces).post(create_workspace),
+        )
+        .route("/v1/workspaces/{workspace_id}", delete(delete_workspace))
+        .route(
+            "/v1/workspaces/{workspace_id}/upload",
+            post(upload_workspace),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/commit",
+            post(commit_workspace),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/download",
+            post(download_workspace),
+        )
         .route("/v1/supplier/summary", get(get_supplier_summary))
         .route("/v1/operator/controls", post(apply_operator_control))
         .route("/v1/operator/audit", get(list_operator_audit))
@@ -3720,6 +3853,260 @@ impl MarketplaceStore {
         }
     }
 
+    async fn list_workspaces(&self, subject: &str) -> Result<Vec<Workspace>, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let mut workspaces = market
+                    .read()
+                    .await
+                    .workspaces
+                    .values()
+                    .filter(|(owner, _)| owner == subject)
+                    .map(|(_, workspace)| workspace.clone())
+                    .collect::<Vec<_>>();
+                // Matches the Postgres ORDER BY, tiebreak included. Two
+                // workspaces created in one transaction share a timestamp
+                // exactly, and a divergence here is a test that passes while
+                // production returns a different order.
+                workspaces.sort_by_key(|workspace| {
+                    Reverse((workspace.updated_at, workspace.workspace_id))
+                });
+                Ok(workspaces)
+            }
+            Self::Postgres(pool) => query_as::<_, WorkspaceRow>(
+                "SELECT workspace_id, name, version, wrapped_key, nonce, ciphertext_digest, \
+                        size_bytes, min_trust_class, created_at, updated_at \
+                 FROM workspaces WHERE subject = $1 \
+                 ORDER BY updated_at DESC, workspace_id DESC",
+            )
+            .bind(subject)
+            .fetch_all(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            .into_iter()
+            .map(workspace_from_row)
+            .collect(),
+        }
+    }
+
+    async fn workspace(
+        &self,
+        subject: &str,
+        workspace_id: Uuid,
+    ) -> Result<Option<Workspace>, StoreError> {
+        match self {
+            Self::Memory(market) => Ok(market
+                .read()
+                .await
+                .workspaces
+                .get(&workspace_id)
+                .filter(|(owner, _)| owner == subject)
+                .map(|(_, workspace)| workspace.clone())),
+            Self::Postgres(pool) => query_as::<_, WorkspaceRow>(
+                "SELECT workspace_id, name, version, wrapped_key, nonce, ciphertext_digest, \
+                        size_bytes, min_trust_class, created_at, updated_at \
+                 FROM workspaces WHERE subject = $1 AND workspace_id = $2",
+            )
+            .bind(subject)
+            .bind(workspace_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            .map(workspace_from_row)
+            .transpose(),
+        }
+    }
+
+    /// The id is minted here rather than accepted from the caller, so nobody
+    /// can probe which ids exist by trying to create over one.
+    async fn create_workspace(
+        &self,
+        subject: &str,
+        name: &str,
+        min_trust_class: TrustClass,
+    ) -> Result<Workspace, StoreError> {
+        let now = Utc::now();
+        let workspace = Workspace {
+            workspace_id: Uuid::now_v7(),
+            name: name.to_owned(),
+            version: 0,
+            snapshot: None,
+            min_trust_class,
+            created_at: now,
+            updated_at: now,
+        };
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let mut held = 0;
+                for (owner, existing) in market.workspaces.values() {
+                    if owner != subject {
+                        continue;
+                    }
+                    if existing.name == name {
+                        return Err(StoreError::WorkspaceNameTaken);
+                    }
+                    held += 1;
+                }
+                if held >= MAX_WORKSPACES_PER_ACCOUNT {
+                    return Err(StoreError::WorkspaceFull);
+                }
+                market.workspaces.insert(
+                    workspace.workspace_id,
+                    (subject.to_owned(), workspace.clone()),
+                );
+                Ok(workspace)
+            }
+            Self::Postgres(pool) => {
+                let inserted = query_as::<_, WorkspaceRow>(
+                    "INSERT INTO workspaces (workspace_id, subject, name, min_trust_class) \
+                     SELECT $1, $2, $3, $4 \
+                     WHERE (SELECT COUNT(*) FROM workspaces WHERE subject = $2) < $5 \
+                     ON CONFLICT (subject, name) DO NOTHING \
+                     RETURNING workspace_id, name, version, wrapped_key, nonce, \
+                               ciphertext_digest, size_bytes, min_trust_class, \
+                               created_at, updated_at",
+                )
+                .bind(workspace.workspace_id)
+                .bind(subject)
+                .bind(name)
+                .bind(min_trust_class.label())
+                .bind(MAX_WORKSPACES_PER_ACCOUNT as i64)
+                .fetch_optional(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                // No row means the name is taken or the account is at its
+                // limit, and the two want different things from the renter:
+                // one is a rename, the other is a delete.
+                match inserted {
+                    Some(row) => workspace_from_row(row),
+                    None if self.workspace_name_taken(subject, name).await? => {
+                        Err(StoreError::WorkspaceNameTaken)
+                    }
+                    None => Err(StoreError::WorkspaceFull),
+                }
+            }
+        }
+    }
+
+    /// Scoped to the subject because the uniqueness constraint is, so a name
+    /// collision can only ever be with the caller's own workspace and never
+    /// discloses that some other account holds it.
+    async fn workspace_name_taken(&self, subject: &str, name: &str) -> Result<bool, StoreError> {
+        match self {
+            Self::Memory(market) => Ok(market
+                .read()
+                .await
+                .workspaces
+                .values()
+                .any(|(owner, workspace)| owner == subject && workspace.name == name)),
+            Self::Postgres(pool) => query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM workspaces WHERE subject = $1 AND name = $2",
+            )
+            .bind(subject)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .map(|count| count > 0)
+            .map_err(StoreError::Storage),
+        }
+    }
+
+    /// Returns the removed workspace so the caller can sweep the objects it
+    /// was pointing at. Nothing else records which those were.
+    async fn delete_workspace(
+        &self,
+        subject: &str,
+        workspace_id: Uuid,
+    ) -> Result<Workspace, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                match market.workspaces.get(&workspace_id) {
+                    Some((owner, _)) if owner == subject => {}
+                    _ => return Err(StoreError::WorkspaceNotFound),
+                }
+                market
+                    .workspaces
+                    .remove(&workspace_id)
+                    .map(|(_, workspace)| workspace)
+                    .ok_or(StoreError::WorkspaceNotFound)
+            }
+            Self::Postgres(pool) => query_as::<_, WorkspaceRow>(
+                "DELETE FROM workspaces WHERE workspace_id = $1 AND subject = $2 \
+                 RETURNING workspace_id, name, version, wrapped_key, nonce, ciphertext_digest, \
+                           size_bytes, min_trust_class, created_at, updated_at",
+            )
+            .bind(workspace_id)
+            .bind(subject)
+            .fetch_optional(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            .ok_or(StoreError::WorkspaceNotFound)
+            .and_then(workspace_from_row),
+        }
+    }
+
+    /// Records a snapshot against exactly the version that was presigned, and
+    /// refuses anything else. Two machines saving the same workspace both
+    /// presign the same next version and race on one object, so the writer
+    /// that loses has to find out here rather than at restore time.
+    async fn commit_workspace_snapshot(
+        &self,
+        subject: &str,
+        workspace_id: Uuid,
+        version: u32,
+        snapshot: WorkspaceSnapshot,
+    ) -> Result<Workspace, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let Some((owner, workspace)) = market.workspaces.get_mut(&workspace_id) else {
+                    return Err(StoreError::WorkspaceNotFound);
+                };
+                if owner != subject {
+                    return Err(StoreError::WorkspaceNotFound);
+                }
+                if version != workspace.version + 1 {
+                    return Err(StoreError::WorkspaceVersionConflict);
+                }
+                workspace.version = version;
+                workspace.snapshot = Some(snapshot);
+                workspace.updated_at = Utc::now();
+                Ok(workspace.clone())
+            }
+            Self::Postgres(pool) => {
+                let updated = query_as::<_, WorkspaceRow>(
+                    "UPDATE workspaces \
+                     SET version = $3, wrapped_key = $4, nonce = $5, ciphertext_digest = $6, \
+                         size_bytes = $7, updated_at = NOW() \
+                     WHERE workspace_id = $1 AND subject = $2 AND version = $8 \
+                     RETURNING workspace_id, name, version, wrapped_key, nonce, \
+                               ciphertext_digest, size_bytes, min_trust_class, \
+                               created_at, updated_at",
+                )
+                .bind(workspace_id)
+                .bind(subject)
+                .bind(version as i32)
+                .bind(&snapshot.wrapped_key)
+                .bind(&snapshot.nonce)
+                .bind(&snapshot.ciphertext_digest)
+                .bind(snapshot.size_bytes as i64)
+                .bind(version as i32 - 1)
+                .fetch_optional(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                match updated {
+                    Some(row) => workspace_from_row(row),
+                    None if self.workspace(subject, workspace_id).await?.is_some() => {
+                        Err(StoreError::WorkspaceVersionConflict)
+                    }
+                    None => Err(StoreError::WorkspaceNotFound),
+                }
+            }
+        }
+    }
+
     async fn claim_command(
         &self,
         node_id: &str,
@@ -4645,6 +5032,351 @@ fn is_base64url(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+async fn list_workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Workspace>>, (StatusCode, Json<ApiError>)> {
+    let account = require_account(&state, &headers, "GET", "/v1/workspaces", &[]).await?;
+    require_workspace_storage(&state)?;
+    state
+        .store
+        .list_workspaces(&account.subject)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
+async fn create_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Workspace>), (StatusCode, Json<ApiError>)> {
+    let account = require_account(&state, &headers, "POST", "/v1/workspaces", &body).await?;
+    require_workspace_storage(&state)?;
+    let request: WorkspaceRequest = serde_json::from_slice(&body)
+        .map_err(|_| bad_request("invalid_json", "request body is not valid JSON"))?;
+    validate_workspace_name(&request.name)?;
+    let workspace = state
+        .store
+        .create_workspace(&account.subject, &request.name, request.min_trust_class)
+        .await
+        .map_err(store_error)?;
+    Ok((StatusCode::CREATED, Json(workspace)))
+}
+
+async fn delete_workspace(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/workspaces/{workspace_id}");
+    let account = require_account(&state, &headers, "DELETE", &path, &[]).await?;
+    let storage = require_workspace_storage(&state)?;
+    let workspace = state
+        .store
+        .delete_workspace(&account.subject, workspace_id)
+        .await
+        .map_err(store_error)?;
+    // Every version is a separate object and the row was the only record of
+    // which ones exist, so they go now or they stay in the bucket forever. One
+    // past the committed version catches bytes uploaded but never committed.
+    for version in 1..=workspace.version + 1 {
+        let key = workspaces::WorkspaceStorage::key(&account.subject, workspace_id, version as i32);
+        if let Err(error) = storage.delete(&key).await {
+            tracing::error!(%workspace_id, version, %error, "workspace object outlived its metadata");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn upload_workspace(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SnapshotUpload>, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/workspaces/{workspace_id}/upload");
+    let account = require_account(&state, &headers, "POST", &path, &body).await?;
+    let storage = require_workspace_storage(&state)?;
+    let request: SnapshotUploadRequest = serde_json::from_slice(&body)
+        .map_err(|_| bad_request("invalid_json", "request body is not valid JSON"))?;
+    validate_snapshot_size(request.size_bytes)?;
+    let workspace = require_workspace(&state, &account.subject, workspace_id).await?;
+    // Only ever the next version, which by definition has nothing committed
+    // against it. Presigning a version that does would hand out a URL that
+    // overwrites bytes the renter still holds metadata for.
+    let version = workspace.version + 1;
+    let key = workspaces::WorkspaceStorage::key(&account.subject, workspace_id, version as i32);
+    // Uploads are write-once, so an abandoned attempt would block every retry
+    // at this version. Clearing it first is safe precisely because nothing is
+    // committed here: no metadata the renter holds can refer to these bytes.
+    if let Err(error) = storage.delete(&key).await {
+        tracing::warn!(%workspace_id, version, %error, "could not clear an abandoned upload");
+    }
+    let url = storage
+        .presign_put(&key, request.size_bytes as i64)
+        .await
+        .map_err(workspace_storage_error)?;
+    // The URL carries its own authorization for as long as it lives, so the
+    // record of handing one out never includes the URL itself.
+    tracing::info!(%workspace_id, version, "presigned a workspace upload");
+    Ok(Json(SnapshotUpload { url, version, key }))
+}
+
+async fn commit_workspace(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Workspace>, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/workspaces/{workspace_id}/commit");
+    let account = require_account(&state, &headers, "POST", &path, &body).await?;
+    let storage = require_workspace_storage(&state)?;
+    let request: SnapshotCommitRequest = serde_json::from_slice(&body)
+        .map_err(|_| bad_request("invalid_json", "request body is not valid JSON"))?;
+    validate_snapshot_commit(&request)?;
+    let workspace = require_workspace(&state, &account.subject, workspace_id).await?;
+    if request.version != workspace.version + 1 {
+        return Err(store_error(StoreError::WorkspaceVersionConflict));
+    }
+    let key =
+        workspaces::WorkspaceStorage::key(&account.subject, workspace_id, request.version as i32);
+    // Storage is the only party that knows what actually arrived. Without this
+    // an account can record a snapshot it never uploaded and discover that at
+    // restore, or declare a size it is not being billed for.
+    match storage
+        .object_size(&key)
+        .await
+        .map_err(workspace_storage_error)?
+    {
+        Some(size) if size == request.snapshot.size_bytes as i64 => {}
+        Some(_) => {
+            return Err(bad_request(
+                "snapshot_size_mismatch",
+                "the uploaded object is not the size this commit declares",
+            ));
+        }
+        None => {
+            return Err(bad_request(
+                "snapshot_not_uploaded",
+                "no object was uploaded for this version",
+            ));
+        }
+    }
+    let workspace = state
+        .store
+        .commit_workspace_snapshot(
+            &account.subject,
+            workspace_id,
+            request.version,
+            request.snapshot,
+        )
+        .await
+        .map_err(store_error)?;
+    // Only the current version is ever downloadable, so the one it replaced is
+    // bytes nobody can read and everybody pays for. An agent checkpointing on a
+    // timer would otherwise leave a day's worth behind. Best effort: the commit
+    // has already succeeded and the renter should not be told it failed because
+    // a cleanup did.
+    if request.version > 1 {
+        let stale = workspaces::WorkspaceStorage::key(
+            &account.subject,
+            workspace_id,
+            request.version as i32 - 1,
+        );
+        if let Err(error) = storage.delete(&stale).await {
+            tracing::warn!(%workspace_id, version = request.version - 1, %error, "could not remove a superseded snapshot");
+        }
+    }
+    Ok(Json(workspace))
+}
+
+async fn download_workspace(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SnapshotDownload>, (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/workspaces/{workspace_id}/download");
+    let account = require_account(&state, &headers, "POST", &path, &body).await?;
+    let request: SnapshotDownloadRequest = serde_json::from_slice(&body)
+        .map_err(|_| bad_request("invalid_json", "request body is not valid JSON"))?;
+    let storage = require_workspace_storage(&state)?;
+    let workspace = require_workspace(&state, &account.subject, workspace_id).await?;
+    let snapshot = committed_snapshot(&workspace)?.clone();
+
+    // A restore is the moment a workspace lands on hardware someone else
+    // administers, so it is gated exactly like a vault release. Enforcing this
+    // in the client would be a courtesy; the renter's guarantee has to be that
+    // the URL is never minted at all.
+    let lease_trust_class = state
+        .store
+        .active_lease_trust_class(&account.subject, request.lease_id)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| {
+            not_found(
+                "workspace_lease_unavailable",
+                "no active lease of yours with that id",
+            )
+        })?;
+    if !vault_release_permitted(workspace.min_trust_class, lease_trust_class) {
+        return Err(store_error(StoreError::VaultTrustFloorUnmet {
+            floor: workspace.min_trust_class.label(),
+            lease: lease_trust_class.label(),
+        }));
+    }
+
+    let key =
+        workspaces::WorkspaceStorage::key(&account.subject, workspace_id, workspace.version as i32);
+    // A row can outlive its object: a lifecycle rule, a bucket-side deletion or
+    // a lost upload all leave metadata pointing at nothing. Say so here rather
+    // than handing over a URL that answers 404 and reads like a flaky network.
+    if storage
+        .object_size(&key)
+        .await
+        .map_err(workspace_storage_error)?
+        .is_none()
+    {
+        return Err(not_found(
+            "workspace_snapshot_missing",
+            "the stored snapshot is no longer in storage",
+        ));
+    }
+    let url = storage
+        .presign_get(&key)
+        .await
+        .map_err(workspace_storage_error)?;
+    tracing::info!(%workspace_id, version = workspace.version, "presigned a workspace download");
+    Ok(Json(SnapshotDownload {
+        url,
+        version: workspace.version,
+        snapshot,
+    }))
+}
+
+/// Reads the workspace as the authenticated caller. That, plus deriving every
+/// object key from the same subject rather than from the row, is what stops a
+/// known workspace id from resolving to another account's snapshot.
+async fn require_workspace(
+    state: &AppState,
+    subject: &str,
+    workspace_id: Uuid,
+) -> Result<Workspace, (StatusCode, Json<ApiError>)> {
+    state
+        .store
+        .workspace(subject, workspace_id)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| store_error(StoreError::WorkspaceNotFound))
+}
+
+/// A workspace exists before it holds anything, so a restore has to be told
+/// there is nothing to restore rather than handed a URL to a missing object.
+fn committed_snapshot(
+    workspace: &Workspace,
+) -> Result<&WorkspaceSnapshot, (StatusCode, Json<ApiError>)> {
+    workspace.snapshot.as_ref().ok_or_else(|| {
+        not_found(
+            "workspace_empty",
+            "this workspace has no committed snapshot yet",
+        )
+    })
+}
+
+/// Names are the one part of a workspace this service can read, so they are
+/// held to what belongs in a listing rather than to whatever the column takes.
+fn validate_workspace_name(name: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let malformed = name.trim().is_empty()
+        || name.len() > MAX_WORKSPACE_NAME_BYTES
+        || name.chars().any(char::is_control);
+    if malformed {
+        return Err(bad_request(
+            "invalid_workspace_name",
+            "a workspace name must be printable and at most 64 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_size(size_bytes: u64) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if size_bytes == 0 || size_bytes > MAX_WORKSPACE_BYTES {
+        return Err(bad_request(
+            "invalid_snapshot_size",
+            "a snapshot must be at least one byte and within the per-workspace cap",
+        ));
+    }
+    if size_bytes > MAX_SNAPSHOT_UPLOAD_BYTES {
+        return Err(bad_request(
+            "snapshot_upload_too_large",
+            "a snapshot larger than 5 GiB cannot be stored in a single upload",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_commit(
+    commit: &SnapshotCommitRequest,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let snapshot = &commit.snapshot;
+    validate_snapshot_size(snapshot.size_bytes)?;
+    let malformed = snapshot.wrapped_key.is_empty()
+        || snapshot.wrapped_key.len() > 1_024
+        || snapshot.nonce.is_empty()
+        || snapshot.nonce.len() > 64
+        || !is_base64url(&snapshot.wrapped_key)
+        || !is_base64url(&snapshot.nonce)
+        || !is_sha256_hex(&snapshot.ciphertext_digest);
+    if malformed {
+        return Err(bad_request(
+            "invalid_snapshot",
+            "a snapshot envelope must be base64url with a lowercase SHA-256 digest",
+        ));
+    }
+    if commit.version == 0 || commit.version > i32::MAX as u32 {
+        return Err(bad_request(
+            "invalid_snapshot",
+            "a snapshot version must be at least 1 and fit a 32-bit counter",
+        ));
+    }
+    Ok(())
+}
+
+/// The digest column carries a hex constraint, so anything else would surface
+/// as a storage failure instead of the bad request it is.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Refuses every workspace endpoint when no bucket is configured. Answering
+/// the metadata calls alone would let a renter create workspaces and record
+/// snapshots that no upload could ever have reached.
+fn require_workspace_storage(
+    state: &AppState,
+) -> Result<&workspaces::WorkspaceStorage, (StatusCode, Json<ApiError>)> {
+    state.workspaces.as_deref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            code: "workspace_storage_unconfigured",
+            message: "durable workspaces are not enabled on this deployment",
+        }),
+    ))
+}
+
+fn workspace_storage_error(error: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    tracing::error!(%error, "workspace object storage failure");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            code: "workspace_storage_unavailable",
+            message: "workspace storage is temporarily unavailable",
+        }),
+    )
 }
 
 async fn get_supplier_summary(
@@ -5691,6 +6423,21 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
         StoreError::VaultLeaseUnavailable => not_found(
             "vault_lease_unavailable",
             "the lease does not exist, is not active, or does not belong to this account",
+        ),
+        StoreError::WorkspaceNotFound => {
+            not_found("workspace_not_found", "no such workspace for this account")
+        }
+        StoreError::WorkspaceNameTaken => conflict(
+            "workspace_name_taken",
+            "this account already has a workspace with that name",
+        ),
+        StoreError::WorkspaceVersionConflict => conflict(
+            "workspace_version_conflict",
+            "another writer committed a snapshot first; re-read the workspace and upload again",
+        ),
+        StoreError::WorkspaceFull => conflict(
+            "workspace_full",
+            "this account is holding the maximum number of workspaces",
         ),
         StoreError::InvalidStoredState(message) => {
             tracing::error!(%message, "invalid stored marketplace state");
@@ -7068,6 +7815,217 @@ mod tests {
 
         assert_eq!(write.min_trust_class, DEFAULT_VAULT_TRUST_FLOOR);
         assert!(write.previous_version.is_none());
+    }
+
+    fn memory_store() -> MarketplaceStore {
+        MarketplaceStore::Memory(Arc::new(RwLock::new(MemoryMarketplace::default())))
+    }
+
+    fn snapshot(size_bytes: u64) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            wrapped_key: "d3JhcHBlZA".to_owned(),
+            nonce: "bm9uY2UtMTIzNA".to_owned(),
+            ciphertext_digest: "a".repeat(64),
+            size_bytes,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workspace_is_invisible_to_every_other_account() {
+        let store = memory_store();
+        let workspace = store
+            .create_workspace("owner", "checkpoints", TrustClass::Open)
+            .await
+            .unwrap();
+        let workspace_id = workspace.workspace_id;
+
+        assert!(
+            store
+                .workspace("intruder", workspace_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_workspaces("intruder").await.unwrap().is_empty());
+        assert!(matches!(
+            store.delete_workspace("intruder", workspace_id).await,
+            Err(StoreError::WorkspaceNotFound)
+        ));
+        // Committing over a stranger's workspace would destroy their snapshot
+        // without ever reading it, and point the row at bytes they cannot open.
+        assert!(matches!(
+            store
+                .commit_workspace_snapshot("intruder", workspace_id, 1, snapshot(64))
+                .await,
+            Err(StoreError::WorkspaceNotFound)
+        ));
+        assert_eq!(
+            store
+                .workspace("owner", workspace_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            0
+        );
+        // And the objects the two would presign never collide, so knowing a
+        // workspace id is not enough to name someone else's snapshot.
+        assert_ne!(
+            workspaces::WorkspaceStorage::key("owner", workspace_id, 1),
+            workspaces::WorkspaceStorage::key("intruder", workspace_id, 1),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_workspace_cap_is_counted_per_account() {
+        let store = memory_store();
+        for index in 0..MAX_WORKSPACES_PER_ACCOUNT {
+            store
+                .create_workspace("owner", &format!("run-{index}"), TrustClass::Open)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            store
+                .create_workspace("owner", "one-more", TrustClass::Open)
+                .await,
+            Err(StoreError::WorkspaceFull)
+        ));
+        // A full account cannot starve anyone else, and a name is only taken
+        // for the account that took it.
+        assert!(
+            store
+                .create_workspace("other", "run-0", TrustClass::Open)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_hold_the_same_workspace_name_twice() {
+        let store = memory_store();
+        store
+            .create_workspace("owner", "checkpoints", TrustClass::Open)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .create_workspace("owner", "checkpoints", TrustClass::Open)
+                .await,
+            Err(StoreError::WorkspaceNameTaken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_commit_only_lands_on_the_version_that_was_presigned() {
+        let store = memory_store();
+        let workspace = store
+            .create_workspace("owner", "checkpoints", TrustClass::Open)
+            .await
+            .unwrap();
+        let workspace_id = workspace.workspace_id;
+
+        // Nothing is committed yet, so version 2 was never on offer.
+        assert!(matches!(
+            store
+                .commit_workspace_snapshot("owner", workspace_id, 2, snapshot(64))
+                .await,
+            Err(StoreError::WorkspaceVersionConflict)
+        ));
+
+        let first = store
+            .commit_workspace_snapshot("owner", workspace_id, 1, snapshot(64))
+            .await
+            .unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(first.snapshot.unwrap().size_bytes, 64);
+
+        // A second machine that presigned version 1 before the first committed
+        // must not replace it, because both sealed different bytes as v1.
+        assert!(matches!(
+            store
+                .commit_workspace_snapshot("owner", workspace_id, 1, snapshot(9))
+                .await,
+            Err(StoreError::WorkspaceVersionConflict)
+        ));
+
+        let second = store
+            .commit_workspace_snapshot("owner", workspace_id, 2, snapshot(128))
+            .await
+            .unwrap();
+        assert_eq!(second.version, 2);
+        assert_eq!(second.created_at, workspace.created_at);
+        assert_eq!(second.snapshot.unwrap().size_bytes, 128);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_with_no_snapshot_has_nothing_to_download() {
+        let store = memory_store();
+        let workspace = store
+            .create_workspace("owner", "checkpoints", TrustClass::Open)
+            .await
+            .unwrap();
+        assert!(workspace.snapshot.is_none());
+        assert!(committed_snapshot(&workspace).is_err());
+
+        let committed = store
+            .commit_workspace_snapshot("owner", workspace.workspace_id, 1, snapshot(64))
+            .await
+            .unwrap();
+        assert!(committed_snapshot(&committed).is_ok());
+    }
+
+    #[test]
+    fn a_workspace_name_must_be_printable_and_short() {
+        assert!(validate_workspace_name("checkpoints").is_ok());
+        assert!(validate_workspace_name("").is_err());
+        assert!(validate_workspace_name("   ").is_err());
+        assert!(validate_workspace_name(&"n".repeat(MAX_WORKSPACE_NAME_BYTES + 1)).is_err());
+        assert!(validate_workspace_name("two\nlines").is_err());
+    }
+
+    #[test]
+    fn a_snapshot_too_large_to_store_is_refused_before_it_is_presigned() {
+        assert!(validate_snapshot_size(1).is_ok());
+        assert!(validate_snapshot_size(0).is_err());
+        assert!(validate_snapshot_size(MAX_WORKSPACE_BYTES + 1).is_err());
+        // The per-workspace cap is larger than one upload can carry, so this
+        // has to be refused here rather than at the end of a long PUT.
+        const { assert!(MAX_SNAPSHOT_UPLOAD_BYTES < MAX_WORKSPACE_BYTES) };
+        assert!(validate_snapshot_size(MAX_SNAPSHOT_UPLOAD_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn a_commit_must_carry_a_lowercase_sha256_digest() {
+        let commit = |digest: &str| SnapshotCommitRequest {
+            version: 1,
+            snapshot: WorkspaceSnapshot {
+                ciphertext_digest: digest.to_owned(),
+                ..snapshot(64)
+            },
+        };
+        assert!(validate_snapshot_commit(&commit(&"a".repeat(64))).is_ok());
+        assert!(validate_snapshot_commit(&commit(&"A".repeat(64))).is_err());
+        assert!(validate_snapshot_commit(&commit(&"a".repeat(63))).is_err());
+        assert!(validate_snapshot_commit(&commit("")).is_err());
+
+        let unversioned = SnapshotCommitRequest {
+            version: 0,
+            snapshot: snapshot(64),
+        };
+        assert!(validate_snapshot_commit(&unversioned).is_err());
+    }
+
+    // Unlike a vault item, a workspace defaults to the weakest floor. Its
+    // contents are the files the renter is already handing to a rented machine,
+    // and a default no live capacity meets would make the feature unusable.
+    #[test]
+    fn a_workspace_request_without_a_trust_class_defaults_to_open() {
+        let request: WorkspaceRequest =
+            serde_json::from_value(serde_json::json!({"name": "checkpoints"})).unwrap();
+
+        assert_eq!(request.min_trust_class, DEFAULT_WORKSPACE_TRUST_FLOOR);
+        assert_eq!(request.name, "checkpoints");
     }
 
     // Marking has to happen wherever offers are read for matching. An earlier
