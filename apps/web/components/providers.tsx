@@ -10,6 +10,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createPublicClient, createWalletClient, custom, http, stringToHex, type Address, type Hex } from "viem";
 import { robinhoodChain } from "@/lib/chain";
+import { resolveWalletConnectProjectId } from "@/lib/wallet-connect";
 
 export type ConnectedAccount = {
   address: Address;
@@ -64,6 +65,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         supportedChains: [robinhoodChain],
         defaultChain: robinhoodChain,
         embeddedWallets: { ethereum: { createOnLogin: "users-without-wallets" } },
+        walletConnectCloudProjectId: resolveWalletConnectProjectId(),
         appearance: { theme: "dark", accentColor: "#ccff00" },
       }}
     >
