@@ -352,6 +352,11 @@ enum StoreError {
     WorkspaceVersionConflict,
     #[error("workspace limit reached")]
     WorkspaceFull,
+    #[error("lease trust class {lease} is below the workspace's floor {floor}")]
+    WorkspaceTrustFloorUnmet {
+        floor: &'static str,
+        lease: &'static str,
+    },
     #[error("storage failure")]
     Storage(#[source] SqlError),
 }
@@ -5237,7 +5242,7 @@ async fn download_workspace(
             )
         })?;
     if !vault_release_permitted(workspace.min_trust_class, lease_trust_class) {
-        return Err(store_error(StoreError::VaultTrustFloorUnmet {
+        return Err(store_error(StoreError::WorkspaceTrustFloorUnmet {
             floor: workspace.min_trust_class.label(),
             lease: lease_trust_class.label(),
         }));
@@ -6438,6 +6443,11 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
         StoreError::VaultFull => conflict(
             "vault_full",
             "this account is holding the maximum number of vault items",
+        ),
+        StoreError::WorkspaceTrustFloorUnmet { .. } => forbidden(
+            "workspace_trust_floor_unmet",
+            "this lease's trust class is below the floor sealed into this workspace; \
+             lower the floor deliberately or restore onto capacity that qualifies",
         ),
         StoreError::VaultTrustFloorUnmet { .. } => forbidden(
             "vault_trust_floor_unmet",
