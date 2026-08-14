@@ -270,8 +270,14 @@ impl ChainStatus {
 }
 
 /// A control-plane lease is open while it can still consume escrow.
+///
+/// `failed` is not settled. Only this control plane writes it, after an action
+/// exhausted its attempts, which is exactly when a chain call could not be
+/// landed and so exactly when the escrow is most likely to still hold the
+/// deposit. Treating it as closed hid those leases from reconciliation at the
+/// one moment their money needed checking.
 fn db_state_is_open(state: &str) -> bool {
-    !matches!(state, "finalized" | "refunded" | "failed")
+    !matches!(state, "finalized" | "refunded")
 }
 
 /// The reconciliation verdict for one lease, comparing the control-plane state to
@@ -331,6 +337,10 @@ impl ChainReader {
             usdg: usdg.to_ascii_lowercase(),
             from_block,
         }))
+    }
+
+    fn escrow_address(&self) -> &str {
+        &self.escrow
     }
 
     async fn eth_call(&self, to: &str, data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
@@ -477,6 +487,9 @@ struct Report {
     drift_db_settled_chain_open: u64,
     conservation_checked: u64,
     conservation_violations: u64,
+    /// Leases the escrow could not be asked about. One of these used to abort
+    /// the whole pass, which took every other invariant down with it.
+    unreadable_leases: u64,
     stuck_provisioning: i64,
     stuck_settlement: i64,
     stuck_closing: i64,
@@ -489,12 +502,23 @@ struct Report {
 }
 
 impl Report {
+    /// Both invariants fail closed. They used to read "true unless the chain
+    /// said otherwise", so losing sight of the chain published exactly the same
+    /// numbers as a healthy idle network: solvent, within the lease bound, zero
+    /// drift, zero violations. The one moment the monitor cannot see is the one
+    /// moment it must not claim everything is fine.
     fn solvency_ok(&self) -> bool {
-        !self.chain_reachable || self.escrow_usdg_balance >= self.open_lease_deposit_sum
+        if self.chain_configured && !self.chain_reachable {
+            return false;
+        }
+        self.escrow_usdg_balance >= self.open_lease_deposit_sum
     }
 
     fn active_bound_ok(&self) -> bool {
-        !self.chain_reachable || self.chain_active_leases <= MAX_NETWORK_LEASES as u128
+        if self.chain_configured && !self.chain_reachable {
+            return false;
+        }
+        self.chain_active_leases <= MAX_NETWORK_LEASES as u128
     }
 
     fn log_breaches(&self) {
@@ -542,13 +566,23 @@ impl Report {
 async fn reconcile(pool: &PgPool, chain: Option<&ChainReader>) -> anyhow::Result<Report> {
     let mut report = Report::default();
 
-    // chain_lease_id, because every value here is handed straight to getLease.
-    let open_leases = query_as::<_, (i64, String)>(
-        "SELECT chain_lease_id, state FROM leases \
-         WHERE state NOT IN ('finalized', 'refunded', 'failed') ORDER BY lease_id",
-    )
-    .fetch_all(pool)
-    .await?;
+    // chain_lease_id, because every value here is handed straight to getLease,
+    // and only for the escrow now deployed. A superseded escrow numbered its
+    // leases from the same counter, so reading one of those ids against this
+    // escrow reports on a different lease or reverts outright.
+    let open_leases = match chain {
+        Some(chain) => {
+            query_as::<_, (i64, String)>(
+                "SELECT chain_lease_id, state FROM leases \
+                 WHERE state NOT IN ('finalized', 'refunded') \
+                   AND escrow_address = $1 ORDER BY lease_id",
+            )
+            .bind(chain.escrow_address())
+            .fetch_all(pool)
+            .await?
+        }
+        None => Vec::new(),
+    };
     report.db_open_leases = open_leases.len() as i64;
 
     report.stuck_provisioning = stuck(pool, "provisioning", PROVISION_TIMEOUT_SECONDS).await?;
@@ -594,6 +628,7 @@ async fn reconcile(pool: &PgPool, chain: Option<&ChainReader>) -> anyhow::Result
             report.drift_db_settled_chain_open = chain_report.drift_db_settled_chain_open;
             report.conservation_checked = chain_report.conservation_checked;
             report.conservation_violations = chain_report.conservation_violations;
+            report.unreadable_leases = chain_report.unreadable_leases;
         }
         Err(error) => {
             tracing::error!(error = %error, "chain reconciliation read failed");
@@ -612,6 +647,7 @@ struct ChainReport {
     drift_db_settled_chain_open: u64,
     conservation_checked: u64,
     conservation_violations: u64,
+    unreadable_leases: u64,
 }
 
 async fn reconcile_chain(
@@ -625,7 +661,17 @@ async fn reconcile_chain(
     };
 
     for (lease_id, db_state) in open_leases {
-        let (deposit, status) = chain.lease(*lease_id).await?;
+        // One unreadable lease is a gap in the picture, not a reason to stop
+        // drawing it. Aborting here left every money invariant reporting
+        // healthy because none of them had been evaluated.
+        let (deposit, status) = match chain.lease(*lease_id).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(lease_id, %error, "could not read a lease from the escrow");
+                report.unreadable_leases += 1;
+                continue;
+            }
+        };
         report.open_lease_deposit_sum = report.open_lease_deposit_sum.saturating_add(deposit);
         match classify_agreement(db_state, status) {
             Agreement::Ok => {}
@@ -746,6 +792,12 @@ fn render_metrics(report: &Report) -> String {
         "prism_reconcile_conservation_violations_total",
         "Finalized settlements that do not conserve the deposit.",
         &report.conservation_violations.to_string(),
+    );
+    gauge(
+        &mut out,
+        "prism_reconcile_unreadable_leases",
+        "Open leases the escrow could not be read for during this pass.",
+        &report.unreadable_leases.to_string(),
     );
     for (kind, value) in [
         ("missing_on_chain", report.drift_missing_on_chain),
@@ -918,6 +970,40 @@ mod tests {
         let mut word = [0_u8; 32];
         word[16..].copy_from_slice(&50_000_000_u128.to_be_bytes());
         assert_eq!(tail_u128(&word), 50_000_000);
+    }
+
+    /// A monitor that cannot see the chain used to publish the same numbers as
+    /// a healthy idle network. Losing sight is the moment the alarm matters
+    /// most, so both invariants fail closed.
+    #[test]
+    fn losing_the_chain_is_not_reported_as_a_healthy_network() {
+        let blind = Report {
+            chain_configured: true,
+            chain_reachable: false,
+            ..Report::default()
+        };
+        assert!(!blind.solvency_ok(), "blind must not read as solvent");
+        assert!(!blind.active_bound_ok(), "blind must not read as in-bound");
+
+        // With no chain configured at all there is nothing to be blind to.
+        let unconfigured = Report::default();
+        assert!(unconfigured.solvency_ok());
+        assert!(unconfigured.active_bound_ok());
+
+        let healthy = Report {
+            chain_configured: true,
+            chain_reachable: true,
+            escrow_usdg_balance: 500,
+            open_lease_deposit_sum: 500,
+            ..Report::default()
+        };
+        assert!(healthy.solvency_ok());
+
+        let short = Report {
+            escrow_usdg_balance: 499,
+            ..healthy
+        };
+        assert!(!short.solvency_ok(), "a shortfall must still be caught");
     }
 
     #[test]

@@ -54,8 +54,14 @@ const PROVISION_TIMEOUT_SECONDS: u64 = 600;
 /// How far back to look for leases the escrow knows about and we do not.
 const ORPHAN_SCAN_DEPTH: u64 = 32;
 const ORPHAN_SCAN_INTERVAL_SECONDS: u64 = 300;
+/// How often a rented machine is asked whether it is still alive. Every active
+/// lease costs one provider call, so this is paced well under the staleness
+/// window that closes a lease, leaving room to miss a round to a flaky API
+/// without ending someone's job.
+const CLOUD_OBSERVATION_INTERVAL_SECONDS: u64 = 45;
 /// LeaseStatus.Funded in the escrow's enum.
 const LEASE_STATUS_FUNDED: u8 = 1;
+const LEASE_STATUS_ACTIVE: u8 = 2;
 const LEASE_STATUS_FINALIZED: u8 = 5;
 const LEASE_STATUS_REFUNDED: u8 = 6;
 
@@ -89,6 +95,7 @@ struct Worker {
     vast: Option<VastBroker>,
     supply_note: tokio::sync::Mutex<Option<String>>,
     last_orphan_sweep: tokio::sync::Mutex<Option<std::time::Instant>>,
+    last_cloud_observation: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// An id the escrow issued. Kept distinct from the internal `lease_id` in the
@@ -236,8 +243,16 @@ fn candidate_refusal(
     if instance.status != "running" {
         return if stalled { timed_out() } else { None };
     }
+    // Vast fills the forwarded port in some seconds after it starts reporting
+    // the instance as running, so a missing port is only a fault once the host
+    // has had its whole budget to produce one. Machine 23779 was refused for
+    // this and served the very next lease it was offered.
     if instance.direct_port_start <= 0 {
-        return Some("host reserved no forwarded ports, so sshd is unreachable".to_owned());
+        return if stalled {
+            Some("host reserved no forwarded ports, so sshd is unreachable".to_owned())
+        } else {
+            None
+        };
     }
     if stalled { timed_out() } else { None }
 }
@@ -256,8 +271,11 @@ fn decode_lease(bytes: &[u8]) -> anyhow::Result<OnchainLease> {
     }
     let mut created = [0u8; 8];
     created.copy_from_slice(&bytes[32 * 7 - 8..32 * 7]);
+    let mut ended = [0u8; 8];
+    ended.copy_from_slice(&bytes[32 * 9 - 8..32 * 9]);
     Ok(OnchainLease {
         created_at: u64::from_be_bytes(created),
+        access_ended_at: u64::from_be_bytes(ended),
         status: bytes[32 * 14 - 1],
     })
 }
@@ -271,6 +289,9 @@ fn expirable(lease: OnchainLease, now: u64) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct OnchainLease {
     created_at: u64,
+    /// Zero until access is closed. A renter can set this themselves with
+    /// forceClose, so it moves without this worker doing anything.
+    access_ended_at: u64,
     status: u8,
 }
 
@@ -334,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
         vast: VastBroker::from_environment()?,
         supply_note: tokio::sync::Mutex::new(None),
         last_orphan_sweep: tokio::sync::Mutex::new(None),
+        last_cloud_observation: tokio::sync::Mutex::new(None),
     };
     if let Some(vast) = worker.vast.as_ref() {
         tracing::info!(
@@ -386,6 +408,9 @@ impl Worker {
         if let Err(error) = self.expire_orphaned_leases().await {
             tracing::error!(%error, "orphaned lease sweep failed");
         }
+        if let Err(error) = self.observe_cloud_instances().await {
+            tracing::error!(%error, "cloud liveness sweep failed");
+        }
         query(
             "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
              SELECT md5(lease_id::text || ':expire_provision')::uuid, lease_id, 'expire_provision', \
@@ -413,7 +438,10 @@ impl Worker {
                         OR nt.observed_at < NOW() - INTERVAL '90 seconds' \
                         OR t.observed_at IS NULL \
                         OR t.observed_at < NOW() - INTERVAL '90 seconds')) \
-                    OR (ci.lease_id IS NOT NULL AND ci.status NOT IN ('running', 'destroying'))) \
+                    OR (ci.lease_id IS NOT NULL AND ( \
+                        ci.status NOT IN ('running', 'destroying') \
+                        OR ci.observed_at IS NULL \
+                        OR ci.observed_at < NOW() - INTERVAL '150 seconds'))) \
              ON CONFLICT (lease_id, kind) DO NOTHING",
         )
         .execute(&self.pool)
@@ -586,6 +614,72 @@ impl Worker {
         unlock?;
         let hash = result?;
         tracing::warn!(lease_id = lease_id.get(), %hash, "refunded an unrecorded lease and released its node");
+        Ok(())
+    }
+
+    /// Keeps watching a rented machine for as long as the renter is paying for
+    /// it. Provisioning writes `running` once and then stops looking, so before
+    /// this a host that rebooted, was preempted, or whose container exited
+    /// stayed `running` in our table until the lease ran out on its own, and
+    /// settlement billed the whole window. A self-hosted node has proved itself
+    /// every few seconds all along; this is the same guarantee for brokered
+    /// capacity.
+    async fn observe_cloud_instances(&self) -> anyhow::Result<()> {
+        let Some(vast) = self.vast.as_ref() else {
+            return Ok(());
+        };
+        {
+            let mut last = self.last_cloud_observation.lock().await;
+            let due = last.is_none_or(|at| {
+                at.elapsed() >= std::time::Duration::from_secs(CLOUD_OBSERVATION_INTERVAL_SECONDS)
+            });
+            if !due {
+                return Ok(());
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let instances = query_as::<_, (i64, i64)>(
+            "SELECT ci.lease_id, ci.provider_instance_id \
+             FROM cloud_instances ci JOIN leases l ON l.lease_id = ci.lease_id \
+             WHERE l.state IN ('ready', 'active') \
+               AND ci.provider_instance_id IS NOT NULL \
+               AND ci.status = 'running'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (lease_id, instance_id) in instances {
+            let observed = match vast.instance(u64::try_from(instance_id)?).await {
+                Ok(instance) => instance.status,
+                // A provider that cannot be reached is not evidence the machine
+                // died. Leaving `observed_at` alone lets the staleness window
+                // close the lease only if this keeps failing.
+                Err(error) => {
+                    tracing::warn!(lease_id, %error, "could not observe a rented machine");
+                    continue;
+                }
+            };
+            let alive = observed == "running";
+            query(
+                "UPDATE cloud_instances \
+                 SET status = CASE WHEN $2 THEN status ELSE 'failed' END, \
+                     last_error = CASE WHEN $2 THEN last_error \
+                                  ELSE 'provider reports ' || $3 END, \
+                     observed_at = NOW(), updated_at = NOW() \
+                 WHERE lease_id = $1",
+            )
+            .bind(lease_id)
+            .bind(alive)
+            .bind(&observed)
+            .execute(&self.pool)
+            .await?;
+            if !alive {
+                tracing::warn!(
+                    lease_id,
+                    status = %observed,
+                    "rented machine stopped running; closing the lease early"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -869,10 +963,58 @@ impl Worker {
             return self.refresh_grant(&action).await;
         }
         if action.kind == ActionKind::StartAccess && action.transaction.is_none() {
-            self.probe(&action).await?;
+            // Funded is the only status a lease can still be started from.
+            // Without this check a refunded lease keeps renting machines for a
+            // renter who has already been paid back, and every attempt puts the
+            // lease back into a state that holds its node out of the market. One
+            // such lease sat in `provisioning` for hours after the escrow had
+            // refunded it, retrying start_access forty-six times.
+            match self.lease_status(action.chain_lease_id).await? {
+                LEASE_STATUS_FUNDED => self.probe(&action).await?,
+                settled @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
+                    self.adopt_settled_lease(&action, settled).await?;
+                    return self.skip_action(&action).await;
+                }
+                // Already started, or disputed. Either way this action has
+                // nothing left to do, and guessing a settlement here would
+                // publish an outcome the chain never reached.
+                status => {
+                    tracing::warn!(
+                        lease_id = action.lease_id,
+                        status,
+                        "skipping start_access for a lease the escrow has moved past"
+                    );
+                    return self.skip_action(&action).await;
+                }
+            }
         }
         if action.kind == ActionKind::CloseAccess && action.transaction.is_none() {
             self.revoke_access(action.lease_id).await?;
+            // closeAccess reverts unless the lease is Active with access still
+            // open, and a renter can close their own access with forceClose. A
+            // transaction built anyway reverts on every attempt until the action
+            // gives up, and giving up is what strands the deposit. Skipping is
+            // not enough either: completing this action is what records the
+            // close and queues settlement, so adopt the close the chain already
+            // has and queue settlement from that.
+            let onchain = self.lease_summary(action.chain_lease_id).await?;
+            if onchain.status != LEASE_STATUS_ACTIVE {
+                tracing::warn!(
+                    lease_id = action.lease_id,
+                    status = onchain.status,
+                    "skipping close_access for a lease the escrow no longer has open"
+                );
+                return self.skip_action(&action).await;
+            }
+            if onchain.access_ended_at != 0 {
+                tracing::warn!(
+                    lease_id = action.lease_id,
+                    "access was closed on chain by someone else; settling from that"
+                );
+                self.adopt_closed_access(&action, onchain.access_ended_at)
+                    .await?;
+                return self.skip_action(&action).await;
+            }
         }
         if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
             match self.lease_status(action.chain_lease_id).await? {
@@ -926,6 +1068,15 @@ impl Worker {
                 self.reschedule_submitted(action.action_id).await?;
             }
             Finality::Reverted { .. } => {
+                // Drop the prepared transaction so the next attempt reads the
+                // chain again and builds a new one. Keeping it meant every
+                // retry resubmitted the identical bytes, the node returned the
+                // same receipt, and the action could only re-observe its own
+                // revert until it exhausted its attempts. The lease was then
+                // marked failed while the escrow still held the deposit and the
+                // registry still held the node, so a transient revert became a
+                // permanent loss.
+                self.discard_prepared_transaction(action.action_id).await?;
                 anyhow::bail!("lifecycle transaction reverted");
             }
             Finality::Confirmed {
@@ -1180,6 +1331,16 @@ impl Worker {
             .await?;
             anyhow::bail!("Vast machine {} refused: {refusal}", instance.machine_id);
         }
+        // Not refused, but not usable yet either. A host reports its forwarded
+        // port some seconds after it starts reporting itself as running, and
+        // the proxy address it advertises in the meantime does not reach sshd.
+        // Handing that address to a renter gives them a machine they are paying
+        // for and cannot log in to, so the lease stays provisioning until the
+        // port is real. If it never becomes real the boot budget refuses the
+        // host on a later pass, which is what `stalled` above is for.
+        if instance.direct_port_start <= 0 {
+            return Err(StillProvisioning.into());
+        }
         let host = instance.ssh_host.context("Vast instance has no SSH host")?;
         let port = instance
             .ssh_port
@@ -1190,7 +1351,8 @@ impl Worker {
         query(
             "UPDATE cloud_instances SET hourly_cost_micros = $2, ssh_host = $3, ssh_port = $4, \
                  status = 'running', started_at = COALESCE(started_at, $5), \
-                 last_error = NULL, updated_at = NOW() WHERE lease_id = $1",
+                 last_error = NULL, observed_at = NOW(), updated_at = NOW() \
+             WHERE lease_id = $1",
         )
         .bind(lease_id as i64)
         .bind(i64::try_from(instance.hourly_micros)?)
@@ -1321,6 +1483,42 @@ impl Worker {
             .await
     }
 
+    /// Records a close this worker did not perform and queues settlement from
+    /// it. Without this a renter who closes their own access leaves the lease
+    /// with no settlement job, so nobody is ever paid and the deposit sits in
+    /// the escrow. There is no close transaction of ours to name, so the hash
+    /// stays null and the receipt names the settling transaction instead.
+    async fn adopt_closed_access(&self, action: &Action, ended_at: u64) -> anyhow::Result<()> {
+        let ended_at = DateTime::from_timestamp(ended_at as i64, 0)
+            .context("on-chain access close timestamp is invalid")?;
+        query(
+            "UPDATE lease_lifecycle SET access_ended_at = COALESCE(access_ended_at, $2), \
+                 updated_at = NOW() WHERE lease_id = $1",
+        )
+        .bind(action.lease_id as i64)
+        .bind(ended_at)
+        .execute(&self.pool)
+        .await?;
+        let evidence = self.settlement_evidence(action.lease_id).await?;
+        let mut transaction = self.pool.begin().await?;
+        query(
+            "INSERT INTO settlement_jobs (lease_id, evidence) VALUES ($1, $2) \
+             ON CONFLICT (lease_id) DO NOTHING",
+        )
+        .bind(action.lease_id as i64)
+        .bind(SqlJson(evidence))
+        .execute(&mut *transaction)
+        .await?;
+        set_lease_state_in(
+            &mut transaction,
+            action.lease_id,
+            LeaseState::SettlementPending,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     async fn complete_close(&self, action: &Action, block_time: u64) -> anyhow::Result<()> {
         let ended_at = DateTime::from_timestamp(block_time as i64, 0)
             .context("access close timestamp is invalid")?;
@@ -1374,7 +1572,9 @@ impl Worker {
             .transaction_hash;
         let mut receipt = PublicReceipt {
             receipt_id: Uuid::now_v7(),
-            lease_id: action.lease_id.to_string(),
+            // What the escrow numbered it, so a reader can find this lease on
+            // chain. The internal id means nothing outside this database.
+            lease_id: action.chain_lease_id.get().to_string(),
             node_id_hash: format!(
                 "0x{}",
                 hex::encode(Sha256::digest(context.lease.node_id.as_bytes()))
@@ -1391,7 +1591,7 @@ impl Worker {
             transaction_hash: transaction_hash.clone(),
         };
         receipt.receipt_hash = receipt_hash(&receipt)?;
-        self.insert_receipt(&receipt, block_number, block_hash)
+        self.insert_receipt(action.lease_id, &receipt, block_number, block_hash)
             .await?;
         self.set_lease_state(action.lease_id, LeaseState::Refunded)
             .await
@@ -1422,7 +1622,7 @@ impl Worker {
             .context("finalization transaction is missing")?
             .transaction_hash
             .clone();
-        self.insert_receipt(&receipt, block_number, block_hash)
+        self.insert_receipt(action.lease_id, &receipt, block_number, block_hash)
             .await?;
         let mut transaction = self.pool.begin().await?;
         query(
@@ -1745,8 +1945,13 @@ impl Worker {
         Ok(bytes[32 * 14 - 1])
     }
 
+    /// `internal_lease_id` is the row this receipt belongs to; the receipt's own
+    /// `lease_id` is the escrow's, which is what a reader checks on chain. They
+    /// are different numbers and the foreign key needs ours, so it is passed
+    /// rather than parsed back out of the published document.
     async fn insert_receipt(
         &self,
+        internal_lease_id: u64,
         receipt: &PublicReceipt,
         block_number: u64,
         block_hash: &str,
@@ -1758,7 +1963,7 @@ impl Worker {
              ON CONFLICT (lease_id) DO NOTHING",
         )
         .bind(receipt.receipt_id)
-        .bind(receipt.lease_id.parse::<i64>()?)
+        .bind(internal_lease_id as i64)
         .bind(SqlJson(receipt.clone()))
         .bind(receipt.transaction_hash.to_ascii_lowercase())
         .bind(block_number as i64)
@@ -1884,6 +2089,21 @@ impl Worker {
         let mut transaction = self.pool.begin().await?;
         set_lease_state_in(&mut transaction, lease_id, state).await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Forgets the transaction prepared for an action, so the next attempt
+    /// builds a fresh one against current chain state.
+    async fn discard_prepared_transaction(&self, action_id: Uuid) -> anyhow::Result<()> {
+        query(
+            "UPDATE lifecycle_outbox \
+             SET raw_transaction = NULL, transaction_hash = NULL, \
+                 transaction_nonce = NULL, updated_at = NOW() \
+             WHERE action_id = $1",
+        )
+        .bind(action_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2206,12 +2426,14 @@ mod tests {
     fn only_an_unprovisioned_lease_past_its_window_is_expirable() {
         let now = 1_000_000u64;
         let funded_and_stale = OnchainLease {
+            access_ended_at: 0,
             created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
             status: 1,
         };
         assert!(expirable(funded_and_stale, now));
 
         let funded_but_fresh = OnchainLease {
+            access_ended_at: 0,
             created_at: now - 60,
             status: 1,
         };
@@ -2222,6 +2444,7 @@ mod tests {
 
         for status in [0u8, 2, 3, 4, 5, 6] {
             let other = OnchainLease {
+                access_ended_at: 0,
                 created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
                 status,
             };
@@ -2305,6 +2528,56 @@ mod tests {
         }
     }
 
+    /// Production regression, caught by renting a machine and failing to log
+    /// into it. A host that reports itself running before it has a forwarded
+    /// port advertises a proxy address that does not reach sshd. Treating that
+    /// as ready handed a renter a box they were paying for and could not use.
+    /// Not refusing it is right; declaring it ready is not.
+    #[test]
+    fn a_running_host_without_a_port_is_neither_refused_nor_ready() {
+        let no_port = booting_instance("running", -1);
+        assert_eq!(
+            candidate_refusal(&no_port, true, 16_000, 640_000, &[], false),
+            None,
+            "inside its budget the host keeps its place in the queue"
+        );
+        assert!(
+            no_port.direct_port_start <= 0,
+            "and the readiness gate holds the lease on exactly this"
+        );
+
+        let with_port = booting_instance("running", 19_300);
+        assert_eq!(
+            candidate_refusal(&with_port, true, 16_000, 640_000, &[], false),
+            None
+        );
+        assert!(with_port.direct_port_start > 0, "only this one is usable");
+    }
+
+    /// The escrow returns the lease as fourteen words. `accessEndedAt` is the
+    /// ninth, and reading the wrong one would silently return another
+    /// timestamp: `accessStartedAt` before it, `proposedUsageSeconds` after.
+    /// Either would make a lease look closed when it is not, or the reverse.
+    #[test]
+    fn a_lease_decodes_the_word_that_actually_holds_access_ended_at() {
+        let mut bytes = vec![0u8; 32 * 14];
+        bytes[32 * 7 - 8..32 * 7].copy_from_slice(&1_700_000_000u64.to_be_bytes());
+        bytes[32 * 8 - 8..32 * 8].copy_from_slice(&1_700_000_111u64.to_be_bytes());
+        bytes[32 * 9 - 8..32 * 9].copy_from_slice(&1_700_000_222u64.to_be_bytes());
+        bytes[32 * 10 - 8..32 * 10].copy_from_slice(&999u64.to_be_bytes());
+        bytes[32 * 14 - 1] = LEASE_STATUS_ACTIVE;
+
+        let lease = decode_lease(&bytes).unwrap();
+        assert_eq!(lease.created_at, 1_700_000_000);
+        assert_eq!(lease.access_ended_at, 1_700_000_222);
+        assert_eq!(lease.status, LEASE_STATUS_ACTIVE);
+
+        // Access still open is the case that must not read as closed.
+        let mut open = bytes.clone();
+        open[32 * 9 - 8..32 * 9].copy_from_slice(&0u64.to_be_bytes());
+        assert_eq!(decode_lease(&open).unwrap().access_ended_at, 0);
+    }
+
     /// Production regression. Vast reports `direct_port_start` as -1 until a
     /// host finishes booting. Reading the port before the boot budget expired
     /// condemned healthy hosts as having reserved no ports, so the broker
@@ -2325,10 +2598,18 @@ mod tests {
             "a timeout must be reported as a timeout, got: {refusal}"
         );
 
-        // Once it is up, the port is real and a missing one is a real fault.
+        // The port arrives some seconds after the instance starts reporting
+        // itself as running, so it is only a fault once the budget is spent.
+        // Machine 23779 was refused inside this gap and then served the very
+        // next lease it was offered.
         let running = booting_instance("running", -1);
-        let refusal = candidate_refusal(&running, true, 16_000, 640_000, &[], false)
-            .expect("a running host with no forwarded port is unusable");
+        assert_eq!(
+            candidate_refusal(&running, true, 16_000, 640_000, &[], false),
+            None,
+            "a host that just came up is still settling, not portless"
+        );
+        let refusal = candidate_refusal(&running, true, 16_000, 640_000, &[], true)
+            .expect("a running host with no port after its whole budget is unusable");
         assert!(refusal.contains("forwarded ports"), "got: {refusal}");
         assert_eq!(
             candidate_refusal(
