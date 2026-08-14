@@ -2846,7 +2846,7 @@ impl MarketplaceStore {
                              (lease_id, sequence, document, observed_at) \
                          SELECT $1, $2, $3, $4 FROM leases \
                          WHERE lease_id = $1 AND document->>'node_id' = $5 \
-                           AND state NOT IN ('finalized', 'refunded', 'failed') \
+                           AND state NOT IN ('finalized', 'refunded') \
                          ON CONFLICT (lease_id, sequence) DO NOTHING",
                     )
                     .bind(lease_id)
@@ -2977,7 +2977,7 @@ impl MarketplaceStore {
                     "SELECT \
                          (SELECT COUNT(*) FROM lease_quotes \
                           WHERE consumed_at IS NULL AND expires_at > NOW()) + \
-                         (SELECT COUNT(*) FROM leases WHERE state NOT IN ('finalized', 'refunded', 'failed'))",
+                         (SELECT COUNT(*) FROM leases WHERE state NOT IN ('finalized', 'refunded'))",
                 )
                     .fetch_one(&mut *transaction)
                     .await
@@ -2990,7 +2990,7 @@ impl MarketplaceStore {
                      WHERE consumed_at IS NULL AND expires_at > NOW() \
                        AND created_at > NOW() - make_interval(secs => $1) \
                      UNION SELECT document->>'node_id' FROM leases \
-                     WHERE state NOT IN ('finalized', 'refunded', 'failed')",
+                     WHERE state NOT IN ('finalized', 'refunded')",
                 )
                 .bind(QUOTE_HOLD_SECONDS as f64)
                 .fetch_all(&mut *transaction)
@@ -4222,10 +4222,13 @@ fn valid_command_transition(current: &str, next: &str) -> bool {
 /// non-terminal state reserves by default instead of silently letting the
 /// scheduler quote a node the registry will reject with `LeaseNotReady`.
 fn occupies_node(lease: &LeaseRecord) -> bool {
-    !matches!(
-        lease.state,
-        LeaseState::Finalized | LeaseState::Refunded | LeaseState::Failed
-    )
+    // `Failed` is deliberately absent. Only this platform writes it, after a
+    // lifecycle action ran out of attempts, and the escrow never agreed: the
+    // deposit is still held and `activeLeaseId` is still set, so the registry
+    // will refuse the next lease on that node with `LeaseNotReady` while the
+    // scheduler keeps quoting it. Giving up on a lease does not free the
+    // machine; only the chain does that.
+    !matches!(lease.state, LeaseState::Finalized | LeaseState::Refunded)
 }
 
 fn lease_state_name(state: &LeaseState) -> &'static str {
@@ -5987,9 +5990,15 @@ mod tests {
         assert!(occupies_node(&lease(LeaseState::SettlementPending)));
         assert!(occupies_node(&lease(LeaseState::Disputed)));
 
+        // Only the chain frees a node. `Failed` is written by this platform
+        // when a lifecycle action ran out of attempts, which is precisely when
+        // the escrow still holds the deposit and `activeLeaseId` is still set.
+        // Treating it as free let the scheduler quote a node the registry then
+        // refused with `LeaseNotReady`.
+        assert!(occupies_node(&lease(LeaseState::Failed)));
+
         assert!(!occupies_node(&lease(LeaseState::Finalized)));
         assert!(!occupies_node(&lease(LeaseState::Refunded)));
-        assert!(!occupies_node(&lease(LeaseState::Failed)));
     }
 
     #[test]
