@@ -10,7 +10,7 @@
     "check": "node --test config.test.mjs && node canary.mjs --dry-run"
   },
   "dependencies": {
-    "@prismnetwork/agent-sdk": "^0.1.0",
+    "@prismnetwork/agent-sdk": "^0.3.1",
     "viem": "^2"
   }
 }

@@ -30,10 +30,27 @@ write_result() {
   mv "$tmp" "$result"
 }
 
-output=$(timeout 900 node /opt/prism/canary/canary.mjs 2>&1)
+# The host runs no Node of its own, and adding one would be a second runtime to
+# patch, so the canary runs in a container. Not the slim image: the SDK shells
+# out to ssh-keygen and ssh, and slim carries neither, which fails the run at
+# the point a renter would be handed their machine.
+image=${PRISM_CANARY_IMAGE:-node:24-bookworm}
+output=$(timeout 900 docker run --rm \
+  --env-file /opt/prism/canary.env \
+  -v /opt/prism/canary:/canary:ro \
+  -v /var/lib/prism/canary-modules:/canary/node_modules:ro \
+  -w /canary "$image" node canary.mjs 2>&1)
 status=$?
 printf '%s === exit %s ===\n%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$status" "$output" >> "$log"
 tail -c 200000 "$log" > "$log.trim" && mv "$log.trim" "$log"
+
+# The canary exits 0 after a preflight when CANARY_CONFIRM is unset, so a
+# misconfigured unit would report healthy forever having rented nothing. That is
+# the exact failure this check exists to remove, so it is treated as a fault.
+if [[ $status -eq 0 && $output == *"preflight OK"* ]]; then
+  write_result false preflight "canary ran preflight only; CANARY_CONFIRM is not set, so nothing was rented"
+  exit 1
+fi
 
 if [[ $status -eq 0 ]]; then
   write_result true complete ""
