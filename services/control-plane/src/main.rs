@@ -297,6 +297,8 @@ enum StoreError {
     CapacityReserved,
     #[error("matched offer exceeds the escrow limit")]
     EscrowLimit,
+    #[error("the node this quote names has been suspended")]
+    NodeSuspended,
     #[error("telemetry sequence was already accepted")]
     TelemetryReplay,
     #[error("internal identity request was already accepted")]
@@ -3271,6 +3273,12 @@ impl MarketplaceStore {
                 // id alone treats a fresh escrow's lease 3 as a replay of a
                 // superseded escrow's lease 3 and rejects a renter who has
                 // already paid.
+                // Suspension is the one control meant to stop a node at once,
+                // so it is re-read at confirm rather than trusted from quote
+                // time up to a day earlier.
+                if market.suspended_nodes.contains(&quote.node_id) {
+                    return Err(StoreError::NodeSuspended);
+                }
                 if let Some((owner, current)) = market.leases.values().find(|(_, current)| {
                     current.escrow_address == lease.escrow_address
                         && current.chain_lease_id == lease.chain_lease_id
@@ -3337,6 +3345,23 @@ impl MarketplaceStore {
                     .execute(&mut *transaction)
                     .await
                     .map_err(StoreError::Storage)?;
+                // A quote stays confirmable for a day so a renter who already
+                // funded is honoured, but every node-side check ran once at
+                // quote time. Suspending a node for abuse therefore did not
+                // stop it taking new work until the last quote naming it
+                // expired. Suspension is the one control that exists to stop a
+                // node immediately, so it is re-read here.
+                let suspended = query_scalar::<_, bool>(
+                    "SELECT COALESCE((SELECT suspended FROM node_controls \
+                                      WHERE node_id = $1), FALSE)",
+                )
+                .bind(&quote.node_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if suspended {
+                    return Err(StoreError::NodeSuspended);
+                }
                 // Identity is the escrow plus the id it issued. Matching on the
                 // id alone treats a fresh escrow's lease 3 as a replay of a
                 // superseded escrow's lease 3 and rejects a renter who has
@@ -6364,6 +6389,11 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
         StoreError::EscrowLimit => {
             bad_request("escrow_limit", "matched offer exceeds the escrow limit")
         }
+        StoreError::NodeSuspended => conflict(
+            "node_suspended",
+            "the node this quote names has been suspended; the funding was not \
+             claimed and can be recovered with cancelUnprovisioned",
+        ),
         StoreError::TelemetryReplay => conflict(
             "telemetry_replay",
             "node telemetry sequence has already been accepted",
@@ -7379,6 +7409,64 @@ mod tests {
             ),
             Err(ChainError::FundingMismatch)
         ));
+    }
+
+    /// Suspension is the one control that exists to stop a node immediately.
+    /// Every other node check runs at quote time, and a quote stays confirmable
+    /// for a day, so a node suspended for abuse kept taking new work until the
+    /// last quote naming it expired.
+    #[tokio::test]
+    async fn a_suspended_node_cannot_take_a_lease_on_an_older_quote() {
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 222, 100_000));
+        market.tunnels.insert("only".to_owned(), Utc::now());
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: None,
+        };
+        let quote = store.quote("renter", &request, 0).await.unwrap();
+
+        // Quoted while healthy, suspended before the renter confirms.
+        match &store {
+            MarketplaceStore::Memory(market) => {
+                market
+                    .write()
+                    .await
+                    .suspended_nodes
+                    .insert("only".to_owned());
+            }
+            _ => unreachable!(),
+        }
+
+        let confirmed = store
+            .confirm_funding(FundingConfirmation {
+                subject: "renter",
+                quote: &quote,
+                transaction_hash: &format!("0x{}", "ee".repeat(32)),
+                funding: ConfirmedFunding {
+                    lease_id: 77,
+                    escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+                    renter_wallet: format!("0x{}", "33".repeat(20)),
+                },
+                ssh_authorized_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA",
+                jupyter_token: "token",
+                encrypted_jupyter_token: EncryptedSecret {
+                    nonce: "bm9uY2U".to_owned(),
+                    ciphertext: "Y2lwaGVy".to_owned(),
+                },
+            })
+            .await;
+        assert!(
+            matches!(confirmed, Err(StoreError::NodeSuspended)),
+            "a suspended node must refuse the lease, got {confirmed:?}"
+        );
     }
 
     /// Production regression. Replacing the escrow restarted its lease counter

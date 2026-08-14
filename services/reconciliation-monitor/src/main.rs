@@ -293,16 +293,19 @@ enum Agreement {
     DbSettledChainOpen,
     /// The control plane has a lease the escrow has never heard of.
     MissingOnChain,
+    /// The escrow reported a status this build does not know. A contract that
+    /// gained a state we cannot interpret must read as drift, because guessing
+    /// it is agreement is how a new failure mode arrives silently.
+    UnknownStatus,
 }
 
 fn classify_agreement(db_state: &str, chain: ChainStatus) -> Agreement {
     let open = db_state_is_open(db_state);
     match (open, chain) {
         (_, ChainStatus::None) => Agreement::MissingOnChain,
+        (_, ChainStatus::Unknown(_)) => Agreement::UnknownStatus,
         (true, status) if status.is_released() => Agreement::DbOpenChainReleased,
-        (false, status) if !matches!(status, ChainStatus::None) && !status.is_released() => {
-            Agreement::DbSettledChainOpen
-        }
+        (false, status) if !status.is_released() => Agreement::DbSettledChainOpen,
         _ => Agreement::Ok,
     }
 }
@@ -487,6 +490,8 @@ struct Report {
     drift_db_settled_chain_open: u64,
     conservation_checked: u64,
     conservation_violations: u64,
+    /// The escrow reported a status this build cannot interpret.
+    drift_unknown_status: u64,
     /// Leases the escrow could not be asked about. One of these used to abort
     /// the whole pass, which took every other invariant down with it.
     unreadable_leases: u64,
@@ -629,6 +634,7 @@ async fn reconcile(pool: &PgPool, chain: Option<&ChainReader>) -> anyhow::Result
             report.conservation_checked = chain_report.conservation_checked;
             report.conservation_violations = chain_report.conservation_violations;
             report.unreadable_leases = chain_report.unreadable_leases;
+            report.drift_unknown_status = chain_report.drift_unknown_status;
         }
         Err(error) => {
             tracing::error!(error = %error, "chain reconciliation read failed");
@@ -648,6 +654,7 @@ struct ChainReport {
     conservation_checked: u64,
     conservation_violations: u64,
     unreadable_leases: u64,
+    drift_unknown_status: u64,
 }
 
 async fn reconcile_chain(
@@ -678,6 +685,7 @@ async fn reconcile_chain(
             Agreement::MissingOnChain => report.drift_missing_on_chain += 1,
             Agreement::DbOpenChainReleased => report.drift_db_open_chain_released += 1,
             Agreement::DbSettledChainOpen => report.drift_db_settled_chain_open += 1,
+            Agreement::UnknownStatus => report.drift_unknown_status += 1,
         }
     }
 
@@ -800,6 +808,7 @@ fn render_metrics(report: &Report) -> String {
         &report.unreadable_leases.to_string(),
     );
     for (kind, value) in [
+        ("unknown_status", report.drift_unknown_status),
         ("missing_on_chain", report.drift_missing_on_chain),
         (
             "db_open_chain_released",
@@ -970,6 +979,45 @@ mod tests {
         let mut word = [0_u8; 32];
         word[16..].copy_from_slice(&50_000_000_u128.to_be_bytes());
         assert_eq!(tail_u128(&word), 50_000_000);
+    }
+
+    /// Two of these arms were unreachable as written, and an unknown status
+    /// fell through to agreement. A contract that gains a state this build
+    /// cannot read has to count as drift, because treating it as agreement is
+    /// how a new failure mode arrives without anyone hearing about it.
+    #[test]
+    fn a_status_this_build_cannot_read_counts_as_drift() {
+        assert_eq!(
+            classify_agreement("active", ChainStatus::Unknown(9)),
+            Agreement::UnknownStatus
+        );
+        assert_eq!(
+            classify_agreement("finalized", ChainStatus::Unknown(9)),
+            Agreement::UnknownStatus
+        );
+        // The dangerous direction: we still meter, the escrow has paid out.
+        assert_eq!(
+            classify_agreement("active", ChainStatus::Refunded),
+            Agreement::DbOpenChainReleased
+        );
+        // The other direction: we consider it done, the escrow still holds it.
+        assert_eq!(
+            classify_agreement("finalized", ChainStatus::Active),
+            Agreement::DbSettledChainOpen
+        );
+        // A lease we gave up on is open, not settled, so this is agreement.
+        assert_eq!(
+            classify_agreement("failed", ChainStatus::Active),
+            Agreement::Ok
+        );
+        assert_eq!(
+            classify_agreement("active", ChainStatus::Active),
+            Agreement::Ok
+        );
+        assert_eq!(
+            classify_agreement("finalized", ChainStatus::Finalized),
+            Agreement::Ok
+        );
     }
 
     /// A monitor that cannot see the chain used to publish the same numbers as
