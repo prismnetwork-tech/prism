@@ -1,0 +1,13 @@
+{
+  "name": "stock-token-agent-example",
+  "private": true,
+  "type": "module",
+  "description": "Example: rent a Prism GPU to research Robinhood Chain stock tokens, then swap on Uniswap v4.",
+  "scripts": {
+    "start": "node agent.mjs"
+  },
+  "dependencies": {
+    "@prismnetwork/agent-sdk": "^0.4.0",
+    "viem": "^2"
+  }
+}

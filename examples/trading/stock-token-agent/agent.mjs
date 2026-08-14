@@ -1,0 +1,403 @@
+// An agent that rents a Prism GPU to research Robinhood Chain stock tokens,
+// then executes the trade it picks on Uniswap v4 — all on chain id 4663.
+//
+//   node agent.mjs                # research locally, print the decision (free)
+//   PRISM_AGENT_KEY=0x... \
+//   PRISM_IMAGE=<cuda+torch image digest> \
+//   node agent.mjs --gpu          # run the analysis on a rented Prism GPU
+//   ... EXECUTE=1 node agent.mjs --gpu   # and place the chosen swap on-chain
+//
+// What it does, end to end:
+//   1. Reads real market state: Chainlink stock feeds (price history), Uniswap
+//      v4 pool spot + liquidity, the USDG/USD feed, and the Robinhood Earn
+//      (Morpho steakUSDG) share rate as the cash hurdle.
+//   2. Ships the dataset to a GPU it leases on Prism (paid on-chain in USDG)
+//      and runs a Monte Carlo momentum study there (gpu_job.py).
+//   3. If the best token's expected edge clears the hurdle plus trading costs,
+//      swaps SPEND_USDG (default 2) into it through the Universal Router.
+//
+// Stock tokens are ERC-20s on Robinhood Chain; check your own eligibility to
+// hold them. Prism is pre-production and unaudited. Keys used here should hold
+// only what you are prepared to lose.
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  createPublicClient,
+  createWalletClient,
+  defineChain,
+  encodeAbiParameters,
+  http,
+  keccak256,
+  parseAbi,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { PrismAgent } from "@prismnetwork/agent-sdk";
+
+const RPC = process.env.PRISM_RPC_URL ?? "https://rpc.mainnet.chain.robinhood.com";
+const USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+const STATE_VIEW = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b";
+const UNIVERSAL_ROUTER = "0x8876789976decbfcbbbe364623c63652db8c0904";
+const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+const STEAK_USDG = "0xBeEff033F34C046626B8D0A041844C5d1A5409dd";
+const USDG_FEED = "0x61B7e5650328764B076A108EFF5fa7282a1B9aD2";
+const ZERO = "0x0000000000000000000000000000000000000000";
+
+// Stock tokens with a live USDG pool at the 0.3% fee tier and a Chainlink feed
+// on Robinhood Chain. Addresses from docs.robinhood.com/chain and the Chainlink
+// feed directory.
+const TOKENS = {
+  NVDA: { token: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", feed: "0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15" },
+  AAPL: { token: "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9", feed: "0x6B22A786bAa607d76728168703a39Ea9C99f2cD0" },
+  TSLA: { token: "0x322F0929c4625eD5bAd873c95208D54E1c003b2d", feed: "0x4A1166a659A55625345e9515b32adECea5547C38" },
+  SPY: { token: "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C", feed: "0x319724394D3A0e3669269846abE664Cd621f9f6A" },
+};
+const FEE = 3000;
+const TICK_SPACING = 60;
+const HISTORY_ROUNDS = 400;
+const SPEND_USDG = Number(process.env.SPEND_USDG ?? 2);
+const SLIPPAGE_BPS = 100n;
+
+const robinhoodChain = defineChain({
+  id: 4663,
+  name: "Robinhood Chain",
+  nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+  rpcUrls: { default: { http: [RPC] } },
+});
+
+const feedAbi = parseAbi([
+  "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
+  "function getRoundData(uint80) view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
+]);
+const stateViewAbi = parseAbi([
+  "function getSlot0(bytes32) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+  "function getLiquidity(bytes32) view returns (uint128)",
+]);
+const erc20Abi = parseAbi([
+  "function balanceOf(address) view returns (uint256)",
+  "function approve(address,uint256) returns (bool)",
+  "function allowance(address,address) view returns (uint256)",
+]);
+const vaultAbi = parseAbi(["function convertToAssets(uint256) view returns (uint256)"]);
+const permit2Abi = parseAbi([
+  "function approve(address token, address spender, uint160 amount, uint48 expiration)",
+  "function allowance(address, address, address) view returns (uint160 amount, uint48 expiration, uint48 nonce)",
+]);
+const routerAbi = parseAbi(["function execute(bytes commands, bytes[] inputs, uint256 deadline) payable"]);
+
+const client = createPublicClient({ chain: robinhoodChain, transport: http(RPC) });
+
+function poolKey(token) {
+  const [c0, c1] = USDG.toLowerCase() < token.toLowerCase() ? [USDG, token] : [token, USDG];
+  return { currency0: c0, currency1: c1, fee: FEE, tickSpacing: TICK_SPACING, hooks: ZERO };
+}
+
+function poolId(key) {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+      [key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks],
+    ),
+  );
+}
+
+// Pool price of one whole stock token in USDG, from slot0. USDG has 6 decimals
+// and stock tokens 18, so the raw ratio is rescaled by 1e12.
+function tokenPriceUsdg(sqrtPriceX96, usdgIsCurrency0) {
+  const ratio = (Number(sqrtPriceX96) / 2 ** 96) ** 2;
+  return usdgIsCurrency0 ? 1e12 / ratio : ratio * 1e12;
+}
+
+async function feedHistory(feed, rounds) {
+  const [latestId, answer, , updatedAt] = await client.readContract({
+    address: feed,
+    abi: feedAbi,
+    functionName: "latestRoundData",
+  });
+  const phase = latestId >> 64n;
+  const aggRound = latestId & ((1n << 64n) - 1n);
+  const span = aggRound - 1n < BigInt(rounds) ? aggRound - 1n : BigInt(rounds);
+  const ids = [];
+  for (let back = span; back >= 1n; back--) ids.push((phase << 64n) | (aggRound - back));
+  const history = [];
+  const batch = 50;
+  for (let i = 0; i < ids.length; i += batch) {
+    const rows = await Promise.all(
+      ids.slice(i, i + batch).map((id) =>
+        client
+          .readContract({ address: feed, abi: feedAbi, functionName: "getRoundData", args: [id] })
+          .catch(() => null),
+      ),
+    );
+    for (const row of rows) {
+      if (row && row[1] > 0n) history.push({ t: Number(row[3]), price: Number(row[1]) / 1e8 });
+    }
+  }
+  history.push({ t: Number(updatedAt), price: Number(answer) / 1e8 });
+  return history;
+}
+
+async function gatherMarketData() {
+  console.log("reading Robinhood Chain: Chainlink feeds, Uniswap v4 pools, Robinhood Earn vault...");
+  const [usdgRound, earnRate] = await Promise.all([
+    client.readContract({ address: USDG_FEED, abi: feedAbi, functionName: "latestRoundData" }),
+    client.readContract({ address: STEAK_USDG, abi: vaultAbi, functionName: "convertToAssets", args: [10n ** 18n] }),
+  ]);
+  const usdgUsd = Number(usdgRound[1]) / 1e8;
+
+  const tickers = {};
+  for (const [symbol, { token, feed }] of Object.entries(TOKENS)) {
+    const key = poolKey(token);
+    const id = poolId(key);
+    const [slot0, liquidity, history] = await Promise.all([
+      client.readContract({ address: STATE_VIEW, abi: stateViewAbi, functionName: "getSlot0", args: [id] }),
+      client.readContract({ address: STATE_VIEW, abi: stateViewAbi, functionName: "getLiquidity", args: [id] }),
+      feedHistory(feed, HISTORY_ROUNDS),
+    ]);
+    const usdgIsCurrency0 = key.currency0.toLowerCase() === USDG.toLowerCase();
+    const poolPrice = tokenPriceUsdg(slot0[0], usdgIsCurrency0);
+    const oracle = history[history.length - 1].price;
+    tickers[symbol] = {
+      history,
+      pool_price_usdg: poolPrice,
+      oracle_price_usd: oracle,
+      basis_bps: ((poolPrice * usdgUsd) / oracle - 1) * 10_000,
+      pool_liquidity: liquidity.toString(),
+    };
+    console.log(
+      `  ${symbol}: oracle $${oracle.toFixed(2)}, pool ${poolPrice.toFixed(2)} USDG ` +
+        `(basis ${tickers[symbol].basis_bps.toFixed(1)} bps), ${history.length} history points`,
+    );
+  }
+
+  // The Robinhood Earn (Morpho steakUSDG) share rate is the cash hurdle: a
+  // trade has to be expected to beat what idle USDG earns there.
+  const earnSharePrice = Number(earnRate) / 1e6;
+  console.log(`  Robinhood Earn steakUSDG share rate: ${earnSharePrice.toFixed(6)} USDG/share`);
+  return {
+    generated_at: new Date().toISOString(),
+    usdg_usd: usdgUsd,
+    earn_share_price: earnSharePrice,
+    fee_bps: FEE / 100,
+    tickers,
+  };
+}
+
+async function analyzeOnGpu(dataset) {
+  const image = process.env.PRISM_IMAGE;
+  if (!image) {
+    console.error("--gpu needs PRISM_IMAGE, a digest-pinned CUDA + PyTorch image (see README)");
+    process.exit(1);
+  }
+  const prism = new PrismAgent({
+    privateKey: requireEnv("PRISM_AGENT_KEY"),
+    escrow: process.env.PRISM_ESCROW ?? "0x62C042265991bEa17B07229322A01850974626dA",
+  });
+  await prism.authenticate();
+  console.log("\nleasing a GPU on Prism (provisioning usually takes 1-4 minutes)...");
+  const lease = await prism.lease({ image, durationSeconds: 1200, minVramMib: 16000 });
+  console.log(`leased #${lease.leaseId}, funded on-chain: ${lease.fundingHash}`);
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const job = readFileSync(join(here, "gpu_job.py")).toString("base64");
+    const payload = Buffer.from(JSON.stringify(dataset)).toString("base64");
+    const remote = [
+      `printf %s ${job} | base64 -d > /tmp/gpu_job.py`,
+      `printf %s ${payload} | base64 -d > /tmp/market.json`,
+      "python /tmp/gpu_job.py /tmp/market.json",
+    ].join(" && ");
+    const result = await prism.run(lease, remote, { timeoutMs: 600_000 });
+    if (result.code !== 0) throw new Error(`gpu job exit ${result.code}: ${result.stderr}`);
+    const line = result.stdout.split("\n").findLast((l) => l.startsWith("{"));
+    return JSON.parse(line);
+  } finally {
+    prism.endLease(lease);
+    console.log("lease released; it settles on-chain with a public receipt.");
+  }
+}
+
+// The same study as gpu_job.py, downscaled to run anywhere. The GPU run uses
+// 200k bootstrap paths; this uses 2k, enough to demo the pipeline for free.
+function analyzeLocally(dataset) {
+  console.log("\nanalyzing locally (small sample; use --gpu for the full study)...");
+  const horizon = 5;
+  const paths = 2000;
+  const report = { device: "local cpu", paths, horizon_days: horizon, tickers: {} };
+  for (const [symbol, data] of Object.entries(dataset.tickers)) {
+    const prices = data.history.map((h) => h.price);
+    const returns = [];
+    // A young feed's first rounds can carry initialization artifacts; a 30%
+    // move between consecutive rounds is data noise, not a market move.
+    for (let i = 1; i < prices.length; i++) {
+      const r = Math.log(prices[i] / prices[i - 1]);
+      if (Math.abs(r) < 0.3) returns.push(r);
+    }
+    if (returns.length < 20) {
+      report.tickers[symbol] = { momentum_20r: 0, expected_return: 0, var_95: 0, p_positive: 0, insufficient_history: true };
+      continue;
+    }
+    const momentum = Math.log(prices[prices.length - 1] / prices[Math.max(0, prices.length - 1 - 10 * 2)]);
+    const outcomes = [];
+    for (let p = 0; p < paths; p++) {
+      let sum = 0;
+      for (let d = 0; d < horizon * 2; d++) sum += returns[Math.floor(Math.random() * returns.length)];
+      outcomes.push(sum);
+    }
+    outcomes.sort((a, b) => a - b);
+    const mean = outcomes.reduce((a, b) => a + b, 0) / paths;
+    const tilt = momentum * 0.35;
+    report.tickers[symbol] = {
+      momentum_20r: momentum,
+      expected_return: mean + tilt,
+      var_95: outcomes[Math.floor(paths * 0.05)],
+      p_positive: outcomes.filter((o) => o + tilt > 0).length / paths,
+    };
+  }
+  return report;
+}
+
+function decide(dataset, analysis) {
+  const feeCost = dataset.fee_bps / 10_000;
+  const ranked = Object.entries(analysis.tickers)
+    .map(([symbol, a]) => ({ symbol, ...a, edge: a.expected_return - feeCost }))
+    .sort((a, b) => b.edge - a.edge);
+  console.log(`\nanalysis (${analysis.device}, ${analysis.paths} paths, ${analysis.horizon_days}d horizon):`);
+  for (const r of ranked) {
+    console.log(
+      `  ${r.symbol}: expected ${(r.expected_return * 100).toFixed(2)}%, ` +
+        `VaR95 ${(r.var_95 * 100).toFixed(2)}%, p(gain) ${(r.p_positive * 100).toFixed(0)}%, ` +
+        `edge after fees ${(r.edge * 100).toFixed(2)}%`,
+    );
+  }
+  const best = ranked[0];
+  if (best.edge <= 0 || best.p_positive < 0.5) {
+    console.log("\ndecision: stay in USDG — no token clears fees with better-than-even odds.");
+    return null;
+  }
+  console.log(`\ndecision: buy ${best.symbol} with ${SPEND_USDG} USDG (edge ${(best.edge * 100).toFixed(2)}%).`);
+  return best.symbol;
+}
+
+async function executeSwap(symbol, dataset) {
+  const account = privateKeyToAccount(requireEnv("PRISM_AGENT_KEY"));
+  const wallet = createWalletClient({ account, chain: robinhoodChain, transport: http(RPC) });
+  const token = TOKENS[symbol].token;
+  const key = poolKey(token);
+  const usdgIsCurrency0 = key.currency0.toLowerCase() === USDG.toLowerCase();
+  const amountIn = BigInt(Math.round(SPEND_USDG * 1e6));
+
+  const expectedOut = BigInt(
+    Math.floor((SPEND_USDG / dataset.tickers[symbol].pool_price_usdg) * 1e18),
+  );
+  const minOut = (expectedOut * (10_000n - SLIPPAGE_BPS)) / 10_000n;
+
+  const usdgAllowance = await client.readContract({
+    address: USDG, abi: erc20Abi, functionName: "allowance", args: [account.address, PERMIT2],
+  });
+  if (usdgAllowance < amountIn) {
+    console.log("approving USDG for Permit2...");
+    const hash = await wallet.writeContract({
+      address: USDG, abi: erc20Abi, functionName: "approve", args: [PERMIT2, 2n ** 160n - 1n],
+    });
+    await client.waitForTransactionReceipt({ hash });
+  }
+  const [permitAmount, permitExpiry] = await client.readContract({
+    address: PERMIT2, abi: permit2Abi, functionName: "allowance", args: [account.address, USDG, UNIVERSAL_ROUTER],
+  });
+  if (permitAmount < amountIn || permitExpiry <= Math.floor(Date.now() / 1000)) {
+    console.log("granting the Universal Router a Permit2 allowance...");
+    const hash = await wallet.writeContract({
+      address: PERMIT2,
+      abi: permit2Abi,
+      functionName: "approve",
+      args: [USDG, UNIVERSAL_ROUTER, 2n ** 160n - 1n, Math.floor(Date.now() / 1000) + 30 * 86400],
+    });
+    await client.waitForTransactionReceipt({ hash });
+  }
+
+  // Universal Router command 0x10 = V4_SWAP; v4 actions: swap exact-in single,
+  // settle the input in full, take the whole output. Robinhood Chain's router
+  // vendors a forked v4-periphery whose swap params carry an extra
+  // minHopPriceX36 field between amountOutMinimum and hookData — omit it and
+  // the calldata mis-decodes and reverts on every ERC-20 pool.
+  const actions = "0x060c0f";
+  const swapParams = encodeAbiParameters(
+    [
+      {
+        type: "tuple",
+        components: [
+          {
+            type: "tuple",
+            name: "poolKey",
+            components: [
+              { type: "address", name: "currency0" },
+              { type: "address", name: "currency1" },
+              { type: "uint24", name: "fee" },
+              { type: "int24", name: "tickSpacing" },
+              { type: "address", name: "hooks" },
+            ],
+          },
+          { type: "bool", name: "zeroForOne" },
+          { type: "uint128", name: "amountIn" },
+          { type: "uint128", name: "amountOutMinimum" },
+          { type: "uint256", name: "minHopPriceX36" },
+          { type: "bytes", name: "hookData" },
+        ],
+      },
+    ],
+    [
+      {
+        poolKey: key,
+        zeroForOne: usdgIsCurrency0,
+        amountIn,
+        amountOutMinimum: minOut,
+        minHopPriceX36: 0n,
+        hookData: "0x",
+      },
+    ],
+  );
+  const settleParams = encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [USDG, amountIn]);
+  const takeParams = encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [token, minOut]);
+  const input = encodeAbiParameters(
+    [{ type: "bytes" }, { type: "bytes[]" }],
+    [actions, [swapParams, settleParams, takeParams]],
+  );
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+
+  const before = await client.readContract({
+    address: token, abi: erc20Abi, functionName: "balanceOf", args: [account.address],
+  });
+  console.log(`swapping ${SPEND_USDG} USDG -> ${symbol} (min out ${Number(minOut) / 1e18})...`);
+  const { request } = await client.simulateContract({
+    account,
+    address: UNIVERSAL_ROUTER,
+    abi: routerAbi,
+    functionName: "execute",
+    args: ["0x10", [input], deadline],
+  });
+  const hash = await wallet.writeContract(request);
+  const receipt = await client.waitForTransactionReceipt({ hash });
+  const after = await client.readContract({
+    address: token, abi: erc20Abi, functionName: "balanceOf", args: [account.address],
+  });
+  console.log(`swap ${receipt.status}: ${hash}`);
+  console.log(`received ${(Number(after - before) / 1e18).toFixed(6)} ${symbol}`);
+}
+
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    console.error(`missing ${name} — see the header of this file.`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const dataset = await gatherMarketData();
+const analysis = process.argv.includes("--gpu") ? await analyzeOnGpu(dataset) : analyzeLocally(dataset);
+const pick = decide(dataset, analysis);
+if (pick && process.env.EXECUTE === "1") {
+  await executeSwap(pick, dataset);
+} else if (pick) {
+  console.log("dry run — set EXECUTE=1 to place the swap on-chain.");
+}
