@@ -1331,6 +1331,16 @@ impl Worker {
             .await?;
             anyhow::bail!("Vast machine {} refused: {refusal}", instance.machine_id);
         }
+        // Not refused, but not usable yet either. A host reports its forwarded
+        // port some seconds after it starts reporting itself as running, and
+        // the proxy address it advertises in the meantime does not reach sshd.
+        // Handing that address to a renter gives them a machine they are paying
+        // for and cannot log in to, so the lease stays provisioning until the
+        // port is real. If it never becomes real the boot budget refuses the
+        // host on a later pass, which is what `stalled` above is for.
+        if instance.direct_port_start <= 0 {
+            return Err(StillProvisioning.into());
+        }
         let host = instance.ssh_host.context("Vast instance has no SSH host")?;
         let port = instance
             .ssh_port
@@ -2516,6 +2526,32 @@ mod tests {
             direct_port_start,
             machine_id: 37_509,
         }
+    }
+
+    /// Production regression, caught by renting a machine and failing to log
+    /// into it. A host that reports itself running before it has a forwarded
+    /// port advertises a proxy address that does not reach sshd. Treating that
+    /// as ready handed a renter a box they were paying for and could not use.
+    /// Not refusing it is right; declaring it ready is not.
+    #[test]
+    fn a_running_host_without_a_port_is_neither_refused_nor_ready() {
+        let no_port = booting_instance("running", -1);
+        assert_eq!(
+            candidate_refusal(&no_port, true, 16_000, 640_000, &[], false),
+            None,
+            "inside its budget the host keeps its place in the queue"
+        );
+        assert!(
+            no_port.direct_port_start <= 0,
+            "and the readiness gate holds the lease on exactly this"
+        );
+
+        let with_port = booting_instance("running", 19_300);
+        assert_eq!(
+            candidate_refusal(&with_port, true, 16_000, 640_000, &[], false),
+            None
+        );
+        assert!(with_port.direct_port_start > 0, "only this one is usable");
     }
 
     /// The escrow returns the lease as fourteen words. `accessEndedAt` is the
