@@ -8,6 +8,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+mod workspaces;
+
 use anyhow::Context;
 use axum::{
     Json, Router,
@@ -5284,6 +5286,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("escrow generation"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0014_escrow_generation.sql")),
+                false,
+            ),
+            Migration::new(
+                15,
+                Cow::Borrowed("workspaces"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0015_workspaces.sql")),
                 false,
             ),
         ]),
