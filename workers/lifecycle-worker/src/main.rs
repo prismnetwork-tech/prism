@@ -54,6 +54,11 @@ const PROVISION_TIMEOUT_SECONDS: u64 = 600;
 /// How far back to look for leases the escrow knows about and we do not.
 const ORPHAN_SCAN_DEPTH: u64 = 32;
 const ORPHAN_SCAN_INTERVAL_SECONDS: u64 = 300;
+/// How often a rented machine is asked whether it is still alive. Every active
+/// lease costs one provider call, so this is paced well under the staleness
+/// window that closes a lease, leaving room to miss a round to a flaky API
+/// without ending someone's job.
+const CLOUD_OBSERVATION_INTERVAL_SECONDS: u64 = 45;
 /// LeaseStatus.Funded in the escrow's enum.
 const LEASE_STATUS_FUNDED: u8 = 1;
 const LEASE_STATUS_FINALIZED: u8 = 5;
@@ -89,6 +94,7 @@ struct Worker {
     vast: Option<VastBroker>,
     supply_note: tokio::sync::Mutex<Option<String>>,
     last_orphan_sweep: tokio::sync::Mutex<Option<std::time::Instant>>,
+    last_cloud_observation: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// An id the escrow issued. Kept distinct from the internal `lease_id` in the
@@ -342,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         vast: VastBroker::from_environment()?,
         supply_note: tokio::sync::Mutex::new(None),
         last_orphan_sweep: tokio::sync::Mutex::new(None),
+        last_cloud_observation: tokio::sync::Mutex::new(None),
     };
     if let Some(vast) = worker.vast.as_ref() {
         tracing::info!(
@@ -394,6 +401,9 @@ impl Worker {
         if let Err(error) = self.expire_orphaned_leases().await {
             tracing::error!(%error, "orphaned lease sweep failed");
         }
+        if let Err(error) = self.observe_cloud_instances().await {
+            tracing::error!(%error, "cloud liveness sweep failed");
+        }
         query(
             "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
              SELECT md5(lease_id::text || ':expire_provision')::uuid, lease_id, 'expire_provision', \
@@ -421,7 +431,10 @@ impl Worker {
                         OR nt.observed_at < NOW() - INTERVAL '90 seconds' \
                         OR t.observed_at IS NULL \
                         OR t.observed_at < NOW() - INTERVAL '90 seconds')) \
-                    OR (ci.lease_id IS NOT NULL AND ci.status NOT IN ('running', 'destroying'))) \
+                    OR (ci.lease_id IS NOT NULL AND ( \
+                        ci.status NOT IN ('running', 'destroying') \
+                        OR ci.observed_at IS NULL \
+                        OR ci.observed_at < NOW() - INTERVAL '150 seconds'))) \
              ON CONFLICT (lease_id, kind) DO NOTHING",
         )
         .execute(&self.pool)
@@ -594,6 +607,72 @@ impl Worker {
         unlock?;
         let hash = result?;
         tracing::warn!(lease_id = lease_id.get(), %hash, "refunded an unrecorded lease and released its node");
+        Ok(())
+    }
+
+    /// Keeps watching a rented machine for as long as the renter is paying for
+    /// it. Provisioning writes `running` once and then stops looking, so before
+    /// this a host that rebooted, was preempted, or whose container exited
+    /// stayed `running` in our table until the lease ran out on its own, and
+    /// settlement billed the whole window. A self-hosted node has proved itself
+    /// every few seconds all along; this is the same guarantee for brokered
+    /// capacity.
+    async fn observe_cloud_instances(&self) -> anyhow::Result<()> {
+        let Some(vast) = self.vast.as_ref() else {
+            return Ok(());
+        };
+        {
+            let mut last = self.last_cloud_observation.lock().await;
+            let due = last.is_none_or(|at| {
+                at.elapsed() >= std::time::Duration::from_secs(CLOUD_OBSERVATION_INTERVAL_SECONDS)
+            });
+            if !due {
+                return Ok(());
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let instances = query_as::<_, (i64, i64)>(
+            "SELECT ci.lease_id, ci.provider_instance_id \
+             FROM cloud_instances ci JOIN leases l ON l.lease_id = ci.lease_id \
+             WHERE l.state IN ('ready', 'active') \
+               AND ci.provider_instance_id IS NOT NULL \
+               AND ci.status = 'running'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (lease_id, instance_id) in instances {
+            let observed = match vast.instance(u64::try_from(instance_id)?).await {
+                Ok(instance) => instance.status,
+                // A provider that cannot be reached is not evidence the machine
+                // died. Leaving `observed_at` alone lets the staleness window
+                // close the lease only if this keeps failing.
+                Err(error) => {
+                    tracing::warn!(lease_id, %error, "could not observe a rented machine");
+                    continue;
+                }
+            };
+            let alive = observed == "running";
+            query(
+                "UPDATE cloud_instances \
+                 SET status = CASE WHEN $2 THEN status ELSE 'failed' END, \
+                     last_error = CASE WHEN $2 THEN last_error \
+                                  ELSE 'provider reports ' || $3 END, \
+                     observed_at = NOW(), updated_at = NOW() \
+                 WHERE lease_id = $1",
+            )
+            .bind(lease_id)
+            .bind(alive)
+            .bind(&observed)
+            .execute(&self.pool)
+            .await?;
+            if !alive {
+                tracing::warn!(
+                    lease_id,
+                    status = %observed,
+                    "rented machine stopped running; closing the lease early"
+                );
+            }
+        }
         Ok(())
     }
 
