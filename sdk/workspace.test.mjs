@@ -234,7 +234,9 @@ test("the presigned url never reaches the leased machine", async () => {
   await client.restore(lease, workspace, "/root/back");
 
   for (const { command } of machine.commands) {
-    assert.ok(!command.includes(STORAGE), "a bearer capability was handed to the host");
+    // No URL at all, rather than just not this one. A presigned URL is a
+    // bearer capability, and the machine has no reason to see any of them.
+    assert.ok(!/https?:\/\//.test(command), "a URL was handed to the host");
     assert.ok(!command.includes("sig="), "a presigned signature was handed to the host");
   }
 });
