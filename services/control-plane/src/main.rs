@@ -5297,6 +5297,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0014_escrow_generation.sql")),
                 false,
             ),
+            Migration::new(
+                15,
+                Cow::Borrowed("cloud liveness"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0015_cloud_liveness.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
