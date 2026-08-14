@@ -1405,7 +1405,9 @@ impl Worker {
             .transaction_hash;
         let mut receipt = PublicReceipt {
             receipt_id: Uuid::now_v7(),
-            lease_id: action.lease_id.to_string(),
+            // What the escrow numbered it, so a reader can find this lease on
+            // chain. The internal id means nothing outside this database.
+            lease_id: action.chain_lease_id.get().to_string(),
             node_id_hash: format!(
                 "0x{}",
                 hex::encode(Sha256::digest(context.lease.node_id.as_bytes()))
@@ -1422,7 +1424,7 @@ impl Worker {
             transaction_hash: transaction_hash.clone(),
         };
         receipt.receipt_hash = receipt_hash(&receipt)?;
-        self.insert_receipt(&receipt, block_number, block_hash)
+        self.insert_receipt(action.lease_id, &receipt, block_number, block_hash)
             .await?;
         self.set_lease_state(action.lease_id, LeaseState::Refunded)
             .await
@@ -1453,7 +1455,7 @@ impl Worker {
             .context("finalization transaction is missing")?
             .transaction_hash
             .clone();
-        self.insert_receipt(&receipt, block_number, block_hash)
+        self.insert_receipt(action.lease_id, &receipt, block_number, block_hash)
             .await?;
         let mut transaction = self.pool.begin().await?;
         query(
@@ -1776,8 +1778,13 @@ impl Worker {
         Ok(bytes[32 * 14 - 1])
     }
 
+    /// `internal_lease_id` is the row this receipt belongs to; the receipt's own
+    /// `lease_id` is the escrow's, which is what a reader checks on chain. They
+    /// are different numbers and the foreign key needs ours, so it is passed
+    /// rather than parsed back out of the published document.
     async fn insert_receipt(
         &self,
+        internal_lease_id: u64,
         receipt: &PublicReceipt,
         block_number: u64,
         block_hash: &str,
@@ -1789,7 +1796,7 @@ impl Worker {
              ON CONFLICT (lease_id) DO NOTHING",
         )
         .bind(receipt.receipt_id)
-        .bind(receipt.lease_id.parse::<i64>()?)
+        .bind(internal_lease_id as i64)
         .bind(SqlJson(receipt.clone()))
         .bind(receipt.transaction_hash.to_ascii_lowercase())
         .bind(block_number as i64)

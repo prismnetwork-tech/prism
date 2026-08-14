@@ -333,6 +333,10 @@ impl ChainReader {
         }))
     }
 
+    fn escrow_address(&self) -> &str {
+        &self.escrow
+    }
+
     async fn eth_call(&self, to: &str, data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
         let calldata = format!("0x{}", hex::encode(data));
         let result: String = self
@@ -542,13 +546,23 @@ impl Report {
 async fn reconcile(pool: &PgPool, chain: Option<&ChainReader>) -> anyhow::Result<Report> {
     let mut report = Report::default();
 
-    // chain_lease_id, because every value here is handed straight to getLease.
-    let open_leases = query_as::<_, (i64, String)>(
-        "SELECT chain_lease_id, state FROM leases \
-         WHERE state NOT IN ('finalized', 'refunded', 'failed') ORDER BY lease_id",
-    )
-    .fetch_all(pool)
-    .await?;
+    // chain_lease_id, because every value here is handed straight to getLease,
+    // and only for the escrow now deployed. A superseded escrow numbered its
+    // leases from the same counter, so reading one of those ids against this
+    // escrow reports on a different lease or reverts outright.
+    let open_leases = match chain {
+        Some(chain) => {
+            query_as::<_, (i64, String)>(
+                "SELECT chain_lease_id, state FROM leases \
+                 WHERE state NOT IN ('finalized', 'refunded', 'failed') \
+                   AND escrow_address = $1 ORDER BY lease_id",
+            )
+            .bind(chain.escrow_address())
+            .fetch_all(pool)
+            .await?
+        }
+        None => Vec::new(),
+    };
     report.db_open_leases = open_leases.len() as i64;
 
     report.stuck_provisioning = stuck(pool, "provisioning", PROVISION_TIMEOUT_SECONDS).await?;
