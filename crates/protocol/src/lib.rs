@@ -963,6 +963,75 @@ pub struct VaultRelease {
     pub released_at: DateTime<Utc>,
 }
 
+/// A renter's durable storage, which outlives the machines it is restored onto.
+///
+/// The vault holds small secrets inline; a workspace holds however many
+/// gigabytes a training run leaves behind, so the ciphertext lives in object
+/// storage and only its shape is recorded here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Workspace {
+    pub workspace_id: Uuid,
+    /// Chosen by the renter and unencrypted, like a vault label: the one thing
+    /// they accept being listable by.
+    pub name: String,
+    /// Increments on every stored snapshot. A restore names the version it
+    /// wants, so being served an older copy is visible rather than silent.
+    pub version: u32,
+    /// Absent until the first snapshot lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<WorkspaceSnapshot>,
+    pub min_trust_class: TrustClass,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSnapshot {
+    /// The snapshot's data key, sealed to the renter's workspace root key.
+    pub wrapped_key: String,
+    /// AES-256-GCM nonce for the stored object, base64url, 12 bytes.
+    pub nonce: String,
+    /// SHA-256 of the ciphertext, recorded by the renter. A restore that hashes
+    /// to anything else was altered in storage, and the renter learns that
+    /// before decrypting rather than after.
+    pub ciphertext_digest: String,
+    pub size_bytes: u64,
+}
+
+/// Bound into the ciphertext so storage cannot serve one renter's snapshot to
+/// another, nor an older version in place of the one that was asked for.
+pub const WORKSPACE_ENVELOPE_DOMAIN: &[u8] = b"prism.workspace.v1\0";
+
+pub fn workspace_associated_data(
+    wallet: &str,
+    workspace_id: Uuid,
+    version: u32,
+    floor: TrustClass,
+) -> Vec<u8> {
+    let mut aad = Vec::from(WORKSPACE_ENVELOPE_DOMAIN);
+    for field in [
+        wallet,
+        &workspace_id.hyphenated().to_string(),
+        &version.to_string(),
+        floor.label(),
+    ] {
+        aad.extend_from_slice(field.as_bytes());
+        aad.push(0);
+    }
+    aad
+}
+
+/// Per snapshot. Large enough for a checkpoint directory, small enough that one
+/// account cannot quietly become the storage bill.
+pub const MAX_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const MAX_WORKSPACES_PER_ACCOUNT: usize = 16;
+pub const MAX_WORKSPACE_NAME_BYTES: usize = 64;
+/// Unlike the vault, a workspace defaults to the weakest floor. Its contents
+/// are the working files a renter is already handing to a rented machine, and
+/// defaulting to a floor no live capacity meets would mean the feature could
+/// never be used.
+pub const DEFAULT_WORKSPACE_TRUST_FLOOR: TrustClass = TrustClass::Open;
+
 #[derive(Clone)]
 pub struct CredentialCipher(Aes256Gcm);
 

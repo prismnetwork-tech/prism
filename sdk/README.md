@@ -65,6 +65,62 @@ ciphertext, so a service that moved an item between accounts, replayed an older
 version, or lowered its floor would produce a failed decrypt rather than a
 plausible wrong answer. See [docs/VAULT.md](../docs/VAULT.md).
 
+## Workspaces
+
+A lease destroys its machine, so training output, checkpoints and a working
+directory need somewhere that outlives it. A workspace is that place: the SDK
+archives a directory off the leased box, seals it here under a key derived from
+your wallet, and uploads the ciphertext straight to object storage. Prism
+records the version, the size and the hash, and holds nothing that opens it.
+
+```js
+await agent.workspace.unlock();
+
+const ws = await agent.workspace.create("finetune-run");
+const saved = await agent.workspace.save(lease, ws, "/root/out");
+
+// On a later lease, onto a fresh machine.
+await agent.workspace.restore(next, ws, "/root/out", { expectVersion: saved.version });
+```
+
+The workspace key comes from a different statement and a different salt than
+the vault's, so opening one does not open the other. Pass `{ passphrase }` to
+require a second factor beyond the wallet.
+
+A restore hashes the downloaded ciphertext and compares it to the digest
+recorded at save time before it decrypts anything, so bytes altered in storage
+are reported as tampering rather than as a wrong key. The account, workspace,
+version and trust floor are authenticated into the ciphertext, so a snapshot
+served for the wrong workspace, or under a floor that has been rewritten, fails
+to open rather than returning a plausible wrong answer.
+
+An older snapshot is a different case worth being precise about: its own
+associated data is genuine for its own version, so it decrypts cleanly and
+nothing in the ciphertext gives it away. A restore therefore compares the
+version it was granted against the version the record says is current, and
+refuses a rollback on that basis. Pass `expectVersion` to pin a specific one,
+and `expectTrustClass` to refuse a floor that has moved.
+
+A restore names the lease it is landing on, and Prism refuses to issue the
+download at all when that lease's trust class is below the workspace's floor.
+The check is server-side deliberately: a client-side one would be a courtesy
+that a modified client could skip.
+
+Bulk data never passes through Prism. Uploads and downloads use presigned URLs
+that live fifteen minutes, and they are used from your process, never handed to
+the leased machine. The machine only ever sees `tar` and `base64`, which is all
+this needs from it.
+
+Snapshots travel over the lease's SSH channel, which caps a single save at 64
+MiB of archive; a larger directory is refused on the machine before anything is
+transferred. New workspaces default to the `open` trust floor, unlike vault
+items: their contents are the files you are already handing to a rented box.
+Raise it at creation when they deserve more:
+
+```js
+await agent.workspace.create("model-weights", { minTrustClass: "isolated" });
+```
+
 ## Auth
 
 `authenticate()` fetches a challenge (`GET /api/agent/challenge`), signs the message with the wallet, and exchanges it for a session (`POST /api/agent/session`). The session is a bearer token used on every `/api/agent/proxy/*` call. No shared secret, no cookie. The wallet is the identity (`subject = wallet:0x...`).
@@ -79,6 +135,7 @@ The wallet needs two balances on Robinhood Chain (id 4663): USDG (`0x5fc5360D040
 
 ## Requirements
 
-Node >= 20, `viem` ^2 (peer), and `ssh` + `ssh-keygen` on PATH for `run()`.
+Node >= 20, `viem` ^2 (peer), and `ssh` + `ssh-keygen` on PATH for `run()` and
+for workspace save and restore.
 
 See `example.mjs` for a full run.

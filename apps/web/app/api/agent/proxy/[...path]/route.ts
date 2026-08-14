@@ -11,7 +11,7 @@ const maxRequestBytes = 256 * 1_024;
 
 // This boundary vouches for any wallet, so it may only reach the renter surface.
 // Operator, node, gateway, and supplier routes are off limits here.
-const renterRoutes = new Set(["offers", "leases", "vault"]);
+const renterRoutes = new Set(["offers", "leases", "vault", "workspaces"]);
 
 async function proxy(request: NextRequest, context: RouteContext) {
   const requestId = randomUUID();
