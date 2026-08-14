@@ -61,6 +61,7 @@ const ORPHAN_SCAN_INTERVAL_SECONDS: u64 = 300;
 const CLOUD_OBSERVATION_INTERVAL_SECONDS: u64 = 45;
 /// LeaseStatus.Funded in the escrow's enum.
 const LEASE_STATUS_FUNDED: u8 = 1;
+const LEASE_STATUS_ACTIVE: u8 = 2;
 const LEASE_STATUS_FINALIZED: u8 = 5;
 const LEASE_STATUS_REFUNDED: u8 = 6;
 
@@ -270,8 +271,11 @@ fn decode_lease(bytes: &[u8]) -> anyhow::Result<OnchainLease> {
     }
     let mut created = [0u8; 8];
     created.copy_from_slice(&bytes[32 * 7 - 8..32 * 7]);
+    let mut ended = [0u8; 8];
+    ended.copy_from_slice(&bytes[32 * 9 - 8..32 * 9]);
     Ok(OnchainLease {
         created_at: u64::from_be_bytes(created),
+        access_ended_at: u64::from_be_bytes(ended),
         status: bytes[32 * 14 - 1],
     })
 }
@@ -285,6 +289,9 @@ fn expirable(lease: OnchainLease, now: u64) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct OnchainLease {
     created_at: u64,
+    /// Zero until access is closed. A renter can set this themselves with
+    /// forceClose, so it moves without this worker doing anything.
+    access_ended_at: u64,
     status: u8,
 }
 
@@ -983,6 +990,31 @@ impl Worker {
         }
         if action.kind == ActionKind::CloseAccess && action.transaction.is_none() {
             self.revoke_access(action.lease_id).await?;
+            // closeAccess reverts unless the lease is Active with access still
+            // open, and a renter can close their own access with forceClose. A
+            // transaction built anyway reverts on every attempt until the action
+            // gives up, and giving up is what strands the deposit. Skipping is
+            // not enough either: completing this action is what records the
+            // close and queues settlement, so adopt the close the chain already
+            // has and queue settlement from that.
+            let onchain = self.lease_summary(action.chain_lease_id).await?;
+            if onchain.status != LEASE_STATUS_ACTIVE {
+                tracing::warn!(
+                    lease_id = action.lease_id,
+                    status = onchain.status,
+                    "skipping close_access for a lease the escrow no longer has open"
+                );
+                return self.skip_action(&action).await;
+            }
+            if onchain.access_ended_at != 0 {
+                tracing::warn!(
+                    lease_id = action.lease_id,
+                    "access was closed on chain by someone else; settling from that"
+                );
+                self.adopt_closed_access(&action, onchain.access_ended_at)
+                    .await?;
+                return self.skip_action(&action).await;
+            }
         }
         if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
             match self.lease_status(action.chain_lease_id).await? {
@@ -1036,6 +1068,15 @@ impl Worker {
                 self.reschedule_submitted(action.action_id).await?;
             }
             Finality::Reverted { .. } => {
+                // Drop the prepared transaction so the next attempt reads the
+                // chain again and builds a new one. Keeping it meant every
+                // retry resubmitted the identical bytes, the node returned the
+                // same receipt, and the action could only re-observe its own
+                // revert until it exhausted its attempts. The lease was then
+                // marked failed while the escrow still held the deposit and the
+                // registry still held the node, so a transient revert became a
+                // permanent loss.
+                self.discard_prepared_transaction(action.action_id).await?;
                 anyhow::bail!("lifecycle transaction reverted");
             }
             Finality::Confirmed {
@@ -1430,6 +1471,42 @@ impl Worker {
         }
         self.set_lease_state(action.lease_id, LeaseState::Active)
             .await
+    }
+
+    /// Records a close this worker did not perform and queues settlement from
+    /// it. Without this a renter who closes their own access leaves the lease
+    /// with no settlement job, so nobody is ever paid and the deposit sits in
+    /// the escrow. There is no close transaction of ours to name, so the hash
+    /// stays null and the receipt names the settling transaction instead.
+    async fn adopt_closed_access(&self, action: &Action, ended_at: u64) -> anyhow::Result<()> {
+        let ended_at = DateTime::from_timestamp(ended_at as i64, 0)
+            .context("on-chain access close timestamp is invalid")?;
+        query(
+            "UPDATE lease_lifecycle SET access_ended_at = COALESCE(access_ended_at, $2), \
+                 updated_at = NOW() WHERE lease_id = $1",
+        )
+        .bind(action.lease_id as i64)
+        .bind(ended_at)
+        .execute(&self.pool)
+        .await?;
+        let evidence = self.settlement_evidence(action.lease_id).await?;
+        let mut transaction = self.pool.begin().await?;
+        query(
+            "INSERT INTO settlement_jobs (lease_id, evidence) VALUES ($1, $2) \
+             ON CONFLICT (lease_id) DO NOTHING",
+        )
+        .bind(action.lease_id as i64)
+        .bind(SqlJson(evidence))
+        .execute(&mut *transaction)
+        .await?;
+        set_lease_state_in(
+            &mut transaction,
+            action.lease_id,
+            LeaseState::SettlementPending,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn complete_close(&self, action: &Action, block_time: u64) -> anyhow::Result<()> {
@@ -2005,6 +2082,21 @@ impl Worker {
         Ok(())
     }
 
+    /// Forgets the transaction prepared for an action, so the next attempt
+    /// builds a fresh one against current chain state.
+    async fn discard_prepared_transaction(&self, action_id: Uuid) -> anyhow::Result<()> {
+        query(
+            "UPDATE lifecycle_outbox \
+             SET raw_transaction = NULL, transaction_hash = NULL, \
+                 transaction_nonce = NULL, updated_at = NOW() \
+             WHERE action_id = $1",
+        )
+        .bind(action_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn reschedule_submitted(&self, action_id: Uuid) -> anyhow::Result<()> {
         query(
             "UPDATE lifecycle_outbox SET status = 'submitted', lease_until = NULL, \
@@ -2324,12 +2416,14 @@ mod tests {
     fn only_an_unprovisioned_lease_past_its_window_is_expirable() {
         let now = 1_000_000u64;
         let funded_and_stale = OnchainLease {
+            access_ended_at: 0,
             created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
             status: 1,
         };
         assert!(expirable(funded_and_stale, now));
 
         let funded_but_fresh = OnchainLease {
+            access_ended_at: 0,
             created_at: now - 60,
             status: 1,
         };
@@ -2340,6 +2434,7 @@ mod tests {
 
         for status in [0u8, 2, 3, 4, 5, 6] {
             let other = OnchainLease {
+                access_ended_at: 0,
                 created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
                 status,
             };
@@ -2421,6 +2516,30 @@ mod tests {
             direct_port_start,
             machine_id: 37_509,
         }
+    }
+
+    /// The escrow returns the lease as fourteen words. `accessEndedAt` is the
+    /// ninth, and reading the wrong one would silently return another
+    /// timestamp: `accessStartedAt` before it, `proposedUsageSeconds` after.
+    /// Either would make a lease look closed when it is not, or the reverse.
+    #[test]
+    fn a_lease_decodes_the_word_that_actually_holds_access_ended_at() {
+        let mut bytes = vec![0u8; 32 * 14];
+        bytes[32 * 7 - 8..32 * 7].copy_from_slice(&1_700_000_000u64.to_be_bytes());
+        bytes[32 * 8 - 8..32 * 8].copy_from_slice(&1_700_000_111u64.to_be_bytes());
+        bytes[32 * 9 - 8..32 * 9].copy_from_slice(&1_700_000_222u64.to_be_bytes());
+        bytes[32 * 10 - 8..32 * 10].copy_from_slice(&999u64.to_be_bytes());
+        bytes[32 * 14 - 1] = LEASE_STATUS_ACTIVE;
+
+        let lease = decode_lease(&bytes).unwrap();
+        assert_eq!(lease.created_at, 1_700_000_000);
+        assert_eq!(lease.access_ended_at, 1_700_000_222);
+        assert_eq!(lease.status, LEASE_STATUS_ACTIVE);
+
+        // Access still open is the case that must not read as closed.
+        let mut open = bytes.clone();
+        open[32 * 9 - 8..32 * 9].copy_from_slice(&0u64.to_be_bytes());
+        assert_eq!(decode_lease(&open).unwrap().access_ended_at, 0);
     }
 
     /// Production regression. Vast reports `direct_port_start` as -1 until a
