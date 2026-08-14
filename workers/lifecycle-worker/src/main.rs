@@ -566,6 +566,27 @@ impl Worker {
         Ok(u64::from_be_bytes(word))
     }
 
+    /// Whether the registry will still accept a lease on this node. The escrow
+    /// asks the same question at createLease, so a node that fails here can only
+    /// produce a revert and a renter who paid for nothing.
+    async fn is_schedulable(&self, node_id: &str) -> anyhow::Result<bool> {
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&selector("isSchedulable(bytes32)"));
+        data.extend_from_slice(&word_bytes32(bytes32(node_id)?));
+        let encoded: String = self
+            .chain
+            .call(
+                "eth_call",
+                serde_json::json!([{
+                    "to": format!("0x{}", hex::encode(self.registry)),
+                    "data": format!("0x{}", hex::encode(data))
+                }, "latest"]),
+            )
+            .await?;
+        let bytes = hex::decode(encoded.strip_prefix("0x").unwrap_or(&encoded))?;
+        Ok(bytes.last().is_some_and(|byte| *byte == 1))
+    }
+
     async fn lease_summary(&self, lease_id: ChainLeaseId) -> anyhow::Result<OnchainLease> {
         let mut data = Vec::with_capacity(36);
         data.extend_from_slice(&selector("getLease(uint256)"));
@@ -770,6 +791,22 @@ impl Worker {
             };
             let mut offer = offer.clone();
             offer.rate_per_second = registered;
+            // The bonded flag was written once at enrolment and never revisited.
+            // A broker node sends no telemetry, so nothing else refreshes it: a
+            // node the registry had taken out of service, by a bond change or a
+            // slash, stayed in the catalogue and every lease matched to it
+            // reverted with LeaseNotReady after the renter had paid. Ask the
+            // registry the same question the escrow will ask.
+            offer.bonded = match self.is_schedulable(node_id).await {
+                Ok(schedulable) => schedulable,
+                // Unreadable is not the same as unbonded. Dropping the whole
+                // catalogue on an RPC blip would be a worse outage than the one
+                // this prevents, so the last known answer stands.
+                Err(error) => {
+                    tracing::warn!(node_id, %error, "could not confirm the node is still bonded");
+                    offer.bonded
+                }
+            };
             // Advertise the class that will actually be handed over, not the one
             // the broker enrolled with.
             offer.gpu.model = host.gpu_name.clone();
@@ -1152,7 +1189,25 @@ impl Worker {
         if !vast.owns(&context.lease.node_id) {
             anyhow::bail!("cloud lease node is not brokered by this worker");
         }
-        if Utc::now() >= context.lease.created_at + chrono::Duration::minutes(10) {
+        // The escrow measures this window from the block that funded the lease.
+        // This row is written later, after the funding reaches its confirmation
+        // depth and the client gets around to calling confirm, so measuring from
+        // it hands out time the escrow has already spent. The worker then keeps
+        // renting hosts for a lease the escrow will refund underneath it, and
+        // the renter waits out a window that closed before they were told.
+        let opened_at = match self
+            .lease_summary(ChainLeaseId(context.lease.chain_lease_id))
+            .await
+        {
+            Ok(lease) if lease.created_at > 0 => {
+                DateTime::from_timestamp(lease.created_at as i64, 0)
+                    .unwrap_or(context.lease.created_at)
+            }
+            // Falling back to the row is the old behaviour, which errs towards
+            // giving a renter longer rather than cutting them off early.
+            _ => context.lease.created_at,
+        };
+        if Utc::now() >= opened_at + chrono::Duration::seconds(PROVISION_TIMEOUT_SECONDS as i64) {
             anyhow::bail!("the provisioning window for this lease has closed");
         }
         let retail = retail_hourly(context.lease.rate_per_second);
