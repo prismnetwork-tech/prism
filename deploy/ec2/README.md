@@ -120,6 +120,7 @@ alarms, so a single flaky host does not page anyone.
 ```sh
 PRISM_AGENT_KEY=0x...        # a funded wallet, and only ever this one
 PRISM_ESCROW=0x...
+CANARY_CONFIRM=1             # without this it only preflights and rents nothing
 CANARY_DURATION=600
 CANARY_MAX_USDG=0.5
 ```
