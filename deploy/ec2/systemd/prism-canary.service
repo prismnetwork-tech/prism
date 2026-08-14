@@ -1,0 +1,11 @@
+[Unit]
+Description=Rent a GPU the way a customer does, and record whether it worked
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/prism/canary.env
+ExecStart=/usr/local/sbin/run-lease-canary.sh
+# A failed run is the point of the unit, not a fault of the unit.
+SuccessExitStatus=0 1

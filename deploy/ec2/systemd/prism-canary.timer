@@ -1,0 +1,12 @@
+[Unit]
+Description=Rent a GPU periodically so an outage is found before a customer finds it
+
+[Timer]
+# Six-hourly. Each run costs one short lease, and the health check alarms after
+# three missed windows, so one flaky host never pages anyone.
+OnCalendar=*-*-* 00,06,12,18:20:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

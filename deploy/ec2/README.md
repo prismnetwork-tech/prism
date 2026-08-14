@@ -97,6 +97,33 @@ PRISM_ALERT_TELEGRAM_CHAT=...
 VAST_API_KEY=...
 ```
 
+### The canary
+
+Everything above infers health from parts. The canary proves it by renting: it
+quotes, funds on chain, waits for a machine, logs in over SSH, runs a command
+and settles, then writes the verdict to `/var/lib/prism/canary.json`. The health
+check reads that file and alarms with the step that failed.
+
+This exists because inference kept missing real outages. A lease id that
+collided with a superseded escrow took every renter's money and started nothing;
+a host was refused for a port it had not been given yet, so no lease could be
+provisioned at all; a machine was handed to a renter before it was reachable.
+Every gauge above read normal through all three, because each asks whether a
+part is working rather than whether a customer can be served.
+
+Install `run-lease-canary.sh` at `/usr/local/sbin/`, put the canary at
+`/opt/prism/canary/`, its wallet and caps in `/opt/prism/canary.env`, then
+`systemctl enable --now prism-canary.timer`. It runs six-hourly and each run
+spends one short lease. The health check waits three missed windows before it
+alarms, so a single flaky host does not page anyone.
+
+```sh
+PRISM_AGENT_KEY=0x...        # a funded wallet, and only ever this one
+PRISM_ESCROW=0x...
+CANARY_DURATION=600
+CANARY_MAX_USDG=0.5
+```
+
 With no channel configured the run still prints its findings and exits non-zero,
 so `systemctl status prism-health` and the journal hold the answer. That is a
 fallback, not a plan: nobody reads a journal they have no reason to open.

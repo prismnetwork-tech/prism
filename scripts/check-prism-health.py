@@ -193,6 +193,47 @@ def check_provider_credit(alarms, api_key, floor_dollars):
         )
 
 
+def check_canary(alarms, path, stale_seconds):
+    """Everything else here infers health. This reads the result of actually
+    renting a GPU: quote, fund, provision, log in, run something, settle.
+
+    Every fault worth having found this year was found by leasing, not by
+    watching. A lease id that collided with a superseded escrow, a host judged
+    on a port it had not been given yet, a machine handed over before it was
+    reachable: all of them left every gauge here reading normal, because each
+    gauge asks whether a part is working rather than whether a customer can be
+    served."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except FileNotFoundError:
+        alarms.append(Alarm("canary", "no lease has been attempted yet"))
+        return
+    except (OSError, ValueError) as error:
+        alarms.append(Alarm("canary", f"canary result is unreadable: {error}"))
+        return
+
+    finished = float(report.get("finished_at", 0))
+    age = time.time() - finished
+    if age > stale_seconds:
+        alarms.append(
+            Alarm(
+                "canary",
+                f"no lease attempted for {int(age // 60)} minutes; the last one "
+                f"is too old to say whether renting still works",
+            )
+        )
+        return
+    if not report.get("ok"):
+        alarms.append(
+            Alarm(
+                "canary",
+                f"renting a GPU failed at the {report.get('stage', 'unknown')} step: "
+                f"{report.get('error', 'no detail')}",
+            )
+        )
+
+
 def check_reconciliation(alarms, url):
     """The monitor already reconciles leases against the escrow. Read its
     answers rather than asking the same questions a second way."""
@@ -283,6 +324,9 @@ def main():
     unconfirmed_depth = int(os.environ.get("PRISM_ALERT_UNCONFIRMED_DEPTH", "25"))
     gas_floor = int(float(os.environ.get("PRISM_ALERT_GAS_FLOOR_ETH", "0.0005")) * 1e18)
     credit_floor = float(os.environ.get("PRISM_ALERT_CREDIT_FLOOR_USD", "25"))
+    canary_path = os.environ.get("PRISM_CANARY_RESULT", "/var/lib/prism/canary.json")
+    # Two missed runs before anyone is woken, so one flaky host does not page.
+    canary_stale = int(os.environ.get("PRISM_ALERT_CANARY_SECONDS", str(3 * 6 * 60 * 60)))
     signers = parse_signers(os.environ.get("PRISM_ALERT_SIGNERS", ""))
 
     alarms = []
@@ -293,6 +337,7 @@ def main():
         ("signers", lambda: check_signers(alarms, rpc_url, signers, gas_floor)),
         ("credit", lambda: check_provider_credit(alarms, os.environ.get("VAST_API_KEY"), credit_floor)),
         ("reconcile", lambda: check_reconciliation(alarms, metrics_url)),
+        ("canary", lambda: check_canary(alarms, canary_path, canary_stale)),
     )
     for name, probe in probes:
         try:
