@@ -145,6 +145,8 @@ The repository contains:
 - `sdk`: headless agent SDK for wallet-signature USDG leasing.
 - `mcp`: Model Context Protocol server exposing leasing to MCP clients.
 - `x402`: pay-per-job GPU execution over HTTP 402.
+- `integrations`: LangChain, CrewAI, AG2/AutoGen, elizaOS and Virtuals GAME adapters.
+- `examples/trading`: agents that rent a GPU for research, then trade on what it finds.
 - `deploy/ec2`: lean Vast launch topology with the web application on Render.
 - `deploy/lightsail`: full single-host reference topology.
 - `deploy/node`: Ubuntu node service units and configuration.
@@ -166,8 +168,12 @@ only renter routes.
 - [`sdk`](sdk/README.md) — `@prismnetwork/agent-sdk`, headless USDG-funded leasing for Node.
 - [`mcp`](mcp/README.md) — `@prismnetwork/mcp`, the same leasing exposed as Model Context Protocol tools.
 - [`x402`](x402/README.md) — `@prismnetwork/x402`, pay-per-job GPU execution over HTTP 402.
+- [`integrations`](integrations/README.md) — the same tools in the dialect of
+  LangChain, CrewAI, AG2/AutoGen, elizaOS, Virtuals GAME and Coinbase AgentKit,
+  plus how to pair Prism with Robinhood's agentic trading MCP.
 
-All three are published on npm under the `@prismnetwork` scope. An agent
+The Node and Python packages are published under the `@prismnetwork` npm scope
+and as `prismnetwork`/`prism-*` on PyPI. An agent
 workspace is still a disposable environment, not confidential computing;
 anything an agent needs to keep private belongs in its vault, which the same
 SDK reaches through `agent.vault`.

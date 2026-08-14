@@ -6,6 +6,7 @@
   "main": "prism.mjs",
   "exports": {
     ".": "./prism.mjs",
+    "./toolset": "./toolset.mjs",
     "./vault": {
       "types": "./vault.d.ts",
       "default": "./vault.mjs"
@@ -17,6 +18,7 @@
   },
   "files": [
     "prism.mjs",
+    "toolset.mjs",
     "vault.mjs",
     "vault.d.ts",
     "workspace.mjs",

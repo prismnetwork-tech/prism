@@ -30,3 +30,5 @@ deploy/ec2/secrets/
 mcp/package-lock.json
 x402/package-lock.json
 sdk/package-lock.json
+__pycache__/
+*.egg-info/

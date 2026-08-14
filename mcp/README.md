@@ -18,10 +18,14 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 | Tool | Wallet |
 | --- | --- |
 | `prism_list_gpus` | no |
+| `prism_price_index` | no |
+| `prism_receipts` | no |
 | `prism_wallet` | yes |
+| `prism_leases` | yes |
 | `prism_lease_and_run` | yes |
 | `prism_lease` | yes |
 | `prism_run` | yes |
+| `prism_batch_run` | yes |
 | `prism_end_lease` | yes |
 | `prism_vault_store` | yes |
 | `prism_vault_list` | yes |
@@ -31,9 +35,16 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 
 - `prism_wallet`: the agent's address and USDG/ETH balances.
 - `prism_list_gpus`: GPUs available to lease, with price per second and per hour.
+- `prism_price_index`: sourced and settled pricing per GPU model, for cost estimates.
+- `prism_receipts`: recent settled receipts from the public proof feed, with the
+  settlement transaction on Robinhood Chain.
+- `prism_leases`: this wallet's leases and their state.
 - `prism_lease_and_run`: lease a GPU, run a command, return the output (one shot).
 - `prism_lease`: lease a GPU and keep it; returns a `lease_id` and SSH access.
 - `prism_run`: run a command on an existing lease.
+- `prism_batch_run`: fund a lease that runs one command with no interactive
+  access; the node reports the signed output. Matches only suppliers at trust
+  class `isolated` or above, so it can find no supplier when none is online.
 - `prism_end_lease`: release a lease.
 - `prism_vault_store`: seal private data under the wallet-derived key.
 - `prism_vault_list`: list sealed items; values are never returned.

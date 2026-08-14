@@ -52,6 +52,14 @@ async function publicOffers(minTrust) {
   return response.json();
 }
 
+const PROOF_FEED = process.env.PRISM_PROOF_URL ?? "https://prismnetwork.tech/api/proof";
+
+async function publicJson(url, what) {
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error(`prism ${what} unavailable (${response.status})`);
+  return response.json();
+}
+
 const leases = new Map();
 const usdg = (micros) => `${(Number(micros) / 1e6).toFixed(6)} USDG`;
 
@@ -90,6 +98,39 @@ const TOOLS = [
           description: "Only list suppliers at or above this trust class (default 'open').",
         },
       },
+    },
+  },
+  {
+    name: "prism_price_index",
+    description: "Current GPU pricing on Prism Network by model: sourced low/median/high and settled mean, in USDG per hour. Needs no wallet. Use it to estimate what an analysis job will cost before leasing.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "prism_receipts",
+    description: "Recent settled lease receipts from the public proof feed: GPU model, runtime, what was charged and refunded, and the settlement transaction hash on Robinhood Chain. Needs no wallet. Every Prism lease ends in one of these.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max receipts to return (default 10)." },
+      },
+    },
+  },
+  {
+    name: "prism_leases",
+    description: "List this wallet's leases on Prism Network with their current state.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "prism_batch_run",
+    description: "Fund a lease that runs one command with no interactive access at all: the node executes it and reports the signed output. Matches only suppliers at trust class 'isolated' or above, so it can find no supplier when none is online — prefer prism_lease_and_run for broad availability. Output is capped at 64 KiB per stream.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "Shell command to run (max 8 KiB)." },
+        duration_seconds: { type: "integer", description: "Paid window in seconds (default 900, max 21600). A command still running at the end is killed and reported exit 124." },
+        min_vram_mib: { type: "integer", description: "Minimum GPU memory in MiB (default 16000)." },
+      },
+      required: ["command"],
     },
   },
   {
@@ -227,6 +268,76 @@ async function handle(name, args) {
       })),
     };
   }
+  if (name === "prism_price_index") {
+    const index = await publicJson(new URL("/v1/price-index", PUBLIC_API), "price index");
+    return {
+      currency: index.currency,
+      generated_at: index.generated_at,
+      gpus: (index.gpus ?? []).map((g) => ({
+        model: g.gpu_model,
+        sourced_low_per_hour: usdg(g.sourced_low_micros_per_hour),
+        sourced_median_per_hour: usdg(g.sourced_median_micros_per_hour),
+        sourced_high_per_hour: usdg(g.sourced_high_micros_per_hour),
+        settled_mean_per_hour: g.settled_mean_micros_per_hour == null ? null : usdg(g.settled_mean_micros_per_hour),
+        settled_leases: g.settled_leases,
+      })),
+    };
+  }
+  if (name === "prism_receipts") {
+    const feed = await publicJson(PROOF_FEED, "proof feed");
+    const limit = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : 10;
+    return {
+      generated_at: feed.generated_at,
+      receipts: (feed.receipts ?? []).slice(0, limit).map((r) => ({
+        lease_id: r.lease_id,
+        outcome: r.outcome,
+        gpu_model: r.gpu_model,
+        trust: r.trust_class,
+        runtime_seconds: r.runtime_seconds,
+        charged: usdg(r.charged_base_units),
+        refunded: usdg(r.refunded_base_units),
+        settlement_tx: r.transaction_hash,
+      })),
+    };
+  }
+  if (name === "prism_leases") {
+    requireWallet(name);
+    await ensureAuth();
+    const all = await agent.leases();
+    return {
+      total: all.length,
+      showing: Math.min(all.length, 20),
+      leases: all.slice(0, 20).map((l) => ({
+        lease_id: l.lease_id,
+        state: l.state,
+        image: l.image,
+        duration_seconds: l.duration_seconds,
+        max_escrow: usdg(l.maximum_escrow),
+        trust: l.trust_class,
+        funding_tx: l.funding_transaction_hash,
+        created_at: l.created_at,
+      })),
+    };
+  }
+  if (name === "prism_batch_run") {
+    if (!args.command) throw new Error("command is required");
+    requireWallet(name);
+    await ensureAuth();
+    const batch = await agent.lease({
+      image: IMAGE,
+      durationSeconds: args.duration_seconds ?? 900,
+      minVramMib: args.min_vram_mib ?? 16000,
+      command: args.command,
+    });
+    return {
+      lease_id: batch.leaseId,
+      funding_tx: batch.fundingHash,
+      exit_code: batch.result?.exit_code,
+      stdout: batch.result?.stdout,
+      stderr: batch.result?.stderr,
+      truncated: batch.result?.truncated ?? false,
+    };
+  }
   if (name === "prism_lease_and_run" || name === "prism_lease") {
     if (name === "prism_lease_and_run" && !args.command) throw new Error("command is required");
     requireWallet(name);
@@ -331,7 +442,7 @@ function ensureAuth() {
   return authPromise;
 }
 
-const server = new Server({ name: "prism", version: "0.4.1" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "prism", version: "0.5.0" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
