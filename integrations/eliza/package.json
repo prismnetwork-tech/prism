@@ -1,0 +1,56 @@
+{
+  "name": "@prismnetwork/plugin-eliza",
+  "version": "0.1.0",
+  "description": "elizaOS plugin for renting and running on Prism Network GPUs.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@prismnetwork/agent-sdk": "^0.4.0",
+    "viem": "^2"
+  },
+  "agentConfig": {
+    "pluginType": "elizaos:plugin:1.0.0",
+    "pluginParameters": {
+      "PRISM_AGENT_KEY": {
+        "type": "string",
+        "description": "Private key of a wallet holding USDG and gas on Robinhood Chain. Only needed to lease; browsing capacity works without it.",
+        "required": false,
+        "sensitive": true
+      },
+      "PRISM_ESCROW": {
+        "type": "string",
+        "description": "Prism lease escrow contract address. Defaults to the live escrow.",
+        "required": false,
+        "sensitive": false
+      }
+    }
+  },
+  "keywords": [
+    "prism",
+    "eliza",
+    "elizaos-plugins",
+    "gpu",
+    "agent",
+    "compute"
+  ],
+  "homepage": "https://prismnetwork.tech",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prismnetwork-tech/prism.git",
+    "directory": "integrations/eliza"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}

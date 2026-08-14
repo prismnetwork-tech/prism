@@ -31,6 +31,21 @@ per-second; each lease settles on-chain with a verifiable receipt.
 
 Read-only helpers: `offers()`, `balances()`, `leases()`, `quote(...)`, `access(id)`.
 
+## Batch
+
+Pass `command=` to `lease()` and the node runs that one command and reports its
+output instead of granting SSH access:
+
+```python
+batch = agent.lease(image=DEFAULT_IMAGE, duration_seconds=600, command="nvidia-smi")
+print(batch.result["stdout"])
+```
+
+Batch leases match only suppliers at trust class `isolated` or above, because the
+broker path has no signed result channel. Commands are capped at 8 KiB and output
+at 64 KiB per stream. `result(lease_id)` and `wait_for_result(lease_id)` read the
+output of an already-funded batch lease.
+
 The wallet needs USDG (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`, 6 decimals) and
 native Robinhood-Chain gas.
 

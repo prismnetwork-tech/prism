@@ -47,6 +47,18 @@ _ESCROW = [
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 
+# Matches the limit the control plane and the node both enforce, so a command
+# that cannot run is rejected here rather than after an escrow is funded.
+MAX_COMMAND_BYTES = 8 * 1024
+
+
+def _command(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PrismError(400, "invalid_command", {"hint": "a batch command cannot be empty"})
+    if len(value.encode("utf-8")) > MAX_COMMAND_BYTES:
+        raise PrismError(400, "invalid_command", {"hint": "a batch command cannot exceed 8 KiB"})
+    return value
+
 
 def _trust_class(value: str) -> str:
     if value not in TRUST_CLASSES:
@@ -69,6 +81,17 @@ class Lease:
     key_path: str
     key_dir: str
     public_key: str
+    funding_hash: str
+    quote: dict
+
+
+@dataclass
+class BatchLease:
+    """A lease that carried a command. There is no access to wait for; the node
+    runs the command and reports its output, which is all a renter receives."""
+
+    lease_id: int
+    result: dict
     funding_hash: str
     quote: dict
 
@@ -116,16 +139,20 @@ class PrismAgent:
         }
 
     def quote(self, image: str, duration_seconds: int, min_vram_mib: int = 16000,
-              preferred_node_id: str | None = None, min_trust_class: str = "open") -> dict:
+              preferred_node_id: str | None = None, min_trust_class: str = "open",
+              command: str | None = None) -> dict:
         if not isinstance(image, str) or not _DIGEST.search(image):
             raise PrismError(400, "image_must_be_digest_pinned")
-        return self._proxy("POST", ["leases", "match"], {"request": {
+        request = {
             "image": image,
             "duration_seconds": duration_seconds,
             "min_vram_mib": min_vram_mib,
             "preferred_node_id": preferred_node_id,
             "min_trust_class": _trust_class(min_trust_class),
-        }})
+        }
+        if command is not None:
+            request["command"] = _command(command)
+        return self._proxy("POST", ["leases", "match"], {"request": request})
 
     def confirm(self, quote_id: str, transaction_hash: str, ssh_authorized_key: str) -> dict:
         return self._proxy("POST", ["leases", "confirm"], {
@@ -140,6 +167,21 @@ class PrismAgent:
     def access(self, lease_id) -> dict:
         return self._proxy("GET", ["leases", str(lease_id), "access"])
 
+    def result(self, lease_id) -> dict:
+        """The output of a batch lease, once its node has reported."""
+        return self._proxy("GET", ["leases", str(lease_id), "result"])
+
+    def wait_for_result(self, lease_id, timeout: int = 900, interval: int = 10) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status, body = self._proxy("GET", ["leases", str(lease_id), "result"], raw=True)
+            if status == 200:
+                return body
+            if status != 404:
+                raise PrismError(status, (body or {}).get("code", "result_failed"), body)
+            time.sleep(interval)
+        raise PrismError(408, "result_timeout")
+
     def wait_for_access(self, lease_id, timeout: int = 600, interval: int = 10) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -153,10 +195,11 @@ class PrismAgent:
 
     def lease(self, image: str, duration_seconds: int, min_vram_mib: int = 16000,
               preferred_node_id: str | None = None, max_deposit: int | None = None,
-              min_trust_class: str = "open") -> Lease:
+              min_trust_class: str = "open", command: str | None = None) -> Lease | BatchLease:
         if not self.session:
             self.authenticate()
-        quote = self.quote(image, duration_seconds, min_vram_mib, preferred_node_id, min_trust_class)
+        quote = self.quote(image, duration_seconds, min_vram_mib, preferred_node_id,
+                           min_trust_class, command)
         if max_deposit is not None and int(quote["maximum_escrow"]) > int(max_deposit):
             raise PrismError(402, "cost_exceeds_max",
                              {"required": quote["maximum_escrow"], "max": str(max_deposit)})
@@ -165,6 +208,13 @@ class PrismAgent:
             funding = self._fund(quote)
             record = self.confirm(quote["quote_id"], funding, key["public_key"])
             lease_id = record["lease_id"]
+            # A batch lease never hands out access, so waiting for it would block
+            # until the timeout and then report a failure that never happened.
+            # Wait for what the command printed instead.
+            if command is not None:
+                result = self.wait_for_result(lease_id)
+                shutil.rmtree(key["dir"], ignore_errors=True)
+                return BatchLease(lease_id, result, funding, quote)
             return Lease(lease_id, self.wait_for_access(lease_id),
                          key["key_path"], key["dir"], key["public_key"], funding, quote)
         except Exception:

@@ -29,6 +29,16 @@ agent.endLease(lease);
 
 `image` must be an immutable digest-pinned reference (`repo@sha256:...`). `DEFAULT_IMAGE` is one; a plain tag is rejected.
 
+## Toolset
+
+`@prismnetwork/agent-sdk/toolset` exports `PrismToolset`, the framework-neutral
+tool surface the MCP server and the framework plugins (elizaOS, Virtuals GAME)
+wrap: `wallet`, `listGpus`, `leaseAndRun`, `run`, `endLease`, each returning a
+human-readable string. It holds the wallet, the open leases and the per-lease
+spending cap in one place, reads `PRISM_AGENT_KEY`/`PRISM_ESCROW` from the
+environment by default, and answers the read-only questions from the public API
+when no wallet is configured.
+
 ## Vault
 
 Cards, identity documents, API credentials and recovery codes go in the vault

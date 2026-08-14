@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prism-langchain"
+version = "0.1.0"
+description = "Prism Network GPU tools for LangChain and LangGraph agents"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Prism Network", email = "opensource@prismnetwork.tech" }]
+dependencies = [
+    "prismnetwork>=0.2.0",
+    "langchain-core>=0.3",
+]
+
+[project.urls]
+Homepage = "https://prismnetwork.tech"
+Repository = "https://github.com/prismnetwork-tech/prism"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prism_langchain"]

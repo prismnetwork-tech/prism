@@ -84,4 +84,41 @@ with patch("coinbase_agentkit.action_providers.action_decorator.send_analytics_e
     assert actions["end_lease"].invoke({"lease_id": 7}) == "released lease 7"
 assert agent.ended == [7]
 
-print("Python SDK and AgentKit wheels are importable and actions are callable")
+import prism_autogen
+import prism_crewai
+import prism_langchain
+from prismnetwork import PrismToolset
+
+
+class FakeToolsetAgent(FakeAgent):
+    def offers(self, min_trust="open"):
+        return super().offers()
+
+
+assert version("prism-langchain") == prism_langchain.__version__
+assert version("prism-crewai") == prism_crewai.__version__
+assert version("prism-autogen") == prism_autogen.__version__
+
+toolset = PrismToolset(agent=FakeToolsetAgent())
+listed = toolset.list_gpus()
+assert "Test GPU" in listed and "isolated" in listed
+assert "lease 7 funded onchain" in toolset.lease_and_run("nvidia-smi", max_usdg=0.25)
+assert toolset.run(7, "echo ready").endswith("7:echo ready")
+assert toolset.end_lease(7) == "released lease 7"
+
+expected = ["prism_wallet", "prism_list_gpus", "prism_lease_and_run", "prism_run", "prism_end_lease"]
+
+lc_tools = prism_langchain.get_prism_tools(PrismToolset(agent=FakeToolsetAgent()))
+assert [t.name for t in lc_tools] == expected
+assert "Test GPU" in lc_tools[1].invoke({"min_trust": "open"})
+
+crew_tools = prism_crewai.prism_tools(PrismToolset(agent=FakeToolsetAgent()))
+assert len(crew_tools) == 5 and all(t.args_schema is not None for t in crew_tools)
+assert "Test GPU" in crew_tools[1].run(min_trust="open")
+
+ag_tools = prism_autogen.prism_tools(PrismToolset(agent=FakeToolsetAgent()))
+assert [f.__name__ for f in ag_tools] == expected
+assert all(f.__doc__ for f in ag_tools)
+assert "Test GPU" in ag_tools[1]("open")
+
+print("Python SDK, AgentKit and integration wheels are importable and their tools are callable")
