@@ -25,6 +25,10 @@ use tracing_subscriber::EnvFilter;
 /// Rebuild a settlement proposal rather than resubmit it after this many
 /// failed attempts, so a transaction priced below the base fee cannot strand
 /// the lease and hold its node until the retry limit runs out.
+/// How much life a signature needs left for it to be worth sending. Under this
+/// it is rebuilt, because a proposal that expires in flight reverts and costs an
+/// attempt for nothing.
+const DEADLINE_MARGIN_SECONDS: u64 = 600;
 const RESIGN_AFTER_ATTEMPTS: i16 = 5;
 const MAX_EVIDENCE_BYTES: u64 = 20_000_000;
 const MAX_EVIDENCE_RECORDS: usize = 1_000;
@@ -216,7 +220,7 @@ async fn run_database(database_url: &str) -> anyhow::Result<()> {
     }
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
     loop {
-        let Some((lease_id, evidence, stored)) = claim_settlement(&pool).await? else {
+        let Some((lease_id, evidence)) = claim_settlement(&pool).await? else {
             if run_once {
                 return Ok(());
             }
@@ -231,7 +235,6 @@ async fn run_database(database_url: &str) -> anyhow::Result<()> {
             confirmations,
             lease_id,
             &evidence,
-            stored,
         )
         .await;
         if let Err(error) = result {
@@ -244,19 +247,13 @@ async fn run_database(database_url: &str) -> anyhow::Result<()> {
     }
 }
 
-async fn claim_settlement(
-    pool: &PgPool,
-) -> anyhow::Result<Option<(u64, SettlementEvidence, Option<Submission>)>> {
+/// Claims a job. The stored proposal is deliberately not returned: whether it
+/// can still be reused is decided in `prepare_durable_submission`, which is the
+/// only place that knows the rules for rebuilding one.
+async fn claim_settlement(pool: &PgPool) -> anyhow::Result<Option<(u64, SettlementEvidence)>> {
     let mut transaction = pool.begin().await?;
-    let row = query_as::<
-        _,
-        (
-            i64,
-            SqlJson<SettlementEvidence>,
-            Option<SqlJson<Submission>>,
-        ),
-    >(
-        "SELECT lease_id, evidence, proposal FROM settlement_jobs \
+    let row = query_as::<_, (i64, SqlJson<SettlementEvidence>)>(
+        "SELECT lease_id, evidence FROM settlement_jobs \
          WHERE attempts < 100 AND available_at <= NOW() \
            AND (status IN ('queued', 'submitted') \
                 OR (status = 'processing' AND lease_until <= NOW())) \
@@ -264,7 +261,7 @@ async fn claim_settlement(
     )
     .fetch_optional(&mut *transaction)
     .await?;
-    let Some((lease_id, SqlJson(evidence), submission)) = row else {
+    let Some((lease_id, SqlJson(evidence))) = row else {
         transaction.commit().await?;
         return Ok(None);
     };
@@ -277,11 +274,7 @@ async fn claim_settlement(
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
-    Ok(Some((
-        u64::try_from(lease_id)?,
-        evidence,
-        submission.map(|SqlJson(value)| value),
-    )))
+    Ok(Some((u64::try_from(lease_id)?, evidence)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -293,12 +286,11 @@ async fn process_settlement(
     confirmations: u64,
     lease_id: u64,
     evidence: &SettlementEvidence,
-    stored: Option<Submission>,
 ) -> anyhow::Result<()> {
-    let submission = match stored {
-        Some(submission) => submission,
-        None => prepare_durable_submission(pool, chain, signer, escrow, evidence).await?,
-    };
+    // Always ask. Taking the claimed submission directly used to bypass the
+    // rebuild rules entirely, so a proposal that could no longer land was
+    // resubmitted verbatim until the job ran out of attempts.
+    let submission = prepare_durable_submission(pool, chain, signer, escrow, evidence).await?;
     let known: Option<serde_json::Value> = chain
         .call(
             "eth_getTransactionByHash",
@@ -316,8 +308,15 @@ async fn process_settlement(
             anyhow::bail!("RPC returned an unexpected transaction hash");
         }
     }
+    // Waiting for confirmations is not an attempt. Charging one for every poll
+    // burned the whole allowance in about eight minutes of a slow inclusion,
+    // after which the job could never be claimed again. Its status stayed
+    // 'submitted' rather than 'failed', so the critical alert never fired and
+    // the finalize step, which is only scheduled on the confirmed path, was
+    // never queued at all.
     query(
         "UPDATE settlement_jobs SET status = 'submitted', lease_until = NULL, \
+             attempts = GREATEST(0, attempts - 1), \
              available_at = NOW() + INTERVAL '5 seconds', updated_at = NOW() \
          WHERE lease_id = $1",
     )
@@ -380,6 +379,9 @@ async fn prepare_durable_submission(
         // rejected them repeatedly they can never land, and resubmitting until
         // the attempt limit strands the lease and holds its node the whole time.
         // Past a few failures the proposal is rebuilt at the current price.
+        // The signature also carries a deadline. Once that passes the escrow
+        // rejects the proposal with Expired() no matter how often it is sent,
+        // so a stale one is rebuilt rather than retried.
         if let Some(SqlJson(existing)) = query_scalar::<_, SqlJson<Submission>>(
             "SELECT proposal FROM settlement_jobs \
                  WHERE lease_id = $1 AND proposal IS NOT NULL AND attempts < $2",
@@ -388,6 +390,8 @@ async fn prepare_durable_submission(
         .bind(RESIGN_AFTER_ATTEMPTS)
         .fetch_optional(&mut *connection)
         .await?
+            && existing.proposal.deadline
+                > (Utc::now().timestamp() as u64) + DEADLINE_MARGIN_SECONDS
         {
             return Ok(existing);
         }
@@ -1127,6 +1131,28 @@ mod tests {
             calldata[signature_start + 65..]
                 .iter()
                 .all(|byte| *byte == 0)
+        );
+    }
+
+    /// A signature carries a deadline, and past it the escrow rejects the
+    /// proposal with Expired() however many times it is sent. Reuse has to stop
+    /// before that, with enough margin that a proposal does not expire while it
+    /// is in flight.
+    #[test]
+    fn a_signature_is_not_reused_once_it_is_close_to_expiring() {
+        let now = 1_700_000_000u64;
+        let reusable = |deadline: u64| deadline > now + DEADLINE_MARGIN_SECONDS;
+
+        assert!(reusable(now + 3_600), "a fresh hour-long signature is fine");
+        assert!(
+            !reusable(now + DEADLINE_MARGIN_SECONDS),
+            "exactly at the margin is already too late to start"
+        );
+        assert!(!reusable(now), "expiring now must be rebuilt");
+        assert!(!reusable(now - 1), "expired must be rebuilt");
+        assert!(
+            DEADLINE_MARGIN_SECONDS < 3_600,
+            "the margin has to leave a freshly signed proposal usable"
         );
     }
 
