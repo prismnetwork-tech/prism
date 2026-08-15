@@ -1,5 +1,4 @@
-export const REFRACTION_PRIZE = "0x882AC2933B1A93e4c3F1B80dc089b0Fe0b441b78";
-export const PRISM_TOKEN = "0x0A1e0Cc751f77C2C93760FC957CC8E4E779b2bC8";
+export const REFRACTION_PRIZE = "0xD19474BC75A65a2a8faa59f93CF0f014cBF8C771";
 export const EXPLORER = "https://robinhoodchain.blockscout.com";
 
 export type Stage = {

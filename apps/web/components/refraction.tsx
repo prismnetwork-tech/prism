@@ -11,7 +11,7 @@ import {
 } from "@/lib/refraction";
 
 const RPC = "https://rpc.mainnet.chain.robinhood.com";
-const AWARDS = [3_000_000, 2_000_000, 1_000_000];
+const AWARDS = [0.05, 0.03, 0.02];
 
 type Winner = { solver: string; revealedAt: number; award: number };
 type Board = { winners: Winner[]; commitments: number; pool: number | null };
@@ -29,6 +29,18 @@ async function ethCall(to: string, data: string) {
 }
 
 const word = (hex: string, index: number) => hex.slice(2 + index * 64, 2 + (index + 1) * 64);
+
+async function ethBalance(address: string) {
+  const response = await fetch(RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [address, "latest"] }),
+    cache: "no-store",
+  });
+  const answer = await response.json();
+  if (answer.error) throw new Error(answer.error.message);
+  return answer.result as string;
+}
 const toNumber = (hex: string) => Number(BigInt("0x" + hex));
 
 /// Reads the board straight from the contract rather than from us. A leaderboard
@@ -37,7 +49,7 @@ async function readBoard(): Promise<Board> {
   const [rawBoard, rawCommits, rawPool] = await Promise.all([
     ethCall(REFRACTION_PRIZE, "0xeb56b740"),
     ethCall(REFRACTION_PRIZE, "0xd28d5bda"),
-    ethCall("0x0A1e0Cc751f77C2C93760FC957CC8E4E779b2bC8", "0x70a08231" + REFRACTION_PRIZE.slice(2).toLowerCase().padStart(64, "0")),
+    ethBalance(REFRACTION_PRIZE),
   ]);
   const body = rawBoard.slice(2 + 64);
   const count = Number(BigInt("0x" + body.slice(0, 64)));
@@ -47,13 +59,13 @@ async function readBoard(): Promise<Board> {
     winners.push({
       solver: "0x" + body.slice(base + 24, base + 64),
       revealedAt: Number(BigInt("0x" + body.slice(base + 64, base + 128))),
-      award: Number(BigInt("0x" + body.slice(base + 128, base + 192)) / 10n ** 18n),
+      award: Number(BigInt("0x" + body.slice(base + 128, base + 192))) / 1e18,
     });
   }
   return {
     winners,
     commitments: toNumber(word(rawCommits, 0)),
-    pool: Number(BigInt("0x" + word(rawPool, 0)) / 10n ** 18n),
+    pool: Number(BigInt(rawPool)) / 1e18,
   };
 }
 
@@ -85,11 +97,11 @@ export function Refraction() {
         <h1>Refraction</h1>
         <p>
           Four questions about how this network actually works. The first three people to answer all
-          four take 3,000,000, 2,000,000 and 1,000,000 PRISM. The prize sits in a contract that pays
+          four take 0.05, 0.03 and 0.02 ETH. The prize sits in a contract that pays
           out by itself, so nobody here decides who wins.
         </p>
         <div className="refraction-pool">
-          <span>{board?.pool !== null && board?.pool !== undefined ? `${board.pool.toLocaleString()} PRISM` : "6,000,000 PRISM"} in the pool</span>
+          <span>{board?.pool !== null && board?.pool !== undefined ? `${board.pool.toFixed(3)} ETH` : "0.1 ETH"} in the pool</span>
           <a href={`${EXPLORER}/address/${REFRACTION_PRIZE}`} target="_blank" rel="noreferrer">
             Check it yourself ↗
           </a>
@@ -136,7 +148,7 @@ export function Refraction() {
                 return (
                   <li key={award} className={winner ? "taken" : ""}>
                     <span className="place">{place + 1}</span>
-                    <span className="award">{award.toLocaleString()} PRISM</span>
+                    <span className="award">{award} ETH</span>
                     {winner ? (
                       <a href={`${EXPLORER}/address/${winner.solver}`} target="_blank" rel="noreferrer" className="mono">
                         {winner.solver.slice(0, 10)}…{winner.solver.slice(-6)}
