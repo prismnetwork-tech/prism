@@ -16,9 +16,20 @@ import subprocess
 import sys
 import tempfile
 
+# A lease id counts from one inside a single escrow deployment, so the same
+# number was issued twice when the escrow was replaced: eleven ids appeared on
+# two different leases, with different GPUs and different transactions. The
+# stored receipt is a signed artifact and is left alone; the escrow that issued
+# it is joined on here instead, which makes every published row identify exactly
+# one lease.
 QUERY = (
-    "select coalesce(json_agg(document order by block_number desc), '[]'::json)::text "
-    "from proof_receipts where document->>'outcome' = 'finalized';"
+    "select coalesce(json_agg(receipt order by block_number desc), '[]'::json)::text from ("
+    "  select r.block_number,"
+    "         r.document || jsonb_build_object('escrow_address', l.escrow_address) as receipt"
+    "  from proof_receipts r"
+    "  join leases l on l.lease_id = r.lease_id"
+    "  where r.document->>'outcome' = 'finalized'"
+    ") as joined;"
 )
 
 REQUIRED_FIELDS = (
@@ -31,6 +42,7 @@ REQUIRED_FIELDS = (
     "outcome",
     "receipt_hash",
     "transaction_hash",
+    "escrow_address",
 )
 
 

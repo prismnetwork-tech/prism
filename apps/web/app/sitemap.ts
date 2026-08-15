@@ -59,6 +59,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.5,
     },
     {
+      url: new URL("/refraction", siteUrl).href,
+      changeFrequency: "hourly",
+      priority: 0.8,
+    },
+    {
       url: new URL("/status", siteUrl).href,
       changeFrequency: "hourly",
       priority: 0.6,
