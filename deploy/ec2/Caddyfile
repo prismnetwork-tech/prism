@@ -12,7 +12,21 @@
 		-Server
 	}
 
-	reverse_proxy control-plane:8080
+	handle /proof/* {
+		root * /srv
+		file_server
+		header Content-Type "application/json"
+		header Access-Control-Allow-Origin "*"
+	}
+
+	handle /inference/* {
+		uri strip_prefix /inference
+		reverse_proxy inference:8500
+	}
+
+	handle {
+		reverse_proxy control-plane:8080
+	}
 }
 
 prismnetwork.tech, www.prismnetwork.tech {

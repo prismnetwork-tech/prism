@@ -19,7 +19,21 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      control-plane:
+      inference:
+    image: node:22-alpine@sha256:9fcc1a6da2b9eba3037dc0d6e0a1a1fbc0f7d047b90aa9d3193b16f04b515821
+    restart: unless-stopped
+    working_dir: /app
+    # The gateway shells out to ssh for the ollama tunnel; the base image does
+    # not carry a client.
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache openssh-client >/dev/null && exec node server.mjs"]
+    env_file: ./inference.env
+    volumes:
+      - ./inference:/app:ro
+      - inference_state:/state
+    environment:
+      INFERENCE_PAYMENTS_FILE: /state/inference-consumed.log
+
+  control-plane:
         condition: service_healthy
 
   control-plane:
@@ -233,6 +247,7 @@ services:
         condition: service_healthy
 
 volumes:
+  inference_state:
   cache_data:
   caddy_config:
   caddy_data:

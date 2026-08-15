@@ -145,6 +145,7 @@ The repository contains:
 - `sdk`: headless agent SDK for wallet-signature USDG leasing.
 - `mcp`: Model Context Protocol server exposing leasing to MCP clients.
 - `x402`: pay-per-job GPU execution over HTTP 402.
+- `inference`: managed inference, a warm ollama lease behind an x402-paid endpoint.
 - `integrations`: LangChain, CrewAI, AG2/AutoGen, elizaOS and Virtuals GAME adapters.
 - `examples/trading`: agents that rent a GPU for research, then trade on what it finds.
 - `deploy/ec2`: lean Vast launch topology with the web application on Render.
