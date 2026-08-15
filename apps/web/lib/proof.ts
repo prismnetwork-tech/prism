@@ -14,6 +14,11 @@ export type PublicProofReceipt = {
   trust_class?: "open" | "isolated" | "attested" | "confidential";
   receipt_hash: string;
   transaction_hash: string;
+  /// The escrow that issued this lease id. Ids count from one inside a single
+  /// deployment, so the same number was handed out twice when the escrow was
+  /// replaced, and only this tells the two apart. Absent on nothing published
+  /// after 2026-08-15; older readers can ignore it.
+  escrow_address?: string;
 };
 
 export type PublicProofIndex = {
