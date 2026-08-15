@@ -19,22 +19,24 @@ const navigation = [
   ["Settings", "/settings"],
 ] as const;
 
+/// Routes behind the console chrome that the sidebar does not link to.
+const CONSOLE_ONLY = ["/activity", "/operator", "/settings"] as const;
+
+function isUnder(pathname: string, href: string) {
+  return pathname === href || pathname.startsWith(`${href}/`);
+}
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [menuOpen, setMenuOpen] = useState(false);
 
-  if (
-    pathname === "/"
-    || pathname.startsWith("/docs")
-    || pathname === "/privacy"
-    || pathname === "/terms"
-    || pathname === "/about"
-    || pathname === "/pricing"
-    || pathname === "/security"
-    || pathname === "/contact"
-    || pathname === "/faq"
-    || pathname.startsWith("/learn")
-  ) return <>{children}</>;
+  // Listed the other way round on purpose. The console is the closed set, so a
+  // new public page is public by default. The previous list named every public
+  // route, and each page added since drew the sidebar on top of its own header,
+  // which is how /status ended up with two logos.
+  const inConsole = navigation.some(([, href]) => href.startsWith("/") && isUnder(pathname, href))
+    || CONSOLE_ONLY.some((href) => isUnder(pathname, href));
+  if (!inConsole) return <>{children}</>;
 
   return (
     <div className="app-shell">

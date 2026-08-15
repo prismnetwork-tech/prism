@@ -1,224 +1,443 @@
 .refraction {
-  max-width: 54rem;
+  --gutter: clamp(22px, 4vw, 72px);
+  position: relative;
+  overflow: hidden;
+  min-height: 100vh;
+}
+
+.refraction-inner {
+  max-width: 1180px;
   margin: 0 auto;
-  padding: 3.5rem 1.5rem 5rem;
+  padding: clamp(48px, 7vw, 96px) var(--gutter) clamp(80px, 10vw, 140px);
 }
 
-.refraction-hero {
-  margin-bottom: 3rem;
+/* Full-bleed hairlines, the way the landing page draws them. */
+.refraction-rule {
+  position: relative;
 }
 
-.refraction-hero .eyebrow {
-  font-size: 0.72rem;
+.refraction-rule::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 100vw;
+  transform: translateX(-50%);
+  border-top: 1px solid rgba(230, 237, 220, 0.12);
+  pointer-events: none;
+}
+
+.refraction-kicker {
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent, #ccff00);
+  margin: 0 0 22px;
+}
+
+.refraction h1 {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-weight: 400;
+  font-size: clamp(58px, 9vw, 132px);
+  line-height: 0.86;
+  letter-spacing: -0.065em;
+  margin: 0 0 28px;
+}
+
+.refraction-lede {
+  max-width: 560px;
+  color: #979e93;
+  font-size: clamp(15px, 1.25vw, 19px);
+  line-height: 1.65;
+  margin: 0 0 44px;
+}
+
+/* The beam. A white line enters, and the four stages are the bands it splits
+   into. Each stays dark until its stage is solved, so the page fills with
+   colour as someone works through it. */
+.beam {
+  display: grid;
+  grid-template-columns: minmax(60px, 1fr) 4fr;
+  align-items: stretch;
+  gap: 0;
+  height: 132px;
+  margin-bottom: 12px;
+}
+
+.beam-in {
+  position: relative;
+}
+
+.beam-in::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, #f4f7ef);
+}
+
+.beam-out {
+  display: grid;
+  grid-template-rows: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.beam-band {
+  border-radius: 2px;
+  background: #16180f;
+  transform-origin: left center;
+  transition: background 420ms ease, opacity 420ms ease;
+  opacity: 0.45;
+}
+
+.beam-band.lit {
+  opacity: 1;
+}
+
+.beam-band.lit:nth-child(1) { background: linear-gradient(90deg, #f4f7ef, #ccff00); }
+.beam-band.lit:nth-child(2) { background: linear-gradient(90deg, #ccff00, #7fdbca); }
+.beam-band.lit:nth-child(3) { background: linear-gradient(90deg, #7fdbca, #7aa2f7); }
+.beam-band.lit:nth-child(4) { background: linear-gradient(90deg, #7aa2f7, #c792ea); }
+
+.beam-caption {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #687064;
+  margin-bottom: clamp(56px, 7vw, 96px);
+  padding-bottom: 28px;
+}
+
+/* Prize figures at display scale: the number is the hook, so it is typeset
+   like one rather than sitting in a sentence. */
+.prize-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: clamp(20px, 3vw, 48px);
+  margin-bottom: clamp(56px, 7vw, 96px);
+  padding-bottom: 40px;
+}
+
+.prize {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.prize .place {
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #687064;
+}
+
+.prize .amount {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-size: clamp(36px, 4.4vw, 62px);
+  line-height: 1;
+  letter-spacing: -0.05em;
+}
+
+.prize.open .amount { color: #f4f7ef; }
+.prize.taken .amount { color: #687064; }
+
+.prize .holder {
+  font-size: 13px;
+  color: #687064;
+}
+
+.prize .holder a { color: var(--accent, #ccff00); }
+
+.refraction h2 {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-weight: 400;
+  font-size: clamp(28px, 3vw, 44px);
+  letter-spacing: -0.04em;
+  line-height: 1;
+  margin: 0 0 32px;
+}
+
+/* Stages read as a numbered sequence, not as cards. The rule between them is
+   the only chrome. */
+.stage {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: clamp(16px, 2vw, 32px);
+  padding: 32px 0;
+  border-top: 1px solid rgba(230, 237, 220, 0.12);
+  align-items: start;
+}
+
+.stage:last-of-type {
+  border-bottom: 1px solid rgba(230, 237, 220, 0.12);
+}
+
+.stage-index {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-size: 28px;
+  line-height: 1;
+  color: #2f3529;
+  letter-spacing: -0.04em;
+}
+
+.stage.solved .stage-index { color: var(--accent, #ccff00); }
+
+.stage h3 {
+  font-size: 17px;
+  font-weight: 400;
+  margin: 0 0 10px;
+  letter-spacing: -0.01em;
+}
+
+.stage p {
+  color: #979e93;
+  font-size: 15px;
+  line-height: 1.6;
+  margin: 0 0 18px;
+  max-width: 640px;
+}
+
+.stage form {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  max-width: 520px;
+}
+
+.stage input {
+  flex: 1 1 15rem;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid rgba(230, 237, 220, 0.2);
+  padding: 10px 2px;
+  color: inherit;
+  font: inherit;
+  font-size: 16px;
+}
+
+.stage input::placeholder { color: #4a5145; }
+
+.stage input:focus {
+  outline: none;
+  border-bottom-color: var(--accent, #ccff00);
+}
+
+.stage-submit {
+  background: none;
+  border: 1px solid rgba(230, 237, 220, 0.2);
+  border-radius: 999px;
+  padding: 8px 20px;
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease;
+}
+
+.stage-submit:hover {
+  border-color: var(--accent, #ccff00);
+  color: var(--accent, #ccff00);
+}
+
+.stage-solved {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px;
+  color: var(--accent, #ccff00);
+  margin: 0;
+}
+
+.stage-wrong {
+  color: #ff8787;
+  font-size: 14px;
+  margin: 12px 0 0;
+}
+
+.stage-hint {
+  background: none;
+  border: 0;
+  padding: 14px 0 0;
+  color: #4a5145;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  display: block;
+}
+
+.stage-hint:hover { color: #979e93; }
+
+.claim {
+  margin: clamp(56px, 7vw, 88px) 0 0;
+  padding: clamp(32px, 4vw, 52px);
+  border: 1px solid var(--accent, #ccff00);
+  border-radius: 4px;
+  background: linear-gradient(135deg, rgba(204, 255, 0, 0.06), transparent 60%);
+}
+
+.claim p {
+  color: #979e93;
+  font-size: 15px;
+  line-height: 1.65;
+  margin: 0 0 16px;
+  max-width: 620px;
+}
+
+.claim .solution {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: clamp(15px, 1.8vw, 22px);
+  color: var(--accent, #ccff00);
+  word-break: break-all;
+  margin: 0 0 24px;
+}
+
+.refraction-foot {
+  margin-top: clamp(56px, 7vw, 88px);
+  padding-top: 32px;
+  border-top: 1px solid rgba(230, 237, 220, 0.12);
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: #687064;
+}
+
+.refraction-foot a { color: #979e93; }
+.refraction-foot a:hover { color: var(--accent, #ccff00); }
+
+@media (max-width: 720px) {
+  .beam { height: 96px; grid-template-columns: 36px 4fr; }
+  .stage { grid-template-columns: 36px 1fr; }
+  .stage-index { font-size: 20px; }
+}
+
+/* Contest chrome: state first, so a visitor knows in one glance that this is
+   live, that money is unclaimed, and that there is a clock on it. */
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-bottom: 28px;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 16px 7px 13px;
+  border-radius: 999px;
+  border: 1px solid;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.status-pill.open {
+  color: var(--accent, #ccff00);
+  border-color: rgba(204, 255, 0, 0.4);
+  background: rgba(204, 255, 0, 0.06);
+}
+
+.status-pill.over {
+  color: #687064;
+  border-color: rgba(230, 237, 220, 0.14);
+}
+
+.status-pill i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-pill.open i {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.status-fact {
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #687064;
+}
+
+.refraction h1 .unit {
+  font-size: 0.34em;
+  letter-spacing: 0.04em;
+  color: #687064;
+  vertical-align: baseline;
+}
+
+/* The three prizes, ranked. Bigger first, so the shape of the contest is
+   legible before a word is read. */
+.podium {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  margin: 8px 0 44px;
+}
+
+.slot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 22px 22px 20px;
+  border: 1px solid rgba(230, 237, 220, 0.14);
+  border-radius: 6px;
+  background: linear-gradient(160deg, rgba(204, 255, 0, 0.05), transparent 70%);
+}
+
+.slot.taken {
+  background: none;
+  border-color: rgba(230, 237, 220, 0.08);
+}
+
+.slot-place {
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #687064;
+}
+
+.slot-amount {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-size: clamp(30px, 3.4vw, 46px);
+  line-height: 1;
+  letter-spacing: -0.05em;
+  color: #f4f7ef;
+}
+
+.slot.taken .slot-amount { color: #4a5145; }
+
+.slot-amount em {
+  font-style: normal;
+  font-size: 0.4em;
+  letter-spacing: 0.04em;
+  color: #687064;
+}
+
+.slot-holder {
+  font-size: 13px;
+  color: #687064;
+}
+
+.slot-holder a { color: #979e93; }
+
+.claim-flag {
+  font-size: 12px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--accent, #ccff00);
-  margin: 0 0 0.75rem;
-}
-
-.refraction-hero h1 {
-  font-size: clamp(2.4rem, 7vw, 4rem);
-  font-weight: 200;
-  letter-spacing: -0.02em;
-  margin: 0 0 1rem;
-}
-
-.refraction-hero p {
-  font-size: 1.05rem;
-  line-height: 1.65;
-  color: var(--muted, #a0a79c);
-  max-width: 42rem;
-  margin: 0 0 1.5rem;
-}
-
-.refraction-pool {
-  display: flex;
-  gap: 1rem;
-  align-items: center;
-  flex-wrap: wrap;
-  padding: 0.9rem 1.1rem;
-  border: 1px solid var(--line, #23261f);
-  border-radius: 10px;
-  font-size: 0.9rem;
-}
-
-.refraction-pool span {
-  color: var(--accent, #ccff00);
-}
-
-.refraction-stage {
-  border: 1px solid var(--line, #23261f);
-  border-radius: 12px;
-  padding: 1.4rem;
-  margin-bottom: 0.9rem;
-  transition: border-color 0.2s ease;
-}
-
-.refraction-stage.solved {
-  border-color: #3d4a12;
-  background: #10140a;
-}
-
-.refraction-stage header {
-  display: flex;
-  align-items: baseline;
-  gap: 0.75rem;
-  margin-bottom: 0.6rem;
-}
-
-.refraction-stage .index {
-  font-size: 0.72rem;
-  letter-spacing: 0.1em;
-  color: var(--muted, #687064);
-}
-
-.refraction-stage h3 {
-  font-size: 1.05rem;
-  font-weight: 400;
-  margin: 0;
-  flex: 1;
-}
-
-.refraction-stage .tick {
-  font-size: 0.7rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--accent, #ccff00);
-}
-
-.refraction-stage p {
-  font-size: 0.92rem;
-  line-height: 1.6;
-  color: var(--muted, #a0a79c);
-  margin: 0 0 1rem;
-}
-
-.refraction-stage form {
-  display: flex;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-}
-
-.refraction-stage input {
-  flex: 1 1 16rem;
-  min-width: 0;
-  background: #0a0b09;
-  border: 1px solid var(--line, #23261f);
-  border-radius: 8px;
-  padding: 0.6rem 0.8rem;
-  color: inherit;
-  font: inherit;
-}
-
-.refraction-stage input:focus {
-  outline: none;
-  border-color: var(--accent, #ccff00);
-}
-
-.refraction-answer {
-  color: var(--accent, #ccff00) !important;
-  margin: 0 !important;
-}
-
-.refraction-wrong {
-  color: #ff8787 !important;
-  font-size: 0.85rem !important;
-  margin: 0.6rem 0 0 !important;
-}
-
-.refraction-hint {
-  background: none;
-  border: none;
-  padding: 0.6rem 0 0;
-  color: var(--muted, #687064);
-  font: inherit;
-  font-size: 0.82rem;
-  cursor: pointer;
-  text-align: left;
-}
-
-.refraction-hint:hover {
-  color: var(--accent, #ccff00);
-}
-
-.refraction-done {
-  border: 1px solid #3d4a12;
-  background: #10140a;
-  border-radius: 12px;
-  padding: 1.6rem;
-  margin: 2rem 0;
-}
-
-.refraction-done h2 {
-  font-size: 1.3rem;
-  font-weight: 300;
-  margin: 0 0 0.8rem;
-}
-
-.refraction-done p {
-  font-size: 0.92rem;
-  line-height: 1.6;
-  color: var(--muted, #a0a79c);
-  margin: 0 0 0.9rem;
-}
-
-.refraction-board {
-  margin-top: 3rem;
-}
-
-.refraction-board h2 {
-  font-size: 0.75rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  font-weight: 400;
-  color: var(--muted, #8f968a);
-  margin: 0 0 1rem;
-}
-
-.refraction-board ol {
-  list-style: none;
-  margin: 0 0 1rem;
-  padding: 0;
-}
-
-.refraction-board li {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  padding: 0.85rem 1.1rem;
-  border: 1px solid var(--line, #23261f);
-  border-radius: 10px;
-  margin-bottom: 0.5rem;
-  font-size: 0.9rem;
-}
-
-.refraction-board li.taken {
-  border-color: #3d4a12;
-}
-
-.refraction-board .place {
-  width: 1.4rem;
-  color: var(--muted, #687064);
-}
-
-.refraction-board .award {
-  flex: 1;
-  color: var(--accent, #ccff00);
-}
-
-.refraction-board .open {
-  color: var(--muted, #687064);
-}
-
-.refraction-note {
-  font-size: 0.82rem;
-  color: var(--muted, #687064);
-  line-height: 1.6;
-}
-
-@media (max-width: 640px) {
-  .refraction-board li {
-    flex-wrap: wrap;
-    gap: 0.5rem;
-  }
+  margin: 0 0 14px !important;
 }
