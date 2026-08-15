@@ -9,59 +9,82 @@ import { DEFAULT_IMAGE, DEFAULT_TRUST_FLOOR, PrismAgent, TRUST_CLASSES } from "@
 
 const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 
-function requireEnv(name) {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-}
-
 const PUBLIC_API = process.env.PRISM_PUBLIC_API ?? "https://api.prismnetwork.tech";
+// The live lease escrow. Overridable, but its absence must not silently
+// disable the wallet the way a missing key does.
+const DEFAULT_ESCROW = "0x62C042265991bEa17B07229322A01850974626dA";
+// Matches the limit the SDK and the control plane enforce, so a command that
+// cannot run is rejected before an escrow is funded.
+const MAX_COMMAND_BYTES = 8 * 1024;
 
 // Refusing to start without a wallet meant nobody could ask what a GPU costs
 // without first producing a private key, which is a strange thing to demand of
 // someone deciding whether to use you at all.
 let agent = null;
-try {
-  agent = new PrismAgent({
-    privateKey: requireEnv("PRISM_AGENT_KEY"),
-    escrow: requireEnv("PRISM_ESCROW"),
-    apiBase: process.env.PRISM_API_BASE ?? "https://prismnetwork.tech",
-    rpcUrl: process.env.PRISM_RPC_URL,
-  });
-} catch {
+let walletProblem = "PRISM_AGENT_KEY is not set";
+if (process.env.PRISM_AGENT_KEY) {
+  try {
+    agent = new PrismAgent({
+      privateKey: process.env.PRISM_AGENT_KEY,
+      escrow: process.env.PRISM_ESCROW ?? DEFAULT_ESCROW,
+      apiBase: process.env.PRISM_API_BASE ?? "https://prismnetwork.tech",
+      rpcUrl: process.env.PRISM_RPC_URL,
+    });
+    walletProblem = null;
+  } catch (err) {
+    walletProblem = `PRISM_AGENT_KEY is set but unusable: ${err?.message ?? err}`;
+  }
+}
+if (!agent) {
   console.error(
-    "prism mcp: no wallet configured, so capacity and pricing are readable and leasing is not. " +
-      "Set PRISM_AGENT_KEY and PRISM_ESCROW to lease.",
+    `prism mcp: no wallet configured (${walletProblem}), so capacity and pricing are readable and leasing is not.`,
   );
 }
 
-function requireWallet(tool) {
+function requireWallet(tool, reason = "spends money") {
   if (!agent) {
     throw new Error(
-      `${tool} spends money, so it needs a wallet. Set PRISM_AGENT_KEY and PRISM_ESCROW in this server's environment and restart it.`,
+      `${tool} ${reason} and needs a wallet. None is configured: ${walletProblem}. Fix the environment and restart the server.`,
     );
   }
   return agent;
 }
 
-async function publicOffers(minTrust) {
-  const url = new URL("/v1/offers", PUBLIC_API);
-  if (minTrust) url.searchParams.set("min_trust", minTrust);
-  const response = await fetch(url, { headers: { accept: "application/json" } });
-  if (!response.ok) throw new Error(`prism offers unavailable (${response.status})`);
-  return response.json();
+function requireCommand(value) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("command is required: the shell command to run on the GPU, e.g. 'nvidia-smi'.");
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_COMMAND_BYTES) {
+    throw new Error(`command exceeds the ${MAX_COMMAND_BYTES / 1024} KiB limit.`);
+  }
+  return value;
+}
+
+function maxDeposit(args) {
+  const cap = args.max_usdg ?? 1;
+  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+    throw new Error("max_usdg must be a positive number of USDG.");
+  }
+  return Math.round(cap * 1e6);
 }
 
 const PROOF_FEED = process.env.PRISM_PROOF_URL ?? "https://prismnetwork.tech/api/proof";
 
 async function publicJson(url, what) {
-  const response = await fetch(url, { headers: { accept: "application/json" } });
+  const response = await fetch(url, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(10_000),
+  });
   if (!response.ok) throw new Error(`prism ${what} unavailable (${response.status})`);
-  return response.json();
+  const body = await response.json().catch(() => null);
+  if (body === null) throw new Error(`prism ${what} answered with something that is not JSON`);
+  return body;
 }
 
 const leases = new Map();
-const usdg = (micros) => `${(Number(micros) / 1e6).toFixed(6)} USDG`;
+// null in, null out: a missing price must never render as 0.000000 USDG.
+const usdg = (micros) =>
+  micros == null || !Number.isFinite(Number(micros)) ? null : `${(Number(micros) / 1e6).toFixed(6)} USDG`;
 
 function sweepExpiredLeases() {
   const now = Date.now();
@@ -111,7 +134,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        limit: { type: "integer", description: "Max receipts to return (default 10)." },
+        limit: { type: "integer", description: "Max receipts to return (default 10, max 50)." },
       },
     },
   },
@@ -122,15 +145,27 @@ const TOOLS = [
   },
   {
     name: "prism_batch_run",
-    description: "Fund a lease that runs one command with no interactive access at all: the node executes it and reports the signed output. Matches only suppliers at trust class 'isolated' or above, so it can find no supplier when none is online — prefer prism_lease_and_run for broad availability. Output is capped at 64 KiB per stream.",
+    description: "Fund a lease that runs one command with no interactive access at all: the node executes it and reports the signed output. Matches only suppliers at trust class 'isolated' or above, so it can find no supplier when none is online; prefer prism_lease_and_run for broad availability. Output is capped at 64 KiB per stream.",
     inputSchema: {
       type: "object",
       properties: {
         command: { type: "string", description: "Shell command to run (max 8 KiB)." },
         duration_seconds: { type: "integer", description: "Paid window in seconds (default 900, max 21600). A command still running at the end is killed and reported exit 124." },
         min_vram_mib: { type: "integer", description: "Minimum GPU memory in MiB (default 16000)." },
+        max_usdg: { type: "number", description: "Hard cap on the USDG this lease may cost (default 1). Raise it deliberately for longer leases." },
       },
       required: ["command"],
+    },
+  },
+  {
+    name: "prism_batch_result",
+    description: "Read the output of a batch lease by lease_id, once its node has reported. Use it to recover a result after prism_batch_run timed out.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        lease_id: { type: "integer", description: "The lease_id from prism_batch_run's output or error." },
+      },
+      required: ["lease_id"],
     },
   },
   {
@@ -147,6 +182,7 @@ const TOOLS = [
           enum: TRUST_CLASSES,
           description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
         },
+        max_usdg: { type: "number", description: "Hard cap on the USDG this lease may cost (default 1). Raise it deliberately for longer leases." },
       },
       required: ["command"],
     },
@@ -164,6 +200,7 @@ const TOOLS = [
           enum: TRUST_CLASSES,
           description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
         },
+        max_usdg: { type: "number", description: "Hard cap on the USDG this lease may cost (default 1). Raise it deliberately for longer leases." },
       },
     },
   },
@@ -191,7 +228,7 @@ const TOOLS = [
   },
   {
     name: "prism_vault_store",
-    description: "Store private data — a card, an identity document, an API credential — encrypted under a key derived from this agent's wallet on this machine. Prism receives ciphertext only and cannot read it. Use this instead of writing a secret into a workspace or a file. Returns an item_id; the value is not recoverable without the wallet.",
+    description: "Store private data (a card, an identity document, an API credential) encrypted under a key derived from this agent's wallet on this machine. Prism receives ciphertext only and cannot read it. Use this instead of writing a secret into a workspace or a file. Returns an item_id; the value is not recoverable without the wallet.",
     inputSchema: {
       type: "object",
       properties: {
@@ -213,7 +250,7 @@ const TOOLS = [
   },
   {
     name: "prism_vault_read",
-    description: "Decrypt and return one vault item, in this process, using the wallet-derived key. The plaintext exists only here — do not echo it into a leased workspace, a log, or a message.",
+    description: "Decrypt and return one vault item, in this process, using the wallet-derived key. The plaintext exists only here; do not echo it into a leased workspace, a log, or a message.",
     inputSchema: {
       type: "object",
       properties: { item_id: { type: "string", description: "The item_id from prism_vault_store or prism_vault_list." } },
@@ -250,12 +287,16 @@ async function handle(name, args) {
   }
   if (name === "prism_list_gpus") {
     const minTrust = args.min_trust ?? "open";
+    if (!TRUST_CLASSES.includes(minTrust)) {
+      throw new Error(`min_trust must be one of ${TRUST_CLASSES.join(", ")}`);
+    }
     let offers;
     if (agent) {
-      await ensureAuth();
       offers = await agent.offers({ minTrust });
     } else {
-      offers = await publicOffers(minTrust);
+      const url = new URL("/v1/offers", PUBLIC_API);
+      url.searchParams.set("min_trust", minTrust);
+      offers = await publicJson(url, "offers");
     }
     return {
       available: offers.length,
@@ -265,6 +306,9 @@ async function handle(name, args) {
         price_per_second: usdg(o.rate_per_second),
         price_per_hour: usdg(o.rate_per_second * 3600),
         trust: o.trust_class,
+        // A staker-only offer will not match a wallet without the stake, so an
+        // unstaked renter should budget from the non-staker rows.
+        ...(o.staker_only ? { staker_only: true } : {}),
       })),
     };
   }
@@ -278,21 +322,27 @@ async function handle(name, args) {
         sourced_low_per_hour: usdg(g.sourced_low_micros_per_hour),
         sourced_median_per_hour: usdg(g.sourced_median_micros_per_hour),
         sourced_high_per_hour: usdg(g.sourced_high_micros_per_hour),
-        settled_mean_per_hour: g.settled_mean_micros_per_hour == null ? null : usdg(g.settled_mean_micros_per_hour),
+        settled_mean_per_hour: usdg(g.settled_mean_micros_per_hour),
         settled_leases: g.settled_leases,
       })),
     };
   }
   if (name === "prism_receipts") {
     const feed = await publicJson(PROOF_FEED, "proof feed");
-    const limit = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : 10;
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit <= 0)) {
+      throw new Error("limit must be a positive integer (max 50)");
+    }
+    const limit = Math.min(args.limit ?? 10, 50);
     return {
       generated_at: feed.generated_at,
       receipts: (feed.receipts ?? []).slice(0, limit).map((r) => ({
+        // The feed numbers leases per escrow deployment, so lease_id repeats
+        // across deployments; receipt_id is the unique handle.
+        receipt_id: r.receipt_id,
         lease_id: r.lease_id,
         outcome: r.outcome,
         gpu_model: r.gpu_model,
-        trust: r.trust_class,
+        trust: r.trust_class ?? null,
         runtime_seconds: r.runtime_seconds,
         charged: usdg(r.charged_base_units),
         refunded: usdg(r.refunded_base_units),
@@ -302,7 +352,6 @@ async function handle(name, args) {
   }
   if (name === "prism_leases") {
     requireWallet(name);
-    await ensureAuth();
     const all = await agent.leases();
     return {
       total: all.length,
@@ -320,13 +369,14 @@ async function handle(name, args) {
     };
   }
   if (name === "prism_batch_run") {
-    if (!args.command) throw new Error("command is required");
+    requireCommand(args.command);
     requireWallet(name);
-    await ensureAuth();
+    const cap = maxDeposit(args);
     const batch = await agent.lease({
       image: IMAGE,
       durationSeconds: args.duration_seconds ?? 900,
       minVramMib: args.min_vram_mib ?? 16000,
+      maxDeposit: cap,
       command: args.command,
     });
     return {
@@ -338,35 +388,54 @@ async function handle(name, args) {
       truncated: batch.result?.truncated ?? false,
     };
   }
+  if (name === "prism_batch_result") {
+    requireWallet(name, "reads this wallet's leases");
+    const id = leaseId(args.lease_id);
+    return { lease_id: id, result: await agent.result(id) };
+  }
   if (name === "prism_lease_and_run" || name === "prism_lease") {
-    if (name === "prism_lease_and_run" && !args.command) throw new Error("command is required");
+    if (name === "prism_lease_and_run") requireCommand(args.command);
     requireWallet(name);
-    await ensureAuth();
+    const cap = maxDeposit(args);
     sweepExpiredLeases();
     const lease = await agent.lease({
       image: IMAGE,
       durationSeconds: args.duration_seconds ?? 900,
       minVramMib: args.min_vram_mib ?? 16000,
+      maxDeposit: cap,
       minTrustClass: args.min_trust_class ?? "open",
     });
     leases.set(lease.leaseId, lease);
     const summary = {
       lease_id: lease.leaseId,
+      funding_tx: lease.fundingHash,
       ssh: { host: lease.access.ssh_host, port: lease.access.ssh_port, user: lease.access.ssh_user },
       trust: lease.quote?.trust_class ?? "open",
       expires_at: lease.access.expires_at,
     };
     if (name === "prism_lease") return summary;
-    const out = await agent.run(lease, args.command);
-    return { ...summary, command: args.command, exit_code: out.code, stdout: out.stdout, stderr: out.stderr };
+    // The lease is paid for by this point; an SSH failure must still hand the
+    // caller everything it bought.
+    try {
+      const out = await agent.run(lease, args.command);
+      return { ...summary, command: args.command, exit_code: out.code, stdout: out.stdout, stderr: out.stderr };
+    } catch (err) {
+      return {
+        ...summary,
+        error: `the lease is funded but the command could not run: ${err?.message ?? err}`,
+        next: `the lease stays open; try prism_run with lease_id ${lease.leaseId}, or prism_end_lease`,
+      };
+    }
   }
   if (name === "prism_run") {
-    if (!args.command) throw new Error("command is required");
+    requireCommand(args.command);
     const id = leaseId(args.lease_id);
     const lease = leases.get(id);
     if (!lease) throw new Error(`no active lease ${id} in this session`);
+    const timeoutSeconds = args.timeout_seconds ?? 120;
     const out = await agent.run(lease, args.command, {
-      timeoutMs: (args.timeout_seconds ?? 120) * 1000,
+      timeoutMs: timeoutSeconds * 1000,
+      connectRetries: 6,
     });
     return { lease_id: id, exit_code: out.code, stdout: out.stdout, stderr: out.stderr };
   }
@@ -380,14 +449,13 @@ async function handle(name, args) {
     return { lease_id: id, released: Boolean(lease) };
   }
   if (name.startsWith("prism_vault_")) return handleVault(name, args);
-  throw new Error(`unknown tool ${name}`);
+  throw new Error(`unknown tool ${name}. Valid tools: ${TOOLS.map((t) => t.name).join(", ")}`);
 }
 
 // The vault key is derived here from the wallet signature and stays in this
 // process. Nothing in this function sends a key or a plaintext to Prism.
 async function handleVault(name, args) {
-  const vault = requireWallet(name).vault;
-  await ensureAuth();
+  const vault = requireWallet(name, "derives the vault key from the wallet").vault;
   if (!vault.unlocked) await vault.unlock();
 
   if (name === "prism_vault_store") {
@@ -433,23 +501,26 @@ async function handleVault(name, args) {
   throw new Error(`unknown tool ${name}`);
 }
 
-let authPromise = null;
-function ensureAuth() {
-  authPromise ??= agent.authenticate().catch((err) => {
-    authPromise = null;
-    throw err;
-  });
-  return authPromise;
-}
-
-const server = new Server({ name: "prism", version: "0.5.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "prism", version: "0.6.0" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const result = await handle(request.params.name, request.params.arguments ?? {});
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return { isError: true, content: [{ type: "text", text: `error: ${err.message ?? err}` }] };
+    const body = err?.body ?? {};
+    const detail = [
+      body.cause,
+      body.hint,
+      body.required != null ? `required ${body.required}` : null,
+      body.max != null ? `cap ${body.max}` : null,
+      body.lease_id != null ? `lease_id ${body.lease_id}` : null,
+      body.funding_hash ? `funding_tx ${body.funding_hash}` : null,
+    ]
+      .filter(Boolean)
+      .join("; ");
+    const text = `error: ${err?.message ?? err}${detail ? ` (${detail})` : ""}`;
+    return { isError: true, content: [{ type: "text", text }] };
   }
 });
 

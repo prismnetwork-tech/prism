@@ -98,7 +98,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      - run: node --test sdk/vault.test.mjs sdk/workspace.test.mjs
+      - run: node --test sdk/vault.test.mjs sdk/workspace.test.mjs sdk/toolset.test.mjs
+      - run: node --check integrations/eliza/index.mjs integrations/virtuals/index.mjs
 
   canary:
     runs-on: ubuntu-24.04

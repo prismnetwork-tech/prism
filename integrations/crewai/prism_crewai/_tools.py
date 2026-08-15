@@ -4,13 +4,24 @@ from crewai.tools import BaseTool
 from prismnetwork import DEFAULT_IMAGE, PrismToolset
 from pydantic import BaseModel, Field, PrivateAttr
 
+_default_toolset: PrismToolset | None = None
+
+
+def _shared_toolset() -> PrismToolset:
+    # Individually constructed tools must still share one lease table, or a
+    # lease opened by one tool is invisible to the others.
+    global _default_toolset
+    if _default_toolset is None:
+        _default_toolset = PrismToolset()
+    return _default_toolset
+
 
 class NoInput(BaseModel):
     pass
 
 
 class ListGpusInput(BaseModel):
-    min_trust: str = Field(
+    min_trust_class: str = Field(
         "open",
         description="Only list suppliers at or above this trust class: open, isolated, attested or confidential.",
     )
@@ -45,11 +56,11 @@ class _PrismTool(BaseTool):
 
     def __init__(self, toolset: PrismToolset | None = None, **data):
         super().__init__(**data)
-        self._toolset = toolset or PrismToolset()
+        self._toolset = toolset or _shared_toolset()
 
 
 class PrismWalletTool(_PrismTool):
-    name: str = "Prism wallet"
+    name: str = "prism_wallet"
     description: str = "Show the Prism wallet address and its USDG and gas balances on Robinhood Chain."
     args_schema: Type[BaseModel] = NoInput
 
@@ -58,24 +69,24 @@ class PrismWalletTool(_PrismTool):
 
 
 class PrismListGpusTool(_PrismTool):
-    name: str = "List Prism GPUs"
+    name: str = "prism_list_gpus"
     description: str = (
         "List GPUs available to rent right now on Prism Network: model, VRAM, "
         "price per hour in USDG, and trust class."
     )
     args_schema: Type[BaseModel] = ListGpusInput
 
-    def _run(self, min_trust: str = "open") -> str:
-        return self._toolset.list_gpus(min_trust)
+    def _run(self, min_trust_class: str = "open") -> str:
+        return self._toolset.list_gpus(min_trust_class=min_trust_class)
 
 
 class PrismLeaseAndRunTool(_PrismTool):
-    name: str = "Rent a GPU and run a command"
+    name: str = "prism_lease_and_run"
     description: str = (
         "Rent a real GPU on Prism Network, run one shell command on it over SSH, and "
         "return the output. Funds an on-chain USDG escrow and blocks while the machine "
         "provisions, usually one to four minutes. The lease stays open for follow-up "
-        "commands with the run tool."
+        "commands with prism_run."
     )
     args_schema: Type[BaseModel] = LeaseAndRunInput
 
@@ -89,26 +100,31 @@ class PrismLeaseAndRunTool(_PrismTool):
         min_trust_class: str = "open",
     ) -> str:
         return self._toolset.lease_and_run(
-            command, duration_seconds, min_vram_mib, image, max_usdg, min_trust_class
+            command=command,
+            duration_seconds=duration_seconds,
+            min_vram_mib=min_vram_mib,
+            image=image,
+            max_usdg=max_usdg,
+            min_trust_class=min_trust_class,
         )
 
 
 class PrismRunTool(_PrismTool):
-    name: str = "Run on a leased GPU"
+    name: str = "prism_run"
     description: str = "Run another shell command on a GPU already leased in this session."
     args_schema: Type[BaseModel] = RunInput
 
     def _run(self, lease_id: int, command: str) -> str:
-        return self._toolset.run(lease_id, command)
+        return self._toolset.run(lease_id=lease_id, command=command)
 
 
 class PrismEndLeaseTool(_PrismTool):
-    name: str = "End a GPU lease"
+    name: str = "prism_end_lease"
     description: str = "Release a leased GPU. The on-chain lease settles when its paid window ends."
     args_schema: Type[BaseModel] = LeaseIdInput
 
     def _run(self, lease_id: int) -> str:
-        return self._toolset.end_lease(lease_id)
+        return self._toolset.end_lease(lease_id=lease_id)
 
 
 def prism_tools(toolset: PrismToolset | None = None) -> list[BaseTool]:
@@ -117,8 +133,9 @@ def prism_tools(toolset: PrismToolset | None = None) -> list[BaseTool]:
     All five tools share one toolset, so a lease opened by one is visible to the
     others. Pass a :class:`PrismToolset` to control the wallet, or let it read
     ``PRISM_AGENT_KEY`` (and optionally ``PRISM_ESCROW``) from the environment.
+    Without a key the read-only tools still answer from the public API.
     """
-    t = toolset or PrismToolset()
+    t = toolset or _shared_toolset()
     return [
         PrismWalletTool(t),
         PrismListGpusTool(t),

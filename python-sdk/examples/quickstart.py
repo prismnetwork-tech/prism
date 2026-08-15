@@ -28,7 +28,7 @@ print("authenticated as", session["subject"])
 
 offers = agent.offers()
 if not offers:
-    sys.exit("no GPUs online right now — try again shortly.")
+    sys.exit("no GPUs online right now; try again shortly.")
 print(f"{len(offers)} offer(s):", ", ".join(o["gpu"]["model"] for o in offers))
 
 if os.environ.get("PRISM_RUN_LEASE") != "1":

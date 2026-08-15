@@ -1,7 +1,7 @@
 # prismnetwork
 
 Headless GPU leasing on [Prism Network](https://prismnetwork.tech) for autonomous
-agents — the Python counterpart to `@prismnetwork/agent-sdk`. Give it a wallet; it
+agents, the Python counterpart to `@prismnetwork/agent-sdk`. Give it a wallet; it
 authenticates with a signature, pays on-chain in USDG, provisions a GPU, and runs
 over SSH. No browser, no dashboard.
 

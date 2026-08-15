@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prism-autogen"
-version = "0.1.0"
+version = "0.2.0"
 description = "Prism Network GPU tools for AG2 and AutoGen agents"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [{ name = "Prism Network", email = "opensource@prismnetwork.tech" }]
 dependencies = [
-    "prismnetwork>=0.2.0",
+    "prismnetwork>=0.3.0",
 ]
 
 [project.urls]

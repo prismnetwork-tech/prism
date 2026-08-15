@@ -1,23 +1,26 @@
 {
   "name": "@prismnetwork/game-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Virtuals Protocol GAME plugin for renting and running on Prism Network GPUs.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
-    ".": "./index.mjs"
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.mjs"
+    }
   },
   "files": [
     "index.mjs",
+    "index.d.ts",
     "README.md"
   ],
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@prismnetwork/agent-sdk": "^0.4.0",
-    "@virtuals-protocol/game": "^0.1.14",
-    "viem": "^2"
+    "@prismnetwork/agent-sdk": "^0.5.0",
+    "viem": "^2.55.11"
   },
   "keywords": [
     "prism",
@@ -36,5 +39,9 @@
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"
-  }
+  },
+  "peerDependencies": {
+    "@virtuals-protocol/game": "^0.1.14"
+  },
+  "types": "index.d.ts"
 }

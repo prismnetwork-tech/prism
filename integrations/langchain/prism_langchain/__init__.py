@@ -14,7 +14,7 @@ from langchain_core.tools import StructuredTool
 from prismnetwork import PrismToolset
 
 __all__ = ["get_prism_tools", "PrismToolset"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def get_prism_tools(toolset: PrismToolset | None = None) -> list[StructuredTool]:
@@ -22,7 +22,8 @@ def get_prism_tools(toolset: PrismToolset | None = None) -> list[StructuredTool]
 
     Pass a :class:`PrismToolset` to control the wallet and escrow, or let it
     read ``PRISM_AGENT_KEY`` (and optionally ``PRISM_ESCROW``) from the
-    environment. Leases opened by one tool call are visible to the others, so
+    environment. Without a key the read-only tools still answer from the
+    public API. Leases opened by one tool call are visible to the others, so
     an agent can lease once and keep running commands on the same machine.
     """
     t = toolset or PrismToolset()

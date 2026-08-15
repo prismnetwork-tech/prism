@@ -65,7 +65,7 @@ function fromHex(value) {
   return bytes;
 }
 
-/// The wallet address, lowercased. Casing varies by source — a checksummed
+/// The wallet address, lowercased. Casing varies by source: a checksummed
 /// address from one wallet and a lowercase one from another must not derive
 /// two different keys for the same vault.
 export function vaultWallet(address) {

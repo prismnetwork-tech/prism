@@ -17,7 +17,7 @@ either is taken here.
 from prismnetwork import DEFAULT_IMAGE, PrismToolset
 
 __all__ = ["prism_tools", "PrismToolset"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def prism_tools(toolset: PrismToolset | None = None) -> list:
@@ -26,6 +26,7 @@ def prism_tools(toolset: PrismToolset | None = None) -> list:
     All five tools share one toolset, so a lease opened by one is visible to the
     others. Pass a :class:`PrismToolset` to control the wallet, or let it read
     ``PRISM_AGENT_KEY`` (and optionally ``PRISM_ESCROW``) from the environment.
+    Without a key the read-only tools still answer from the public API.
     """
     t = toolset or PrismToolset()
 
@@ -33,16 +34,17 @@ def prism_tools(toolset: PrismToolset | None = None) -> list:
         """Show the Prism wallet address and its USDG and gas balances on Robinhood Chain."""
         return t.wallet()
 
-    def prism_list_gpus(min_trust: str = "open") -> str:
+    def prism_list_gpus(min_trust_class: str = "open") -> str:
         """List GPUs available to rent right now on Prism Network: model, VRAM, price
         per hour in USDG, and trust class (open, isolated, attested or confidential).
         On an 'open' supplier the host operator can read anything the workload touches."""
-        return t.list_gpus(min_trust)
+        return t.list_gpus(min_trust_class=min_trust_class)
 
     def prism_lease_and_run(
         command: str,
         duration_seconds: int = 600,
         min_vram_mib: int = 16000,
+        image: str = DEFAULT_IMAGE,
         max_usdg: float = 1.0,
         min_trust_class: str = "open",
     ) -> str:
@@ -50,14 +52,21 @@ def prism_tools(toolset: PrismToolset | None = None) -> list:
         Funds an on-chain USDG escrow up to max_usdg and blocks while the machine
         provisions, usually one to four minutes. The lease stays open for follow-up
         commands with prism_run; release it with prism_end_lease."""
-        return t.lease_and_run(command, duration_seconds, min_vram_mib, DEFAULT_IMAGE, max_usdg, min_trust_class)
+        return t.lease_and_run(
+            command=command,
+            duration_seconds=duration_seconds,
+            min_vram_mib=min_vram_mib,
+            image=image,
+            max_usdg=max_usdg,
+            min_trust_class=min_trust_class,
+        )
 
     def prism_run(lease_id: int, command: str) -> str:
         """Run another shell command on a GPU already leased in this session."""
-        return t.run(lease_id, command)
+        return t.run(lease_id=lease_id, command=command)
 
     def prism_end_lease(lease_id: int) -> str:
         """Release a leased GPU. The on-chain lease settles when its paid window ends."""
-        return t.end_lease(lease_id)
+        return t.end_lease(lease_id=lease_id)
 
     return [prism_wallet, prism_list_gpus, prism_lease_and_run, prism_run, prism_end_lease]

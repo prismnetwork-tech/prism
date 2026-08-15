@@ -58,7 +58,7 @@ const escrowAbi = parseAbi([
 
 // Matches the limit the control plane and the node both enforce, so a command
 // that cannot run is rejected here rather than after an escrow is funded.
-const MAX_COMMAND_BYTES = 8 * 1024;
+export const MAX_COMMAND_BYTES = 8 * 1024;
 
 function assertCommand(value) {
   if (typeof value !== "string" || value.trim() === "") {
@@ -107,9 +107,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export class PrismAgent {
   constructor({ privateKey, apiBase = "https://prismnetwork.tech", escrow, rpcUrl }) {
     if (!escrow) throw new Error("escrow address is required");
+    if (typeof privateKey !== "string" || privateKey.trim() === "") {
+      throw new Error(
+        "privateKey is required: a 32-byte hex key, with or without 0x (most surfaces read it from PRISM_AGENT_KEY)",
+      );
+    }
     this.apiBase = apiBase.replace(/\/$/, "");
     this.escrow = escrow;
-    this.account = privateKeyToAccount(privateKey);
+    const trimmed = privateKey.trim();
+    try {
+      this.account = privateKeyToAccount(trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`);
+    } catch (err) {
+      throw new Error(
+        `privateKey is not a valid key: ${err?.message ?? err}. Expected 32 bytes of hex, with or without the 0x prefix.`,
+      );
+    }
     const transport = http(rpcUrl ?? robinhoodChain.rpcUrls.default.http[0]);
     this.publicClient = createPublicClient({ chain: robinhoodChain, transport });
     this.walletClient = createWalletClient({ account: this.account, chain: robinhoodChain, transport });
@@ -264,13 +276,43 @@ export class PrismAgent {
 
   async waitForResult(leaseId, { timeoutMs = 900_000, intervalMs = 10_000 } = {}) {
     const deadline = Date.now() + timeoutMs;
+    let polls = 0;
     while (Date.now() < deadline) {
       const res = await this.#proxy("GET", ["leases", String(leaseId), "result"], { raw: true });
       if (res.status === 200) return res.body;
-      if (res.status !== 404) throw new PrismError(res.status, res.body?.code ?? "result_failed", res.body);
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      // The control plane keeps answering 404 for a batch whose node died
+      // without reporting, so check the lease state occasionally and stop
+      // waiting once it is terminal. 429 and 5xx are transient; aborting a
+      // paid wait on one would strand the deposit.
+      if (res.status === 404) {
+        polls += 1;
+        if (polls % 6 === 0) {
+          const state = await this.#terminalState(leaseId);
+          if (state) {
+            const again = await this.#proxy("GET", ["leases", String(leaseId), "result"], { raw: true });
+            if (again.status === 200) return again.body;
+            throw new PrismError(502, "batch_no_result", { lease_id: leaseId, state });
+          }
+        }
+      } else if (res.status !== 429 && res.status < 500) {
+        throw new PrismError(res.status, res.body?.code ?? "result_failed", res.body);
+      }
+      await sleep(intervalMs);
     }
-    throw new PrismError(408, "result_timeout");
+    throw new PrismError(408, "result_timeout", { lease_id: leaseId });
+  }
+
+  async #terminalState(leaseId) {
+    let leases;
+    try {
+      leases = await this.leases();
+    } catch {
+      return null;
+    }
+    const record = Array.isArray(leases) ? leases.find((l) => l.lease_id === leaseId) : null;
+    const state = record?.state ?? "";
+    const terminal = ["closing", "settlement_pending", "finalized", "refunded", "failed"];
+    return terminal.includes(state) ? state : null;
   }
 
   async waitForAccess(leaseId, { timeoutMs = 600_000, intervalMs = 10_000 } = {}) {
@@ -281,10 +323,12 @@ export class PrismAgent {
         if (!res.body?.ssh_host && res.body?.mode !== "gateway") throw new PrismError(502, "malformed_access");
         return res.body;
       }
-      if (res.status !== 404) throw new PrismError(res.status, res.body?.error ?? "access_error");
+      if (res.status !== 404 && res.status !== 429 && res.status < 500) {
+        throw new PrismError(res.status, res.body?.error ?? "access_error", res.body);
+      }
       await sleep(intervalMs);
     }
-    throw new PrismError(408, "access_timeout");
+    throw new PrismError(408, "access_timeout", { lease_id: leaseId });
   }
 
   // quote -> ssh keygen -> fund on-chain -> confirm -> wait for access.
@@ -298,6 +342,18 @@ export class PrismAgent {
     command = null,
   } = {}) {
     if (!this.session) await this.authenticate();
+    // A wallet with no balance at all cannot fund anything, and a doomed quote
+    // still holds capacity against other renters until it expires. Refuse
+    // before quoting.
+    const balances = await this.balances();
+    if (balances.usdg === "0" || balances.eth === "0") {
+      throw new PrismError(402, "wallet_unfunded", {
+        address: this.address,
+        usdg: balances.usdg,
+        eth_wei: balances.eth,
+        hint: "the wallet needs USDG for the deposit and native ETH for gas on Robinhood Chain (id 4663) before it can lease",
+      });
+    }
     const quote = await this.quote({
       image,
       durationSeconds,
@@ -310,25 +366,30 @@ export class PrismAgent {
       throw new PrismError(402, "cost_exceeds_max", { required: quote.maximum_escrow, max: String(maxDeposit) });
     }
     const key = this.#generateSshKey();
+    let funded = null;
+    let leaseId = null;
     try {
-      const funded = await this.fund(quote);
+      funded = await this.fund(quote);
       const record = await this.confirm({
         quoteId: quote.quote_id,
         transactionHash: funded.hash,
         sshAuthorizedKey: key.publicKey,
       });
-      if (!Number.isInteger(record?.lease_id)) throw new PrismError(502, "malformed_lease_record");
+      if (!Number.isInteger(record?.lease_id)) {
+        throw new PrismError(502, "malformed_lease_record", { funding_hash: funded.hash });
+      }
+      leaseId = record.lease_id;
       // A batch lease never hands out access, so waiting for it would block
       // until the timeout and then report a failure that never happened. Wait
       // for what the command printed instead.
       if (command !== null) {
-        const result = await this.waitForResult(record.lease_id);
+        const result = await this.waitForResult(leaseId, { timeoutMs: durationSeconds * 1000 + 900_000 });
         rmSync(key.dir, { recursive: true, force: true });
-        return { leaseId: record.lease_id, result, fundingHash: funded.hash, quote };
+        return { leaseId, result, fundingHash: funded.hash, quote };
       }
-      const access = await this.waitForAccess(record.lease_id);
+      const access = await this.waitForAccess(leaseId);
       return {
-        leaseId: record.lease_id,
+        leaseId,
         access,
         keyPath: key.keyPath,
         keyDir: key.dir,
@@ -337,8 +398,19 @@ export class PrismAgent {
         quote,
       };
     } catch (err) {
-      rmSync(key.dir, { recursive: true, force: true });
-      throw err;
+      // Before funding, the key opens nothing; discard it. After funding it is
+      // the only way into a machine that is being paid for, so it stays on
+      // disk and the error says where everything is.
+      if (funded === null) {
+        rmSync(key.dir, { recursive: true, force: true });
+        throw err;
+      }
+      const detail = { funding_hash: funded.hash, lease_id: leaseId, key_path: key.keyPath };
+      if (err instanceof PrismError) {
+        err.body = { ...(err.body ?? {}), ...detail };
+        throw err;
+      }
+      throw new PrismError(502, "lease_failed_after_funding", { ...detail, cause: err?.message ?? String(err) });
     }
   }
 
@@ -348,7 +420,11 @@ export class PrismAgent {
   // its input, which keeps anything sensitive out of the remote process table.
   async run(lease, command, { timeoutMs = 120_000, connectRetries = 24, connectDelayMs = 10_000, stdin = null } = {}) {
     if (!lease?.access?.ssh_host || !lease.access.ssh_port || !lease.keyPath) {
-      throw new PrismError(400, "invalid_lease_handle");
+      throw new PrismError(400, "invalid_lease_handle", {
+        mode: lease?.access?.mode ?? null,
+        lease_id: lease?.leaseId ?? null,
+        hint: "gateway-mode access has no ssh endpoint",
+      });
     }
     if (typeof command !== "string" || command.length === 0) throw new PrismError(400, "command_required");
     const target = {
@@ -475,6 +551,7 @@ export class PrismAgent {
 export class PrismError extends Error {
   constructor(status, code, body) {
     super(`prism ${status}: ${code}`);
+    this.name = "PrismError";
     this.status = status;
     this.code = code;
     this.body = body;

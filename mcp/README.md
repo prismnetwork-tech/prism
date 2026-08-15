@@ -60,7 +60,7 @@ derived from the agent's wallet inside this server process; Prism receives
 ciphertext and holds no way to read it.
 
 Each item names the weakest workspace trust class it may ever be released into,
-and new items default to `confidential` — above anything the network serves
+and new items default to `confidential`, above anything the network serves
 today. `prism_vault_release` is therefore refused on current capacity instead of
 handing a secret to a host that can read it. Lowering an item's floor is a
 deliberate act, and allowed releases are recorded against the account.

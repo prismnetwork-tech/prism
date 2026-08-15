@@ -3,14 +3,16 @@
 // in USDG on Robinhood Chain.
 //
 // GAME delivers every argument as a string, so numeric arguments are parsed
-// here and refused with a Failed response when they do not parse.
+// here and refused with a Failed response when they do not parse. GAME does
+// not catch a rejection out of an executable (it would kill the agent loop),
+// so every function reports Failed instead of throwing.
 import {
   ExecutableGameFunctionResponse,
   ExecutableGameFunctionStatus,
   GameFunction,
   GameWorker,
 } from "@virtuals-protocol/game";
-import { PrismToolset } from "@prismnetwork/agent-sdk/toolset";
+import { PrismToolset, isRefusal } from "@prismnetwork/agent-sdk/toolset";
 
 const { Done, Failed } = ExecutableGameFunctionStatus;
 
@@ -18,6 +20,22 @@ function integer(value, fallback) {
   if (value === undefined || value === "") return fallback;
   const n = Number(value);
   return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// The toolset reports refusals and failures as prose rather than throwing; the
+// planner still needs them as Failed, or it records a step that never happened.
+function verdict(body) {
+  return new ExecutableGameFunctionResponse(isRefusal(body) ? Failed : Done, body);
+}
+
+async function attempt(logger, work) {
+  try {
+    const body = await work();
+    logger(body);
+    return verdict(body);
+  } catch (err) {
+    return new ExecutableGameFunctionResponse(Failed, `prism call failed: ${err?.message ?? err}`);
+  }
 }
 
 export class PrismGamePlugin {
@@ -53,11 +71,7 @@ export class PrismGamePlugin {
       description:
         "List GPUs available to rent right now, with model, VRAM, price per hour in USDG, and trust class.",
       args: [],
-      executable: async (_args, logger) => {
-        const body = await this.toolset.listGpus();
-        logger(body);
-        return new ExecutableGameFunctionResponse(Done, body);
-      },
+      executable: (_args, logger) => attempt(logger, () => this.toolset.listGpus()),
     });
   }
 
@@ -66,11 +80,7 @@ export class PrismGamePlugin {
       name: "wallet",
       description: "Show the Prism wallet address and its USDG and gas balances on Robinhood Chain.",
       args: [],
-      executable: async (_args, logger) => {
-        const body = await this.toolset.wallet();
-        logger(body);
-        return new ExecutableGameFunctionResponse(Done, body);
-      },
+      executable: (_args, logger) => attempt(logger, () => this.toolset.wallet()),
     });
   }
 
@@ -91,27 +101,26 @@ export class PrismGamePlugin {
       executable: async (args, logger) => {
         if (!args.command) return new ExecutableGameFunctionResponse(Failed, "command is required");
         const durationSeconds = integer(args.duration_seconds, 600);
-        const minVramMib = integer(args.min_vram_mib, 16000);
-        const maxUsdg = args.max_usdg === undefined || args.max_usdg === "" ? 1 : Number(args.max_usdg);
-        if (durationSeconds === null || minVramMib === null || !Number.isFinite(maxUsdg) || maxUsdg <= 0) {
-          return new ExecutableGameFunctionResponse(
-            Failed,
-            "duration_seconds and min_vram_mib must be positive integers and max_usdg a positive number",
-          );
+        if (durationSeconds === null) {
+          return new ExecutableGameFunctionResponse(Failed, "duration_seconds must be a positive integer");
         }
-        try {
-          logger(`leasing a GPU for ${durationSeconds}s (cap ${maxUsdg} USDG)`);
-          const body = await this.toolset.leaseAndRun({
+        const minVramMib = integer(args.min_vram_mib, 16000);
+        if (minVramMib === null) {
+          return new ExecutableGameFunctionResponse(Failed, "min_vram_mib must be a positive integer");
+        }
+        const maxUsdg = args.max_usdg === undefined || args.max_usdg === "" ? 1 : Number(args.max_usdg);
+        if (!Number.isFinite(maxUsdg) || maxUsdg <= 0) {
+          return new ExecutableGameFunctionResponse(Failed, "max_usdg must be a positive number");
+        }
+        logger(`leasing a GPU for ${durationSeconds}s (cap ${maxUsdg} USDG)`);
+        return attempt(logger, () =>
+          this.toolset.leaseAndRun({
             command: args.command,
             durationSeconds,
             minVramMib,
             maxUsdg,
-          });
-          logger(body);
-          return new ExecutableGameFunctionResponse(Done, body);
-        } catch (err) {
-          return new ExecutableGameFunctionResponse(Failed, `lease failed: ${err?.message ?? err}`);
-        }
+          }),
+        );
       },
     });
   }
@@ -126,12 +135,11 @@ export class PrismGamePlugin {
       ],
       executable: async (args, logger) => {
         const leaseId = integer(args.lease_id, null);
-        if (leaseId === null || !args.command) {
-          return new ExecutableGameFunctionResponse(Failed, "lease_id and command are required");
+        if (leaseId === null) {
+          return new ExecutableGameFunctionResponse(Failed, "lease_id must be a positive integer");
         }
-        const body = await this.toolset.run(leaseId, args.command);
-        logger(body);
-        return new ExecutableGameFunctionResponse(Done, body);
+        if (!args.command) return new ExecutableGameFunctionResponse(Failed, "command is required");
+        return attempt(logger, () => this.toolset.run(leaseId, args.command));
       },
     });
   }
@@ -143,10 +151,10 @@ export class PrismGamePlugin {
       args: [{ name: "lease_id", description: "The lease id to release" }],
       executable: async (args, logger) => {
         const leaseId = integer(args.lease_id, null);
-        if (leaseId === null) return new ExecutableGameFunctionResponse(Failed, "lease_id is required");
-        const body = this.toolset.endLease(leaseId);
-        logger(body);
-        return new ExecutableGameFunctionResponse(Done, body);
+        if (leaseId === null) {
+          return new ExecutableGameFunctionResponse(Failed, "lease_id must be a positive integer");
+        }
+        return attempt(logger, async () => this.toolset.endLease(leaseId));
       },
     });
   }
