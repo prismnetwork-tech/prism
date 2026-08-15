@@ -1,0 +1,46 @@
+{
+  "name": "@prismnetwork/inference-gateway",
+  "version": "0.1.0",
+  "description": "Managed inference on Prism Network GPUs: a warm ollama lease behind an x402-paid HTTP surface.",
+  "type": "module",
+  "main": "gateway.mjs",
+  "bin": {
+    "prism-inference": "server.mjs"
+  },
+  "exports": {
+    ".": "./gateway.mjs"
+  },
+  "files": [
+    "gateway.mjs",
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@prismnetwork/agent-sdk": "^0.5.0",
+    "viem": "^2.55.11"
+  },
+  "keywords": [
+    "prism",
+    "inference",
+    "x402",
+    "gpu",
+    "agent",
+    "ollama"
+  ],
+  "homepage": "https://prismnetwork.tech",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prismnetwork-tech/prism.git",
+    "directory": "inference"
+  },
+  "bugs": {
+    "url": "https://github.com/prismnetwork-tech/prism/issues"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -45,6 +45,12 @@ The project follows semantic versioning after its first stable release.
 
 ### Added
 
+- `@prismnetwork/inference-gateway`: managed inference on network GPUs. The
+  gateway keeps a leased box warm with ollama and the configured models and
+  sells single generations over HTTP for USDG via x402. Payments are consumed
+  only when a response is served, generations are capped at 1024 output
+  tokens, and an idle box lapses instead of renewing.
+
 - Framework integrations under `integrations/`: LangChain/LangGraph
   (`prism-langchain`), CrewAI (`prism-crewai`), AG2 and AutoGen
   (`prism-autogen`), elizaOS (`@prismnetwork/plugin-eliza`) and Virtuals GAME
