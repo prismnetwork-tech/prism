@@ -59,7 +59,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.5,
     },
     {
-      url: new URL("/refraction", siteUrl).href,
+      url: new URL("/refraction-bounty", siteUrl).href,
       changeFrequency: "hourly",
       priority: 0.8,
     },
