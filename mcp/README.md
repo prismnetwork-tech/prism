@@ -22,6 +22,7 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 | `prism_receipts` | no |
 | `prism_wallet` | yes |
 | `prism_leases` | yes |
+| `prism_infer` | yes |
 | `prism_lease_and_run` | yes |
 | `prism_lease` | yes |
 | `prism_run` | yes |
@@ -39,6 +40,10 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 - `prism_receipts`: recent settled receipts from the public proof feed, with the
   settlement transaction on Robinhood Chain.
 - `prism_leases`: this wallet's leases and their state.
+- `prism_infer`: buy one LLM generation from the managed inference endpoint,
+  paying the quoted USDG price from this wallet (about 0.01 USDG). Waits
+  through a cold start; an unconsumed payment is kept and reused on the next
+  call instead of paying twice.
 - `prism_lease_and_run`: lease a GPU, run a command, return the output (one shot).
 - `prism_lease`: lease a GPU and keep it; returns a `lease_id` and SSH access.
 - `prism_run`: run a command on an existing lease.

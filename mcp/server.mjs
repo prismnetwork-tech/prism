@@ -82,6 +82,9 @@ async function publicJson(url, what) {
 }
 
 const leases = new Map();
+// Unconsumed inference payments, keyed by endpoint and price, so a failed
+// generation is retried with the same paid header instead of paying again.
+const pendingInference = new Map();
 // null in, null out: a missing price must never render as 0.000000 USDG.
 const usdg = (micros) =>
   micros == null || !Number.isFinite(Number(micros)) ? null : `${(Number(micros) / 1e6).toFixed(6)} USDG`;
@@ -166,6 +169,19 @@ const TOOLS = [
         lease_id: { type: "integer", description: "The lease_id from prism_batch_run's output or error." },
       },
       required: ["lease_id"],
+    },
+  },
+  {
+    name: "prism_infer",
+    description: "Buy one LLM generation from Prism's managed inference endpoint. Pays the quoted USDG price from this wallet (about 0.01 USDG), waits through a cold start when no box is warm (up to a few minutes), and returns the generation with token usage. Cheaper and simpler than leasing when all you need is a completion.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "The prompt to generate from (max 32 KiB)." },
+        model: { type: "string", description: "Model to use; defaults to the endpoint's first offered model." },
+        max_usdg: { type: "number", description: "Refuse if the quoted price exceeds this (default 0.05)." },
+      },
+      required: ["prompt"],
     },
   },
   {
@@ -393,6 +409,66 @@ async function handle(name, args) {
     const id = leaseId(args.lease_id);
     return { lease_id: id, result: await agent.result(id) };
   }
+  if (name === "prism_infer") {
+    if (typeof args.prompt !== "string" || args.prompt.trim() === "") {
+      throw new Error("prompt is required.");
+    }
+    requireWallet(name);
+    const base = (process.env.PRISM_INFERENCE_URL ?? "https://api.prismnetwork.tech/inference").replace(/\/$/, "");
+    const offer = await publicJson(`${base}/v1/models`, "inference endpoint");
+    const model = args.model ?? offer.models?.[0];
+    if (!model || (Array.isArray(offer.models) && !offer.models.includes(model))) {
+      throw new Error(`model must be one of ${offer.models?.join(", ") ?? "(endpoint offered none)"}`);
+    }
+    const price = BigInt(offer.price_micros ?? 0);
+    const cap = args.max_usdg ?? 0.05;
+    if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+      throw new Error("max_usdg must be a positive number of USDG.");
+    }
+    if (price <= 0n || price > BigInt(Math.round(cap * 1e6))) {
+      throw new Error(`the endpoint quotes ${usdg(price)} per generation, past the ${cap} USDG cap.`);
+    }
+    const pendingKey = `${base}:${price}`;
+    let pending = pendingInference.get(pendingKey);
+    if (!pending) {
+      const paymentTx = await agent.transferUsdg(offer.pay_to, price);
+      const signature = await agent.account.signMessage({ message: paymentTx });
+      pending = {
+        tx: paymentTx,
+        header: Buffer.from(JSON.stringify({ txHash: paymentTx, signature })).toString("base64"),
+      };
+      pendingInference.set(pendingKey, pending);
+    }
+    // A cold endpoint holds the request through provisioning; when it answers
+    // 503 instead, the payment is not consumed and the same header retries.
+    const deadline = Date.now() + 600_000;
+    for (;;) {
+      const res = await fetch(`${base}/v1/inference`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-payment": pending.header },
+        body: JSON.stringify({ model, prompt: args.prompt }),
+        signal: AbortSignal.timeout(620_000),
+      });
+      const body = await res.json().catch(() => null);
+      if (res.status === 200 && body) {
+        pendingInference.delete(pendingKey);
+        return { ...body, paid: usdg(price), payment_tx: pending.tx };
+      }
+      const last = body?.detail ?? body?.error ?? `status ${res.status}`;
+      // 503 means the box is warming; a 402 for a payment that is merely too
+      // young (confirmations still landing, receipt not yet visible) heals by
+      // itself. Everything else is final.
+      const retryable =
+        res.status === 503 ||
+        (res.status === 402 && ["insufficient_confirmations", "tx_not_found"].includes(body?.error));
+      if (!retryable || Date.now() > deadline) {
+        throw new Error(
+          `inference failed: ${last}. The payment (tx ${pending.tx}) was not consumed and is kept; the next prism_infer call retries with it instead of paying again.`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 15_000));
+    }
+  }
   if (name === "prism_lease_and_run" || name === "prism_lease") {
     if (name === "prism_lease_and_run") requireCommand(args.command);
     requireWallet(name);
@@ -501,7 +577,7 @@ async function handleVault(name, args) {
   throw new Error(`unknown tool ${name}`);
 }
 
-const server = new Server({ name: "prism", version: "0.6.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "prism", version: "0.7.0" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {

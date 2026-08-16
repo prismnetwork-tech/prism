@@ -45,6 +45,11 @@ The project follows semantic versioning after its first stable release.
 
 ### Added
 
+- `prism_infer` in the MCP server: one tool call buys a generation from the
+  managed inference endpoint. It pays the quoted USDG price from the server's
+  wallet, waits through cold starts, and keeps an unconsumed payment for the
+  next call instead of paying twice.
+
 - `@prismnetwork/inference-gateway`: managed inference on network GPUs. The
   gateway keeps a leased box warm with ollama and the configured models and
   sells single generations over HTTP for USDG via x402. Payments are consumed
