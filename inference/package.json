@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/inference-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Managed inference on Prism Network GPUs: a warm ollama lease behind an x402-paid HTTP surface.",
   "type": "module",
   "main": "gateway.mjs",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createGateway } from "./gateway.mjs";
+import { createGateway, priceFor } from "./gateway.mjs";
 
 const TX = `0x${"ab".repeat(32)}`;
 const payment = Buffer.from(JSON.stringify({ txHash: TX, signature: "0xsig" })).toString("base64");
@@ -83,13 +83,64 @@ test("a paid request warms the box once and serves through it", async () => {
   assert.equal(deps.calls.leases, 1);
 });
 
-test("no payment answers 402 with the USDG requirements", async () => {
+test("no payment answers 402 with a request-specific quote", async () => {
   const deps = fakeDeps();
   const gateway = build(deps);
   const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined);
   assert.equal(out.status, 402);
   assert.equal(out.body.accepts[0].network, "eip155:4663");
+  assert.equal(out.body.quote.output_cap, 1024);
   assert.equal(deps.calls.leases, 0);
+});
+
+test("prices scale with the model and the requested output cap", async () => {
+  const pricing = {
+    "llama3.2:3b": { base: 5000, per_token: 10 },
+    "llama3.1:8b": { base: 10000, per_token: 25 },
+  };
+  const deps = fakeDeps();
+  const verified = [];
+  deps.verify = async (_tx, _sig, micros) => {
+    verified.push(micros);
+    return { ok: true, payer: "0x0000000000000000000000000000000000000001" };
+  };
+  const gateway = createGateway({
+    agent: deps.agent,
+    models: ["llama3.2:3b", "llama3.1:8b"],
+    pricing,
+    payTo: "0x0000000000000000000000000000000000000002",
+    image: "img@sha256:" + "0".repeat(64),
+    verify: deps.verify,
+    spawnTunnel: deps.spawnTunnel,
+    fetchOllama: deps.fetchOllama,
+    log: deps.log,
+    now: deps.clock,
+  });
+
+  const listing = gateway.models();
+  assert.equal(listing.pricing["llama3.2:3b"].full_cap_micros, String(5000 + 10 * 1024));
+  assert.equal(listing.price_micros, String(10000 + 25 * 1024));
+
+  const quoted = await gateway.handleInference(
+    { model: "llama3.1:8b", prompt: "hi", options: { num_predict: 100 } },
+    undefined,
+  );
+  assert.equal(quoted.body.quote.price_micros, String(10000 + 25 * 100));
+
+  await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi", options: { num_predict: 100 } }, payment);
+  assert.deepEqual(verified, [BigInt(5000 + 10 * 100)]);
+  assert.equal(priceFor(pricing, "llama3.2:3b", 0).cap, 1024);
+});
+
+test("stats count served generations and revenue", async () => {
+  const deps = fakeDeps();
+  const gateway = build(deps);
+  await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
+  const stats = gateway.stats();
+  assert.equal(stats.generations, 1);
+  assert.equal(stats.tokens_out, 7);
+  assert.equal(stats.revenue_micros, "10000");
+  assert.equal(stats.leases_warmed, 1);
 });
 
 test("validation runs before payment and before any lease", async () => {

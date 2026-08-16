@@ -32,9 +32,16 @@ with the paying wallet (`personal_sign`), and retry with
 `X-PAYMENT: base64({txHash, signature})`. The response carries the generation,
 token usage, and the id of the lease that served it.
 
+The price scales with the request: each model has a base price plus a
+per-token rate over the output cap you ask for (`options.num_predict`, up to
+1024). The unpaid `402` quotes the exact figure for your request, and
+`GET /v1/models` lists each model's rates next to `price_micros`, the highest
+full-cap price, which always clears verification when paid.
+
 A payment is consumed only when a response is served. If the box is still
 warming or the generation fails, the answer is `503` and the same `X-PAYMENT`
-header works on the retry.
+header works on the retry. `GET /v1/stats` reports generations served, tokens,
+revenue, and leases warmed since boot.
 
 The first paid request on a cold gateway waits through provisioning, usually
 one to four minutes. `POST /v1/warm` (free) starts the warmup early, and
@@ -47,7 +54,8 @@ one to four minutes. `POST /v1/warm` (free) starts the warmup early, and
 | `PRISM_AGENT_KEY` / `PRISM_ESCROW` | The wallet and escrow the gateway leases with. |
 | `INFERENCE_PAY_TO` | Address paid generations must reach. |
 | `INFERENCE_MODELS` | Comma list of ollama models to preload (default `llama3.2:3b`). |
-| `INFERENCE_PRICE_MICROS` | Price per generation in USDG micros (default 10000 = 0.01 USDG). |
+| `INFERENCE_PRICE_MICROS` | Default base price in USDG micros (default 10000 = 0.01 USDG). |
+| `INFERENCE_PRICING` | Per-model JSON, e.g. `{"llama3.2:3b":{"base":5000,"per_token":10}}`. |
 | `INFERENCE_WARM_SECONDS` | Lease length per warm window (default 1800). |
 | `INFERENCE_IDLE_SECONDS` | Idle time before the box is allowed to lapse (default 600). |
 | `INFERENCE_PORT` / `INFERENCE_TUNNEL_PORT` | HTTP port (8500) and local ollama tunnel port (11435). |

@@ -30,6 +30,7 @@ try {
     port: Number(process.env.INFERENCE_PORT ?? 8500),
     models: (process.env.INFERENCE_MODELS ?? "llama3.2:3b").split(",").map((m) => m.trim()).filter(Boolean),
     priceMicros: BigInt(process.env.INFERENCE_PRICE_MICROS ?? "10000"),
+    pricing: process.env.INFERENCE_PRICING ? JSON.parse(process.env.INFERENCE_PRICING) : null,
     payTo: getAddress(requireEnv("INFERENCE_PAY_TO")),
     durationSeconds: Number(process.env.INFERENCE_WARM_SECONDS ?? 1800),
     minVramMib: Number(process.env.INFERENCE_MIN_VRAM_MIB ?? 16000),
@@ -115,6 +116,7 @@ const gateway = createGateway({
   models: config.models,
   payTo: config.payTo,
   priceMicros: config.priceMicros,
+  pricing: config.pricing,
   image: process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE,
   durationSeconds: config.durationSeconds,
   minVramMib: config.minVramMib,
@@ -136,6 +138,9 @@ const server = createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/v1/models") {
     return json(res, 200, gateway.models());
+  }
+  if (req.method === "GET" && url.pathname === "/v1/stats") {
+    return json(res, 200, gateway.stats());
   }
   if (req.method === "POST" && url.pathname === "/v1/warm") {
     gateway.ensureWarm().catch((err) => console.error(`warmup failed: ${err.message}`));
