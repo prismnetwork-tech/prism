@@ -42,6 +42,7 @@ jobs:
             opensource@prismnetwork.tech
             contact@prismnetwork.tech
             dev@prismnetwork.tech
+            mika@prismnetwork.tech
             noreply@github.com
           PRISM_ALLOWED_GIT_NAMES: |-
             Prism Network

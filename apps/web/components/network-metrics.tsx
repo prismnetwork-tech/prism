@@ -20,9 +20,49 @@ type Loaded = {
   generatedAt: string;
 };
 
+type Status = "loading" | "unavailable" | "ready";
+
+const STATE_LABEL: Record<Status, string> = {
+  loading: "Reading receipts",
+  unavailable: "Unavailable",
+  ready: "Live",
+};
+
+// The formatters carry their unit so a figure reads correctly in prose. Here the
+// unit is set beside the number at its own size, so it gets split back off.
+function split(formatted: string): [string, string] {
+  const gap = formatted.lastIndexOf(" ");
+  return gap === -1 ? [formatted, ""] : [formatted.slice(0, gap), formatted.slice(gap + 1)];
+}
+
+function Figure({ label, value, unit }: { label: string; value: string; unit?: string }) {
+  return (
+    <div className="network-figure">
+      <span className="network-figure-label">{label}</span>
+      <span className="network-figure-value">
+        {value}
+        {unit ? <em>{unit}</em> : null}
+      </span>
+    </div>
+  );
+}
+
+function Pending({ labels }: { labels: string[] }) {
+  return (
+    <div className="network-figures">
+      {labels.map((label) => (
+        <div className="network-figure" key={label}>
+          <span className="network-figure-label">{label}</span>
+          <span className="network-figure-value pending" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function NetworkMetrics() {
   const [data, setData] = useState<Loaded | null>(null);
-  const [status, setStatus] = useState<"loading" | "unavailable" | "ready">("loading");
+  const [status, setStatus] = useState<Status>("loading");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -49,110 +89,163 @@ export function NetworkMetrics() {
     return () => controller.abort();
   }, []);
 
+  const totals = data?.totals;
+  const share = totals ? providerShare(totals) : null;
+  const [hours, hoursUnit] = split(formatHours(totals?.seconds ?? 0));
+  const capacity = data?.capacity;
+
   return (
-    <section className="page-stack">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">Network metrics</p>
-          <h1>Network</h1>
-        </div>
-        <span className="chip">{status === "ready" ? "Live" : status === "loading" ? "Loading" : "Unavailable"}</span>
+    <>
+      <div className="network-status">
+        <span className={`network-state ${status}`}>{STATE_LABEL[status]}</span>
+        {data ? (
+          <span>Receipts published {new Date(data.generatedAt).toISOString().replace("T", " ").slice(0, 16)} UTC</span>
+        ) : null}
       </div>
 
-      <article className="panel proof-disclosure">
-        <strong>Where these numbers come from</strong>
-        <p>
-          Every settled figure below is the sum of amounts written into settlement transactions on Robinhood Chain, taken
-          from the same public feed that backs the receipts page. Capacity is what the marketplace is advertising right
-          now. Nothing here is an internal counter.
-        </p>
-      </article>
-
-      {status === "loading" && (
-        <article className="panel empty-state">
-          <span className="empty-icon">◇</span>
-          <h2>Loading network metrics</h2>
-        </article>
-      )}
-
       {status === "unavailable" && (
-        <article className="panel empty-state">
-          <span className="empty-icon">◇</span>
+        <section className="network-unavailable">
           <h2>Metrics are temporarily unavailable</h2>
-          <p>No figures can be shown while the publication endpoint is unreachable.</p>
-        </article>
+          <p>
+            The page could not reach the publication endpoint just now. No figures are shown rather than stale ones, and
+            the settled record itself is unaffected.
+          </p>
+        </section>
       )}
 
-      {status === "ready" && data && (
-        <>
-          <article className="panel">
-            <p className="eyebrow">Settled to date</p>
-            <div className="receipt-values">
-              <span>{data.totals.leases.toLocaleString()} leases settled</span>
-              <span>{formatHours(data.totals.seconds)} of GPU time</span>
-              <span>{formatUsdg(data.totals.charged)} USDG charged</span>
-              <span>{formatUsdg(data.totals.paidToProviders)} USDG to suppliers</span>
-              <span>{formatUsdg(data.totals.refunded)} USDG refunded</span>
-              <span>{data.totals.refundedLeases} leases refunded</span>
-            </div>
-            {providerShare(data.totals) !== null && (
-              <p>
-                {Math.round((providerShare(data.totals) ?? 0) * 100)}% of everything charged went to the supplier that
-                served the work.{" "}
-                {data.totals.refundedLeases > 0
-                  ? `${data.totals.refundedLeases} settled leases returned part of the deposit to the renter.`
-                  : "No settled lease has returned a deposit: a lease the network cannot serve is refunded before it ever settles, so it is absent from these totals rather than counted as work."}
-              </p>
-            )}
-          </article>
+      {status !== "unavailable" && (
+        <section className="network-section">
+          <header>
+            <span>01</span>
+            <h2>Settled to date</h2>
+          </header>
 
-          {data.capacity && (
-            <article className="panel">
-              <p className="eyebrow">Rentable right now</p>
-              <div className="receipt-values">
-                <span>{data.capacity.offers} machines advertised</span>
-                <span>{data.capacity.openToEveryone} open to any wallet</span>
-                <span>{formatVram(data.capacity.vramMib)} of GPU memory</span>
-                {data.capacity.lowRatePerHour !== null && (
-                  <span>from {formatUsdg(data.capacity.lowRatePerHour, 2)} USDG per hour</span>
+          {totals ? (
+            <>
+              <div className="network-figures">
+                <Figure label="Leases settled" value={totals.leases.toLocaleString()} />
+                <Figure label="GPU time served" value={hours} unit={hoursUnit} />
+                <Figure label="Charged" value={formatUsdg(totals.charged)} unit="USDG" />
+                {share !== null && <Figure label="Share to suppliers" value={`${Math.round(share * 100)}%`} />}
+              </div>
+
+              <dl className="network-detail">
+                <div>
+                  <dt>Paid to suppliers</dt>
+                  <dd>{formatUsdg(totals.paidToProviders)} USDG</dd>
+                </div>
+                <div>
+                  <dt>Refunded</dt>
+                  <dd>{formatUsdg(totals.refunded)} USDG</dd>
+                </div>
+                <div>
+                  <dt>Leases refunded</dt>
+                  <dd>{totals.refundedLeases.toLocaleString()}</dd>
+                </div>
+              </dl>
+
+              {totals.leases > 0 && (
+                <p className="network-note">
+                  {totals.refundedLeases > 0
+                    ? `${totals.refundedLeases} settled leases returned part of the deposit to the renter. Whatever the meter does not consume goes back automatically once a lease finalizes.`
+                    : "No settled lease has returned a deposit. A lease the network cannot serve is refunded before it ever settles, so it stays out of these totals rather than counting as work."}
+                </p>
+              )}
+            </>
+          ) : (
+            <Pending labels={["Leases settled", "GPU time served", "Charged", "Share to suppliers"]} />
+          )}
+        </section>
+      )}
+
+      {status !== "unavailable" && (
+        <section className="network-section">
+          <header>
+            <span>02</span>
+            <h2>Rentable right now</h2>
+          </header>
+
+          {capacity ? (
+            <>
+              <div className="network-figures">
+                <Figure label="Machines advertised" value={capacity.offers.toLocaleString()} />
+                <Figure label="Open to any wallet" value={capacity.openToEveryone.toLocaleString()} />
+                <Figure label="GPU memory" value={split(formatVram(capacity.vramMib))[0]} unit="GB" />
+                {capacity.lowRatePerHour !== null && (
+                  <Figure label="Lowest open rate" value={formatUsdg(capacity.lowRatePerHour, 2)} unit="USDG / hr" />
                 )}
               </div>
-              <p>
-                {data.capacity.models.map((m) => `${m.count}x ${m.model}`).join(", ")}
-                {data.capacity.offers > data.capacity.openToEveryone
-                  ? ". Machines beyond the open count are reserved for stakers and will not match an unstaked wallet."
-                  : "."}
-              </p>
-            </article>
+
+              <ul className="network-models">
+                {capacity.models.map((entry) => (
+                  <li key={entry.model}>
+                    <b>{entry.count}×</b>
+                    {entry.model}
+                  </li>
+                ))}
+              </ul>
+
+              {capacity.offers > capacity.openToEveryone && (
+                <p className="network-note">
+                  Machines beyond the open count are reserved for stakers and will not match an unstaked wallet.
+                </p>
+              )}
+            </>
+          ) : status === "loading" ? (
+            <Pending labels={["Machines advertised", "Open to any wallet", "GPU memory", "Lowest open rate"]} />
+          ) : (
+            <p className="network-note">
+              The marketplace is not reporting capacity just now. The settled record above is unaffected.
+            </p>
           )}
-
-          <article className="panel">
-            <p className="eyebrow">By GPU</p>
-            <div className="proof-list">
-              {data.totals.models.map((model) => (
-                <div className="receipt" key={model.model}>
-                  <div>
-                    <h2>{model.model}</h2>
-                    <span className="mono">{model.leases} settled</span>
-                  </div>
-                  <div className="receipt-values">
-                    <span>{formatHours(model.seconds)} served</span>
-                    <span>{formatUsdg(model.charged)} USDG charged</span>
-                    {model.refunded > 0 && <span>{formatUsdg(model.refunded)} USDG refunded</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </article>
-
-          <p className="mono">
-            Receipts published {new Date(data.generatedAt).toISOString().replace("T", " ").slice(0, 16)} UTC
-            {data.totals.escrows > 1
-              ? `. Lease ids restart at one per escrow deployment, and these totals span ${data.totals.escrows}.`
-              : "."}
-          </p>
-        </>
+        </section>
       )}
-    </section>
+
+      {totals && totals.models.length > 0 && (
+        <section className="network-section">
+          <header>
+            <span>03</span>
+            <h2>By GPU</h2>
+          </header>
+          <div className="network-scroll">
+            <table className="network-table">
+              <thead>
+                <tr>
+                  <th scope="col">GPU</th>
+                  <th className="network-num" scope="col">Leases</th>
+                  <th className="network-num" scope="col">Hours served</th>
+                  <th className="network-num" scope="col">USDG charged</th>
+                  <th scope="col">Share of hours</th>
+                </tr>
+              </thead>
+              <tbody>
+                {totals.models.map((model) => {
+                  const portion = totals.seconds > 0 ? model.seconds / totals.seconds : 0;
+                  return (
+                    <tr key={model.model}>
+                      <td className="network-gpu">{model.model}</td>
+                      <td className="network-num">{model.leases.toLocaleString()}</td>
+                      <td className="network-num">{split(formatHours(model.seconds))[0]}</td>
+                      <td className="network-num">{formatUsdg(model.charged)}</td>
+                      <td className="network-share">
+                        <span role="img" aria-label={`${Math.round(portion * 100)}% of settled GPU hours`}>
+                          <i style={{ width: `${Math.max(portion * 100, 1)}%` }} />
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {totals && totals.escrows > 1 && (
+        <p className="network-footnote">
+          Lease ids restart at one per escrow deployment, and these totals span {totals.escrows}.
+        </p>
+      )}
+    </>
   );
 }
