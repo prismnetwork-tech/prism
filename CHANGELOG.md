@@ -8,6 +8,12 @@ The project follows semantic versioning after its first stable release.
 
 ### Changed
 
+- Repository links across the site, the packages and the docs now point at the
+  new `prismnetworkdottech` organisation. Published artifact names are
+  deliberately untouched: container images keep their `ghcr.io` path and the
+  MCP registry entry keeps its namespace, because renaming either would break
+  what is already published under it.
+
 - A lease from a wallet holding zero USDG or zero gas is refused before a
   quote is created, so a doomed attempt no longer holds capacity against other
   renters.

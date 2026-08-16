@@ -18,7 +18,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://prismnetwork.tech"
-Source = "https://github.com/prismnetwork-tech/prism"
+Source = "https://github.com/prismnetworkdottech/prism"
 
 [tool.hatch.build.targets.wheel]
 packages = ["prismnetwork"]

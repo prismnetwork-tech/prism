@@ -19,7 +19,7 @@ function graph() {
         logo: `${origin}/brand/prism-logo.svg`,
         description:
           "Open infrastructure for metered GPU compute. Agents rent NVIDIA capacity with a wallet and settle onchain.",
-        sameAs: ["https://x.com/useprismnetwork", "https://github.com/prismnetwork-tech"],
+        sameAs: ["https://x.com/useprismnetwork", "https://github.com/prismnetworkdottech"],
       },
       {
         "@type": "WebSite",

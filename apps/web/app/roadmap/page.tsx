@@ -131,7 +131,7 @@ export default function RoadmapPage() {
           </a>
           , and in the{" "}
           <a
-            href="https://github.com/prismnetwork-tech/prism"
+            href="https://github.com/prismnetworkdottech/prism"
             target="_blank"
             rel="noopener noreferrer"
           >

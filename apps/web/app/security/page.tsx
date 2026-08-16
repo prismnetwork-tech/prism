@@ -58,7 +58,7 @@ export default function SecurityPage() {
           Send security reports to{" "}
           <a href="mailto:security@prismnetwork.tech">security@prismnetwork.tech</a> or use{" "}
           <a
-            href="https://github.com/prismnetwork-tech/prism/security/advisories/new"
+            href="https://github.com/prismnetworkdottech/prism/security/advisories/new"
             target="_blank"
             rel="noopener noreferrer"
           >
