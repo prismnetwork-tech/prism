@@ -12,6 +12,19 @@ export const DEFAULT_PRICE_MICROS = 10_000n;
 export const MAX_PROMPT_BYTES = 32 * 1024;
 export const MAX_PREDICT_TOKENS = 1_024;
 
+// A request's price is the model's base plus its per-token rate over the
+// output cap the caller asked for. The full-cap price is what /v1/models
+// advertises, so a client that pays it without asking for a request-specific
+// quote always clears verification.
+export function priceFor(pricing, model, requestedTokens) {
+  const p = pricing[model];
+  const perToken = p.perToken ?? p.per_token ?? 0;
+  const cap = Number.isInteger(requestedTokens) && requestedTokens > 0
+    ? Math.min(requestedTokens, MAX_PREDICT_TOKENS)
+    : MAX_PREDICT_TOKENS;
+  return { cap, micros: BigInt(p.base) + BigInt(perToken) * BigInt(cap) };
+}
+
 const TX_HASH = /^0x[0-9a-f]{64}$/i;
 
 export function loadConsumed(file) {
@@ -30,6 +43,7 @@ export function createGateway({
   models,
   payTo,
   priceMicros = DEFAULT_PRICE_MICROS,
+  pricing: pricingIn = null,
   image,
   durationSeconds = 1800,
   minVramMib = 16000,
@@ -45,6 +59,17 @@ export function createGateway({
   now = () => Date.now(),
 }) {
   if (!models?.length) throw new Error("at least one model is required");
+  const pricing = {};
+  for (const m of models) {
+    const p = pricingIn?.[m] ?? {};
+    pricing[m] = { base: Number(p.base ?? priceMicros), perToken: Number(p.per_token ?? p.perToken ?? 0) };
+    if (!Number.isFinite(pricing[m].base) || pricing[m].base < 0 || !Number.isFinite(pricing[m].perToken) || pricing[m].perToken < 0) {
+      throw new Error(`pricing for ${m} must be non-negative numbers`);
+    }
+  }
+  const fullCap = (m) => priceFor(pricing, m, null).micros;
+  const maxPriceMicros = models.map(fullCap).reduce((a, b) => (a > b ? a : b));
+  const stats = { since: now(), generations: 0, tokens_in: 0, tokens_out: 0, revenue_micros: 0n, leases_warmed: 0 };
 
   const consumed = loadConsumed(paymentsFile);
   // A client that paid and then lost the connection must be able to fetch what
@@ -121,6 +146,7 @@ export function createGateway({
       box.expiresAt = Date.parse(lease.access?.expires_at ?? "") || now() + durationSeconds * 1000;
       box.lastUsed = now();
       box.phase = "warm";
+      stats.leases_warmed += 1;
       log(`warm: lease ${lease.leaseId}, models ${models.join(", ")}`);
     } catch (err) {
       // The lease is paid for either way; drop only what this process holds,
@@ -171,29 +197,32 @@ export function createGateway({
     await ensureWarm().catch((err) => log(`renewal failed: ${err.message}`));
   }
 
-  function requirements(state) {
+  function requirements(state, quote = null) {
+    const amount = quote?.micros ?? maxPriceMicros;
     return {
       x402Version: 1,
       state,
+      ...(quote ? { quote: { model: quote.model, output_cap: quote.cap, price_micros: amount.toString() } } : {}),
       accepts: [
         {
           scheme: "exact",
           network: "eip155:4663",
           asset: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
           payTo,
-          maxAmountRequired: priceMicros.toString(),
+          maxAmountRequired: amount.toString(),
           resource: "/v1/inference",
           description:
-            "One generation on a Prism GPU, paid in USDG on Robinhood Chain. Pay maxAmountRequired " +
-            "to payTo, then retry with header X-PAYMENT: base64({txHash, signature}) where signature " +
-            "is a personal_sign of the tx hash.",
+            "One generation on a Prism GPU, paid in USDG on Robinhood Chain. The price covers the " +
+            "requested output cap for the requested model. Pay maxAmountRequired to payTo, then retry " +
+            "with header X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of " +
+            "the tx hash.",
           mimeType: "application/json",
         },
       ],
     };
   }
 
-  async function checkPayment(header) {
+  async function checkPayment(header, quotedMicros) {
     let txHash;
     let signature;
     try {
@@ -210,7 +239,7 @@ export function createGateway({
       if (replay) return { ok: false, reason: "payment_reused", replay };
       return { ok: false, reason: "payment_reused" };
     }
-    const outcome = await verify(txHash, signature, priceMicros);
+    const outcome = await verify(txHash, signature, quotedMicros);
     if (!outcome.ok) {
       releasePayment(key);
       return outcome;
@@ -229,10 +258,8 @@ export function createGateway({
     };
   }
 
-  async function generate(body) {
-    const options = { ...(body.options ?? {}) };
-    const cap = Number(options.num_predict);
-    options.num_predict = Number.isInteger(cap) && cap > 0 ? Math.min(cap, MAX_PREDICT_TOKENS) : MAX_PREDICT_TOKENS;
+  async function generate(body, cap) {
+    const options = { ...(body.options ?? {}), num_predict: cap };
     const res = await fetchOllama("/api/generate", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -242,6 +269,9 @@ export function createGateway({
     if (!res.ok) throw new Error(`ollama answered ${res.status}`);
     const out = await res.json();
     box.lastUsed = now();
+    stats.generations += 1;
+    stats.tokens_in += out.prompt_eval_count ?? 0;
+    stats.tokens_out += out.eval_count ?? 0;
     return {
       model: body.model,
       response: out.response,
@@ -264,16 +294,19 @@ export function createGateway({
     if (Buffer.byteLength(body.prompt, "utf8") > MAX_PROMPT_BYTES) {
       return { status: 413, body: { error: "prompt_too_large", max_bytes: MAX_PROMPT_BYTES } };
     }
-    if (!paymentHeader) return { status: 402, body: requirements(box.phase) };
-    const payment = await checkPayment(String(paymentHeader));
+    const { cap, micros } = priceFor(pricing, body.model, Number(body.options?.num_predict));
+    const quote = { model: body.model, cap, micros };
+    if (!paymentHeader) return { status: 402, body: requirements(box.phase, quote) };
+    const payment = await checkPayment(String(paymentHeader), micros);
     if (!payment.ok) {
       if (payment.replay) return { status: 200, body: { ...payment.replay, replayed: true } };
-      return { status: 402, body: { ...requirements(box.phase), error: payment.reason } };
+      return { status: 402, body: { ...requirements(box.phase, quote), error: payment.reason } };
     }
     try {
       await ensureWarm();
-      const result = await generate(body);
+      const result = await generate(body, cap);
       payment.commit(result);
+      stats.revenue_micros += micros;
       return { status: 200, body: result };
     } catch (err) {
       payment.release();
@@ -292,7 +325,30 @@ export function createGateway({
 
   return {
     state: () => ({ phase: box.phase, lease_id: box.lease?.leaseId ?? null, expires_at: box.expiresAt || null }),
-    models: () => ({ models, price_micros: priceMicros.toString(), pay_to: payTo, ...boxView() }),
+    models: () => ({
+      models,
+      // The highest full-cap price: paying it clears any request. Per-model
+      // detail sits alongside for clients that quote per request.
+      price_micros: maxPriceMicros.toString(),
+      pricing: Object.fromEntries(
+        models.map((m) => [m, {
+          base_micros: pricing[m].base,
+          per_token_micros: pricing[m].perToken,
+          full_cap_micros: fullCap(m).toString(),
+        }]),
+      ),
+      pay_to: payTo,
+      ...boxView(),
+    }),
+    stats: () => ({
+      since: new Date(stats.since).toISOString(),
+      generations: stats.generations,
+      tokens_in: stats.tokens_in,
+      tokens_out: stats.tokens_out,
+      revenue_micros: stats.revenue_micros.toString(),
+      leases_warmed: stats.leases_warmed,
+      ...boxView(),
+    }),
     ensureWarm,
     maintain,
     drain,
