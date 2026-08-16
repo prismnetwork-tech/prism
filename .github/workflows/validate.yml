@@ -40,6 +40,7 @@ jobs:
         env:
           PRISM_ALLOWED_GIT_EMAILS: |-
             opensource@prismnetwork.tech
+            contact@prismnetwork.tech
             dev@prismnetwork.tech
             noreply@github.com
           PRISM_ALLOWED_GIT_NAMES: |-

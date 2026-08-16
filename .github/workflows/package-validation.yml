@@ -100,6 +100,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
+      # toolset.test.mjs exercises the SDK itself, which takes viem as a peer,
+      # so the runner needs it present before the tests can import anything.
+      - run: npm install --no-save --no-audit --no-fund viem@2
+        working-directory: sdk
       - run: node --test sdk/vault.test.mjs sdk/workspace.test.mjs sdk/toolset.test.mjs inference/gateway.test.mjs
       - run: node --check integrations/eliza/index.mjs integrations/virtuals/index.mjs
       - run: node --check inference/server.mjs
