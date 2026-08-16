@@ -19,6 +19,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.8,
     },
     {
+      url: new URL("/network", siteUrl).href,
+      changeFrequency: "daily",
+      priority: 0.8,
+    },
+    {
       url: new URL("/compute", siteUrl).href,
       changeFrequency: "daily",
       priority: 0.7,
