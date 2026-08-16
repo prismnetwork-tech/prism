@@ -19,6 +19,10 @@
 		header Access-Control-Allow-Origin "*"
 	}
 
+	handle /.well-known/x402.json {
+		reverse_proxy inference:8500
+	}
+
 	handle /inference/* {
 		uri strip_prefix /inference
 		reverse_proxy inference:8500

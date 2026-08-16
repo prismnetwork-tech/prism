@@ -142,6 +142,53 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/v1/stats") {
     return json(res, 200, gateway.stats());
   }
+  // The x402 discovery manifest indexers crawl. Served here so the prices in
+  // it are the prices the 402 will actually quote.
+  if (req.method === "GET" && url.pathname === "/.well-known/x402.json") {
+    const m = gateway.models();
+    return json(res, 200, {
+      x402Version: 1,
+      name: "Prism Network managed inference",
+      description:
+        "Pay-per-generation LLM inference on rented GPUs. An unpaid request answers 402 with a USDG " +
+        "price on Robinhood Chain; a paid one returns the generation with token usage. The serving " +
+        "lease settles on-chain with a public receipt.",
+      image: "https://prismnetwork.tech/brand/prism-mark-400.png",
+      endpoints: [
+        {
+          path: "/inference/v1/inference",
+          method: "POST",
+          description:
+            "One LLM generation. The price is the model's base plus its per-token rate over the " +
+            "requested output cap; the unpaid 402 quotes the exact figure. Pay it in USDG on " +
+            "Robinhood Chain (eip155:4663), then retry with X-PAYMENT: base64({txHash, signature}) " +
+            "where signature is a personal_sign of the tx hash. A payment is consumed only when a " +
+            "response is served; a consumed tx hash replays its own result.",
+          price: `up to ${(Number(m.price_micros) / 1e6).toFixed(6)} USDG per generation, quoted per request`,
+          inputSchema: {
+            type: "object",
+            required: ["model", "prompt"],
+            properties: {
+              model: { type: "string", enum: m.models },
+              prompt: { type: "string", description: "Prompt to generate from (max 32 KiB)." },
+              options: {
+                type: "object",
+                properties: {
+                  num_predict: { type: "integer", minimum: 1, maximum: 1024, description: "Output token cap; the price scales with it." },
+                },
+              },
+            },
+          },
+        },
+        {
+          path: "/inference/v1/models",
+          method: "GET",
+          description: "Models, per-model pricing, and the gateway's current state. Free.",
+          price: "free",
+        },
+      ],
+    });
+  }
   if (req.method === "POST" && url.pathname === "/v1/warm") {
     gateway.ensureWarm().catch((err) => console.error(`warmup failed: ${err.message}`));
     return json(res, 202, gateway.state());
