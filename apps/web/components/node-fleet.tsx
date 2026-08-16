@@ -13,7 +13,7 @@ const checks = [
 
 const REGISTRY = "0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc";
 const RPC = "https://rpc.mainnet.chain.robinhood.com";
-const GUIDE = "https://github.com/prismnetwork-tech/prism/blob/main/deploy/node/README.md";
+const GUIDE = "https://github.com/prismnetworkdottech/prism/blob/main/deploy/node/README.md";
 
 export function NodeFleet() {
   const { auth, data, isPending, isError, refetch } = useSupplierSummary();

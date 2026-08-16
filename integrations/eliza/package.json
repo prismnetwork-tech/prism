@@ -50,7 +50,7 @@
   "homepage": "https://prismnetwork.tech",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/prismnetwork-tech/prism.git",
+    "url": "git+https://github.com/prismnetworkdottech/prism.git",
     "directory": "integrations/eliza"
   },
   "license": "Apache-2.0",
