@@ -45,6 +45,13 @@ The project follows semantic versioning after its first stable release.
 
 ### Added
 
+- A public `/network` page: what the network has settled (leases, GPU hours,
+  USDG charged, the share that reached suppliers, refunds, and a per-GPU
+  breakdown) beside what it can rent right now. Every settled figure is summed
+  from the same public receipt feed the settlements wrote, and capacity comes
+  through a new `/api/offers` proxy that prices the headline from offers an
+  unstaked wallet can actually match.
+
 - Inference gateway 0.2.0: prices scale per request (a model's base plus its
   per-token rate over the requested output cap), the unpaid 402 quotes the
   exact figure, `/v1/models` carries the per-model rates, and `/v1/stats`

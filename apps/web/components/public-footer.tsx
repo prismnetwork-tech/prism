@@ -23,6 +23,7 @@ const columns = [
       ["Leases", new URL("/leases", siteUrl).href, false],
       ["Activity", new URL("/activity", siteUrl).href, false],
       ["Receipts", new URL("/proof", siteUrl).href, false],
+      ["Network", new URL("/network", siteUrl).href, false],
     ],
   },
   {
