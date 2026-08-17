@@ -7,6 +7,7 @@ on:
       - "agentkit/**"
       - "mcp/**"
       - "inference/**"
+      - "x402/**"
       - "integrations/**"
       - "python-sdk/**"
       - "scripts/canary/**"
@@ -20,6 +21,7 @@ on:
       - "agentkit/**"
       - "mcp/**"
       - "inference/**"
+      - "x402/**"
       - "integrations/**"
       - "python-sdk/**"
       - "scripts/canary/**"
@@ -104,7 +106,13 @@ jobs:
       # so the runner needs it present before the tests can import anything.
       - run: npm install --no-save --no-audit --no-fund viem@2
         working-directory: sdk
-      - run: node --test sdk/vault.test.mjs sdk/workspace.test.mjs sdk/toolset.test.mjs inference/gateway.test.mjs
+      # The gateway now shapes its 402 through the x402 codec, and the x402
+      # tests sign with viem, so both directories need their imports resolvable
+      # before anything here can run.
+      - run: npm install --no-save --no-audit --no-fund viem@2
+        working-directory: x402
+      - run: mkdir -p inference/node_modules/@prismnetwork && ln -sfn ../../../x402 inference/node_modules/@prismnetwork/x402
+      - run: node --test sdk/vault.test.mjs sdk/workspace.test.mjs sdk/toolset.test.mjs inference/gateway.test.mjs x402/exact-evm.test.mjs
       - run: node --check integrations/eliza/index.mjs integrations/virtuals/index.mjs
       - run: node --check inference/server.mjs
 

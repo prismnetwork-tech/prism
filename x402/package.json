@@ -1,14 +1,16 @@
 {
   "name": "@prismnetwork/x402",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pay-per-job GPU compute on Prism Network over HTTP 402, payable in USDC on Base.",
   "type": "module",
   "bin": {
     "prism-x402": "server.mjs"
   },
   "files": [
-    "server.mjs",
-    "README.md"
+    "README.md",
+    "codec.mjs",
+    "exact-evm.mjs",
+    "server.mjs"
   ],
   "engines": {
     "node": ">=20"
@@ -40,5 +42,10 @@
   },
   "scripts": {
     "test": "node --test"
+  },
+  "exports": {
+    ".": "./server.mjs",
+    "./exact-evm": "./exact-evm.mjs",
+    "./codec": "./codec.mjs"
   }
 }

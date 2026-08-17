@@ -257,3 +257,175 @@ test("maintain drains an idle box at renewal time and renews a busy one", async 
   assert.equal(gateway.state().phase, "warm");
   assert.equal(deps.calls.leases, 3);
 });
+
+// The Base rail. `exact` stands in for the verifier so these pin the gateway's
+// own ordering and bookkeeping rather than re-testing EIP-3009, which
+// x402/exact-evm.test.mjs already covers.
+const BASE_PAY_TO = "0xe67a61f8e2aC4057aa22e64306107E7120078447";
+const PAYER = "0x1111111111111111111111111111111111111111";
+const NONCE = `0x${"ab".repeat(32)}`;
+
+function authorization(overrides = {}) {
+  return Buffer.from(JSON.stringify({
+    x402Version: 2,
+    accepted: { scheme: "exact", network: "eip155:8453" },
+    payload: {
+      signature: "0xsig",
+      authorization: { from: PAYER, to: BASE_PAY_TO, value: "10000", validAfter: "1", validBefore: "2", nonce: NONCE },
+      ...overrides,
+    },
+  })).toString("base64");
+}
+
+function fakeExact({ isValid = true, settles = true } = {}) {
+  const calls = { verified: 0, settled: 0, requirements: [] };
+  return {
+    calls,
+    verify: async (_payload, requirements) => {
+      calls.verified += 1;
+      calls.requirements.push(requirements);
+      return isValid ? { isValid: true, payer: PAYER } : { isValid: false, invalidReason: "insufficient_funds", payer: PAYER };
+    },
+    settle: async () => {
+      calls.settled += 1;
+      return settles
+        ? { success: true, payer: PAYER, transaction: "0xdeadbeef", network: "eip155:8453" }
+        : { success: false, errorReason: "invalid_transaction_state", payer: PAYER, transaction: "", network: "eip155:8453" };
+    },
+  };
+}
+
+test("both rails are offered when Base is configured, Robinhood alone when it is not", async () => {
+  const deps = fakeDeps();
+  const dual = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  // v1 names Base by its ecosystem name and v2 by CAIP-2; both mean chain 8453.
+  const v1 = (await dual.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 1)).body.accepts;
+  assert.deepEqual(v1.map((a) => a.network), ["base", "eip155:4663"]);
+  assert.equal(v1[0].maxAmountRequired, "10000");
+
+  const offered = (await dual.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts;
+  assert.deepEqual(offered.map((a) => a.network), ["eip155:8453", "eip155:4663"]);
+  assert.equal(offered[0].amount, "10000");
+  assert.equal(offered[0].payTo, BASE_PAY_TO);
+  assert.equal(offered[0].extra.assetTransferMethod, "eip3009");
+  // The domain the signer must use has to travel with the requirement.
+  assert.equal(offered[0].extra.name, "USD Coin");
+
+  const single = build(fakeDeps());
+  const only = (await single.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts;
+  assert.deepEqual(only.map((a) => a.network), ["eip155:4663"]);
+});
+
+test("a Base authorization is settled only after a generation exists", async () => {
+  const deps = fakeDeps();
+  const exact = fakeExact();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.response, "hello");
+  assert.equal(exact.calls.verified, 1);
+  assert.equal(exact.calls.settled, 1);
+  assert.equal(deps.calls.generations.length, 1);
+  // v2 reports the settlement in a header.
+  const receipt = JSON.parse(Buffer.from(out.headers["PAYMENT-RESPONSE"], "base64").toString());
+  assert.equal(receipt.transaction, "0xdeadbeef");
+});
+
+test("a failed generation never broadcasts, so the payer keeps their money", async () => {
+  const exact = fakeExact();
+  const deps = fakeDeps({
+    fetchOllama: async (path) => {
+      if (path === "/api/tags") return { ok: true, json: async () => ({ models: [] }) };
+      return { ok: false, status: 500 };
+    },
+  });
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 503);
+  assert.equal(exact.calls.verified, 1);
+  assert.equal(exact.calls.settled, 0, "nothing may be broadcast when there is no generation to pay for");
+
+  // And the authorization is free to use again.
+  const retry = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.notEqual(retry.body.error, "payment_reused");
+});
+
+test("a settlement that fails after serving is counted rather than hidden", async () => {
+  const deps = fakeDeps();
+  const exact = fakeExact({ settles: false });
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 200, "the work was done, so the caller still gets it");
+  assert.equal(gateway.stats().unsettled, 1);
+  assert.equal(gateway.stats().revenue_micros, "0", "an unsettled payment is not revenue");
+});
+
+test("an authorization is verified against our own requirement, not the client's copy", async () => {
+  const deps = fakeDeps();
+  const exact = fakeExact();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact });
+  await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  const used = exact.calls.requirements[0];
+  assert.equal(used.payTo, BASE_PAY_TO);
+  assert.equal(used.asset, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+  assert.equal(used.network, "eip155:8453");
+});
+
+test("the same authorization cannot be spent twice", async () => {
+  const deps = fakeDeps();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  const first = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(first.status, 200);
+  const second = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(second.status, 200);
+  assert.equal(second.body.replayed, true, "a replay returns what it paid for");
+  assert.equal(deps.calls.generations.length, 1, "and does not generate again");
+});
+
+test("a Base payment is refused when no Base rail is configured", async () => {
+  const gateway = build(fakeDeps());
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 402);
+  assert.equal(out.body.error, "invalid_scheme");
+});
+
+test("a refused authorization frees its key for a corrected retry", async () => {
+  const deps = fakeDeps();
+  const exact = fakeExact({ isValid: false });
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 402);
+  assert.equal(out.body.error, "insufficient_funds");
+  assert.equal(deps.calls.generations.length, 0);
+
+  const funded = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  const retry = await funded.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(retry.status, 200);
+});
+
+test("the legacy tx-hash scheme keeps working alongside the new one", async () => {
+  const deps = fakeDeps();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  const legacy = Buffer.from(JSON.stringify({ txHash: `0x${"ef".repeat(32)}`, signature: "0xsig" })).toString("base64");
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, legacy);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.response, "hello");
+});
+
+test("a v2 refusal carries the terms in the header, not only the body", async () => {
+  const gateway = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact: fakeExact({ isValid: false }) });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 402);
+  const decoded = JSON.parse(Buffer.from(out.headers["PAYMENT-REQUIRED"], "base64").toString());
+  assert.equal(decoded.x402Version, 2);
+  assert.equal(decoded.accepts[0].network, "eip155:8453");
+  assert.equal(decoded.error, "insufficient_funds");
+});
+
+test("an unpaid v1 request gets no protocol headers, which is where v1 puts nothing", async () => {
+  const gateway = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 1);
+  assert.equal(out.status, 402);
+  assert.deepEqual(out.headers, {});
+  assert.equal(out.body.accepts[0].network, "base");
+});

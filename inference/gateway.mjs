@@ -7,6 +7,7 @@
 // `spawnTunnel` (ssh -L to the box's ollama), `fetchOllama`, and `verify`
 // (on-chain payment verification).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { parsePayment, paymentRequired, paymentResponse, requirementsFor } from "@prismnetwork/x402/codec";
 
 export const DEFAULT_PRICE_MICROS = 10_000n;
 export const MAX_PROMPT_BYTES = 32 * 1024;
@@ -27,6 +28,20 @@ export function priceFor(pricing, model, requestedTokens) {
 
 const TX_HASH = /^0x[0-9a-f]{64}$/i;
 
+// A consumed payment is keyed by whatever makes it unique. The legacy scheme
+// pays first, so its key is the transaction hash. The exact scheme authorizes
+// first, so its key is the payer and the authorization nonce, which is also
+// what the token contract itself refuses to reuse.
+const PAYMENT_KEY = /^(0x[0-9a-f]{64}|0x[0-9a-f]{40}:0x[0-9a-f]{64})$/i;
+
+export const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+export const USDG_ROBINHOOD = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+
+/// Base USDC reports this as its EIP-712 domain, and the domain feeds the
+/// signing hash. The published spec example carries the testnet token's
+/// "USDC", which signs against nothing here.
+export const USDC_BASE_DOMAIN = { name: "USD Coin", version: "2" };
+
 export function loadConsumed(file) {
   const set = new Set();
   if (file && existsSync(file)) {
@@ -42,6 +57,8 @@ export function createGateway({
   agent,
   models,
   payTo,
+  basePayTo = null,
+  exact = null,
   priceMicros = DEFAULT_PRICE_MICROS,
   pricing: pricingIn = null,
   image,
@@ -69,7 +86,13 @@ export function createGateway({
   }
   const fullCap = (m) => priceFor(pricing, m, null).micros;
   const maxPriceMicros = models.map(fullCap).reduce((a, b) => (a > b ? a : b));
-  const stats = { since: now(), generations: 0, tokens_in: 0, tokens_out: 0, revenue_micros: 0n, leases_warmed: 0 };
+  const stats = {
+    since: now(), generations: 0, tokens_in: 0, tokens_out: 0,
+    revenue_micros: 0n, leases_warmed: 0,
+    // A generation served whose settlement then failed. Nonzero means either
+    // an rpc problem or someone racing the broadcast, and both are worth seeing.
+    unsettled: 0, unsettled_micros: 0n,
+  };
 
   const consumed = loadConsumed(paymentsFile);
   // A client that paid and then lost the connection must be able to fetch what
@@ -92,7 +115,7 @@ export function createGateway({
   // parts rather than trusting a string built elsewhere.
   function commitPayment(txHash) {
     const hash = String(txHash).toLowerCase();
-    if (!TX_HASH.test(hash)) throw new Error("refusing to record a malformed transaction hash");
+    if (!PAYMENT_KEY.test(hash)) throw new Error("refusing to record a malformed payment key");
     if (!paymentsFile) return;
     try {
       appendFileSync(paymentsFile, `${hash}\n`);
@@ -197,39 +220,114 @@ export function createGateway({
     await ensureWarm().catch((err) => log(`renewal failed: ${err.message}`));
   }
 
-  function requirements(state, quote = null) {
+  /// Both stablecoins carry six decimals, so one price in micros is the price
+  /// on either rail with no conversion.
+  function accepted(amount) {
+    const list = [];
+    if (basePayTo) {
+      list.push({
+        scheme: "exact",
+        network: "eip155:8453",
+        asset: USDC_BASE,
+        payTo: basePayTo,
+        amount: amount.toString(),
+        resource: "/v1/inference",
+        description:
+          "One generation on a Prism GPU, paid in USDC on Base. Sign an EIP-3009 " +
+          "transferWithAuthorization for the quoted amount and send it as the payment header. " +
+          "You need no gas: the authorization is broadcast for you.",
+        mimeType: "application/json",
+        maxTimeoutSeconds: 60,
+        extra: { ...USDC_BASE_DOMAIN, assetTransferMethod: "eip3009" },
+      });
+    }
+    list.push({
+      scheme: "exact",
+      network: "eip155:4663",
+      asset: USDG_ROBINHOOD,
+      payTo,
+      amount: amount.toString(),
+      resource: "/v1/inference",
+      description:
+        "One generation on a Prism GPU, paid in USDG on Robinhood Chain, which is where the " +
+        "serving lease settles. Send the amount to payTo, then retry with " +
+        "X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of the tx hash.",
+      mimeType: "application/json",
+      maxTimeoutSeconds: 60,
+    });
+    return list;
+  }
+
+  /// `version` selects the wire shape: v1 wants `maxAmountRequired` and a chain
+  /// name, v2 wants `amount` and CAIP-2. The prices and networks are the same
+  /// either way.
+  function requirements(state, quote = null, version = 1) {
     const amount = quote?.micros ?? maxPriceMicros;
+    const accepts = accepted(amount).map((entry) => requirementsFor(version, entry));
     return {
-      x402Version: 1,
+      x402Version: version,
       state,
       ...(quote ? { quote: { model: quote.model, output_cap: quote.cap, price_micros: amount.toString() } } : {}),
-      accepts: [
-        {
-          scheme: "exact",
-          network: "eip155:4663",
-          asset: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
-          payTo,
-          maxAmountRequired: amount.toString(),
-          resource: "/v1/inference",
-          description:
-            "One generation on a Prism GPU, paid in USDG on Robinhood Chain. The price covers the " +
-            "requested output cap for the requested model. Pay maxAmountRequired to payTo, then retry " +
-            "with header X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of " +
-            "the tx hash.",
-          mimeType: "application/json",
-        },
-      ],
+      accepts,
     };
   }
 
-  async function checkPayment(header, quotedMicros) {
-    let txHash;
-    let signature;
-    try {
-      ({ txHash, signature } = JSON.parse(Buffer.from(header, "base64").toString("utf8")));
-    } catch {
-      return { ok: false, reason: "malformed_payment" };
+  /// The exact scheme: the payer signed an authorization but nothing has moved
+  /// yet, so verification is read-only and the broadcast happens only once a
+  /// generation exists to pay for. A failed generation therefore costs the
+  /// payer nothing and needs no refund, which the legacy scheme cannot offer.
+  async function checkAuthorization(parsed, quotedMicros, quote) {
+    const authorization = parsed.payload?.authorization;
+    const from = authorization?.from;
+    const nonce = authorization?.nonce;
+    if (typeof from !== "string" || typeof nonce !== "string") {
+      return { ok: false, reason: "invalid_payload" };
     }
+    const key = `${from}:${nonce}`.toLowerCase();
+    if (!PAYMENT_KEY.test(key)) return { ok: false, reason: "invalid_payload" };
+
+    // The requirement we quoted, not the one the client echoed back: a payer
+    // who rewrites the amount or the recipient must fail, and comparing their
+    // copy against itself would always pass.
+    const want = accepted(quotedMicros).find(
+      (entry) => entry.network === parsed.accepted?.network,
+    );
+    if (!want) return { ok: false, reason: "invalid_network" };
+
+    if (!reservePayment(key)) {
+      const replay = served.get(key);
+      return { ok: false, reason: "payment_reused", ...(replay ? { replay } : {}) };
+    }
+
+    const verdict = await exact.verify(parsed, want);
+    if (!verdict.isValid) {
+      releasePayment(key);
+      return { ok: false, reason: verdict.invalidReason };
+    }
+
+    return {
+      ok: true,
+      payer: verdict.payer,
+      settle: async () => exact.settle(parsed, want),
+      commit: (result) => {
+        commitPayment(key);
+        served.set(key, result);
+        if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
+      },
+      release: () => releasePayment(key),
+    };
+  }
+
+  async function checkPayment(header, quotedMicros, quote) {
+    const parsed = parsePayment(header);
+    if (!parsed) return { ok: false, reason: "invalid_payload" };
+    // An authorization means the exact scheme; a bare tx hash is the legacy
+    // one, kept working for a release so anything already integrated survives.
+    if (parsed.payload?.authorization) {
+      if (!exact) return { ok: false, reason: "invalid_scheme" };
+      return checkAuthorization(parsed, quotedMicros, quote);
+    }
+    const { txHash, signature } = parsed.raw ?? {};
     if (!TX_HASH.test(txHash ?? "") || typeof signature !== "string") {
       return { ok: false, reason: "malformed_payment" };
     }
@@ -284,7 +382,7 @@ export function createGateway({
     };
   }
 
-  async function handleInference(body, paymentHeader) {
+  async function handleInference(body, paymentHeader, paymentVersion = 1) {
     if (typeof body?.model !== "string" || !models.includes(body.model)) {
       return { status: 400, body: { error: "unknown_model", models } };
     }
@@ -296,18 +394,27 @@ export function createGateway({
     }
     const { cap, micros } = priceFor(pricing, body.model, Number(body.options?.num_predict));
     const quote = { model: body.model, cap, micros };
-    if (!paymentHeader) return { status: 402, body: requirements(box.phase, quote) };
-    const payment = await checkPayment(String(paymentHeader), micros);
+    const version = paymentVersion ?? 1;
+    if (!paymentHeader) {
+      const required = requirements(box.phase, quote, version);
+      return { status: 402, body: required, headers: paymentRequired(version, required).headers };
+    }
+    const payment = await checkPayment(String(paymentHeader), micros, quote);
     if (!payment.ok) {
       if (payment.replay) return { status: 200, body: { ...payment.replay, replayed: true } };
-      return { status: 402, body: { ...requirements(box.phase, quote), error: payment.reason } };
+      // A refused payment is still a 402, and a v2 client reads the terms from
+      // the header rather than the body, so it has to carry them here too.
+      const required = requirements(box.phase, quote, version);
+      return {
+        status: 402,
+        body: { ...required, error: payment.reason },
+        headers: paymentRequired(version, { ...required, error: payment.reason }).headers,
+      };
     }
+    let result;
     try {
       await ensureWarm();
-      const result = await generate(body, cap);
-      payment.commit(result);
-      stats.revenue_micros += micros;
-      return { status: 200, body: result };
+      result = await generate(body, cap);
     } catch (err) {
       payment.release();
       log(`inference failed: ${err.message}`);
@@ -317,10 +424,36 @@ export function createGateway({
           error: "inference_unavailable",
           detail: String(err.message ?? err),
           state: box.phase,
-          retry: "the payment was not consumed; retry with the same X-PAYMENT header",
+          retry: "the payment was not consumed; retry with the same payment header",
         },
       };
     }
+
+    // Under the exact scheme nothing has moved until this call, so the money is
+    // taken only once there is something to hand back. The exposure is the
+    // reverse window: a payer who empties their wallet between verification and
+    // this broadcast gets one generation free. That is bounded by a single
+    // request's price, needs a deliberate race, and is cheaper to absorb than a
+    // refund path that can fail on its own.
+    let settlement = null;
+    if (payment.settle) {
+      settlement = await payment.settle();
+      if (!settlement.success) {
+        stats.unsettled += 1;
+        stats.unsettled_micros += micros;
+        log(`settlement failed after serving: ${settlement.errorReason ?? "unknown"} payer=${payment.payer}`);
+        payment.commit(result);
+        return { status: 200, body: result, headers: paymentResponse(version, settlement).headers };
+      }
+    }
+
+    payment.commit(result);
+    stats.revenue_micros += micros;
+    return {
+      status: 200,
+      body: result,
+      headers: settlement ? paymentResponse(version, settlement).headers : {},
+    };
   }
 
   return {
@@ -347,6 +480,10 @@ export function createGateway({
       tokens_out: stats.tokens_out,
       revenue_micros: stats.revenue_micros.toString(),
       leases_warmed: stats.leases_warmed,
+      // Served but not paid for. Worth watching: a rising count is either an
+      // rpc fault or someone racing the broadcast.
+      unsettled: stats.unsettled,
+      unsettled_micros: stats.unsettled_micros.toString(),
       ...boxView(),
     }),
     ensureWarm,

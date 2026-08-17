@@ -11,7 +11,10 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createPublicClient, getAddress, http, recoverMessageAddress } from "viem";
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
-import { createGateway } from "./gateway.mjs";
+import { createExactEvm } from "@prismnetwork/x402/exact-evm";
+import { detect } from "@prismnetwork/x402/codec";
+import { base as baseChain } from "viem/chains";
+import { createGateway, USDC_BASE, USDC_BASE_DOMAIN } from "./gateway.mjs";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
@@ -37,7 +40,16 @@ try {
     idleMs: Number(process.env.INFERENCE_IDLE_SECONDS ?? 600) * 1000,
     tunnelPort: Number(process.env.INFERENCE_TUNNEL_PORT ?? 11435),
     paymentsFile: process.env.INFERENCE_PAYMENTS_FILE ?? "./inference-consumed.log",
+    // Base is offered only when there is somewhere to collect it. Omitting the
+    // address leaves the endpoint exactly as it was.
+    basePayTo: process.env.X402_BASE_PAY_TO ? getAddress(process.env.X402_BASE_PAY_TO) : null,
+    // Not mainnet.base.org: one verification is four calls and the public
+    // endpoint rate-limits a burst that size.
+    baseRpcUrl: process.env.X402_BASE_RPC_URL ?? "https://base-rpc.publicnode.com",
   };
+  if (config.basePayTo && !process.env.PRISM_X402_COLLECTOR_KEY) {
+    throw new Error("X402_BASE_PAY_TO is set but PRISM_X402_COLLECTOR_KEY is not, so nothing can broadcast an authorization");
+  }
   agent = new PrismAgent({
     privateKey: requireEnv("PRISM_AGENT_KEY"),
     escrow: requireEnv("PRISM_ESCROW"),
@@ -111,10 +123,29 @@ function spawnTunnel(lease) {
 
 const fetchOllama = (path, init) => fetch(`http://127.0.0.1:${config.tunnelPort}${path}`, init);
 
+const exact = config.basePayTo
+  ? createExactEvm({
+      "eip155:8453": {
+        chain: baseChain,
+        rpcUrl: config.baseRpcUrl,
+        privateKey: process.env.PRISM_X402_COLLECTOR_KEY,
+        assets: { [USDC_BASE]: USDC_BASE_DOMAIN },
+      },
+      base: {
+        chain: baseChain,
+        rpcUrl: config.baseRpcUrl,
+        privateKey: process.env.PRISM_X402_COLLECTOR_KEY,
+        assets: { [USDC_BASE]: USDC_BASE_DOMAIN },
+      },
+    })
+  : null;
+
 const gateway = createGateway({
   agent,
   models: config.models,
   payTo: config.payTo,
+  basePayTo: config.basePayTo,
+  exact,
   priceMicros: config.priceMicros,
   pricing: config.pricing,
   image: process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE,
@@ -150,9 +181,9 @@ const server = createServer(async (req, res) => {
       x402Version: 1,
       name: "Prism Network managed inference",
       description:
-        "Pay-per-generation LLM inference on rented GPUs. An unpaid request answers 402 with a USDG " +
-        "price on Robinhood Chain; a paid one returns the generation with token usage. The serving " +
-        "lease settles on-chain with a public receipt.",
+        "Pay-per-generation LLM inference on rented GPUs. Pay in USDC on Base or USDG on Robinhood " +
+        "Chain; an unpaid request answers 402 with the exact price on each. The serving lease " +
+        "settles onchain with a public receipt.",
       image: "https://prismnetwork.tech/brand/prism-mark-400.png",
       endpoints: [
         {
@@ -160,11 +191,13 @@ const server = createServer(async (req, res) => {
           method: "POST",
           description:
             "One LLM generation. The price is the model's base plus its per-token rate over the " +
-            "requested output cap; the unpaid 402 quotes the exact figure. Pay it in USDG on " +
-            "Robinhood Chain (eip155:4663), then retry with X-PAYMENT: base64({txHash, signature}) " +
-            "where signature is a personal_sign of the tx hash. A payment is consumed only when a " +
-            "response is served; a consumed tx hash replays its own result.",
-          price: `up to ${(Number(m.price_micros) / 1e6).toFixed(6)} USDG per generation, quoted per request`,
+            "requested output cap, and the unpaid 402 quotes the exact figure for every network it " +
+            "accepts. On Base, sign an EIP-3009 authorization for the quoted USDC amount and send " +
+            "it in the payment header; you need no gas, because the authorization is broadcast for " +
+            "you, and nothing is taken unless a generation is returned. A payment is consumed only " +
+            "when a response is served, and a consumed one replays its own result.",
+          price: `up to ${(Number(m.price_micros) / 1e6).toFixed(6)} USDC or USDG per generation, quoted per request`,
+          accepts: gateway.requirements().accepts,
           inputSchema: {
             type: "object",
             required: ["model", "prompt"],
@@ -200,15 +233,23 @@ const server = createServer(async (req, res) => {
     } catch (err) {
       return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
     }
-    const out = await gateway.handleInference(body, req.headers["x-payment"]);
-    return json(res, out.status, out.body);
+    // Which version the caller speaks comes from which payment header they
+    // sent. An unpaid request has neither, and answering v1 to those keeps
+    // the reply readable to anything that just curls the endpoint.
+    const payment = detect(req.headers);
+    const out = await gateway.handleInference(body, payment?.header, payment?.version ?? 1);
+    return json(res, out.status, out.body, out.headers);
   }
   json(res, 404, { error: "not_found" });
 });
 
-function json(res, status, obj) {
+function json(res, status, obj, extra = {}) {
   const payload = JSON.stringify(obj);
-  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(payload),
+    ...extra,
+  });
   res.end(payload);
 }
 
