@@ -246,7 +246,16 @@ services:
       control-plane:
         condition: service_healthy
 
+  registry:
+    image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+    restart: unless-stopped
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - registry_data:/var/lib/registry
+
 volumes:
+  registry_data:
   inference_state:
   cache_data:
   caddy_config:

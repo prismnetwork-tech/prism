@@ -189,3 +189,18 @@ export function openApiDocument({ models, pricing, jobPriceMicros, contactEmail,
     },
   };
 }
+
+/// A literal generation, for the discovery extension's `output.example`.
+export const inferenceExample = {
+  model: "llama3.2:3b",
+  response: "Metered GPU compute bills by the second and settles onchain.",
+  usage: { prompt_tokens: 12, completion_tokens: 14, duration_ms: 640 },
+  lease_id: 1047,
+};
+
+/// A literal request, for the discovery extension's `info.input.body`.
+export const inferenceInputExample = {
+  model: "llama3.2:3b",
+  prompt: "Explain metered GPU compute in one sentence.",
+  options: { num_predict: 64 },
+};

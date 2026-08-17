@@ -145,3 +145,22 @@ test("the facilitator refuses a malformed settle without touching the chain", as
   assert.equal(res.status, 400);
   assert.equal((await res.json()).errorReason, "invalid_payment_requirements");
 });
+
+test("a discovery probe on GET is quoted, not 404ed", async () => {
+  await ready();
+  const res = await fetch(`http://127.0.0.1:${port}/run`);
+  assert.equal(res.status, 402, "crawlers probe with GET and read a 404 as broken");
+  const body = await res.json();
+  assert.ok(body.accepts.length > 0);
+  assert.ok(body.resource.url.endsWith("/run"));
+});
+
+test("GET never runs a job, whatever it carries", async () => {
+  await ready();
+  // A safe method stays safe: a payment header on a GET still only quotes.
+  const res = await fetch(`http://127.0.0.1:${port}/run`, {
+    headers: { "PAYMENT-SIGNATURE": "bm90LXJlYWw=" },
+  });
+  assert.equal(res.status, 402);
+  assert.equal((await res.json()).job_id, undefined);
+});

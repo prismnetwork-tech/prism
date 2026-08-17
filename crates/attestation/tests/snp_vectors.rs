@@ -35,13 +35,32 @@ const CHALLENGE_NONCE: [u8; 32] = [
 const CHIP_ID: [u8; 64] = [0x5a; 64];
 const HOST_DATA: [u8; 32] = [0x3c; 32];
 
-/// The floor reference/snp-platform.json pins for this product line.
-const TCB_FLOOR: SnpTcb = SnpTcb {
-    bootloader: 10,
-    tee: 0,
-    snp: 25,
-    microcode: 84,
-};
+/// The floor reference/snp-platform.json pins for this product line. Read from
+/// the file rather than repeated here: a copy drifts the moment the real floor
+/// moves, and every fixture below is built relative to it.
+#[derive(serde::Deserialize)]
+struct PlatformFile {
+    tcb_floor: TcbFloorEntry,
+}
+
+#[derive(serde::Deserialize)]
+struct TcbFloorEntry {
+    bootloader: u8,
+    tee: u8,
+    snp: u8,
+    microcode: u8,
+}
+
+fn tcb_floor() -> SnpTcb {
+    let raw = include_str!("../reference/snp-platform.json");
+    let file: PlatformFile = serde_json::from_str(raw).expect("reference platform");
+    SnpTcb {
+        bootloader: file.tcb_floor.bootloader,
+        tee: file.tcb_floor.tee,
+        snp: file.tcb_floor.snp,
+        microcode: file.tcb_floor.microcode,
+    }
+}
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/snp")
@@ -141,10 +160,10 @@ fn good_report_builder() -> SnpReportBuilder {
     SnpReportBuilder::genoa(report_data(), reference_measurement(), CHIP_ID)
         .host_data(HOST_DATA)
         .tcb(
-            TCB_FLOOR.bootloader,
-            TCB_FLOOR.tee,
-            TCB_FLOOR.snp,
-            TCB_FLOOR.microcode,
+            tcb_floor().bootloader,
+            tcb_floor().tee,
+            tcb_floor().snp,
+            tcb_floor().microcode,
         )
 }
 
@@ -188,15 +207,17 @@ fn a_good_report_and_chain_earn_attested_while_the_served_class_stays_clamped() 
         verdict.guest.chip_id_digest,
         hex::encode(Sha256::digest(CHIP_ID))
     );
-    assert_eq!(verdict.guest.reported_tcb, TCB_FLOOR);
+    assert_eq!(verdict.guest.reported_tcb, tcb_floor());
     assert!(!verdict.guest.policy_debug);
     assert_eq!(verdict.guest.vmpl, 0);
     assert!(verdict.guest.channel_key_fingerprint.starts_with("SHA256:"));
     assert_eq!(verdict.verified_at, now());
     assert_eq!(verdict.expires_at, now() + Duration::days(7));
 
-    // The verifier says what the evidence earns. What the renter is served is
-    // decided in the protocol, and today that is one rung lower.
+    // The verifier says what the evidence earns; the protocol decides what the
+    // network serves and clamps it to what the checked-in material can back.
+    // Those agree for SNP today, so the clamp changes nothing here. It is still
+    // the thing that stops a future verdict outrunning the evidence.
     assert_eq!(
         class_for_lease(
             LEASE_ID,
@@ -205,9 +226,9 @@ fn a_good_report_and_chain_earn_attested_while_the_served_class_stays_clamped() 
             Some(&verdict),
             now()
         ),
-        MAX_VERIFIABLE_TRUST_CLASS
+        TrustClass::Attested
     );
-    assert_eq!(MAX_VERIFIABLE_TRUST_CLASS, TrustClass::Isolated);
+    assert!(TrustClass::Attested <= MAX_VERIFIABLE_TRUST_CLASS);
 }
 
 #[test]
@@ -411,10 +432,10 @@ fn a_measurement_outside_the_reference_set_grants_nothing() {
 fn a_tcb_one_below_the_floor_grants_nothing() {
     let report = good_report_builder()
         .tcb(
-            TCB_FLOOR.bootloader,
-            TCB_FLOOR.tee,
-            TCB_FLOOR.snp,
-            TCB_FLOOR.microcode - 1,
+            tcb_floor().bootloader,
+            tcb_floor().tee,
+            tcb_floor().snp,
+            tcb_floor().microcode - 1,
         )
         .signed_with(&vcek_key());
 
@@ -433,10 +454,10 @@ fn a_tcb_one_below_the_floor_grants_nothing() {
 fn a_platform_downgraded_before_launch_grants_nothing() {
     let report = good_report_builder()
         .launch_tcb(
-            TCB_FLOOR.bootloader,
-            TCB_FLOOR.tee,
-            TCB_FLOOR.snp - 1,
-            TCB_FLOOR.microcode,
+            tcb_floor().bootloader,
+            tcb_floor().tee,
+            tcb_floor().snp - 1,
+            tcb_floor().microcode,
         )
         .signed_with(&vcek_key());
 
@@ -469,7 +490,8 @@ fn a_signature_field_wider_than_a_scalar_is_rejected_rather_than_truncated() {
 
 #[test]
 fn a_report_of_an_unsupported_abi_version_is_rejected() {
-    let report = good_report_builder().version(3).signed_with(&vcek_key());
+    // 2 and 3 are both real ABI revisions and both accepted. 4 is not one.
+    let report = good_report_builder().version(4).signed_with(&vcek_key());
 
     assert_eq!(
         verify(&attestation(report, chain())),
@@ -594,7 +616,6 @@ fn the_ceiling_matches_the_evidence_on_file() {
 }
 
 #[test]
-#[ignore = "waiting on a capture from the Dallas Genoa platform"]
 fn genuine_genoa_report_verifies() {
     let report = fs::read(fixtures().join("genuine/report.bin")).expect("genuine report");
     let chain: Vec<String> = ["vcek.der", "ask.der", "ark.der"]
@@ -602,14 +623,26 @@ fn genuine_genoa_report_verifies() {
         .map(|name| STANDARD.encode(fs::read(fixtures().join("genuine/chain").join(name)).unwrap()))
         .collect();
 
-    let verdict = verify_sev_snp_attestation(
-        &attestation(report, chain),
-        &expectation(),
-        now(),
-        &Policy::default(),
-    )
-    .expect("verdict");
-    assert_eq!(verdict.granted_class, TrustClass::Attested);
+    // Taken from prism-node-01 on 2026-08-17 with a random nonce, outside any
+    // lease, so it carries none of this crate's lease binding. What it does
+    // prove is every platform check ahead of that binding: a real VERSION 3
+    // report, signed by a VCEK AMD issued for that chip, chaining to the real
+    // ARK, at VMPL0, whose launch measurement equals the one sev-snp-measure
+    // computes from the recorded boot inputs, on a platform at or above the TCB
+    // floor. Reaching the report-data check is therefore the pass condition;
+    // asserting Attested here would require inventing a lease this capture
+    // never belonged to.
+    let captured_at = Utc.with_ymd_and_hms(2026, 8, 17, 19, 15, 0).unwrap();
+
+    assert_eq!(
+        verify_sev_snp_attestation(
+            &attestation(report, chain),
+            &expectation(),
+            captured_at,
+            &Policy::default(),
+        ),
+        Err(VerificationError::SnpReportDataMismatch)
+    );
 }
 
 fn attacker_vcek_key() -> SigningKey {
@@ -851,14 +884,14 @@ mod certgen {
             .as_bytes()
             .to_vec();
         let extensions = vec![
-            der::extension("1.3.6.1.4.1.3704.1.4", false, der::octet_string(&hwid)),
+            der::extension("1.3.6.1.4.1.3704.1.4", false, hwid.to_vec()),
             der::extension(
                 "1.3.6.1.4.1.3704.1.3.1",
                 false,
                 der::tlv(0x02, &[tcb.bootloader]),
             ),
             der::extension("1.3.6.1.4.1.3704.1.3.2", false, der::tlv(0x02, &[tcb.tee])),
-            der::extension("1.3.6.1.4.1.3704.1.3.7", false, der::tlv(0x02, &[tcb.snp])),
+            der::extension("1.3.6.1.4.1.3704.1.3.3", false, der::tlv(0x02, &[tcb.snp])),
             der::extension(
                 "1.3.6.1.4.1.3704.1.3.8",
                 false,
@@ -923,11 +956,11 @@ fn regenerate_fixtures() {
     );
     write(
         "vcek.der",
-        &certgen::vcek(&vcek_key, CHIP_ID, TCB_FLOOR, ASK, &ask_key),
+        &certgen::vcek(&vcek_key, CHIP_ID, tcb_floor(), ASK, &ask_key),
     );
     write(
         "vcek-wrong-hwid.der",
-        &certgen::vcek(&vcek_key, [0x77; 64], TCB_FLOOR, ASK, &ask_key),
+        &certgen::vcek(&vcek_key, [0x77; 64], tcb_floor(), ASK, &ask_key),
     );
     write(
         "vcek-low-svn.der",
@@ -935,8 +968,8 @@ fn regenerate_fixtures() {
             &vcek_key,
             CHIP_ID,
             SnpTcb {
-                microcode: TCB_FLOOR.microcode - 1,
-                ..TCB_FLOOR
+                microcode: tcb_floor().microcode - 1,
+                ..tcb_floor()
             },
             ASK,
             &ask_key,
@@ -963,7 +996,7 @@ fn regenerate_fixtures() {
         &certgen::vcek(
             &attacker_vcek_key,
             CHIP_ID,
-            TCB_FLOOR,
+            tcb_floor(),
             ASK,
             &attacker_ask_key,
         ),
@@ -993,5 +1026,53 @@ fn regenerate_placeholder_ark() {
     println!(
         "roots/amd-ark-genoa.der sha256: {}",
         hex::encode(Sha256::digest(&root))
+    );
+}
+
+/// The whole path on real silicon: a report taken inside a confidential guest on
+/// prism-node-01, bound to a lease through REPORT_DATA and to the workload
+/// through HOST_DATA, verified against the VCEK AMD issued for that chip.
+///
+/// Nothing here is generated. The report is what the PSP signed, the chain is
+/// what AMD's KDS serves for that chip and TCB, and the launch measurement is
+/// the one sev-snp-measure computes from the recorded boot inputs.
+#[test]
+fn a_genuine_lease_report_earns_attested() {
+    let report = fs::read(fixtures().join("genuine-lease/report.bin")).expect("genuine report");
+    let chain: Vec<String> = ["vcek.der", "ask.der", "ark.der"]
+        .iter()
+        .map(|name| {
+            STANDARD.encode(fs::read(fixtures().join("genuine-lease/chain").join(name)).unwrap())
+        })
+        .collect();
+
+    // Kata commits to the workload by hashing the initdata document it was
+    // launched with, and the digest lands in HOST_DATA.
+    let host_data: [u8; 32] =
+        hex::decode("48d99906dbea27dcce229c6385afeaffb55a5e410773c2caec0cee56f5162890")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let expectation = SnpExpectation {
+        report_data: report_data(),
+        host_data,
+        chip_id_digest: None,
+    };
+    let captured_at = Utc.with_ymd_and_hms(2026, 8, 17, 20, 58, 0).unwrap();
+
+    let verdict = verify_sev_snp_attestation(
+        &attestation(report, chain),
+        &expectation,
+        captured_at,
+        &Policy::default(),
+    )
+    .expect("verdict");
+
+    assert_eq!(verdict.granted_class, TrustClass::Attested);
+    assert_eq!(verdict.guest.vmpl, 0);
+    assert!(!verdict.guest.policy_debug);
+    assert_eq!(
+        verdict.guest.measurement,
+        hex::encode(reference_measurement())
     );
 }

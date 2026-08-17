@@ -86,8 +86,13 @@ impl ReferenceFile {
         Self::parse(&raw)
     }
 
+    /// Anything but `placeholder` is a claim that the numbers came out of a
+    /// computation, and every such claim has to survive being recomputed.
+    /// Matching the exact string `computed` instead let `computed-and-confirmed`
+    /// through the gate unchecked, which is the one outcome this file exists to
+    /// prevent.
     pub fn claims_computed_values(&self) -> bool {
-        self.provenance == "computed"
+        self.provenance != "placeholder"
     }
 
     /// Everything checkable without the artifacts themselves.

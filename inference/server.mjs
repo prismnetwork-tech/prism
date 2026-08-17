@@ -12,10 +12,11 @@ import { createServer } from "node:http";
 import { createPublicClient, getAddress, http, recoverMessageAddress } from "viem";
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
 import { createExactEvm } from "@prismnetwork/x402/exact-evm";
+import { createCdpFacilitator, routeByNetwork } from "@prismnetwork/x402/cdp-facilitator";
 import { detect } from "@prismnetwork/x402/codec";
 import { base as baseChain } from "viem/chains";
 import { createGateway, USDC_BASE, USDC_BASE_DOMAIN } from "./gateway.mjs";
-import { inferenceInput, inferenceOutput, openApiDocument } from "./openapi.mjs";
+import { inferenceExample, inferenceInput, inferenceInputExample, inferenceOutput, openApiDocument } from "./openapi.mjs";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
@@ -128,7 +129,7 @@ function spawnTunnel(lease) {
 
 const fetchOllama = (path, init) => fetch(`http://127.0.0.1:${config.tunnelPort}${path}`, init);
 
-const exact = config.basePayTo
+const localExact = config.basePayTo
   ? createExactEvm({
       "eip155:8453": {
         chain: baseChain,
@@ -145,13 +146,26 @@ const exact = config.basePayTo
     })
   : null;
 
+// Base settles at Coinbase when a key is configured, because the Bazaar only
+// indexes endpoints its own facilitator has settled for. Everything else, and
+// Base itself when no key is set, stays on ours.
+const cdp = process.env.CDP_API_KEY_ID && process.env.CDP_API_KEY_SECRET
+  ? createCdpFacilitator({
+      keyId: process.env.CDP_API_KEY_ID,
+      keySecret: process.env.CDP_API_KEY_SECRET,
+      networks: ["eip155:8453", "base"],
+    })
+  : null;
+
+const exact = cdp && localExact ? routeByNetwork(cdp, localExact) : localExact;
+
 const gateway = createGateway({
   agent,
   models: config.models,
   payTo: config.payTo,
   basePayTo: config.basePayTo,
   exact,
-  schemas: { input: inferenceInput(config.models), output: inferenceOutput },
+  schemas: { input: inferenceInput(config.models), output: inferenceOutput, example: inferenceExample, inputExample: inferenceInputExample, method: "POST" },
   priceMicros: config.priceMicros,
   pricing: config.pricing,
   image: process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE,
@@ -246,6 +260,13 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/v1/warm") {
     gateway.ensureWarm().catch((err) => console.error(`warmup failed: ${err.message}`));
     return json(res, 202, gateway.state());
+  }
+  // Discovery probes come in on GET, and an endpoint that answers 404 to one
+  // reads as broken rather than as paid. A GET never runs a generation whatever
+  // it carries, because a safe method must stay safe; it only quotes.
+  if (req.method === "GET" && url.pathname === "/v1/inference") {
+    const out = await gateway.handleInference({}, undefined, detect(req.headers)?.version ?? 2);
+    return json(res, out.status, out.body, out.headers);
   }
   if (req.method === "POST" && url.pathname === "/v1/inference") {
     let body;

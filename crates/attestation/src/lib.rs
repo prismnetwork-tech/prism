@@ -406,11 +406,14 @@ mod tests {
     }
 
     /// The verifier says what the evidence earns and the protocol says what the
-    /// network serves. Those are allowed to differ, and today they do.
+    /// network serves. They are allowed to differ, and the clamp is what keeps
+    /// the served rung from outrunning the evidence. They agree today, which
+    /// makes the clamp a no-op for SNP rather than absent: the assertion that
+    /// matters is that a report can never earn more than the network can back.
     #[test]
-    fn a_guest_report_earns_attested_and_the_clamp_lives_elsewhere() {
+    fn a_guest_report_earns_attested_and_never_outruns_the_ceiling() {
         assert_eq!(SNP_GRANTABLE_CLASS, TrustClass::Attested);
-        assert!(SNP_GRANTABLE_CLASS > prism_protocol::MAX_VERIFIABLE_TRUST_CLASS);
+        assert!(SNP_GRANTABLE_CLASS <= prism_protocol::MAX_VERIFIABLE_TRUST_CLASS);
     }
 
     #[test]

@@ -5384,8 +5384,18 @@ impl MarketplaceStore {
                     .get(&lease.quote_id)
                     .map_or(lease.trust_class, |quote| quote.trust_class);
                 let verdict = market.lease_verdicts.get(&lease_id);
-                if class_for_lease(lease_id, &lease.node_id, quoted_class, verdict, now)
-                    < quoted_class
+                let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
+                let node_class = class_for_verdict(
+                    &lease.node_id,
+                    market
+                        .tunnels
+                        .get(&lease.node_id)
+                        .is_some_and(|observed_at| *observed_at >= cutoff),
+                    fresh_posture(&market, &lease.node_id, cutoff),
+                    market.verdicts.get(&lease.node_id),
+                    now,
+                );
+                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, now) < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
                 }
@@ -5417,23 +5427,47 @@ impl MarketplaceStore {
                         Option<String>,
                         Option<String>,
                         Option<SqlJson<LeaseAttestationVerdict>>,
+                        bool,
+                        Option<SqlJson<NodePosture>>,
+                        Option<SqlJson<AttestationVerdict>>,
                     ),
                 >(
                     "SELECT l.document->>'node_id', \
                             l.document->>'trust_class', \
                             q.document->>'trust_class', \
                             (SELECT v.document FROM lease_attestation_verdicts v \
-                             WHERE v.lease_id = l.lease_id) \
+                             WHERE v.lease_id = l.lease_id), \
+                            EXISTS ( \
+                                SELECT 1 FROM node_tunnels t \
+                                WHERE t.node_id = l.document->>'node_id' \
+                                  AND t.observed_at >= $3 \
+                            ), \
+                            (SELECT nt.document->'posture' FROM node_telemetry nt \
+                             WHERE nt.node_id = l.document->>'node_id' \
+                               AND nt.observed_at >= $3), \
+                            (SELECT nv.document FROM node_attestation_verdicts nv \
+                             WHERE nv.node_id = l.document->>'node_id' \
+                               AND nv.expires_at > now()) \
                      FROM leases l \
                      LEFT JOIN lease_quotes q ON q.quote_id = l.quote_id \
                      WHERE l.lease_id = $1 AND l.subject = $2 AND l.state = 'active'",
                 )
                 .bind(lease_id as i64)
                 .bind(subject)
+                .bind(now - Duration::seconds(OFFER_MAX_AGE_SECONDS))
                 .fetch_optional(pool)
                 .await
                 .map_err(StoreError::Storage)?;
-                let Some((node_id, recorded_class, quoted_class, verdict)) = standing else {
+                let Some((
+                    node_id,
+                    recorded_class,
+                    quoted_class,
+                    verdict,
+                    tunneled,
+                    posture,
+                    node_verdict,
+                )) = standing
+                else {
                     return Ok(None);
                 };
                 // A lease predating trust classes is `open`, matching the serde
@@ -5443,7 +5477,14 @@ impl MarketplaceStore {
                 let quoted_class =
                     quoted_class.map_or(Ok(recorded_class), |class| parse_trust_class(&class))?;
                 let verdict = verdict.map(|SqlJson(verdict)| verdict);
-                if class_for_lease(lease_id, &node_id, quoted_class, verdict.as_ref(), now)
+                let node_class = class_for_verdict(
+                    &node_id,
+                    tunneled,
+                    posture.as_ref().map(|SqlJson(posture)| posture),
+                    node_verdict.as_ref().map(|SqlJson(verdict)| verdict),
+                    now,
+                );
+                if class_for_lease(lease_id, &node_id, node_class, verdict.as_ref(), now)
                     < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
@@ -8746,6 +8787,18 @@ mod tests {
         let mut listing = offer(&node_id, 100, 10_000);
         listing.device_public_key = attestation_device_key();
         market.offers.insert(node_id.clone(), listing);
+        // The guest rung sits on top of the node rung, so the node has to have
+        // earned `Isolated` before any report from the VM on it can lift a
+        // lease to `Attested`.
+        market.tunnels.insert(node_id.clone(), Utc::now());
+        market.telemetry.insert(
+            node_id.clone(),
+            posture_telemetry(&node_id, IsolationMode::KataVfio, Utc::now()),
+        );
+        market.verdicts.insert(
+            node_id.clone(),
+            attestation_verdict(&node_id, Utc::now() + Duration::hours(24)),
+        );
         let quote_id = Uuid::now_v7();
         market.open_quotes.insert(
             quote_id,
@@ -9116,13 +9169,12 @@ mod tests {
             .await
     }
 
-    /// The rung is earned and then clamped. The verifier grants `Attested` for a
-    /// report that passes every check, and the lease still settles at
-    /// `Isolated`, because that is what the network can substantiate while the
-    /// reference material under the rung is a placeholder. If this test starts
-    /// failing, the ceiling moved and the claim moved with it.
+    /// A report that passes every check earns `Attested`, and the lease settles
+    /// there because the reference material under the rung is now real. The
+    /// second assertion names the class rather than the constant on purpose: if
+    /// the ceiling moves again, this fails and whoever moved it has to say so.
     #[tokio::test]
-    async fn a_fully_verified_guest_still_settles_at_the_ceiling() {
+    async fn a_fully_verified_guest_settles_at_attested() {
         let market = guest_lease_market(TrustClass::Isolated, LeaseState::Provisioning);
         let lease = market.leases[&GUEST_LEASE_ID].1.clone();
         let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
@@ -9141,7 +9193,7 @@ mod tests {
         );
         assert_eq!(
             market.leases[&GUEST_LEASE_ID].1.trust_class,
-            TrustClass::Isolated
+            TrustClass::Attested
         );
 
         // The renter is handed the host key the report names, not whatever the
@@ -9447,8 +9499,12 @@ mod tests {
         );
     }
 
+    /// The posture names a confidential kind, the verdict backing it is an
+    /// ordinary GPU report granting `Isolated`, and the node is served at
+    /// `Isolated`. What the node says about its own hardware adds nothing to
+    /// what the verifier was able to check.
     #[test]
-    fn attested_hardware_claims_are_capped_until_a_verifier_exists() {
+    fn a_claimed_kind_buys_nothing_the_verdict_did_not() {
         let claimed = NodePosture {
             isolation: IsolationMode::KataVfio,
             attestation: Some(prism_protocol::AttestationRef {
@@ -9460,7 +9516,7 @@ mod tests {
 
         assert_eq!(
             class_for_verdict("node-1", true, Some(&claimed), Some(&verdict), Utc::now()),
-            prism_protocol::MAX_VERIFIABLE_TRUST_CLASS,
+            TrustClass::Isolated,
             "naming a confidential kind is a claim, and a claim buys nothing"
         );
     }

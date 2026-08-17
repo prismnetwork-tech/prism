@@ -8,9 +8,11 @@ use axum::{
     routing::{delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
-use prism_protocol::AccessGrant;
+use prism_protocol::{
+    AccessGrant, LeaseAttestationVerdict, MAX_VERIFIABLE_TRUST_CLASS, TrustClass,
+};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +53,16 @@ struct GrantRequest {
     node_id: String,
     connection_id: String,
     ttl_seconds: u32,
+    /// The class the lease was sold at. Absent means the weakest, which needs
+    /// no evidence.
+    #[serde(default)]
+    trust_class: TrustClass,
+    /// Required whenever `trust_class` is above `Open`. The gateway checks it
+    /// rather than trusting the caller's word, because this is the last point
+    /// before credentials exist and a lease sold on hardware evidence must not
+    /// be servable when that evidence is missing.
+    #[serde(default)]
+    verdict: Option<LeaseAttestationVerdict>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +151,39 @@ async fn health(State(state): State<GatewayState>) -> StatusCode {
     }
 }
 
+/// A lease quoted above `Open` only gets credentials if a verdict says the
+/// hardware earned it. The verdict has to be for this lease on this node, still
+/// valid, and at least as strong as what was sold. Anything else is refused
+/// here rather than downgraded, because the renter has already been charged for
+/// the stronger tier.
+fn check_trust_evidence(
+    request: &GrantRequest,
+    now: DateTime<Utc>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if request.trust_class == TrustClass::Open {
+        return Ok(());
+    }
+    if request.trust_class > MAX_VERIFIABLE_TRUST_CLASS {
+        return Err(error(StatusCode::FORBIDDEN, "class_above_ceiling"));
+    }
+    let Some(verdict) = request.verdict.as_ref() else {
+        return Err(error(StatusCode::FORBIDDEN, "attestation_missing"));
+    };
+    if verdict.node_id != request.node_id {
+        return Err(error(StatusCode::FORBIDDEN, "attestation_node_mismatch"));
+    }
+    if verdict.lease_id.to_string() != request.lease_id {
+        return Err(error(StatusCode::FORBIDDEN, "attestation_lease_mismatch"));
+    }
+    if verdict.expires_at <= now {
+        return Err(error(StatusCode::FORBIDDEN, "attestation_expired"));
+    }
+    if verdict.granted_class < request.trust_class {
+        return Err(error(StatusCode::FORBIDDEN, "attestation_too_weak"));
+    }
+    Ok(())
+}
+
 async fn issue_grant(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -153,6 +198,7 @@ async fn issue_grant(
         return Err(error(StatusCode::BAD_REQUEST, "invalid_grant"));
     }
     let now = Utc::now();
+    check_trust_evidence(&request, now)?;
     let grant = AccessGrant {
         token_id: request.token_id,
         lease_id: request.lease_id,
@@ -568,5 +614,162 @@ mod tests {
         second.changed().await.unwrap();
         assert!(*first.borrow());
         assert!(*second.borrow());
+    }
+
+    fn verdict_for(
+        lease: u64,
+        node: &str,
+        class: TrustClass,
+        expires: DateTime<Utc>,
+    ) -> LeaseAttestationVerdict {
+        LeaseAttestationVerdict {
+            lease_id: lease,
+            node_id: node.to_owned(),
+            kind: prism_protocol::AttestationKind::SevSnp,
+            guest: prism_protocol::AttestedGuest {
+                measurement: String::new(),
+                host_data: String::new(),
+                chip_id_digest: String::new(),
+                reported_tcb: prism_protocol::SnpTcb {
+                    bootloader: 0,
+                    tee: 0,
+                    snp: 0,
+                    microcode: 0,
+                },
+                policy_debug: false,
+                vmpl: 0,
+                channel_key_fingerprint: String::new(),
+                image_digest: String::new(),
+            },
+            granted_class: class,
+            verifier_version: "test".to_owned(),
+            verified_at: expires - Duration::days(1),
+            expires_at: expires,
+        }
+    }
+
+    fn request_at(class: TrustClass, verdict: Option<LeaseAttestationVerdict>) -> GrantRequest {
+        GrantRequest {
+            token_id: Uuid::nil(),
+            lease_id: "4711".to_owned(),
+            node_id: "0xabc".to_owned(),
+            connection_id: "c1".to_owned(),
+            ttl_seconds: 900,
+            trust_class: class,
+            verdict,
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    fn reason(r: Result<(), (StatusCode, Json<ErrorResponse>)>) -> String {
+        match r {
+            Ok(()) => "ok".to_owned(),
+            Err((_, body)) => body.0.code.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_weakest_class_needs_no_evidence() {
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Open, None),
+                now()
+            )),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn a_stronger_class_without_a_verdict_gets_nothing() {
+        // The whole point of the gate: the lease was sold on hardware evidence,
+        // so it must not be servable when that evidence is absent.
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Isolated, None),
+                now()
+            )),
+            "attestation_missing"
+        );
+    }
+
+    #[test]
+    fn a_verdict_for_another_lease_or_node_grants_nothing() {
+        let n = now();
+        let wrong_lease = verdict_for(9999, "0xabc", TrustClass::Isolated, n + Duration::days(1));
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Isolated, Some(wrong_lease)),
+                n
+            )),
+            "attestation_lease_mismatch"
+        );
+        let wrong_node = verdict_for(4711, "0xdef", TrustClass::Isolated, n + Duration::days(1));
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Isolated, Some(wrong_node)),
+                n
+            )),
+            "attestation_node_mismatch"
+        );
+    }
+
+    #[test]
+    fn an_expired_or_weaker_verdict_grants_nothing() {
+        let n = now();
+        let expired = verdict_for(
+            4711,
+            "0xabc",
+            TrustClass::Isolated,
+            n - Duration::seconds(1),
+        );
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Isolated, Some(expired)),
+                n
+            )),
+            "attestation_expired"
+        );
+        let weak = verdict_for(4711, "0xabc", TrustClass::Open, n + Duration::days(1));
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Isolated, Some(weak)),
+                n
+            )),
+            "attestation_too_weak"
+        );
+    }
+
+    #[test]
+    fn a_matching_verdict_opens_the_gate() {
+        let n = now();
+        let good = verdict_for(4711, "0xabc", TrustClass::Isolated, n + Duration::days(1));
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Isolated, Some(good)),
+                n
+            )),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn nothing_above_the_ceiling_is_servable_however_good_the_verdict() {
+        let n = now();
+        let strong = verdict_for(
+            4711,
+            "0xabc",
+            TrustClass::Confidential,
+            n + Duration::days(1),
+        );
+        assert_eq!(
+            reason(check_trust_evidence(
+                &request_at(TrustClass::Confidential, Some(strong)),
+                n
+            )),
+            "class_above_ceiling"
+        );
     }
 }

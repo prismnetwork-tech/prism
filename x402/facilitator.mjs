@@ -1,9 +1,9 @@
 // The facilitator half of x402: verify and settle on someone else's behalf.
 //
-// The public facilitators the ecosystem points at are testnet-only, so anyone
-// wanting to charge real money on Base has to run this themselves. This is the
-// same verifier Prism uses for its own endpoints, exposed at the routes the
-// spec defines.
+// The free public facilitators are testnet-only. Coinbase's settles Base
+// mainnet but wants an API key and does not know Robinhood Chain, which is
+// where our leases settle, so we run our own. This is the same verifier Prism
+// uses for its own endpoints, exposed at the routes the spec defines.
 //
 // Settling for a stranger means broadcasting a transaction and paying its gas,
 // which is the whole cost of the service and the whole abuse surface. Verify is

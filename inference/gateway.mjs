@@ -247,7 +247,7 @@ export function createGateway({
         asset: USDC_BASE,
         payTo: basePayTo,
         amount: amount.toString(),
-        resource: "/v1/inference",
+        resource: `${originUrl}/v1/inference`,
         description:
           "One generation on a Prism GPU, paid in USDC on Base. Sign an EIP-3009 " +
           "transferWithAuthorization for the quoted amount and send it as the payment header. " +

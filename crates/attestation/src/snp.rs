@@ -4,9 +4,9 @@
 //! ABI Specification, publication 56860, revision 1.55, tables
 //! "ATTESTATION_REPORT Structure", "TCB_VERSION" and "GUEST_POLICY". That is
 //! the ABI the Dallas platform reports (SEV-SNP API 1.55) and it defines report
-//! VERSION 2. Revision 1.56 introduced VERSION 3, which names three bytes the
-//! reserved block at 0x188 used to cover; this decoder refuses it by version
-//! rather than reading a field it was not built for.
+//! VERSION 2. Revision 1.56 introduced VERSION 3, which only names three bytes
+//! the reserved block at 0x188 used to cover. Both are accepted because every
+//! field read below is identical in the two, and the platform emits 3.
 //!
 //! The full VERSION 2 layout, for confirming the constants below against the
 //! table:
@@ -44,7 +44,13 @@ pub(crate) const REPORT_LEN: usize = 1184;
 /// nothing after it.
 const SIGNED_LEN: usize = 0x2A0;
 
-const REPORT_VERSION: u32 = 2;
+/// Revision 1.55 defines VERSION 2 and 1.56 defines VERSION 3. The two are
+/// identical across every field this decoder reads: 3 only names three bytes
+/// at 0x188 that 2 left reserved (the CPUID family/model/stepping), and
+/// nothing here depends on them. Genoa platforms in the field emit 3, so
+/// refusing it rejects genuine current hardware.
+const REPORT_VERSIONS: [u32; 2] = [2, 3];
+const REPORT_VERSION_EMITTED: u32 = 2;
 const SIGNATURE_ALGO_ECDSA_P384_SHA384: u32 = 1;
 
 /// Bits 2 through 4 of the flags word name the key that signed the report. Zero
@@ -153,7 +159,7 @@ pub(crate) fn parse_report(raw: &[u8], line: ProductLine) -> Result<Report, Veri
     if raw.len() != REPORT_LEN {
         return Err(VerificationError::SnpReportWrongSize);
     }
-    if u32_at(raw, OFF_VERSION) != REPORT_VERSION {
+    if !REPORT_VERSIONS.contains(&u32_at(raw, OFF_VERSION)) {
         return Err(VerificationError::SnpReportVersionUnsupported);
     }
     if u32_at(raw, OFF_SIGNATURE_ALGO) != SIGNATURE_ALGO_ECDSA_P384_SHA384 {
@@ -239,7 +245,7 @@ impl SnpReportBuilder {
     /// Dallas platform; debug, migration and single socket are not set.
     pub fn genoa(report_data: [u8; 64], measurement: [u8; 48], chip_id: [u8; 64]) -> Self {
         let mut raw = [0_u8; REPORT_LEN];
-        raw[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&REPORT_VERSION.to_le_bytes());
+        raw[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&REPORT_VERSION_EMITTED.to_le_bytes());
         raw[OFF_SIGNATURE_ALGO..OFF_SIGNATURE_ALGO + 4]
             .copy_from_slice(&SIGNATURE_ALGO_ECDSA_P384_SHA384.to_le_bytes());
         raw[OFF_POLICY..OFF_POLICY + 8].copy_from_slice(&((1_u64 << 17) | (1 << 16)).to_le_bytes());

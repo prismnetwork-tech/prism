@@ -7,9 +7,9 @@ use prism_chain::{
     word_u128,
 };
 use prism_protocol::{
-    AttestationVerdict, CredentialCipher, ExecutionEvidence, LeaseRecord, LeaseState, NodeOffer,
-    NodeTelemetry, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptAttestation, ReceiptOutcome,
-    SettlementEvidence, TrustClass, receipt_hash, verdict_digest,
+    AttestationVerdict, CredentialCipher, ExecutionEvidence, LeaseAttestationVerdict, LeaseRecord,
+    LeaseState, NodeOffer, NodeTelemetry, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptAttestation,
+    ReceiptOutcome, SettlementEvidence, TrustClass, receipt_hash, verdict_digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -161,6 +161,13 @@ struct GrantRequest<'a> {
     node_id: &'a str,
     connection_id: &'a str,
     ttl_seconds: u32,
+    /// What the lease was sold as, and the evidence for it. The gateway refuses
+    /// anything above `Open` without a verdict that matches, so a lease quoted
+    /// on hardware evidence stops being servable the moment that evidence is
+    /// missing rather than degrading quietly to a weaker guarantee.
+    trust_class: TrustClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verdict: Option<LeaseAttestationVerdict>,
 }
 
 #[derive(Deserialize)]
@@ -1707,6 +1714,23 @@ impl Worker {
         Ok(())
     }
 
+    /// The verdict recorded for this lease, if the guest has been attested.
+    /// Read rather than derived: the gateway checks it against what the lease
+    /// was sold as, and a worker that could synthesise one would defeat the
+    /// check it is feeding.
+    async fn lease_verdict(
+        &self,
+        lease_id: u64,
+    ) -> anyhow::Result<Option<LeaseAttestationVerdict>> {
+        let row = query_scalar::<_, SqlJson<LeaseAttestationVerdict>>(
+            "SELECT document FROM lease_attestation_verdicts WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|SqlJson(verdict)| verdict))
+    }
+
     async fn issue_grant(&self, lease_id: u64, rotate: bool) -> anyhow::Result<()> {
         let context = self.lease_context(lease_id).await?;
         let connection_id = context
@@ -1745,6 +1769,8 @@ impl Worker {
                 &context.lease.node_id,
                 connection_id,
                 ttl_seconds,
+                context.lease.trust_class,
+                self.lease_verdict(lease_id).await?,
             )
             .await?;
         if response.grant.token_id != token_id
@@ -2327,6 +2353,8 @@ impl GatewayClient {
         node_id: &str,
         connection_id: &str,
         ttl_seconds: u32,
+        trust_class: TrustClass,
+        verdict: Option<LeaseAttestationVerdict>,
     ) -> anyhow::Result<GrantResponse> {
         self.client
             .post(self.base_url.join("v1/grants")?)
@@ -2337,6 +2365,8 @@ impl GatewayClient {
                 node_id,
                 connection_id,
                 ttl_seconds,
+                trust_class,
+                verdict,
             })
             .send()
             .await?

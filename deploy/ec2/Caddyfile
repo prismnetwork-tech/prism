@@ -46,3 +46,20 @@ prismnetwork.tech, www.prismnetwork.tech {
 		header_up Host prism-network-web.onrender.com
 	}
 }
+
+registry.prismnetwork.tech {
+	# Pulls are open because the image is the public website. Publishing is not.
+	# The hash lives in registry-auth/htpasswd on the host, not in the repo.
+	@write not method GET HEAD OPTIONS
+	basic_auth @write {
+		prism-deploy {$PRISM_REGISTRY_HASH}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	reverse_proxy registry:5000
+}

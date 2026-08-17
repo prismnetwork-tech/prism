@@ -98,3 +98,55 @@ GPU attestation reports need confidential computing mode on the card, which
 reports `CC status: OFF` by default and is not enabled by any of the above.
 Until it is on, there is no NVIDIA-signed report to verify and the trust roots
 in `crates/attestation` stay placeholders.
+
+## Confidential guests
+
+The same node runs the workload inside an SEV-SNP guest with the GPU attached,
+which is what `confidential` describes. From inside such a guest:
+
+    Memory Encryption Features active: AMD SEV SEV-ES SEV-SNP
+    nvidia-smi conf-compute -f  ->  CC status: ON
+
+Three things have to line up, and each fails differently.
+
+**Confidential mode on the card.** `nvidia-smi conf-compute -srs` is the ready
+state, not the mode. The mode lives on the card and is set with NVIDIA's
+`gpu-admin-tools`:
+
+    python3 ./nvidia_gpu_tools.py --gpu-bdf=<bdf> --set-cc-mode=on \
+      --reset-after-cc-mode-switch
+
+Once it is on, the host's own `nvidia-smi` reports no devices. That is the mode
+working, not a fault: a CC-mode card refuses to serve anything outside a
+confidential guest, which also means the plain Kata path above stops getting a
+GPU.
+
+**IOMMUFD, not the legacy VFIO group.** A confidential guest refuses
+`/dev/vfio/<group>` with "ConfidentialGuest needs IOMMUFD". Load `iommufd` and
+pass the cdev instead:
+
+    modprobe iommufd            # creates /dev/iommu
+    --device /dev/vfio/devices/vfio0
+
+**Guest pull, and the annotation it needs.** A confidential guest will not mount
+a rootfs the host prepared, because trusting the host is the thing it exists to
+avoid. It pulls its own image, which needs
+`experimental_force_guest_pull = true`. Outside Kubernetes that then fails with
+"Failed to get image name from annotation", because the image name normally
+arrives from CRI. Supply it directly:
+
+    nerdctl run --annotation io.kubernetes.cri.image-name=<full image ref> ...
+
+Confirm it is genuinely confidential rather than a plain VM that happened to
+boot. The guest's own dmesg is the authority, and the QEMU line should carry
+`-object sev-snp-guest`:
+
+    journalctl -t kata | grep -oE '\-object [a-z-]*'
+
+## What is still missing for `attested`
+
+The guest cannot take an SNP attestation report yet. Kata's guest kernel has no
+`sev-guest` driver and no `/sys/kernel/config/tsm`, so there is no interface to
+ask the PSP for one. Encrypted memory is running; the evidence that proves it to
+someone else is not available. That needs a guest kernel built with
+`CONFIG_SEV_GUEST`, or the CoCo attestation agent inside the guest image.

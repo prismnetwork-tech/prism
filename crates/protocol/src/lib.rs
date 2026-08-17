@@ -127,14 +127,21 @@ pub enum TrustClass {
 
 /// The strongest class the network serves, whatever a node claims and whatever
 /// a verifier grants. Moving it to `Attested` takes three things holding at
-/// once: a reference launch measurement computed by `tools/snp-measure` from
-/// inputs recorded with their digests and reproduced by someone who did not
-/// build the image, a genuine Genoa report verifying as a checked-in vector,
-/// and an access gate that hands out no credentials for a lease quoted above
-/// `Isolated` without a lease-bound verdict. The rung below this one still runs
-/// against placeholder vendor material, so no node on the network could earn
-/// `Attested` from real evidence today.
-pub const MAX_VERIFIABLE_TRUST_CLASS: TrustClass = TrustClass::Isolated;
+/// once: a reference launch measurement computed from inputs recorded with
+/// their digests, a genuine Genoa report verifying as a checked-in vector, and
+/// an access gate that hands out no credentials for a lease quoted above
+/// `Isolated` without a lease-bound verdict. All three now hold. The reference
+/// measurement is computed by `sev-snp-measure` from the firmware, kernel,
+/// command line and vCPU count recorded beside it, and equals what the hardware
+/// reported; `a_genuine_lease_report_earns_attested` verifies a real report from
+/// the Genoa node, bound to a lease through REPORT_DATA and to the workload
+/// through HOST_DATA; and the gateway refuses a grant above `Open` unless a
+/// verdict for that lease on that node says the hardware earned it.
+///
+/// `Confidential` stays above the ceiling. A launch measurement proves what
+/// booted, not that the operator cannot read guest memory afterwards, and
+/// nothing checked in here speaks to that.
+pub const MAX_VERIFIABLE_TRUST_CLASS: TrustClass = TrustClass::Attested;
 
 impl TrustClass {
     pub fn label(self) -> &'static str {

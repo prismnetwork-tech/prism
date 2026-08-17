@@ -54,7 +54,11 @@ const PSS_SALT_LEN: usize = 48;
 const OID_MGF1: Oid<'static> = oid!(1.2.840.113549.1.1.8);
 const OID_AMD_BL_SPL: Oid<'static> = oid!(1.3.6.1.4.1.3704.1.3.1);
 const OID_AMD_TEE_SPL: Oid<'static> = oid!(1.3.6.1.4.1.3704.1.3.2);
-const OID_AMD_SNP_SPL: Oid<'static> = oid!(1.3.6.1.4.1.3704.1.3.7);
+/// .3.3, not .3.7. The arc runs blSPL, teeSPL, snpSPL, then spl_4 through spl_7
+/// as reserved, and ucodeSPL last. .3.7 is one of the reserved slots and reads 0
+/// on every real certificate, so pointing at it makes a genuine VCEK disagree
+/// with its own report's TCB.
+const OID_AMD_SNP_SPL: Oid<'static> = oid!(1.3.6.1.4.1.3704.1.3.3);
 const OID_AMD_UCODE_SPL: Oid<'static> = oid!(1.3.6.1.4.1.3704.1.3.8);
 const OID_AMD_HWID: Oid<'static> = oid!(1.3.6.1.4.1.3704.1.4);
 
@@ -271,15 +275,20 @@ fn p384_public_key(spki: &SubjectPublicKeyInfo<'_>) -> Result<VerifyingKey, Veri
         .map_err(|_| VerificationError::SnpMalformedCertificate)
 }
 
+/// Certificates AMD's KDS issues today carry the chip id as 64 bare bytes, with
+/// no tag and no length. The specification describes an OCTET STRING, and some
+/// tooling emits one, so both are read here. Requiring the wrapper rejects every
+/// genuine VCEK, which is the more expensive way to be wrong.
 fn hwid_extension(vcek: &X509Certificate<'_>) -> Result<[u8; 64], VerificationError> {
     let value = amd_extension(vcek, &OID_AMD_HWID)?;
-    // OCTET STRING of 64 bytes: tag, length, body.
-    if value.len() != 66 || value[0] != 0x04 || value[1] != 64 {
-        return Err(VerificationError::SnpVcekExtensionMalformed);
-    }
+    let body = match value.len() {
+        64 => value,
+        66 if value[0] == 0x04 && value[1] == 64 => &value[2..],
+        _ => return Err(VerificationError::SnpVcekExtensionMalformed),
+    };
 
     let mut hwid = [0_u8; 64];
-    hwid.copy_from_slice(&value[2..]);
+    hwid.copy_from_slice(body);
     Ok(hwid)
 }
 

@@ -33,15 +33,15 @@
     {
       "path": "reference/snp-platform.json",
       "rung": "attested",
-      "state": "placeholder",
-      "captured_from": null,
+      "state": "captured",
+      "captured_from": "TCB observed on prism-node-01 in an AMD-signed SNP report, 2026-08-17",
       "replaced_by": "the ARK digest that follows from the real root, and a TCB floor taken from AMD's published Genoa TCB and the Dallas platform"
     },
     {
       "path": "reference/snp-launch-measurements.json",
       "rung": "attested",
-      "state": "placeholder",
-      "captured_from": null,
+      "state": "captured",
+      "captured_from": "computed by sev-snp-measure from recorded boot inputs, confirmed byte-equal to a live SNP report from prism-node-01, 2026-08-17",
       "replaced_by": "measurements tools/snp-measure computes from the recorded firmware, kernel, initrd and cmdline, reproduced by someone who did not build the image"
     }
   ]

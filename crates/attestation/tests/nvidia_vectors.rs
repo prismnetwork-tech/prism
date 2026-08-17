@@ -112,7 +112,10 @@ fn reference_measurements() -> Vec<(u32, [u8; 48])> {
         .map(|entry| {
             // A slot may list alternatives; a report carries one value, so the
             // vectors build a conforming report from the first.
-            let first = entry.sha384.first().expect("a slot lists at least one digest");
+            let first = entry
+                .sha384
+                .first()
+                .expect("a slot lists at least one digest");
             let digest: [u8; 48] = hex::decode(first)
                 .expect("hex digest")
                 .try_into()

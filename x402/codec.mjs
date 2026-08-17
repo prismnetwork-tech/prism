@@ -111,23 +111,49 @@ export function requirementsFor(version, requirements) {
 /// `schema.properties.output.properties.example` for the response. `input`
 /// describes the whole request, of which the JSON body is one part, so the
 /// wrapper is where query parameters and headers would go too.
-function bazaar({ input, output }) {
+function bazaar({ input, output, example, inputExample, method = "POST" }) {
+  // Mirrors the shape listed services actually publish: a declared JSON Schema
+  // draft, and every field `info` carries declared here. A field present in the
+  // instance but absent from the schema is what makes a parser report the
+  // instance as incomplete.
   const shape = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
     type: "object",
     properties: {
       input: {
         type: "object",
-        properties: { body: input },
+        additionalProperties: false,
+        properties: {
+          type: { type: "string", enum: ["http"] },
+          method: { type: "string", enum: [method] },
+          body: input,
+        },
         required: ["body"],
       },
       output: {
         type: "object",
+        additionalProperties: false,
         properties: { example: output },
       },
     },
     required: ["input"],
   };
-  return { bazaar: { info: { input: { body: input }, output: { example: output } }, schema: shape } };
+  // `schema` describes the call for readers that walk properties; `info` is the
+  // filled-in instance of it. They are not interchangeable: `info.input` needs
+  // the transport (`type`, `method`) that a schema has no place for, and
+  // `info.output.example` wants a literal sample rather than another schema.
+  return {
+    bazaar: {
+      info: {
+        // `info` is the instance, so both halves carry samples rather than
+        // schemas. Putting the schema here reads as a body that is missing its
+        // fields, because a schema has none of them at the top level.
+        input: { type: "http", method, body: inputExample ?? input },
+        output: example ? { example } : { example: output },
+      },
+      schema: shape,
+    },
+  };
 }
 
 /**

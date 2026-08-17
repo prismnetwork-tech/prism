@@ -1122,15 +1122,13 @@ mod tests {
 
     #[test]
     fn a_class_above_the_ceiling_is_never_minted() {
-        for class in [TrustClass::Attested, TrustClass::Confidential] {
-            let mut evidence = evidence();
-            evidence.trust_class = Some(class);
-            assert!(
-                reconcile(&evidence).is_err(),
-                "{} settled without verified attestation",
-                class.label()
-            );
-        }
+        let mut evidence = evidence();
+        evidence.trust_class = Some(TrustClass::Confidential);
+
+        assert!(
+            reconcile(&evidence).is_err(),
+            "confidential settled without verified attestation"
+        );
     }
 
     #[test]

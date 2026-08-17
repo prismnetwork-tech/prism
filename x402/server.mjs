@@ -8,8 +8,8 @@
 // A failed job therefore charges nothing and needs no refund.
 //
 // /verify, /settle and /supported are the facilitator half: the same verifier,
-// offered to other people's endpoints, because every public facilitator the
-// ecosystem lists is testnet-only.
+// offered to other people's endpoints, because the free public ones are
+// testnet-only and the one that is not needs an API key.
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -17,7 +17,7 @@ import { base } from "viem/chains";
 import { createPublicClient, createWalletClient, erc20Abi, getAddress, http, recoverMessageAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
-import { jobInput, jobOutput } from "./schemas.mjs";
+import { jobExample, jobInput, jobInputExample, jobOutput } from "./schemas.mjs";
 import { createExactEvm } from "./exact-evm.mjs";
 import { createFacilitator, createBudget } from "./facilitator.mjs";
 import { detect, parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "./codec.mjs";
@@ -175,7 +175,13 @@ function releasePayment(key) {
 const JOB_TIMEOUT_SECONDS = () => config.durationSeconds + 120;
 
 function accepted(resource) {
-  return networks.map((network) => ({
+  // Base first, matching the inference endpoint. Validators read accepts[0] as
+  // the headline, and leading with a chain they do not index makes a payable
+  // endpoint look unsupported.
+  const ordered = [...networks].sort(
+    (a, b) => Number(b.id === `eip155:${base.id}`) - Number(a.id === `eip155:${base.id}`),
+  );
+  return ordered.map((network) => ({
     scheme: "exact",
     network: network.id,
     asset: network.asset,
@@ -206,7 +212,7 @@ function paymentRequirements(path, version = 2, error = null) {
       description: "One shell command on a rented GPU, charged only if it succeeds.",
       mimeType: "application/json",
     },
-    schemas: { input: jobInput, output: jobOutput },
+    schemas: { input: jobInput, output: jobOutput, example: jobExample, inputExample: jobInputExample, method: "POST" },
   });
 }
 
@@ -426,6 +432,14 @@ const server = createServer(async (req, res) => {
     return json(res, 200, view);
   }
 
+  // A discovery probe asks with GET. Answering 404 makes a paid endpoint look
+  // broken to every crawler that finds it; answering the challenge costs
+  // nothing and runs no job, because a safe method must stay safe.
+  if (req.method === "GET" && url.pathname === "/run") {
+    const version = detect(req.headers)?.version ?? 2;
+    const required = paymentRequirements("/run", version);
+    return json(res, 402, required.body, required.headers);
+  }
   if (req.method === "POST" && url.pathname === "/run") {
     let body;
     try {

@@ -948,19 +948,21 @@ mod tests {
         assert!(validate_receipts(&[receipt]).is_err());
     }
 
+    /// `Confidential` is the one class left above the ceiling, and a receipt
+    /// carrying perfectly well-formed evidence for it is still refused. The
+    /// evidence is what makes this worth asserting: the receipt fails on the
+    /// class alone.
     #[test]
     fn receipt_validation_rejects_a_class_the_network_cannot_verify() {
-        for class in [TrustClass::Attested, TrustClass::Confidential] {
-            let mut receipt = valid_receipt("1", 'a');
-            receipt.trust_class = Some(class);
-            receipt.attestation = Some(attestation());
-            receipt.receipt_hash = receipt_hash(&receipt).unwrap();
-            assert!(
-                validate_receipts(&[receipt]).is_err(),
-                "{} published above the ceiling",
-                class.label()
-            );
-        }
+        let mut receipt = valid_receipt("1", 'a');
+        receipt.trust_class = Some(TrustClass::Confidential);
+        receipt.attestation = Some(attestation());
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        assert!(
+            validate_receipts(&[receipt]).is_err(),
+            "confidential published above the ceiling"
+        );
     }
 
     #[test]
@@ -983,6 +985,9 @@ mod tests {
         ] {
             let mut receipt = valid_receipt("1", 'a');
             receipt.trust_class = class;
+            if class.is_some_and(|class| class >= TrustClass::Attested) {
+                receipt.attestation = Some(attestation());
+            }
             receipt.receipt_hash = receipt_hash(&receipt).unwrap();
             validate_receipts(&[receipt]).unwrap();
         }
