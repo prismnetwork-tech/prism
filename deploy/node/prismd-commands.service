@@ -18,7 +18,10 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/prismd /run/lock/prismd
+# nerdctl keeps its own volume and container state outside the daemon's, and it
+# talks to containerd over a socket, so both have to stay writable or every
+# workspace dies at `mkdir ... read-only file system`.
+ReadWritePaths=/var/lib/prismd /run/lock/prismd /var/lib/nerdctl /run/containerd
 PrivateTmp=true
 UMask=0077
 

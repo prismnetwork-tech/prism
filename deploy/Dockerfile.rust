@@ -5,6 +5,10 @@ COPY crates ./crates
 COPY services ./services
 COPY workers ./workers
 COPY node ./node
+# A workspace member cargo cannot find fails the manifest for every binary, not
+# just its own, so every member the lockfile names has to be here even when no
+# service links it.
+COPY tools ./tools
 ARG BINARY
 RUN test -n "${BINARY}"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
