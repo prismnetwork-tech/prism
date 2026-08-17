@@ -1,0 +1,22 @@
+# The renter's session. The host key is generated at boot into /run, never
+# shipped in the image, and its fingerprint is what the guest's attestation
+# report commits to. A client that does not pin that fingerprint is talking to
+# whatever answered.
+
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /run/prism/ssh_host_key
+PidFile /run/prism/sshd.pid
+AuthorizedKeysFile /run/prism/authorized_keys
+
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+PermitUserEnvironment no
+AllowAgentForwarding no
+AllowTcpForwarding no
+X11Forwarding no
+GatewayPorts no
+AllowUsers workspace
+Subsystem sftp internal-sftp

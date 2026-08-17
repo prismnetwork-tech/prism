@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "product_line": "genoa",
+  "provenance": "genuine-root-placeholder-tcb",
+  "note": "ark_sha256 is the digest of roots/amd-ark-genoa.der, which is now the real ARK-Genoa fetched from AMD KDS and verified self-signed, with the ASK chaining to it. The TCB floor below is still a guess: it has not been read off AMD's published Genoa TCB or off the Dallas platform, so this file is only half real. A mismatch between this digest and the compiled root is a build mistake and panics at load.",
+  "ark_sha256": "4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1",
+  "required_vmpl": 0,
+  "guest_policy": {
+    "debug": false,
+    "migrate_ma": false,
+    "smt": true,
+    "single_socket": false
+  },
+  "tcb_floor": {
+    "bootloader": 10,
+    "tee": 0,
+    "snp": 25,
+    "microcode": 84
+  },
+  "ark_subject": "CN=ARK-Genoa, O=Advanced Micro Devices",
+  "ark_source": "https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain, fetched 2026-08-17"
+}

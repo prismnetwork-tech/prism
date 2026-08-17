@@ -1,0 +1,16 @@
+# Installed into the guest root filesystem. Anything added here changes the
+# verity root hash, the command line and every measurement in the reference
+# file, so the list stays as short as the guest can run on.
+
+# The renter's session terminates on this sshd, inside the guest, on a host key
+# the agent generates at boot and the report commits to.
+openssh-server
+
+# The workload image is pulled and run inside the guest against the digest
+# HOST_DATA names, so the guest needs its own runtime rather than trusting one
+# the host would hand it.
+crun
+skopeo
+umoci
+
+ca-certificates

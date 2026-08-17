@@ -429,3 +429,141 @@ test("an unpaid v1 request gets no protocol headers, which is where v1 puts noth
   assert.deepEqual(out.headers, {});
   assert.equal(out.body.accepts[0].network, "base");
 });
+
+test("a settlement that broadcasts but cannot be read is neither revenue nor loss", async () => {
+  const exact = fakeExact();
+  exact.settle = async () => ({
+    success: false,
+    settled: null,
+    errorReason: "settlement_unconfirmed",
+    payer: PAYER,
+    transaction: "0xbroadcast",
+    network: "eip155:8453",
+  });
+  const gateway = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 200);
+  const s = gateway.stats();
+  assert.equal(s.unconfirmed, 1);
+  assert.equal(s.unsettled, 0, "an unread receipt is not a known loss");
+  assert.equal(s.revenue_micros, "0", "nor is it known revenue");
+});
+
+test("a settle that throws still hands over the work already paid for", async () => {
+  const exact = fakeExact();
+  exact.settle = async () => {
+    throw new Error("rpc exploded");
+  };
+  const gateway = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact });
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 200, "the money may have moved and the generation exists");
+  assert.equal(out.body.response, "hello");
+  assert.equal(gateway.stats().unconfirmed, 1);
+});
+
+test("a payment quoted under v1 is accepted when it echoes the v1 network name", async () => {
+  const deps = fakeDeps();
+  const exact = fakeExact();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact });
+  // What a client that read the v1 402 sends back: the chain named, not CAIP-2.
+  const v1Echo = Buffer.from(JSON.stringify({
+    x402Version: 1,
+    scheme: "exact",
+    network: "base",
+    payload: {
+      signature: "0xsig",
+      authorization: { from: PAYER, to: BASE_PAY_TO, value: "10000", validAfter: "1", validBefore: "2", nonce: NONCE },
+    },
+  })).toString("base64");
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, v1Echo, 1);
+  assert.equal(out.status, 200);
+  // And it is still checked against our own CAIP-2 requirement.
+  assert.equal(exact.calls.requirements[0].network, "eip155:8453");
+});
+
+test("a cold box answers immediately with when to retry instead of holding the caller", async () => {
+  let release;
+  const deps = fakeDeps({
+    agent: {
+      ...fakeDeps().agent,
+      // A lease that never lands, which is what a cold start looks like for the
+      // minutes it takes to source a GPU and pull models.
+      lease: () => new Promise((r) => { release = r; }),
+    },
+  });
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact(), readyWaitMs: 30, retryAfterMs: 90_000 });
+  const started = Date.now();
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.ok(Date.now() - started < 2_000, "the caller must not wait on a GPU");
+  assert.equal(out.status, 503);
+  assert.equal(out.body.error, "warming_up");
+  assert.equal(out.body.retry_after_seconds, 90);
+  assert.equal(out.headers["retry-after"], "90");
+  release?.({ leaseId: 1, access: {} });
+});
+
+test("nothing is charged while warming, so the same authorization still works", async () => {
+  let release;
+  const base = fakeDeps();
+  const deps = fakeDeps({ agent: { ...base.agent, lease: () => new Promise((r) => { release = r; }) } });
+  const exact = fakeExact();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact, readyWaitMs: 30 });
+  const first = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(first.status, 503);
+  assert.equal(exact.calls.settled, 0, "a warming box must not take money");
+
+  // Same authorization again once the box is up: not a replay, because the
+  // first attempt never consumed it.
+  const warm = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  const second = await warm.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(second.status, 200);
+  release?.({ leaseId: 1, access: {} });
+});
+
+test("a warm box still serves without waiting", async () => {
+  const gateway = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact: fakeExact(), readyWaitMs: 30 });
+  await gateway.ensureWarm();
+  const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.response, "hello");
+});
+
+test("an unpaid request never leases a GPU, so nobody can spend our money for free", async () => {
+  const deps = fakeDeps();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2);
+  // And neither does one whose payment does not verify.
+  await gateway.handleInference(
+    { model: "llama3.2:3b", prompt: "hi" },
+    authorization(),
+    2,
+  ).catch(() => {});
+  const refused = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact({ isValid: false }) });
+  await refused.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
+  assert.equal(deps.calls.leases, 1, "only the one verified payment leased anything");
+});
+
+test("an unpaid probe is told the price, not that its body is wrong", async () => {
+  const gateway = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  // What a discovery crawler sends: nothing.
+  for (const body of [{}, undefined, { model: "nope" }, { model: "llama3.2:3b" }]) {
+    const out = await gateway.handleInference(body, undefined, 2);
+    assert.equal(out.status, 402, `an empty or partial body must still be quoted: ${JSON.stringify(body)}`);
+    assert.ok(out.body.accepts.length > 0);
+    assert.ok(BigInt(out.body.accepts[0].amount) > 0n, "amounts are atomic units, never zero");
+  }
+  // An unpriceable request is quoted at the full-cap price, which clears
+  // anything, and that is the same figure /v1/models advertises.
+  const vague = await gateway.handleInference({}, undefined, 2);
+  assert.equal(vague.body.quote, undefined);
+  assert.equal(vague.body.accepts[0].amount, gateway.models().price_micros);
+});
+
+test("a paid request with a bad body is still refused in detail and never charged", async () => {
+  const deps = fakeDeps();
+  const exact = fakeExact();
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact });
+  assert.equal((await gateway.handleInference({ model: "nope" }, authorization(), 2)).status, 400);
+  assert.equal(exact.calls.settled, 0);
+  assert.equal(deps.calls.leases, 0);
+});

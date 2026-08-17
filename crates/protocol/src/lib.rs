@@ -6,7 +6,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -65,6 +65,8 @@ const TUNNEL_SIGNATURE_DOMAIN: &[u8] = b"prism.node-tunnel.v1\0";
 const CERTIFICATE_SIGNATURE_DOMAIN: &[u8] = b"prism.node-certificate.v1\0";
 const COMMAND_POLL_SIGNATURE_DOMAIN: &[u8] = b"prism.node-command-poll.v1\0";
 const COMMAND_REPORT_SIGNATURE_DOMAIN: &[u8] = b"prism.node-command-report.v1\0";
+const ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.node-attestation.v1\0";
+const GUEST_ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.guest-attestation.v1\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -114,17 +116,24 @@ pub enum TrustClass {
     /// Kata VM with exclusive VFIO passthrough and a digest-pinned public
     /// image. Narrows the attack surface; the host is still privileged.
     Isolated,
-    /// Launch measurement and GPU device identity verified against vendor
-    /// roots, so the renter can check what booted.
+    /// The launch measurement of the renter's own guest, reported by that guest
+    /// rather than by the machine hosting it: SNP assumes a hostile host and
+    /// gives it no way to attest, so this says what the VM booted and nothing
+    /// about who ran it.
     Attested,
     /// Guest memory and VRAM are encrypted against the host.
     Confidential,
 }
 
-/// The strongest class the network can currently substantiate. Attestation
-/// evidence is carried end to end but not yet verified, so nothing is served
-/// above `Isolated` no matter what a node claims. Raise this only when a
-/// verifier is wired in.
+/// The strongest class the network serves, whatever a node claims and whatever
+/// a verifier grants. Moving it to `Attested` takes three things holding at
+/// once: a reference launch measurement computed by `tools/snp-measure` from
+/// inputs recorded with their digests and reproduced by someone who did not
+/// build the image, a genuine Genoa report verifying as a checked-in vector,
+/// and an access gate that hands out no credentials for a lease quoted above
+/// `Isolated` without a lease-bound verdict. The rung below this one still runs
+/// against placeholder vendor material, so no node on the network could earn
+/// `Attested` from real evidence today.
 pub const MAX_VERIFIABLE_TRUST_CLASS: TrustClass = TrustClass::Isolated;
 
 impl TrustClass {
@@ -152,6 +161,9 @@ pub enum AttestationKind {
     SevSnp,
     Tdx,
     NvidiaCc,
+    /// An H100 device report: it proves which GPU signed and what firmware it
+    /// runs, and says nothing about the host software that booted.
+    NvidiaGpu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,22 +180,439 @@ pub struct NodePosture {
 }
 
 impl NodePosture {
-    /// The class this posture would justify if every piece of evidence in it
-    /// checked out. Callers must clamp it with [`MAX_VERIFIABLE_TRUST_CLASS`].
+    /// The strongest class this posture could ever back, before any evidence is
+    /// checked. Attestation deliberately does not lift it: a quote digest the
+    /// control plane never receives is a claim, and a claim must not reach past
+    /// `Isolated`. Anything above comes from [`class_for_verdict`].
     pub fn claimed_class(&self) -> TrustClass {
-        match (self.isolation, self.attestation.as_ref()) {
-            (IsolationMode::Shared, _) => TrustClass::Open,
-            (IsolationMode::KataVfio, None) => TrustClass::Isolated,
-            (IsolationMode::KataVfio, Some(attestation)) => match attestation.kind {
-                AttestationKind::NvidiaCc => TrustClass::Confidential,
-                AttestationKind::SevSnp | AttestationKind::Tdx => TrustClass::Attested,
-            },
+        match self.isolation {
+            IsolationMode::Shared => TrustClass::Open,
+            IsolationMode::KataVfio => TrustClass::Isolated,
         }
     }
 
+    #[deprecated(note = "use class_for_verdict")]
     pub fn effective_class(&self) -> TrustClass {
         self.claimed_class().min(MAX_VERIFIABLE_TRUST_CLASS)
     }
+}
+
+/// What the host's TEE stack can actually do, reported as it is found rather
+/// than collapsed into a single flag. Kernel 6.8 has SEV and SEV-ES but no
+/// SEV-SNP host support, and that has to be distinguishable from a machine with
+/// no TEE at all: one is a rung away, the other is not.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostTeeCapability {
+    pub sev: bool,
+    pub sev_es: bool,
+    pub sev_snp: bool,
+    pub sev_guest_device: bool,
+    pub kata_runtime: bool,
+    pub kata_confidential_runtime: bool,
+}
+
+/// A one-shot nonce the control plane hands out and consumes. Without it a node
+/// could replay a report it captured once, or relay one taken from a machine it
+/// does not own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestationChallenge {
+    pub challenge_id: Uuid,
+    pub node_id: String,
+    /// 32 random bytes, hex.
+    pub nonce: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Base64 of an SPDM measurement response and its opaque data. Comfortably
+/// above an H100 report and far below the 256 KiB request body limit.
+pub const MAX_ATTESTATION_EVIDENCE_BYTES: usize = 64 * 1_024;
+pub const MAX_ATTESTATION_CERTIFICATE_BYTES: usize = 16 * 1_024;
+/// NVIDIA's device chain is leaf to root in four hops. Bounding the count is
+/// what keeps evidence plus certificates inside the body limit.
+pub const MAX_ATTESTATION_CERTIFICATES: usize = 8;
+
+/// The value the GPU signs over. Binding the control plane's nonce to the node
+/// id and the device key is the only thing tying a vendor signature to one
+/// identity: a report relayed from another machine hashes to something else and
+/// fails. The node and the verifier both call this, so it lives in one place.
+pub fn attestation_report_nonce(
+    challenge_nonce: &[u8],
+    node_id: &str,
+    device_public_key: &str,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(challenge_nonce);
+    hasher.update(node_id.as_bytes());
+    hasher.update(device_public_key.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Attestation evidence travels here, on its own signed envelope against a
+/// challenge, and never on telemetry: the heartbeat's canonical bytes are
+/// already signed by deployed nodes, and a multi-kilobyte chain has no business
+/// on a thirty-second loop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeAttestation {
+    pub node_id: String,
+    pub challenge_id: Uuid,
+    pub kind: AttestationKind,
+    pub evidence_base64: String,
+    pub certificate_chain_base64: Vec<String>,
+    pub capability: HostTeeCapability,
+    pub pci_address: String,
+    pub collected_at: DateTime<Utc>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsignedNodeAttestation {
+    pub node_id: String,
+    pub challenge_id: Uuid,
+    pub kind: AttestationKind,
+    pub evidence_base64: String,
+    pub certificate_chain_base64: Vec<String>,
+    pub capability: HostTeeCapability,
+    pub pci_address: String,
+    pub collected_at: DateTime<Utc>,
+}
+
+impl NodeAttestation {
+    pub fn sign(
+        unsigned: UnsignedNodeAttestation,
+        key: &SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        let payload = signature_payload(ATTESTATION_SIGNATURE_DOMAIN, &unsigned)?;
+        let signature = key.sign(&payload);
+        let attestation = Self {
+            node_id: unsigned.node_id,
+            challenge_id: unsigned.challenge_id,
+            kind: unsigned.kind,
+            evidence_base64: unsigned.evidence_base64,
+            certificate_chain_base64: unsigned.certificate_chain_base64,
+            capability: unsigned.capability,
+            pci_address: unsigned.pci_address,
+            collected_at: unsigned.collected_at,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        };
+        attestation.validate()?;
+        Ok(attestation)
+    }
+
+    pub fn verify(&self, key: &VerifyingKey) -> Result<(), ProtocolError> {
+        verify_signature(
+            &UnsignedNodeAttestation {
+                node_id: self.node_id.clone(),
+                challenge_id: self.challenge_id,
+                kind: self.kind,
+                evidence_base64: self.evidence_base64.clone(),
+                certificate_chain_base64: self.certificate_chain_base64.clone(),
+                capability: self.capability,
+                pci_address: self.pci_address.clone(),
+                collected_at: self.collected_at,
+            },
+            &self.signature,
+            key,
+            ATTESTATION_SIGNATURE_DOMAIN,
+        )
+    }
+
+    /// Checked before a signature is even looked at, so a body that would cost
+    /// more to parse than to reject never gets that far.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.node_id.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.evidence_base64.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.evidence_base64.len() > MAX_ATTESTATION_EVIDENCE_BYTES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self.certificate_chain_base64.len() > MAX_ATTESTATION_CERTIFICATES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self
+            .certificate_chain_base64
+            .iter()
+            .any(|certificate| certificate.len() > MAX_ATTESTATION_CERTIFICATE_BYTES)
+        {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        Ok(())
+    }
+}
+
+/// What the control plane concluded after walking the chain itself. A node
+/// never produces one of these.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestationVerdict {
+    pub node_id: String,
+    pub kind: AttestationKind,
+    /// The attested device as the verifier read it off the leaf certificate,
+    /// subject plus board serial. Indexed uniquely, so one physical GPU cannot
+    /// back two node ids.
+    pub device_identity: String,
+    pub measurement_digest: String,
+    /// What the node said about its own TEE support, carried for diagnostics
+    /// and named for what it is. Nothing verifies it and nothing may grant a
+    /// class from it: a host that lies here is caught by no check in this
+    /// crate.
+    pub claimed_capability: HostTeeCapability,
+    pub granted_class: TrustClass,
+    pub verifier_version: String,
+    pub verified_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub fn verdict_digest(verdict: &AttestationVerdict) -> Result<String, ProtocolError> {
+    Ok(hex::encode(Sha256::digest(canonical_json(verdict)?)))
+}
+
+/// The class a node is served at. Every input is something the control plane
+/// checked: a live tunnel it registered, a posture it confirmed, and a verdict
+/// it reached by verifying evidence against a pinned vendor root. Nothing a
+/// node asserts about itself is consulted, and the answer is clamped to what
+/// the network can substantiate today.
+pub fn class_for_verdict(
+    node_id: &str,
+    tunneled: bool,
+    posture: Option<&NodePosture>,
+    verdict: Option<&AttestationVerdict>,
+    now: DateTime<Utc>,
+) -> TrustClass {
+    let class = match (tunneled, verdict) {
+        (false, _) | (_, None) => TrustClass::Open,
+        // A verdict names the node it was reached for. Checking that here, in
+        // the one function that turns evidence into a class, means a caller
+        // that pairs the wrong verdict with a node grants nothing rather than
+        // granting someone else's.
+        (true, Some(verdict)) if verdict.node_id != node_id => TrustClass::Open,
+        (true, Some(verdict)) if verdict.expires_at <= now => TrustClass::Open,
+        (true, Some(verdict)) => {
+            let isolated =
+                posture.is_some_and(|posture| posture.isolation == IsolationMode::KataVfio);
+            if isolated
+                && verdict.kind == AttestationKind::NvidiaGpu
+                && verdict.granted_class >= TrustClass::Isolated
+            {
+                TrustClass::Isolated
+            } else {
+                TrustClass::Open
+            }
+        }
+    };
+    class.min(MAX_VERIFIABLE_TRUST_CLASS)
+}
+
+pub const SNP_REPORT_DATA_DOMAIN: &[u8] = b"prism.snp.report-data.v1\0";
+
+/// REPORT_DATA is the only field of an SNP report the guest chooses; the host
+/// picks or influences the rest. The lease id is in here because a report taken
+/// for one renter must not be presentable for another's session, and the
+/// channel key is in here because a correctly measured VM somewhere on the
+/// machine proves nothing about the box the renter's client actually terminates
+/// on. SHA-512 fills all 64 bytes, which leaves the host no room to choose any
+/// of them.
+pub fn snp_report_data(challenge_nonce: &[u8], lease_id: u64, guest_channel_key: &str) -> [u8; 64] {
+    let mut hasher = Sha512::new();
+    hasher.update(SNP_REPORT_DATA_DOMAIN);
+    hasher.update(challenge_nonce);
+    hasher.update(lease_id.to_be_bytes());
+    hasher.update(guest_channel_key.as_bytes());
+    let mut report_data = [0_u8; 64];
+    report_data.copy_from_slice(&hasher.finalize());
+    report_data
+}
+
+/// An SNP report is 1184 bytes, so base64 of one lands near 1.6 KiB. The cap is
+/// well clear of that and nowhere near the request body limit.
+pub const MAX_SNP_REPORT_BYTES: usize = 4 * 1_024;
+
+/// A report the guest running a lease took of itself, carried to the control
+/// plane by the host. The envelope is signed by the node's device key rather
+/// than by anything inside the guest: the host is a courier here, and it cannot
+/// forge the report it is carrying, so its signature only has to say which node
+/// is presenting this one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestAttestation {
+    pub node_id: String,
+    pub lease_id: u64,
+    pub challenge_id: Uuid,
+    pub kind: AttestationKind,
+    pub report_base64: String,
+    pub certificate_chain_base64: Vec<String>,
+    /// The OpenSSH public key line the guest generated for this lease.
+    pub guest_channel_key: String,
+    pub collected_at: DateTime<Utc>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsignedGuestAttestation {
+    pub node_id: String,
+    pub lease_id: u64,
+    pub challenge_id: Uuid,
+    pub kind: AttestationKind,
+    pub report_base64: String,
+    pub certificate_chain_base64: Vec<String>,
+    pub guest_channel_key: String,
+    pub collected_at: DateTime<Utc>,
+}
+
+impl GuestAttestation {
+    pub fn sign(
+        unsigned: UnsignedGuestAttestation,
+        key: &SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        let payload = signature_payload(GUEST_ATTESTATION_SIGNATURE_DOMAIN, &unsigned)?;
+        let signature = key.sign(&payload);
+        let attestation = Self {
+            node_id: unsigned.node_id,
+            lease_id: unsigned.lease_id,
+            challenge_id: unsigned.challenge_id,
+            kind: unsigned.kind,
+            report_base64: unsigned.report_base64,
+            certificate_chain_base64: unsigned.certificate_chain_base64,
+            guest_channel_key: unsigned.guest_channel_key,
+            collected_at: unsigned.collected_at,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        };
+        attestation.validate()?;
+        Ok(attestation)
+    }
+
+    pub fn verify(&self, key: &VerifyingKey) -> Result<(), ProtocolError> {
+        verify_signature(
+            &UnsignedGuestAttestation {
+                node_id: self.node_id.clone(),
+                lease_id: self.lease_id,
+                challenge_id: self.challenge_id,
+                kind: self.kind,
+                report_base64: self.report_base64.clone(),
+                certificate_chain_base64: self.certificate_chain_base64.clone(),
+                guest_channel_key: self.guest_channel_key.clone(),
+                collected_at: self.collected_at,
+            },
+            &self.signature,
+            key,
+            GUEST_ATTESTATION_SIGNATURE_DOMAIN,
+        )
+    }
+
+    /// Checked before a signature is even looked at, so a body that would cost
+    /// more to parse than to reject never gets that far.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.node_id.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        // A report that names no lease binds to no session, which is the whole
+        // point of taking it inside the guest.
+        if self.lease_id == 0 {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.report_base64.is_empty() || self.guest_channel_key.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.report_base64.len() > MAX_SNP_REPORT_BYTES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self.certificate_chain_base64.len() > MAX_ATTESTATION_CERTIFICATES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self
+            .certificate_chain_base64
+            .iter()
+            .any(|certificate| certificate.len() > MAX_ATTESTATION_CERTIFICATE_BYTES)
+        {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        Ok(())
+    }
+}
+
+/// The TCB the VCEK that signed a report was issued against. Kept as four
+/// numbers rather than one packed word because the encoding is per product
+/// line: Turin packs these differently, so a second CPU generation needs its
+/// own floor rather than a widened one.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnpTcb {
+    pub bootloader: u8,
+    pub tee: u8,
+    pub snp: u8,
+    pub microcode: u8,
+}
+
+/// What the verifier read out of a report it walked to the AMD root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestedGuest {
+    /// The launch digest over the initial image, its guest physical layout,
+    /// page types and per-vCPU VMSA. It is only meaningful against a reference
+    /// value computed from published inputs, never against one read off the
+    /// machine being attested.
+    pub measurement: String,
+    pub host_data: String,
+    /// sha256 of CHIP_ID. The raw value names a physical machine and receipts
+    /// are pseudonymous, so it stays in the verifier.
+    pub chip_id_digest: String,
+    pub reported_tcb: SnpTcb,
+    pub policy_debug: bool,
+    pub vmpl: u32,
+    pub channel_key_fingerprint: String,
+    /// The container digest the measured guest agent will run, taken from
+    /// HOST_DATA. The host fixes this at launch and cannot change it after, but
+    /// it is still a host input: it means something only because the agent
+    /// inside the measured image refuses to run anything else.
+    pub image_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseAttestationVerdict {
+    pub lease_id: u64,
+    pub node_id: String,
+    pub kind: AttestationKind,
+    pub guest: AttestedGuest,
+    pub granted_class: TrustClass,
+    pub verifier_version: String,
+    pub verified_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub fn lease_verdict_digest(verdict: &LeaseAttestationVerdict) -> Result<String, ProtocolError> {
+    Ok(hex::encode(Sha256::digest(canonical_json(verdict)?)))
+}
+
+/// The class one lease is served at. A guest report is evidence about a single
+/// VM, so it lifts a single lease and never the node: an operator who boots the
+/// blessed image once and serves everyone else from a bare container gets
+/// nothing out of it.
+pub fn class_for_lease(
+    lease_id: u64,
+    node_id: &str,
+    node_class: TrustClass,
+    verdict: Option<&LeaseAttestationVerdict>,
+    now: DateTime<Utc>,
+) -> TrustClass {
+    let class = match verdict {
+        None => node_class,
+        Some(verdict) => {
+            let bound = verdict.lease_id == lease_id && verdict.node_id == node_id;
+            // The node must already stand at `Isolated`, because a guest report
+            // says nothing about the bonded identity, the live tunnel or the
+            // GPU underneath it and cannot stand in for them.
+            if bound
+                && verdict.expires_at > now
+                && verdict.kind == AttestationKind::SevSnp
+                && verdict.granted_class >= TrustClass::Attested
+                && node_class >= TrustClass::Isolated
+            {
+                TrustClass::Attested
+            } else {
+                node_class
+            }
+        }
+    };
+    class.min(MAX_VERIFIABLE_TRUST_CLASS)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -753,8 +1182,20 @@ pub struct PublicReceipt {
     pub outcome: ReceiptOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_class: Option<TrustClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<ReceiptAttestation>,
     pub receipt_hash: String,
     pub transaction_hash: String,
+}
+
+/// What the receipt commits to about attestation: a digest of the verdict, not
+/// the verdict. A board serial would name the host, and the published receipt
+/// is pseudonymous on purpose.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiptAttestation {
+    pub kind: AttestationKind,
+    pub verdict_digest: String,
+    pub verifier_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -810,6 +1251,8 @@ struct ReceiptPayload {
     outcome: ReceiptOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     trust_class: Option<TrustClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attestation: Option<ReceiptAttestation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1129,6 +1572,7 @@ pub fn receipt_hash(receipt: &PublicReceipt) -> Result<String, ProtocolError> {
         failure_class: receipt.failure_class.clone(),
         outcome: receipt.outcome.clone(),
         trust_class: receipt.trust_class,
+        attestation: receipt.attestation.clone(),
     };
     Ok(hex::encode(Sha256::digest(canonical_json(&payload)?)))
 }
@@ -1177,6 +1621,10 @@ pub enum ProtocolError {
     InvalidEncryptionKey,
     #[error("credential encryption failed")]
     Encryption,
+    #[error("attestation evidence exceeds the accepted size")]
+    AttestationTooLarge,
+    #[error("attestation is malformed")]
+    InvalidAttestation,
 }
 
 #[cfg(test)]
@@ -1280,7 +1728,7 @@ mod tests {
 
     #[test]
     fn posture_claims_are_clamped_to_what_the_network_can_verify() {
-        let confidential = NodePosture {
+        let claimed = NodePosture {
             isolation: IsolationMode::KataVfio,
             attestation: Some(AttestationRef {
                 kind: AttestationKind::NvidiaCc,
@@ -1288,12 +1736,31 @@ mod tests {
             }),
         };
 
-        assert_eq!(confidential.claimed_class(), TrustClass::Confidential);
-        assert_eq!(confidential.effective_class(), MAX_VERIFIABLE_TRUST_CLASS);
+        assert_eq!(claimed.claimed_class(), TrustClass::Isolated);
 
         let shared = NodePosture::default();
         assert_eq!(shared.claimed_class(), TrustClass::Open);
-        assert_eq!(shared.effective_class(), TrustClass::Open);
+    }
+
+    /// The reason the attestation arm was removed: a node that names a kind
+    /// nobody checked must not reach past the rung its isolation alone earns.
+    #[test]
+    fn a_posture_alone_never_exceeds_isolated() {
+        for kind in [
+            AttestationKind::SevSnp,
+            AttestationKind::Tdx,
+            AttestationKind::NvidiaCc,
+            AttestationKind::NvidiaGpu,
+        ] {
+            let posture = NodePosture {
+                isolation: IsolationMode::KataVfio,
+                attestation: Some(AttestationRef {
+                    kind,
+                    quote_sha256: "0".repeat(64),
+                }),
+            };
+            assert_eq!(posture.claimed_class(), TrustClass::Isolated, "{kind:?}");
+        }
     }
 
     #[test]
@@ -1335,6 +1802,7 @@ mod tests {
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
+            attestation: None,
             receipt_hash: String::new(),
             transaction_hash: "0x5678".to_owned(),
         };
@@ -1366,6 +1834,7 @@ mod tests {
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
+            attestation: None,
             receipt_hash: String::new(),
             transaction_hash: "0x3669fa89".to_owned(),
         };
@@ -1393,6 +1862,7 @@ mod tests {
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: Some(TrustClass::Open),
+            attestation: None,
             receipt_hash: String::new(),
             transaction_hash: "0x3669fa89".to_owned(),
         };
@@ -1401,6 +1871,617 @@ mod tests {
         assert!(receipt_hash_matches(&receipt).unwrap());
         receipt.trust_class = Some(TrustClass::Confidential);
         assert!(!receipt_hash_matches(&receipt).unwrap());
+    }
+
+    fn receipt_at(lease_id: &str, receipt_id: Uuid) -> PublicReceipt {
+        PublicReceipt {
+            receipt_id,
+            lease_id: lease_id.to_owned(),
+            node_id_hash: "0x1234".to_owned(),
+            gpu_model: "NVIDIA H100 PCIe".to_owned(),
+            runtime_seconds: 300,
+            charged_base_units: 66_600,
+            refunded_base_units: 0,
+            provider_paid_base_units: 59_940,
+            failure_class: None,
+            outcome: ReceiptOutcome::Finalized,
+            trust_class: Some(TrustClass::Isolated),
+            attestation: None,
+            receipt_hash: String::new(),
+            transaction_hash: "0x3669fa89".to_owned(),
+        }
+    }
+
+    /// Receipts settled before attestation existed carry a trust class and no
+    /// attestation. Their hashes are committed on chain, so the payload has to
+    /// serialize exactly as it did then.
+    #[test]
+    fn receipts_without_attestation_keep_their_published_hash() {
+        let receipt_id = Uuid::now_v7();
+        let receipt = receipt_at("13", receipt_id);
+        let legacy = format!(
+            r#"{{"receipt_id":"{receipt_id}","lease_id":"13","node_id_hash":"0x1234","gpu_model":"NVIDIA H100 PCIe","runtime_seconds":300,"charged_base_units":66600,"refunded_base_units":0,"provider_paid_base_units":59940,"failure_class":null,"outcome":"finalized","trust_class":"isolated"}}"#
+        );
+
+        assert_eq!(
+            receipt_hash(&receipt).unwrap(),
+            hex::encode(Sha256::digest(legacy))
+        );
+    }
+
+    #[test]
+    fn receipt_hashes_cover_the_attestation() {
+        let mut receipt = receipt_at("14", Uuid::now_v7());
+        receipt.attestation = Some(ReceiptAttestation {
+            kind: AttestationKind::NvidiaGpu,
+            verdict_digest: "a".repeat(64),
+            verifier_version: "prism-attestation/0.1.0".to_owned(),
+        });
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        assert!(receipt_hash_matches(&receipt).unwrap());
+        receipt.attestation.as_mut().unwrap().verdict_digest = "b".repeat(64);
+        assert!(!receipt_hash_matches(&receipt).unwrap());
+    }
+
+    fn unsigned_attestation(node_id: &str) -> UnsignedNodeAttestation {
+        UnsignedNodeAttestation {
+            node_id: node_id.to_owned(),
+            challenge_id: Uuid::now_v7(),
+            kind: AttestationKind::NvidiaGpu,
+            evidence_base64: URL_SAFE_NO_PAD.encode("spdm measurement response"),
+            certificate_chain_base64: vec![URL_SAFE_NO_PAD.encode("leaf der")],
+            capability: HostTeeCapability {
+                sev: true,
+                sev_es: true,
+                sev_snp: false,
+                sev_guest_device: true,
+                kata_runtime: true,
+                kata_confidential_runtime: false,
+            },
+            pci_address: "0000:01:00.0".to_owned(),
+            collected_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn attestation_round_trip_verifies() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut attestation =
+            NodeAttestation::sign(unsigned_attestation(&node_id(&key.verifying_key())), &key)
+                .unwrap();
+
+        assert!(attestation.verify(&key.verifying_key()).is_ok());
+        attestation.pci_address = "0000:02:00.0".to_owned();
+        assert!(attestation.verify(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn attestation_rejects_a_foreign_key() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let other = SigningKey::generate(&mut rand::rngs::OsRng);
+        let attestation =
+            NodeAttestation::sign(unsigned_attestation(&node_id(&key.verifying_key())), &key)
+                .unwrap();
+
+        assert!(attestation.verify(&other.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn attestation_rejects_oversized_evidence() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut unsigned = unsigned_attestation("0xabc");
+        unsigned.evidence_base64 = "A".repeat(MAX_ATTESTATION_EVIDENCE_BYTES + 1);
+
+        assert!(matches!(
+            NodeAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+
+        unsigned.evidence_base64 = URL_SAFE_NO_PAD.encode("report");
+        unsigned.certificate_chain_base64 = vec!["A".repeat(MAX_ATTESTATION_CERTIFICATE_BYTES + 1)];
+        assert!(matches!(
+            NodeAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+
+        unsigned.certificate_chain_base64 =
+            vec![URL_SAFE_NO_PAD.encode("der"); MAX_ATTESTATION_CERTIFICATES + 1];
+        assert!(matches!(
+            NodeAttestation::sign(unsigned, &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+    }
+
+    // Two nodes sharing one challenge would otherwise be able to swap reports.
+    #[test]
+    fn attestation_report_nonce_binds_the_device_key() {
+        let challenge = [7_u8; 32];
+        assert_ne!(
+            attestation_report_nonce(&challenge, "0xabc", "key-one"),
+            attestation_report_nonce(&challenge, "0xabc", "key-two")
+        );
+        assert_ne!(
+            attestation_report_nonce(&challenge, "0xabc", "key-one"),
+            attestation_report_nonce(&challenge, "0xdef", "key-one")
+        );
+    }
+
+    fn verdict_at(
+        kind: AttestationKind,
+        granted: TrustClass,
+        expires_at: DateTime<Utc>,
+    ) -> AttestationVerdict {
+        AttestationVerdict {
+            node_id: "0xabc".to_owned(),
+            kind,
+            device_identity: "CN=NVIDIA GH100 / serial 1323824012345".to_owned(),
+            measurement_digest: "c".repeat(64),
+            claimed_capability: HostTeeCapability {
+                sev: true,
+                sev_es: true,
+                ..HostTeeCapability::default()
+            },
+            granted_class: granted,
+            verifier_version: "prism-attestation/0.1.0".to_owned(),
+            verified_at: expires_at - chrono::Duration::hours(1),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn a_served_class_needs_a_tunnel_a_posture_and_a_live_verdict() {
+        let now = Utc::now();
+        let fresh = verdict_at(
+            AttestationKind::NvidiaGpu,
+            TrustClass::Isolated,
+            now + chrono::Duration::hours(12),
+        );
+        let expired = verdict_at(
+            AttestationKind::NvidiaGpu,
+            TrustClass::Isolated,
+            now - chrono::Duration::minutes(1),
+        );
+        let overreaching = verdict_at(
+            AttestationKind::NvidiaGpu,
+            TrustClass::Confidential,
+            now + chrono::Duration::hours(12),
+        );
+        let kata = NodePosture {
+            isolation: IsolationMode::KataVfio,
+            attestation: None,
+        };
+        let shared = NodePosture::default();
+
+        let cases = [
+            (
+                "untunneled",
+                false,
+                Some(&kata),
+                Some(&fresh),
+                TrustClass::Open,
+            ),
+            (
+                "expired verdict",
+                true,
+                Some(&kata),
+                Some(&expired),
+                TrustClass::Open,
+            ),
+            (
+                "shared host",
+                true,
+                Some(&shared),
+                Some(&fresh),
+                TrustClass::Open,
+            ),
+            ("no posture", true, None, Some(&fresh), TrustClass::Open),
+            (
+                "verified",
+                true,
+                Some(&kata),
+                Some(&fresh),
+                TrustClass::Isolated,
+            ),
+            (
+                "clamped",
+                true,
+                Some(&kata),
+                Some(&overreaching),
+                TrustClass::Isolated,
+            ),
+        ];
+
+        for (name, tunneled, posture, verdict, expected) in cases {
+            assert_eq!(
+                class_for_verdict("0xabc", tunneled, posture, verdict, now),
+                expected,
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            class_for_verdict("0xabc", true, Some(&kata), None, now),
+            TrustClass::Open
+        );
+    }
+
+    // A verdict is a statement about one node. Pairing it with another grants
+    // nothing, so a lookup that returns the wrong row cannot promote a node
+    // that never attested.
+    #[test]
+    fn a_verdict_does_not_class_a_node_it_does_not_name() {
+        let now = Utc::now();
+        let kata = NodePosture {
+            isolation: IsolationMode::KataVfio,
+            attestation: None,
+        };
+        let verdict = verdict_at(
+            AttestationKind::NvidiaGpu,
+            TrustClass::Isolated,
+            now + chrono::Duration::hours(1),
+        );
+        assert_eq!(verdict.node_id, "0xabc");
+        assert_eq!(
+            class_for_verdict("0xabc", true, Some(&kata), Some(&verdict), now),
+            TrustClass::Isolated,
+            "its own node is classed"
+        );
+        assert_eq!(
+            class_for_verdict("0xdef", true, Some(&kata), Some(&verdict), now),
+            TrustClass::Open,
+            "another node is not"
+        );
+    }
+
+    // A kind the verifier does not walk a chain for cannot grant a class.
+    #[test]
+    fn only_a_gpu_verdict_grants_isolated_today() {
+        let now = Utc::now();
+        let kata = NodePosture {
+            isolation: IsolationMode::KataVfio,
+            attestation: None,
+        };
+        for kind in [
+            AttestationKind::SevSnp,
+            AttestationKind::Tdx,
+            AttestationKind::NvidiaCc,
+        ] {
+            let verdict = verdict_at(kind, TrustClass::Isolated, now + chrono::Duration::hours(1));
+            assert_eq!(
+                class_for_verdict("0xabc", true, Some(&kata), Some(&verdict), now),
+                TrustClass::Open,
+                "{kind:?}"
+            );
+        }
+    }
+
+    const GUEST_CHANNEL_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 prism-guest";
+
+    #[test]
+    fn snp_report_data_fills_the_whole_field() {
+        let nonce = [0x11_u8; 32];
+        assert_eq!(
+            hex::encode(snp_report_data(&nonce, 42, GUEST_CHANNEL_KEY)),
+            "f45d37bedc45ef6d6bf57b93f8e246cddd406331fb767c93781a7aefc867d256\
+             17e6bca59720cf3e0d0c7919cd44dd3a3d4df2ffe72a52b1bacdfb9b22ed6fda"
+        );
+    }
+
+    // Drop any one of the three and the report stops being about this guest, on
+    // this lease, reachable at this key.
+    #[test]
+    fn snp_report_data_binds_the_nonce_the_lease_and_the_channel_key() {
+        let nonce = [0x11_u8; 32];
+        let bound = snp_report_data(&nonce, 42, GUEST_CHANNEL_KEY);
+
+        assert_ne!(
+            bound,
+            snp_report_data(&[0x12_u8; 32], 42, GUEST_CHANNEL_KEY)
+        );
+        assert_ne!(bound, snp_report_data(&nonce, 43, GUEST_CHANNEL_KEY));
+        assert_ne!(
+            bound,
+            snp_report_data(&nonce, 42, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 other-guest")
+        );
+    }
+
+    fn unsigned_guest_attestation(node_id: &str, lease_id: u64) -> UnsignedGuestAttestation {
+        UnsignedGuestAttestation {
+            node_id: node_id.to_owned(),
+            lease_id,
+            challenge_id: Uuid::now_v7(),
+            kind: AttestationKind::SevSnp,
+            report_base64: URL_SAFE_NO_PAD.encode("snp attestation report"),
+            certificate_chain_base64: vec![URL_SAFE_NO_PAD.encode("vcek der")],
+            guest_channel_key: GUEST_CHANNEL_KEY.to_owned(),
+            collected_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn guest_attestation_round_trip_verifies() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut attestation = GuestAttestation::sign(
+            unsigned_guest_attestation(&node_id(&key.verifying_key()), 7),
+            &key,
+        )
+        .unwrap();
+
+        assert!(attestation.verify(&key.verifying_key()).is_ok());
+        attestation.guest_channel_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 swapped".to_owned();
+        assert!(attestation.verify(&key.verifying_key()).is_err());
+
+        attestation.guest_channel_key = GUEST_CHANNEL_KEY.to_owned();
+        attestation.lease_id = 8;
+        assert!(attestation.verify(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn guest_attestation_rejects_an_unbound_or_oversized_body() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut unsigned = unsigned_guest_attestation("0xabc", 0);
+        assert!(matches!(
+            GuestAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::InvalidAttestation)
+        ));
+
+        unsigned.lease_id = 7;
+        unsigned.report_base64 = "A".repeat(MAX_SNP_REPORT_BYTES + 1);
+        assert!(matches!(
+            GuestAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+
+        unsigned.report_base64 = URL_SAFE_NO_PAD.encode("report");
+        unsigned.certificate_chain_base64 = vec!["A".repeat(MAX_ATTESTATION_CERTIFICATE_BYTES + 1)];
+        assert!(matches!(
+            GuestAttestation::sign(unsigned, &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+    }
+
+    fn lease_verdict_at(
+        lease_id: u64,
+        kind: AttestationKind,
+        granted: TrustClass,
+        expires_at: DateTime<Utc>,
+    ) -> LeaseAttestationVerdict {
+        LeaseAttestationVerdict {
+            lease_id,
+            node_id: "0xabc".to_owned(),
+            kind,
+            guest: AttestedGuest {
+                measurement: "d".repeat(96),
+                host_data: "e".repeat(64),
+                chip_id_digest: "f".repeat(64),
+                reported_tcb: SnpTcb {
+                    bootloader: 4,
+                    tee: 0,
+                    snp: 22,
+                    microcode: 213,
+                },
+                policy_debug: false,
+                vmpl: 0,
+                channel_key_fingerprint: "SHA256:0000000000000000000000000000000000000000000"
+                    .to_owned(),
+                image_digest: "sha256:".to_owned() + &"a".repeat(64),
+            },
+            granted_class: granted,
+            verifier_version: "prism-attestation/0.1.0".to_owned(),
+            verified_at: expires_at - chrono::Duration::hours(1),
+            expires_at,
+        }
+    }
+
+    // Expectations are written unclamped and clamped on the way into the
+    // assertion. While the ceiling sits at `Isolated` the bound case collapses
+    // onto the rest; the day it moves, this starts discriminating without being
+    // rewritten.
+    #[test]
+    fn a_lease_class_needs_a_live_verdict_naming_that_lease_on_that_node() {
+        let now = Utc::now();
+        let fresh = lease_verdict_at(
+            7,
+            AttestationKind::SevSnp,
+            TrustClass::Attested,
+            now + chrono::Duration::hours(2),
+        );
+        let expired = lease_verdict_at(
+            7,
+            AttestationKind::SevSnp,
+            TrustClass::Attested,
+            now - chrono::Duration::minutes(1),
+        );
+        let other_lease = lease_verdict_at(
+            8,
+            AttestationKind::SevSnp,
+            TrustClass::Attested,
+            now + chrono::Duration::hours(2),
+        );
+        let gpu_only = lease_verdict_at(
+            7,
+            AttestationKind::NvidiaGpu,
+            TrustClass::Attested,
+            now + chrono::Duration::hours(2),
+        );
+
+        let cases = [
+            (
+                "bound",
+                "0xabc",
+                TrustClass::Isolated,
+                Some(&fresh),
+                TrustClass::Attested,
+            ),
+            (
+                "another node",
+                "0xdef",
+                TrustClass::Isolated,
+                Some(&fresh),
+                TrustClass::Isolated,
+            ),
+            (
+                "another lease",
+                "0xabc",
+                TrustClass::Isolated,
+                Some(&other_lease),
+                TrustClass::Isolated,
+            ),
+            (
+                "expired",
+                "0xabc",
+                TrustClass::Isolated,
+                Some(&expired),
+                TrustClass::Isolated,
+            ),
+            (
+                "no verdict",
+                "0xabc",
+                TrustClass::Isolated,
+                None,
+                TrustClass::Isolated,
+            ),
+            (
+                "open node",
+                "0xabc",
+                TrustClass::Open,
+                Some(&fresh),
+                TrustClass::Open,
+            ),
+            (
+                "gpu verdict",
+                "0xabc",
+                TrustClass::Isolated,
+                Some(&gpu_only),
+                TrustClass::Isolated,
+            ),
+        ];
+
+        for (name, node, node_class, verdict, expected) in cases {
+            assert_eq!(
+                class_for_lease(7, node, node_class, verdict, now),
+                expected.min(MAX_VERIFIABLE_TRUST_CLASS),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lease_class_never_exceeds_what_the_network_substantiates() {
+        let now = Utc::now();
+        let overreaching = lease_verdict_at(
+            7,
+            AttestationKind::SevSnp,
+            TrustClass::Confidential,
+            now + chrono::Duration::hours(2),
+        );
+
+        for node_class in [
+            TrustClass::Open,
+            TrustClass::Isolated,
+            TrustClass::Attested,
+            TrustClass::Confidential,
+        ] {
+            for verdict in [None, Some(&overreaching)] {
+                assert!(
+                    class_for_lease(7, "0xabc", node_class, verdict, now)
+                        <= MAX_VERIFIABLE_TRUST_CLASS
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lease_verdict_digest_covers_every_field() {
+        let now = Utc::now();
+        let verdict = lease_verdict_at(
+            7,
+            AttestationKind::SevSnp,
+            TrustClass::Attested,
+            now + chrono::Duration::hours(2),
+        );
+        let mut relaunched = verdict.clone();
+        relaunched.guest.measurement = "9".repeat(96);
+
+        assert_ne!(
+            lease_verdict_digest(&verdict).unwrap(),
+            lease_verdict_digest(&relaunched).unwrap()
+        );
+        assert_eq!(lease_verdict_digest(&verdict).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn a_verdict_digest_covers_every_field() {
+        let now = Utc::now();
+        let verdict = verdict_at(
+            AttestationKind::NvidiaGpu,
+            TrustClass::Isolated,
+            now + chrono::Duration::hours(12),
+        );
+        let mut moved = verdict.clone();
+        moved.device_identity = "CN=NVIDIA GH100 / serial 1323824099999".to_owned();
+
+        assert_ne!(
+            verdict_digest(&verdict).unwrap(),
+            verdict_digest(&moved).unwrap()
+        );
+        assert_eq!(verdict_digest(&verdict).unwrap().len(), 64);
+    }
+
+    /// Adding attestation types must not move a byte of the heartbeat payload:
+    /// deployed nodes are already signing this exact string.
+    #[test]
+    fn telemetry_signing_payload_is_unchanged_by_attestation_types() {
+        let observed_at = DateTime::parse_from_rfc3339("2026-07-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let unsigned = UnsignedTelemetry {
+            node_id: "0xabc".to_owned(),
+            sequence: 7,
+            observed_at,
+            gpu_utilization_bps: 4_200,
+            gpu_memory_used_mib: 1_024,
+            active_lease: Some("11".to_owned()),
+            tunnel_connected: true,
+            image_digest: Some("sha256:abc".to_owned()),
+            posture: None,
+        };
+
+        assert_eq!(
+            canonical_json(&unsigned).unwrap(),
+            r#"{"node_id":"0xabc","sequence":7,"observed_at":"2026-07-24T00:00:00Z","gpu_utilization_bps":4200,"gpu_memory_used_mib":1024,"active_lease":"11","tunnel_connected":true,"image_digest":"sha256:abc"}"#
+        );
+
+        let with_posture = UnsignedTelemetry {
+            posture: Some(NodePosture {
+                isolation: IsolationMode::KataVfio,
+                attestation: None,
+            }),
+            ..unsigned
+        };
+
+        assert_eq!(
+            canonical_json(&with_posture).unwrap(),
+            r#"{"node_id":"0xabc","sequence":7,"observed_at":"2026-07-24T00:00:00Z","gpu_utilization_bps":4200,"gpu_memory_used_mib":1024,"active_lease":"11","tunnel_connected":true,"image_digest":"sha256:abc","posture":{"isolation":"kata_vfio"}}"#
+        );
+    }
+
+    // Kernel 6.8 has SEV and SEV-ES but no SNP host support. That has to read
+    // differently from a box with no TEE at all, or the gap is invisible.
+    #[test]
+    fn a_host_without_snp_is_not_a_host_without_a_tee() {
+        let genoa = HostTeeCapability {
+            sev: true,
+            sev_es: true,
+            sev_snp: false,
+            sev_guest_device: true,
+            kata_runtime: true,
+            kata_confidential_runtime: false,
+        };
+
+        assert_ne!(genoa, HostTeeCapability::default());
+        assert!(!genoa.sev_snp);
     }
 
     #[test]

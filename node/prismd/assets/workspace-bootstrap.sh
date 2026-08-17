@@ -28,6 +28,21 @@ install -m 0400 "$control/authorized_keys" /run/prism/authorized_keys
 chown workspace:workspace /run/prism/authorized_keys
 ssh-keygen -q -t ed25519 -N "" -f /run/prism/ssh_host_key
 
+# A report the renter can use has to commit to the key their session will
+# terminate on, so it is taken after the key exists and before anything is
+# listening on it. set -e makes a reporter that cannot produce one end the
+# lease here rather than serve a session no report covers. The challenge comes
+# from a mount the host controls and is not trusted: a stale or invented one
+# hashes into report data the control plane refuses.
+if [ -f "$control/attestation_challenge" ]; then
+    command -v prismd >/dev/null
+    prismd snp-report \
+        --challenge-file "$control/attestation_challenge" \
+        --lease-id "$(cat "$control/lease_id")" \
+        --channel-key-file /run/prism/ssh_host_key.pub \
+        --output-directory /run/prism/evidence
+fi
+
 cat >/run/prism/sshd_config <<'EOF'
 Port 2222
 ListenAddress 0.0.0.0

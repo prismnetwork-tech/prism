@@ -7,8 +7,9 @@ use prism_chain::{
     word_u128,
 };
 use prism_protocol::{
-    CredentialCipher, ExecutionEvidence, LeaseRecord, LeaseState, NodeOffer, NodeTelemetry,
-    PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, SettlementEvidence, receipt_hash,
+    AttestationVerdict, CredentialCipher, ExecutionEvidence, LeaseRecord, LeaseState, NodeOffer,
+    NodeTelemetry, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptAttestation, ReceiptOutcome,
+    SettlementEvidence, TrustClass, receipt_hash, verdict_digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -1625,6 +1626,7 @@ impl Worker {
             .as_ref()
             .context("refund transaction is missing")?
             .transaction_hash;
+        let attestation = self.receipt_attestation(&context).await?;
         let mut receipt = PublicReceipt {
             receipt_id: Uuid::now_v7(),
             // What the escrow numbered it, so a reader can find this lease on
@@ -1642,6 +1644,7 @@ impl Worker {
             failure_class: Some("provisioning_timeout".to_owned()),
             outcome: ReceiptOutcome::Refunded,
             trust_class: Some(context.lease.trust_class),
+            attestation,
             receipt_hash: String::new(),
             transaction_hash: transaction_hash.clone(),
         };
@@ -1866,6 +1869,33 @@ impl Worker {
         .execute(&self.pool)
         .await?;
         Ok(true)
+    }
+
+    /// The verdict the lease's class rests on, as a digest. Only a class above
+    /// `Open` was earned from one, and a digest hung off an Open lease would
+    /// read as a claim nobody made, so nothing is looked up in that case.
+    async fn receipt_attestation(
+        &self,
+        context: &LeaseContext,
+    ) -> anyhow::Result<Option<ReceiptAttestation>> {
+        if context.lease.trust_class <= TrustClass::Open {
+            return Ok(None);
+        }
+        let verdict = query_scalar::<_, SqlJson<AttestationVerdict>>(
+            "SELECT document FROM node_attestation_verdicts WHERE node_id = $1",
+        )
+        .bind(&context.lease.node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        verdict
+            .map(|SqlJson(verdict)| {
+                Ok(ReceiptAttestation {
+                    kind: verdict.kind,
+                    verdict_digest: verdict_digest(&verdict)?,
+                    verifier_version: verdict.verifier_version,
+                })
+            })
+            .transpose()
     }
 
     async fn settlement_evidence(&self, lease_id: u64) -> anyhow::Result<SettlementEvidence> {

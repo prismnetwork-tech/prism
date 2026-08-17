@@ -7,8 +7,18 @@
 //
 // Verify never writes. Settle broadcasts, and only after simulating, so a
 // malformed authorization costs us nothing.
-import { createPublicClient, createWalletClient, getAddress, http, parseAbi } from "viem";
+import { createPublicClient, createWalletClient, fallback, getAddress, http, parseAbi } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+
+/// Money should not stop moving because one free endpoint had a bad minute.
+/// `rpcUrl` takes a list as readily as a string, and each url keeps its own
+/// retries before the next one is tried.
+function transportFor(rpcUrl) {
+  const urls = (Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl]).filter(Boolean);
+  if (urls.length === 0) return http();
+  const transports = urls.map((url) => http(url, { timeout: 20_000, retryCount: 2 }));
+  return transports.length === 1 ? transports[0] : fallback(transports);
+}
 
 export const AUTHORIZATION_TYPES = {
   TransferWithAuthorization: [
@@ -42,6 +52,9 @@ const REASON = {
   recipient: "invalid_exact_evm_payload_recipient_mismatch",
   funds: "insufficient_funds",
   state: "invalid_transaction_state",
+  // Not in the protocol's list, because the protocol assumes a facilitator can
+  // read what it broadcast. Ours must survive an rpc that cannot.
+  unconfirmed: "settlement_unconfirmed",
 };
 
 const SUPPORTED_VERSIONS = new Set([1, 2]);
@@ -68,14 +81,15 @@ export function createExactEvm(networks) {
   const entries = new Map();
   for (const [id, config] of Object.entries(networks)) {
     const chain = config.chain;
-    const client = createPublicClient({ chain, transport: http(config.rpcUrl) });
+    const transport = transportFor(config.rpcUrl);
+    const client = createPublicClient({ chain, transport });
     const account = config.privateKey ? privateKeyToAccount(config.privateKey) : null;
     entries.set(id.toLowerCase(), {
       id,
       chain,
       client,
       account,
-      wallet: account ? createWalletClient({ account, chain, transport: http(config.rpcUrl) }) : null,
+      wallet: account ? createWalletClient({ account, chain, transport }) : null,
       assets: new Map(
         Object.entries(config.assets).map(([address, meta]) => [getAddress(address), meta]),
       ),
@@ -160,7 +174,13 @@ export function createExactEvm(networks) {
     if (value !== required) return { isValid: false, invalidReason: REASON.value, payer };
 
     if (validAfter > BigInt(now)) return { isValid: false, invalidReason: REASON.early, payer };
-    if (validBefore <= BigInt(now + EXPIRY_MARGIN_SECONDS)) {
+    // The authorization has to outlive the work it pays for, not just the
+    // moment it is checked. `maxTimeoutSeconds` is the server's own promise of
+    // how long it may take, so a job that runs for fifteen minutes refuses a
+    // sixty-second authorization up front rather than doing the work and then
+    // discovering it cannot charge for it.
+    const mustOutlive = Math.max(EXPIRY_MARGIN_SECONDS, Number(requirements.maxTimeoutSeconds) || 0);
+    if (validBefore < BigInt(now + mustOutlive)) {
       return { isValid: false, invalidReason: REASON.expired, payer };
     }
 
@@ -211,6 +231,7 @@ export function createExactEvm(networks) {
     if (!check.isValid) {
       return {
         success: false,
+        settled: false,
         errorReason: check.invalidReason,
         payer: check.payer ?? "",
         transaction: "",
@@ -222,6 +243,7 @@ export function createExactEvm(networks) {
     if (!entry.wallet) {
       return {
         success: false,
+        settled: false,
         errorReason: REASON.network,
         payer: check.payer,
         transaction: "",
@@ -251,6 +273,7 @@ export function createExactEvm(networks) {
     } catch (error) {
       return {
         success: false,
+        settled: false,
         errorReason: REASON.state,
         payer: check.payer,
         transaction: "",
@@ -259,12 +282,30 @@ export function createExactEvm(networks) {
       };
     }
 
-    const receipt = await entry.client.waitForTransactionReceipt({
-      hash,
-      timeout: (requirements.maxTimeoutSeconds ?? 60) * 1000,
-    });
+    // The broadcast already happened, so a failure to read the receipt is not a
+    // failure to pay. Reporting it as one loses money that moved: an endpoint
+    // that saw an error here would refund, or serve free, against a transfer
+    // that actually settled. Say "unconfirmed" and hand back the hash.
+    let receipt;
+    try {
+      receipt = await entry.client.waitForTransactionReceipt({
+        hash,
+        timeout: (requirements.maxTimeoutSeconds ?? 60) * 1000,
+      });
+    } catch (error) {
+      return {
+        success: false,
+        settled: null,
+        errorReason: REASON.unconfirmed,
+        payer: check.payer,
+        transaction: hash,
+        network: requirements.network,
+        detail: String(error?.shortMessage ?? error?.message ?? error),
+      };
+    }
     return {
       success: receipt.status === "success",
+      settled: receipt.status === "success",
       ...(receipt.status === "success" ? {} : { errorReason: REASON.state }),
       payer: check.payer,
       transaction: hash,
@@ -275,10 +316,22 @@ export function createExactEvm(networks) {
   /// What a facilitator would publish at GET /supported. Kept here so the same
   /// list drives both the manifest and this module's own routing.
   function supported() {
+    // One entry per chain, not per alias. The same chain is registered under
+    // both its CAIP-2 id and its v1 name so either spelling routes, but a
+    // caller reading this must not conclude we settle on two chains.
+    const chains = new Map();
+    for (const entry of entries.values()) {
+      if (!chains.has(entry.chain.id)) chains.set(entry.chain.id, entry);
+    }
     const kinds = [];
-    for (const entry of new Set(entries.values())) {
+    for (const entry of chains.values()) {
       for (const version of SUPPORTED_VERSIONS) {
-        kinds.push({ x402Version: version, scheme: "exact", network: entry.id });
+        kinds.push({
+          x402Version: version,
+          scheme: "exact",
+          network: `eip155:${entry.chain.id}`,
+          extra: { assetTransferMethod: "eip3009", assets: [...entry.assets.keys()] },
+        });
       }
     }
     return { kinds };

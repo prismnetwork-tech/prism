@@ -15,6 +15,7 @@ import { createExactEvm } from "@prismnetwork/x402/exact-evm";
 import { detect } from "@prismnetwork/x402/codec";
 import { base as baseChain } from "viem/chains";
 import { createGateway, USDC_BASE, USDC_BASE_DOMAIN } from "./gateway.mjs";
+import { inferenceInput, inferenceOutput, openApiDocument } from "./openapi.mjs";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
@@ -43,9 +44,13 @@ try {
     // Base is offered only when there is somewhere to collect it. Omitting the
     // address leaves the endpoint exactly as it was.
     basePayTo: process.env.X402_BASE_PAY_TO ? getAddress(process.env.X402_BASE_PAY_TO) : null,
-    // Not mainnet.base.org: one verification is four calls and the public
-    // endpoint rate-limits a burst that size.
-    baseRpcUrl: process.env.X402_BASE_RPC_URL ?? "https://base-rpc.publicnode.com",
+    // A list, tried in order, because money should not stop moving because one
+    // free endpoint had a bad minute, and each of these has had one. Not
+    // mainnet.base.org: a verification is four calls and it rate-limits a burst
+    // that size. Not publicnode first either: it broadcasts fine but refuses to
+    // read the receipt back.
+    baseRpcUrl: (process.env.X402_BASE_RPC_URL ?? "https://base.drpc.org,https://1rpc.io/base")
+      .split(",").map((u) => u.trim()).filter(Boolean),
   };
   if (config.basePayTo && !process.env.PRISM_X402_COLLECTOR_KEY) {
     throw new Error("X402_BASE_PAY_TO is set but PRISM_X402_COLLECTOR_KEY is not, so nothing can broadcast an authorization");
@@ -146,6 +151,7 @@ const gateway = createGateway({
   payTo: config.payTo,
   basePayTo: config.basePayTo,
   exact,
+  schemas: { input: inferenceInput(config.models), output: inferenceOutput },
   priceMicros: config.priceMicros,
   pricing: config.pricing,
   image: process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE,
@@ -173,6 +179,21 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/v1/stats") {
     return json(res, 200, gateway.stats());
   }
+  // The canonical discovery contract. Built from live pricing for the same
+  // reason as the manifest below: a document that disagrees with the endpoint
+  // is worse than no document, because scanners treat the runtime 402 as
+  // authoritative and list the mismatch as a failure.
+  if (req.method === "GET" && url.pathname === "/openapi.json") {
+    const m = gateway.models();
+    return json(res, 200, openApiDocument({
+      models: m.models,
+      pricing: m.pricing,
+      jobPriceMicros: Number(process.env.X402_PRICE_MICROS ?? 30000),
+      contactEmail: process.env.PRISM_CONTACT_EMAIL ?? "contact@prismnetwork.tech",
+      siteUrl: process.env.PRISM_PUBLIC_ORIGIN ?? "https://api.prismnetwork.tech",
+    }), { "cache-control": "public, max-age=300" });
+  }
+
   // The x402 discovery manifest indexers crawl. Served here so the prices in
   // it are the prices the 402 will actually quote.
   if (req.method === "GET" && url.pathname === "/.well-known/x402.json") {
@@ -237,7 +258,7 @@ const server = createServer(async (req, res) => {
     // sent. An unpaid request has neither, and answering v1 to those keeps
     // the reply readable to anything that just curls the endpoint.
     const payment = detect(req.headers);
-    const out = await gateway.handleInference(body, payment?.header, payment?.version ?? 1);
+    const out = await gateway.handleInference(body, payment?.header, payment?.version ?? null);
     return json(res, out.status, out.body, out.headers);
   }
   json(res, 404, { error: "not_found" });

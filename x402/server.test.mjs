@@ -17,6 +17,9 @@ const child = spawn(process.execPath, [server], {
     PRISM_ESCROW: payTo,
     X402_PAY_TO: payTo,
     X402_BASE_PAY_TO: payTo,
+    // Offering Base means being able to broadcast on it, so the server refuses
+    // to boot with a payTo and no key to settle with.
+    PRISM_X402_COLLECTOR_KEY: `0x${"22".repeat(32)}`,
     X402_PORT: String(port),
     X402_PAYMENTS_FILE: join(mkdtempSync(join(tmpdir(), "x402-")), "consumed.log"),
   },
@@ -57,17 +60,31 @@ test("an unpaid request is quoted on every configured network", async () => {
   assert.equal(res.status, 402);
 
   const body = await res.json();
-  assert.equal(body.x402Version, 1);
+  // A caller who has not shown us which version it speaks is answered in v2,
+  // because that is what the scanners and agent tooling read.
+  assert.equal(body.x402Version, 2);
   const byNetwork = Object.fromEntries(body.accepts.map((offer) => [offer.network, offer]));
   assert.deepEqual(Object.keys(byNetwork).sort(), ["eip155:4663", "eip155:8453"]);
 
-  assert.equal(byNetwork["eip155:8453"].asset, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+  const base = byNetwork["eip155:8453"];
+  assert.equal(base.asset, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+  assert.equal(base.extra.name, "USD Coin", "the signing domain must travel with the offer");
   assert.equal(byNetwork["eip155:4663"].asset, "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168");
   for (const offer of body.accepts) {
     assert.equal(offer.scheme, "exact");
     assert.equal(offer.payTo, payTo);
-    assert.equal(offer.maxAmountRequired, "300000");
+    assert.equal(offer.amount, "300000", "atomic units, not decimal dollars");
+    // v2 entries carry payment terms only; anything describing the resource
+    // moved up a level, and leaving it here fails their schema validation.
+    assert.equal(offer.resource, undefined);
+    assert.equal(offer.outputSchema, undefined);
   }
+
+  // v2 puts the resource and the call shape at the top level instead.
+  assert.equal(body.resource.url, "https://api.prismnetwork.tech/x402/run");
+  assert.equal(body.resource.mimeType, "application/json");
+  assert.ok(body.extensions.bazaar.schema.properties.input, "the 402 must say how to call the endpoint");
+  assert.ok(body.extensions.bazaar.schema.properties.output);
 });
 
 test("a refused payment says which check refused it", async () => {
@@ -83,4 +100,48 @@ test("a refused payment says which check refused it", async () => {
 
   const unsigned = await run(envelope({ txHash: `0x${"ab".repeat(32)}` }));
   assert.equal((await unsigned.json()).error, "malformed_payment");
+});
+
+test("a caller that speaks v1 is still answered in v1", async () => {
+  await ready();
+  const res = await fetch(`http://127.0.0.1:${port}/run`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-PAYMENT": "bm90LXJlYWw=" },
+    body: JSON.stringify({ command: "nvidia-smi" }),
+  });
+  assert.equal(res.status, 402);
+  const body = await res.json();
+  assert.equal(body.x402Version, 1);
+  const names = body.accepts.map((o) => o.network).sort();
+  assert.deepEqual(names, ["base", "eip155:4663"], "v1 names chains");
+  assert.equal(body.accepts.find((o) => o.network === "base").maxAmountRequired, "300000");
+});
+
+test("a v2 caller is quoted in CAIP-2, and the facilitator reports what it can settle", async () => {
+  await ready();
+  const res = await fetch(`http://127.0.0.1:${port}/run`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "PAYMENT-SIGNATURE": "bm90LXJlYWw=" },
+    body: JSON.stringify({ command: "nvidia-smi" }),
+  });
+  assert.equal(res.status, 402);
+  const body = await res.json();
+  assert.equal(body.x402Version, 2);
+  assert.ok(body.accepts.some((offer) => offer.network === "eip155:8453"));
+  assert.ok(res.headers.get("payment-required"), "v2 carries the terms in a header");
+
+  const supported = await (await fetch(`http://127.0.0.1:${port}/supported`)).json();
+  assert.ok(supported.kinds.some((k) => k.network === "eip155:8453" && k.scheme === "exact"));
+  assert.equal(typeof supported.daily_limit, "number");
+});
+
+test("the facilitator refuses a malformed settle without touching the chain", async () => {
+  await ready();
+  const res = await fetch(`http://127.0.0.1:${port}/settle`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ paymentPayload: { x402Version: 2 } }),
+  });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).errorReason, "invalid_payment_requirements");
 });

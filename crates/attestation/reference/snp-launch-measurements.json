@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "provenance": "placeholder",
+  "note": "Placeholder digests, sha384 of \"prism-fixture/<image_version>/<vcpu_count>\". Every value here has to be replaced by one tools/snp-measure computes from the recorded inputs and someone who did not build the image reproduces. A measurement read off the machine being attested certifies whatever happened to boot, so it is never a source. Until then a genuine report fails with SnpUnknownLaunchMeasurement.",
+  "measurements": [
+    {
+      "image_version": "prism-guest-0.1.0",
+      "vcpu_count": 8,
+      "cpu": {
+        "family": 25,
+        "model": 17,
+        "stepping": 1
+      },
+      "sha384": "c1b558f9861f3a2aa6753708a53e33807c3506ebf86675c0254515f0c9ccbaa2def49d98da79cfeb543571cb185a803f",
+      "inputs": {
+        "ovmf": "sha256:9a19a0ec1a86ed03968ae4d7934419af5fb52a4fa8afdf93f06afdb9bb9546cb",
+        "kernel": "sha256:51d0c4c7d6ae6a4f81efdc1fe814ffe8fbc70a6530999b1c4923d6a75c86adec",
+        "initrd": "sha256:f23dfd2e4f64aeddcbad0303a6dc86fd9d79f1d152ae2162e103f2b85a789d20",
+        "cmdline": "sha256:a7e0f611d4f3ce388136131d0c3667a922af345d560a2938f6fe7d3a13df49ff"
+      }
+    },
+    {
+      "image_version": "prism-guest-0.1.0",
+      "vcpu_count": 16,
+      "cpu": {
+        "family": 25,
+        "model": 17,
+        "stepping": 1
+      },
+      "sha384": "e7db2f9a24704f30149ac276899b84d7193b9a0cfe0cb9d77245df0649b3cbdde32464c6e49eee31e67f97261d70c66b",
+      "inputs": {
+        "ovmf": "sha256:9a19a0ec1a86ed03968ae4d7934419af5fb52a4fa8afdf93f06afdb9bb9546cb",
+        "kernel": "sha256:51d0c4c7d6ae6a4f81efdc1fe814ffe8fbc70a6530999b1c4923d6a75c86adec",
+        "initrd": "sha256:f23dfd2e4f64aeddcbad0303a6dc86fd9d79f1d152ae2162e103f2b85a789d20",
+        "cmdline": "sha256:a7e0f611d4f3ce388136131d0c3667a922af345d560a2938f6fe7d3a13df49ff"
+      }
+    },
+    {
+      "image_version": "prism-guest-0.1.0",
+      "vcpu_count": 32,
+      "cpu": {
+        "family": 25,
+        "model": 17,
+        "stepping": 1
+      },
+      "sha384": "06e1af07b9e18e3c296b19a2f186498ddd6c4f2259dacf2cfa8d59377764960b4c1ce80801a78293aed7b8864620a361",
+      "inputs": {
+        "ovmf": "sha256:9a19a0ec1a86ed03968ae4d7934419af5fb52a4fa8afdf93f06afdb9bb9546cb",
+        "kernel": "sha256:51d0c4c7d6ae6a4f81efdc1fe814ffe8fbc70a6530999b1c4923d6a75c86adec",
+        "initrd": "sha256:f23dfd2e4f64aeddcbad0303a6dc86fd9d79f1d152ae2162e103f2b85a789d20",
+        "cmdline": "sha256:a7e0f611d4f3ce388136131d0c3667a922af345d560a2938f6fe7d3a13df49ff"
+      }
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+# Merged over x86_64_defconfig. Everything here either has to be present for the
+# guest to boot at all, or is the difference between a guest that anchors its
+# filesystem and one that trusts whatever the host attached.
+
+CONFIG_AMD_MEM_ENCRYPT=y
+CONFIG_KVM_GUEST=y
+CONFIG_SEV_GUEST=y
+
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+
+# The root filesystem is a read-only squashfs behind dm-verity, and the root
+# hash lives in the measured command line. dm-mod.create is what lets the
+# kernel assemble that device with no initrd to be trusted first.
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_VERITY=y
+CONFIG_DM_INIT=y
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_ZSTD=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_CRYPTO_SHA256=y
+
+# The NVIDIA driver is out of tree, so modules stay enabled. Every module the
+# guest can reach is inside the verity tree, and there is no writable
+# filesystem it could load one from.
+CONFIG_MODULES=y
+
+# Ways to read or replace a running kernel from inside the guest. None of them
+# are needed here, and each one is a way around the image that was measured.
+# CONFIG_DEVMEM is not set
+# CONFIG_DEVPORT is not set
+# CONFIG_KEXEC is not set
+# CONFIG_KEXEC_FILE is not set
+# CONFIG_HIBERNATION is not set
+# CONFIG_PROC_KCORE is not set

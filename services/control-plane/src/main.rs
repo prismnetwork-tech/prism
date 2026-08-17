@@ -22,15 +22,18 @@ use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use prism_protocol::{
-    Account, CommandResult, CredentialCipher, DEFAULT_WORKSPACE_TRUST_FLOOR, EncryptedSecret,
-    LeaseAccess, LeaseQuote, LeaseRecord, LeaseRequest, LeaseState, MAX_ESCROW_BASE_UNITS,
-    MAX_LEASE_SECONDS, MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
-    MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_NAME_BYTES,
-    MAX_WORKSPACES_PER_ACCOUNT, NodeCertificateBundle, NodeCertificateRequest, NodeCommand,
-    NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment,
-    NodeOffer, NodePosture, NodeTelemetry, STANDARD_RATE_PER_SECOND, SettlementEvidence,
-    TrustClass, VaultEnvelope, VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot,
-    discounted_rate, node_id, stake_discount_bps, vault_release_permitted, verifying_key,
+    Account, AttestationChallenge, AttestationKind, AttestationVerdict, CommandResult,
+    CredentialCipher, DEFAULT_WORKSPACE_TRUST_FLOOR, EncryptedSecret, GuestAttestation,
+    LeaseAccess, LeaseAttestationVerdict, LeaseQuote, LeaseRecord, LeaseRequest, LeaseState,
+    MAX_ESCROW_BASE_UNITS, MAX_LEASE_SECONDS, MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES,
+    MAX_VAULT_ITEMS_PER_ACCOUNT, MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES,
+    MAX_WORKSPACE_NAME_BYTES, MAX_WORKSPACES_PER_ACCOUNT, NodeAttestation, NodeCertificateBundle,
+    NodeCertificateRequest, NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll,
+    NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture, NodeTelemetry,
+    STANDARD_RATE_PER_SECOND, SettlementEvidence, TrustClass, VaultEnvelope, VaultItem,
+    VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot, attestation_report_nonce,
+    class_for_lease, class_for_verdict, discounted_rate, node_id, snp_report_data,
+    stake_discount_bps, vault_release_permitted, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -82,17 +85,22 @@ const QUOTE_TTL_MINUTES: i64 = 5;
 /// stops well below `MAX_WORKSPACE_BYTES`. Refusing here is better than minting
 /// a URL that the upload fails against after the renter has sent gigabytes.
 const MAX_SNAPSHOT_UPLOAD_BYTES: u64 = 5 * 1_024 * 1_024 * 1_024;
+/// Long enough for a node to read its GPU and post the report, short enough
+/// that a nonce lifted off the wire is worthless by the time it is used.
+const ATTESTATION_CHALLENGE_TTL_MINUTES: i64 = 5;
+/// A verdict is device identity and firmware, neither of which changes hourly,
+/// but re-proving daily is what makes a card that left the machine stop
+/// carrying the class it earned.
+const ATTESTATION_VERDICT_TTL_HOURS: i64 = 24;
+/// A guest has to boot, generate its host key and take a report before it can
+/// answer, which is minutes rather than the seconds a GPU read costs. Still
+/// short enough that a nonce lifted off the wire is worthless by the time a
+/// second guest could be launched against it.
+const LEASE_ATTESTATION_CHALLENGE_TTL_MINUTES: i64 = 15;
+/// A guest verdict is about one lease, so it is given the life of that lease
+/// plus enough slack to cover provisioning. Nothing is served on it afterwards.
+const LEASE_VERDICT_PROVISIONING_SLACK_HOURS: i64 = 2;
 type HmacSha256 = Hmac<Sha256>;
-
-/// Broker-backed capacity reaches renters over direct SSH with no tunnel and
-/// no daemon, so it can never rise above `Open`. Everything stronger has to
-/// come from a device-signed posture on a node we hold a bond for.
-fn trust_class_for(tunneled: bool, posture: Option<&NodePosture>) -> TrustClass {
-    if !tunneled {
-        return TrustClass::Open;
-    }
-    posture.map_or(TrustClass::Open, NodePosture::effective_class)
-}
 
 #[derive(Clone)]
 struct AppState {
@@ -108,6 +116,7 @@ struct AppState {
     require_node_certificates: bool,
     stake: StakeReader,
     workspaces: Option<Arc<workspaces::WorkspaceStorage>>,
+    attestation_policy: Arc<prism_attestation::Policy>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +210,24 @@ struct ChainLog {
     data: String,
 }
 
+struct AttestationSubmission<'a> {
+    attestation: &'a NodeAttestation,
+    /// The key this node enrolled with, not one carried on the submission.
+    /// It is half of what the GPU signed over, so a report built against any
+    /// other key hashes to a nonce that does not match.
+    device_public_key: &'a str,
+    policy: &'a prism_attestation::Policy,
+}
+
+struct LeaseAttestationSubmission<'a> {
+    attestation: &'a GuestAttestation,
+    /// The lease this report claims to be about, resolved from the path. The
+    /// image on it is what the guest's `HOST_DATA` has to name, and the node on
+    /// it is who is allowed to present the report.
+    lease: &'a LeaseRecord,
+    policy: &'a prism_attestation::Policy,
+}
+
 struct ConfirmedFunding {
     /// The id the escrow assigned. Unique only within the escrow that issued
     /// it, which is why the address travels with it.
@@ -256,6 +283,125 @@ struct MemoryMarketplace {
     vault_items: BTreeMap<Uuid, (String, VaultItem)>,
     vault_releases: Vec<(String, VaultRelease)>,
     workspaces: BTreeMap<Uuid, (String, Workspace)>,
+    attestation_challenges: BTreeMap<Uuid, StoredChallenge>,
+    verdicts: BTreeMap<String, AttestationVerdict>,
+    lease_challenges: BTreeMap<u64, StoredChallenge>,
+    lease_verdicts: BTreeMap<u64, LeaseAttestationVerdict>,
+    /// Which node a physical processor was last attested under, so the same
+    /// chip cannot stand behind two identities.
+    snp_chips: BTreeMap<String, String>,
+}
+
+struct StoredChallenge {
+    challenge: AttestationChallenge,
+    consumed_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// The challenge is stored hex and the GPU signs over the bytes, so the two
+/// sides only agree if this decodes. A stored nonce that is not hex is our own
+/// corruption, never something a node can provoke.
+fn expected_report_nonce(
+    nonce: &str,
+    node_id: &str,
+    device_public_key: &str,
+) -> Result<[u8; 32], StoreError> {
+    let nonce = hex::decode(nonce)
+        .map_err(|_| StoreError::InvalidStoredState("attestation nonce is not hex".to_owned()))?;
+    Ok(attestation_report_nonce(&nonce, node_id, device_public_key))
+}
+
+/// As above, for the 64 bytes a guest commits to in `REPORT_DATA`. The lease id
+/// is in the digest because a report taken for one renter must not be
+/// presentable for another's session, and the channel key is in it because a
+/// correctly measured VM somewhere on the machine says nothing about the box
+/// the renter's client terminates on.
+fn expected_report_data(
+    nonce: &str,
+    lease_id: u64,
+    guest_channel_key: &str,
+) -> Result<[u8; 64], StoreError> {
+    let nonce = hex::decode(nonce)
+        .map_err(|_| StoreError::InvalidStoredState("attestation nonce is not hex".to_owned()))?;
+    Ok(snp_report_data(&nonce, lease_id, guest_channel_key))
+}
+
+/// `HOST_DATA` is the one field the host fixes at launch and cannot change
+/// afterwards, so it is where the image the renter paid for gets nailed down.
+/// The expectation is the lease's own image digest, read off the record rather
+/// than off anything the submission carries. It is worth something only because
+/// the measured guest agent refuses to run any other image: nothing here checks
+/// what was pulled.
+fn lease_host_data(image: &str) -> Result<[u8; 32], StoreError> {
+    image
+        .rsplit_once("@sha256:")
+        .and_then(|(_, digest)| hex::decode(digest).ok())
+        .and_then(|digest| <[u8; 32]>::try_from(digest).ok())
+        .ok_or_else(|| {
+            StoreError::InvalidStoredState(
+                "lease image is not pinned to a sha256 digest".to_owned(),
+            )
+        })
+}
+
+/// The processor this node was last attested on, if it has been. Passing it into
+/// verification is what stops a node that earned a class on one chip presenting
+/// a report from another: the first report binds the pair and every later one
+/// has to match it.
+fn bound_chip_digest(digest: Option<String>) -> Result<Option<[u8; 32]>, StoreError> {
+    let Some(digest) = digest else {
+        return Ok(None);
+    };
+    hex::decode(&digest)
+        .ok()
+        .and_then(|digest| <[u8; 32]>::try_from(digest).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            StoreError::InvalidStoredState("stored chip identity is not a sha256 digest".to_owned())
+        })
+}
+
+/// A guest can bind a report to its lease while the machine is being prepared
+/// for it and not afterwards. Once the lease is live the access grant has
+/// already been decided, and a report arriving then would be asking for a class
+/// the renter is mid-session at.
+fn accepts_guest_attestation(state: &LeaseState) -> bool {
+    matches!(state, LeaseState::Provisioning | LeaseState::Ready)
+}
+
+/// One code for every verification failure, as on the node path: which check
+/// the evidence failed is a hint to whoever is trying to forge past it.
+fn verify_lease_attestation(
+    attestation: &GuestAttestation,
+    expected: &prism_attestation::SnpExpectation,
+    now: chrono::DateTime<Utc>,
+    policy: &prism_attestation::Policy,
+) -> Result<LeaseAttestationVerdict, StoreError> {
+    prism_attestation::verify_sev_snp_attestation(attestation, expected, now, policy).map_err(
+        |error| {
+            tracing::warn!(
+                lease_id = attestation.lease_id,
+                node_id = %attestation.node_id,
+                %error,
+                "guest attestation evidence rejected"
+            );
+            StoreError::AttestationUnverified
+        },
+    )
+}
+
+/// Posture counts only while the heartbeat that carried it is still current.
+/// The Postgres arm has always bounded it that way; the memory arm did not, so
+/// tests were accepting a posture production would have thrown away.
+fn fresh_posture<'a>(
+    market: &'a MemoryMarketplace,
+    node_id: &str,
+    cutoff: chrono::DateTime<Utc>,
+) -> Option<&'a NodePosture> {
+    market
+        .telemetry
+        .get(node_id)
+        .filter(|telemetry| telemetry.observed_at >= cutoff)
+        .and_then(|telemetry| telemetry.posture.as_ref())
 }
 
 struct MemoryCommand {
@@ -283,6 +429,15 @@ enum StoredLeaseAccess {
         port: u16,
         expires_at: chrono::DateTime<Utc>,
     },
+}
+
+struct LeaseAccessGrant {
+    access: StoredLeaseAccess,
+    /// The fingerprint of the SSH host key the guest generated for this lease,
+    /// taken from the key line the report commits to. Present only where a guest
+    /// verdict is on file, and worth something only if the renter's client pins
+    /// it: a client that auto-accepts host keys makes the binding decorative.
+    channel_key_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -354,6 +509,20 @@ enum StoreError {
     WorkspaceVersionConflict,
     #[error("workspace limit reached")]
     WorkspaceFull,
+    #[error("attestation challenge was not found, expired or already consumed")]
+    AttestationChallengeUnavailable,
+    #[error("attestation evidence did not verify")]
+    AttestationUnverified,
+    #[error("this device is already attested under another node")]
+    AttestedDeviceConflict,
+    #[error("this processor is already attested under another node")]
+    AttestedChipConflict,
+    #[error("this lease cannot carry a guest attestation")]
+    LeaseNotAttestable,
+    #[error("this lease was quoted above what its guest has proved")]
+    LeaseUnattested,
+    #[error("the node no longer holds the trust class this quote was issued at")]
+    TrustClassExpired,
     #[error("storage failure")]
     Storage(#[source] SqlError),
 }
@@ -482,6 +651,18 @@ struct PriceIndex {
     unit: &'static str,
     generated_at: chrono::DateTime<Utc>,
     gpus: Vec<PriceIndexEntry>,
+}
+
+/// The access grant, plus the fingerprint of the SSH host key the attested guest
+/// generated for this lease. It rides alongside rather than inside `LeaseAccess`
+/// because it is evidence about the session, not a credential for it: clients
+/// that do not pin host keys ignore the field and lose only the binding.
+#[derive(Serialize)]
+struct LeaseAccessResponse {
+    #[serde(flatten)]
+    access: LeaseAccess,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_key_fingerprint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -825,6 +1006,12 @@ async fn main() -> anyhow::Result<()> {
         workspaces: workspaces::WorkspaceStorage::from_environment()
             .await?
             .map(Arc::new),
+        // No environment switch here on purpose. A relaxed verification mode is
+        // one variable away from being set on the box that matters.
+        attestation_policy: Arc::new(
+            prism_attestation::Policy::default()
+                .with_verdict_ttl(Duration::hours(ATTESTATION_VERDICT_TTL_HOURS)),
+        ),
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -837,6 +1024,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/nodes/{node_id}/heartbeat", post(record_telemetry))
         .route(
+            "/v1/nodes/{node_id}/attestation/challenge",
+            get(create_attestation_challenge),
+        )
+        .route("/v1/nodes/{node_id}/attestation", post(record_attestation))
+        .route(
             "/v1/gateway/tunnels/{node_id}",
             post(record_tunnel_observation),
         )
@@ -848,6 +1040,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/leases/match", post(match_lease))
         .route("/v1/leases", get(list_account_leases))
         .route("/v1/leases/{lease_id}/access", get(get_lease_access))
+        .route(
+            "/v1/leases/{lease_id}/attestation/challenge",
+            get(create_lease_attestation_challenge),
+        )
+        .route(
+            "/v1/leases/{lease_id}/attestation",
+            post(record_lease_attestation),
+        )
         .route("/v1/leases/{lease_id}/result", get(get_lease_result))
         .route("/v1/leases/confirm", post(confirm_lease))
         .route("/v1/account/session/revoke", post(revoke_account_session))
@@ -2741,27 +2941,36 @@ impl MarketplaceStore {
                     .cloned()
                     .map(|mut offer| {
                         offer.online = true;
-                        offer.trust_class = trust_class_for(
+                        offer.trust_class = class_for_verdict(
+                            &offer.node_id,
                             true,
-                            market
-                                .telemetry
-                                .get(&offer.node_id)
-                                .and_then(|telemetry| telemetry.posture.as_ref()),
+                            fresh_posture(&market, &offer.node_id, cutoff),
+                            market.verdicts.get(&offer.node_id),
+                            Utc::now(),
                         );
                         offer
                     })
                     .collect())
             }
             Self::Postgres(pool) => {
-                let documents =
-                    query_as::<_, (SqlJson<NodeOffer>, bool, Option<SqlJson<NodePosture>>)>(
-                        "SELECT o.document, \
+                let documents = query_as::<
+                    _,
+                    (
+                        SqlJson<NodeOffer>,
+                        bool,
+                        Option<SqlJson<NodePosture>>,
+                        Option<SqlJson<AttestationVerdict>>,
+                    ),
+                >(
+                    "SELECT o.document, \
                             EXISTS ( \
                                 SELECT 1 FROM node_tunnels t \
                                 WHERE t.node_id = o.node_id AND t.observed_at >= $1 \
                             ), \
                             (SELECT nt.document->'posture' FROM node_telemetry nt \
-                             WHERE nt.node_id = o.node_id AND nt.observed_at >= $1) \
+                             WHERE nt.node_id = o.node_id AND nt.observed_at >= $1), \
+                            (SELECT v.document FROM node_attestation_verdicts v \
+                             WHERE v.node_id = o.node_id AND v.expires_at > now()) \
                      FROM node_offers o \
                      WHERE (o.document->>'bonded')::boolean = true \
                        AND (document->>'public_image_only')::boolean = true \
@@ -2788,17 +2997,23 @@ impl MarketplaceStore {
                        ) \
                        ) \
                      ORDER BY (o.document->>'rate_per_second')::bigint ASC, o.updated_at DESC",
-                    )
-                    .bind(cutoff)
-                    .fetch_all(pool)
-                    .await
-                    .map_err(StoreError::Storage)?;
+                )
+                .bind(cutoff)
+                .fetch_all(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                let now = Utc::now();
                 Ok(documents
                     .into_iter()
-                    .map(|(SqlJson(mut offer), tunneled, posture)| {
+                    .map(|(SqlJson(mut offer), tunneled, posture, verdict)| {
                         offer.online = true;
-                        offer.trust_class =
-                            trust_class_for(tunneled, posture.as_ref().map(|SqlJson(p)| p));
+                        offer.trust_class = class_for_verdict(
+                            &offer.node_id,
+                            tunneled,
+                            posture.as_ref().map(|SqlJson(posture)| posture),
+                            verdict.as_ref().map(|SqlJson(verdict)| verdict),
+                            now,
+                        );
                         offer
                     })
                     .collect())
@@ -3000,6 +3215,646 @@ impl MarketplaceStore {
         }
     }
 
+    async fn create_attestation_challenge(
+        &self,
+        node_id: &str,
+    ) -> Result<AttestationChallenge, StoreError> {
+        let mut nonce = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let issued_at = Utc::now();
+        let challenge = AttestationChallenge {
+            challenge_id: Uuid::now_v7(),
+            node_id: node_id.to_owned(),
+            nonce: hex::encode(nonce),
+            issued_at,
+            expires_at: issued_at + Duration::minutes(ATTESTATION_CHALLENGE_TTL_MINUTES),
+        };
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                if !market.offers.contains_key(node_id) {
+                    return Err(StoreError::NodeNotFound);
+                }
+                // A live challenge is handed back, never replaced. One nonce at
+                // a time stops a node shopping for the one a captured report
+                // happens to match, and handing it back stops anyone who knows
+                // a node id from invalidating the nonce that node is busy
+                // answering. The nonce is worth nothing without the GPU that
+                // has to sign over it.
+                if let Some(live) = market.attestation_challenges.values().find(|stored| {
+                    stored.consumed_at.is_none()
+                        && stored.challenge.node_id == node_id
+                        && stored.challenge.expires_at > issued_at
+                }) {
+                    return Ok(live.challenge.clone());
+                }
+                market.attestation_challenges.retain(|_, stored| {
+                    stored.challenge.node_id != node_id
+                        && stored.challenge.expires_at > issued_at - Duration::days(7)
+                });
+                market.attestation_challenges.insert(
+                    challenge.challenge_id,
+                    StoredChallenge {
+                        challenge: challenge.clone(),
+                        consumed_at: None,
+                    },
+                );
+                Ok(challenge)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let enrolled = query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM node_offers WHERE node_id = $1)",
+                )
+                .bind(node_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if !enrolled {
+                    return Err(StoreError::NodeNotFound);
+                }
+                // A live challenge is handed back, never replaced. One nonce at
+                // a time stops a node shopping for the one a captured report
+                // happens to match, and handing it back stops anyone who knows
+                // a node id from invalidating the nonce that node is busy
+                // answering. The nonce is worth nothing without the GPU that
+                // has to sign over it.
+                if let Some(live) =
+                    query_as::<_, (Uuid, String, chrono::DateTime<Utc>, chrono::DateTime<Utc>)>(
+                        "SELECT challenge_id, nonce, issued_at, expires_at \
+                     FROM node_attestation_challenges \
+                     WHERE node_id = $1 AND consumed_at IS NULL AND expires_at > NOW() \
+                     ORDER BY issued_at DESC LIMIT 1",
+                    )
+                    .bind(node_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?
+                {
+                    let (challenge_id, nonce, issued_at, expires_at) = live;
+                    return Ok(AttestationChallenge {
+                        challenge_id,
+                        node_id: node_id.to_owned(),
+                        nonce,
+                        issued_at,
+                        expires_at,
+                    });
+                }
+                // A spent nonce proves nothing once its verdict is on file, so
+                // the table is not an archive.
+                query(
+                    "DELETE FROM node_attestation_challenges \
+                     WHERE node_id = $1 OR expires_at < NOW() - INTERVAL '7 days'",
+                )
+                .bind(node_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                query(
+                    "INSERT INTO node_attestation_challenges \
+                         (challenge_id, node_id, nonce, issued_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(challenge.challenge_id)
+                .bind(&challenge.node_id)
+                .bind(&challenge.nonce)
+                .bind(challenge.issued_at)
+                .bind(challenge.expires_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(challenge)
+            }
+        }
+    }
+
+    /// The challenge is spent whatever the evidence turns out to be. Handing it
+    /// back on failure would let an operator grind reports against one nonce
+    /// until something passed.
+    async fn record_attestation(
+        &self,
+        submission: AttestationSubmission<'_>,
+    ) -> Result<AttestationVerdict, StoreError> {
+        let AttestationSubmission {
+            attestation,
+            device_public_key,
+            policy,
+        } = submission;
+        let node_id = attestation.node_id.as_str();
+        let now = Utc::now();
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                if !market.offers.contains_key(node_id) {
+                    return Err(StoreError::NodeNotFound);
+                }
+                if market.suspended_nodes.contains(node_id) {
+                    return Err(StoreError::NodeSuspended);
+                }
+                let nonce = {
+                    let Some(stored) = market
+                        .attestation_challenges
+                        .get_mut(&attestation.challenge_id)
+                        .filter(|stored| {
+                            stored.consumed_at.is_none()
+                                && stored.challenge.node_id == node_id
+                                && stored.challenge.expires_at > now
+                        })
+                    else {
+                        return Err(StoreError::AttestationChallengeUnavailable);
+                    };
+                    stored.consumed_at = Some(now);
+                    stored.challenge.nonce.clone()
+                };
+                let expected = expected_report_nonce(&nonce, node_id, device_public_key)?;
+                let verdict = prism_attestation::verify_nvidia_gpu_attestation(
+                    attestation,
+                    &expected,
+                    now,
+                    policy,
+                )
+                .map_err(|error| {
+                    tracing::warn!(node_id, %error, "attestation evidence rejected");
+                    StoreError::AttestationUnverified
+                })?;
+                if market.verdicts.values().any(|current| {
+                    current.device_identity == verdict.device_identity
+                        && current.node_id != verdict.node_id
+                }) {
+                    return Err(StoreError::AttestedDeviceConflict);
+                }
+                market.verdicts.insert(node_id.to_owned(), verdict.clone());
+                Ok(verdict)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let enrolled = query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM node_offers o \
+                         WHERE o.node_id = $1 AND NOT EXISTS ( \
+                             SELECT 1 FROM node_controls c \
+                             WHERE c.node_id = o.node_id AND c.suspended \
+                         ) \
+                     )",
+                )
+                .bind(node_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if !enrolled {
+                    let known = query_scalar::<_, bool>(
+                        "SELECT EXISTS (SELECT 1 FROM node_offers WHERE node_id = $1)",
+                    )
+                    .bind(node_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                    return Err(if known {
+                        StoreError::NodeSuspended
+                    } else {
+                        StoreError::NodeNotFound
+                    });
+                }
+                let Some(nonce) = query_scalar::<_, String>(
+                    "UPDATE node_attestation_challenges SET consumed_at = now() \
+                     WHERE challenge_id = $1 AND node_id = $2 \
+                       AND consumed_at IS NULL AND expires_at > now() \
+                     RETURNING nonce",
+                )
+                .bind(attestation.challenge_id)
+                .bind(node_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?
+                else {
+                    return Err(StoreError::AttestationChallengeUnavailable);
+                };
+                let expected = expected_report_nonce(&nonce, node_id, device_public_key)?;
+                let verdict = match prism_attestation::verify_nvidia_gpu_attestation(
+                    attestation,
+                    &expected,
+                    now,
+                    policy,
+                ) {
+                    Ok(verdict) => verdict,
+                    Err(error) => {
+                        tracing::warn!(node_id, %error, "attestation evidence rejected");
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(StoreError::AttestationUnverified);
+                    }
+                };
+                let taken = query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM node_attestation_verdicts \
+                         WHERE device_identity = $1 AND node_id <> $2 \
+                     )",
+                )
+                .bind(&verdict.device_identity)
+                .bind(node_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if taken {
+                    transaction.commit().await.map_err(StoreError::Storage)?;
+                    return Err(StoreError::AttestedDeviceConflict);
+                }
+                query(
+                    "INSERT INTO node_attestation_verdicts \
+                         (node_id, document, device_identity, verified_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (node_id) DO UPDATE \
+                     SET document = EXCLUDED.document, \
+                         device_identity = EXCLUDED.device_identity, \
+                         verified_at = EXCLUDED.verified_at, \
+                         expires_at = EXCLUDED.expires_at",
+                )
+                .bind(node_id)
+                .bind(SqlJson(verdict.clone()))
+                .bind(&verdict.device_identity)
+                .bind(verdict.verified_at)
+                .bind(verdict.expires_at)
+                .execute(&mut *transaction)
+                .await
+                // Two nodes racing the same card both pass the check above and
+                // the index settles it, so that loss reads as a conflict too.
+                .map_err(|error| match &error {
+                    SqlError::Database(database) if database.is_unique_violation() => {
+                        StoreError::AttestedDeviceConflict
+                    }
+                    _ => StoreError::Storage(error),
+                })?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(verdict)
+            }
+        }
+    }
+
+    /// The nonce the guest serving one lease has to commit to in `REPORT_DATA`.
+    /// It is issued against the lease rather than the node because an SNP report
+    /// describes the guest that asked for it: a report bound to nothing but a
+    /// machine is a badge the operator can farm, by booting the measured image
+    /// once and serving the renter from a bare container beside it.
+    async fn create_lease_attestation_challenge(
+        &self,
+        lease_id: u64,
+    ) -> Result<AttestationChallenge, StoreError> {
+        let mut nonce = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let issued_at = Utc::now();
+        let expires_at = issued_at + Duration::minutes(LEASE_ATTESTATION_CHALLENGE_TTL_MINUTES);
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let Some((_, lease)) = market.leases.get(&lease_id) else {
+                    return Err(StoreError::LeaseNotAttestable);
+                };
+                if !accepts_guest_attestation(&lease.state) {
+                    return Err(StoreError::LeaseNotAttestable);
+                }
+                let node_id = lease.node_id.clone();
+                // A live challenge is handed back rather than replaced, as on
+                // the node path: one nonce at a time stops a host shopping for
+                // the one a report it already holds happens to match.
+                if let Some(live) = market.lease_challenges.get(&lease_id).filter(|stored| {
+                    stored.consumed_at.is_none() && stored.challenge.expires_at > issued_at
+                }) {
+                    return Ok(live.challenge.clone());
+                }
+                let challenge = AttestationChallenge {
+                    challenge_id: Uuid::now_v7(),
+                    node_id,
+                    nonce: hex::encode(nonce),
+                    issued_at,
+                    expires_at,
+                };
+                market.lease_challenges.insert(
+                    lease_id,
+                    StoredChallenge {
+                        challenge: challenge.clone(),
+                        consumed_at: None,
+                    },
+                );
+                Ok(challenge)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let Some((node_id, state)) = query_as::<_, (String, String)>(
+                    "SELECT document->>'node_id', state FROM leases \
+                     WHERE lease_id = $1 FOR UPDATE",
+                )
+                .bind(lease_id as i64)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?
+                else {
+                    return Err(StoreError::LeaseNotAttestable);
+                };
+                if !matches!(state.as_str(), "provisioning" | "ready") {
+                    return Err(StoreError::LeaseNotAttestable);
+                }
+                if let Some((challenge_id, nonce, issued_at, expires_at)) =
+                    query_as::<_, (Uuid, String, chrono::DateTime<Utc>, chrono::DateTime<Utc>)>(
+                        "SELECT challenge_id, nonce, issued_at, expires_at \
+                         FROM lease_attestation_challenges \
+                         WHERE lease_id = $1 AND consumed_at IS NULL AND expires_at > now()",
+                    )
+                    .bind(lease_id as i64)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?
+                {
+                    transaction.commit().await.map_err(StoreError::Storage)?;
+                    return Ok(AttestationChallenge {
+                        challenge_id,
+                        node_id,
+                        nonce,
+                        issued_at,
+                        expires_at,
+                    });
+                }
+                let challenge = AttestationChallenge {
+                    challenge_id: Uuid::now_v7(),
+                    node_id,
+                    nonce: hex::encode(nonce),
+                    issued_at,
+                    expires_at,
+                };
+                // A spent nonce proves nothing once its verdict is on file, so
+                // the row is replaced rather than kept alongside a new one.
+                query(
+                    "INSERT INTO lease_attestation_challenges \
+                         (lease_id, challenge_id, node_id, nonce, issued_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (lease_id) DO UPDATE \
+                     SET challenge_id = EXCLUDED.challenge_id, \
+                         node_id = EXCLUDED.node_id, \
+                         nonce = EXCLUDED.nonce, \
+                         issued_at = EXCLUDED.issued_at, \
+                         expires_at = EXCLUDED.expires_at, \
+                         consumed_at = NULL",
+                )
+                .bind(lease_id as i64)
+                .bind(challenge.challenge_id)
+                .bind(&challenge.node_id)
+                .bind(&challenge.nonce)
+                .bind(challenge.issued_at)
+                .bind(challenge.expires_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(challenge)
+            }
+        }
+    }
+
+    /// The expectation is computed here and never accepted from the submission:
+    /// `REPORT_DATA` from the nonce this service issued, the lease it issued it
+    /// for and the channel key presented with the report, and `HOST_DATA` from
+    /// the image the renter paid for. A guest that answered a different question
+    /// produces a report that fails rather than one that is stored.
+    ///
+    /// The challenge is spent whatever the evidence turns out to be, for the
+    /// reason written above `record_attestation`: handing it back on failure
+    /// would let a host grind reports against one nonce until something passed.
+    async fn record_lease_attestation(
+        &self,
+        submission: LeaseAttestationSubmission<'_>,
+    ) -> Result<LeaseAttestationVerdict, StoreError> {
+        let LeaseAttestationSubmission {
+            attestation,
+            lease,
+            policy,
+        } = submission;
+        let lease_id = lease.lease_id;
+        let now = Utc::now();
+        let host_data = lease_host_data(&lease.image)?;
+        // A guest verdict is about one lease and is worth nothing past it, so it
+        // is given that lease's life rather than the crate's default.
+        let policy = policy.clone().with_lease_verdict_ttl(
+            Duration::seconds(i64::from(lease.duration_seconds))
+                + Duration::hours(LEASE_VERDICT_PROVISIONING_SLACK_HOURS),
+        );
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let nonce = {
+                    let Some(stored) =
+                        market.lease_challenges.get_mut(&lease_id).filter(|stored| {
+                            stored.consumed_at.is_none()
+                                && stored.challenge.challenge_id == attestation.challenge_id
+                                && stored.challenge.node_id == attestation.node_id
+                                && stored.challenge.expires_at > now
+                        })
+                    else {
+                        return Err(StoreError::AttestationChallengeUnavailable);
+                    };
+                    stored.consumed_at = Some(now);
+                    stored.challenge.nonce.clone()
+                };
+                let expected = prism_attestation::SnpExpectation {
+                    report_data: expected_report_data(
+                        &nonce,
+                        lease_id,
+                        &attestation.guest_channel_key,
+                    )?,
+                    host_data,
+                    chip_id_digest: bound_chip_digest(
+                        market
+                            .snp_chips
+                            .iter()
+                            .find(|(_, owner)| owner.as_str() == lease.node_id)
+                            .map(|(digest, _)| digest.clone()),
+                    )?,
+                };
+                let verdict = verify_lease_attestation(attestation, &expected, now, &policy)?;
+                if verdict.lease_id != lease_id || verdict.node_id != lease.node_id {
+                    return Err(StoreError::AttestationUnverified);
+                }
+                // One chip stands behind one node and one node behind one chip,
+                // the bound 0017 already puts on the GPU. Either direction
+                // failing is a conflict rather than a second earned class.
+                let taken = market.snp_chips.iter().any(|(digest, owner)| {
+                    if digest == &verdict.guest.chip_id_digest {
+                        owner != &verdict.node_id
+                    } else {
+                        owner == &verdict.node_id
+                    }
+                });
+                if taken {
+                    return Err(StoreError::AttestedChipConflict);
+                }
+                market.snp_chips.insert(
+                    verdict.guest.chip_id_digest.clone(),
+                    verdict.node_id.clone(),
+                );
+                market.lease_verdicts.insert(lease_id, verdict.clone());
+                if let Some((_, record)) = market.leases.get_mut(&lease_id) {
+                    record.trust_class = class_for_lease(
+                        lease_id,
+                        &record.node_id,
+                        record.trust_class,
+                        Some(&verdict),
+                        now,
+                    );
+                    record.updated_at = now;
+                }
+                Ok(verdict)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let Some(nonce) = query_scalar::<_, String>(
+                    "UPDATE lease_attestation_challenges SET consumed_at = now() \
+                     WHERE lease_id = $1 AND challenge_id = $2 AND node_id = $3 \
+                       AND consumed_at IS NULL AND expires_at > now() \
+                     RETURNING nonce",
+                )
+                .bind(lease_id as i64)
+                .bind(attestation.challenge_id)
+                .bind(&attestation.node_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?
+                else {
+                    return Err(StoreError::AttestationChallengeUnavailable);
+                };
+                let expected = prism_attestation::SnpExpectation {
+                    report_data: expected_report_data(
+                        &nonce,
+                        lease_id,
+                        &attestation.guest_channel_key,
+                    )?,
+                    host_data,
+                    chip_id_digest: bound_chip_digest(
+                        query_scalar::<_, String>(
+                            "SELECT chip_id_digest FROM node_snp_chips WHERE node_id = $1",
+                        )
+                        .bind(&lease.node_id)
+                        .fetch_optional(&mut *transaction)
+                        .await
+                        .map_err(StoreError::Storage)?,
+                    )?,
+                };
+                let verdict = match verify_lease_attestation(attestation, &expected, now, &policy) {
+                    Ok(verdict)
+                        if verdict.lease_id == lease_id && verdict.node_id == lease.node_id =>
+                    {
+                        verdict
+                    }
+                    Ok(_) => {
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(StoreError::AttestationUnverified);
+                    }
+                    Err(error) => {
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(error);
+                    }
+                };
+                // The insert settles a race between two nodes presenting the
+                // same processor: the second one updates no row and reads as a
+                // conflict rather than as a second earned class. A node that has
+                // moved to another chip loses the unique node index instead.
+                let bound = query(
+                    "INSERT INTO node_snp_chips \
+                         (chip_id_digest, node_id, first_attested_at, last_attested_at) \
+                     VALUES ($1, $2, $3, $3) \
+                     ON CONFLICT (chip_id_digest) DO UPDATE \
+                     SET last_attested_at = EXCLUDED.last_attested_at \
+                     WHERE node_snp_chips.node_id = EXCLUDED.node_id",
+                )
+                .bind(&verdict.guest.chip_id_digest)
+                .bind(&verdict.node_id)
+                .bind(verdict.verified_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| match &error {
+                    SqlError::Database(database) if database.is_unique_violation() => {
+                        StoreError::AttestedChipConflict
+                    }
+                    _ => StoreError::Storage(error),
+                })?;
+                if bound.rows_affected() != 1 {
+                    transaction.commit().await.map_err(StoreError::Storage)?;
+                    return Err(StoreError::AttestedChipConflict);
+                }
+                query(
+                    "INSERT INTO lease_attestation_verdicts \
+                         (lease_id, node_id, document, measurement, chip_id_digest, \
+                          channel_key_fingerprint, verified_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                     ON CONFLICT (lease_id) DO UPDATE \
+                     SET node_id = EXCLUDED.node_id, \
+                         document = EXCLUDED.document, \
+                         measurement = EXCLUDED.measurement, \
+                         chip_id_digest = EXCLUDED.chip_id_digest, \
+                         channel_key_fingerprint = EXCLUDED.channel_key_fingerprint, \
+                         verified_at = EXCLUDED.verified_at, \
+                         expires_at = EXCLUDED.expires_at",
+                )
+                .bind(lease_id as i64)
+                .bind(&verdict.node_id)
+                .bind(SqlJson(verdict.clone()))
+                .bind(&verdict.guest.measurement)
+                .bind(&verdict.guest.chip_id_digest)
+                .bind(&verdict.guest.channel_key_fingerprint)
+                .bind(verdict.verified_at)
+                .bind(verdict.expires_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                let record = query_scalar::<_, SqlJson<LeaseRecord>>(
+                    "SELECT document FROM leases WHERE lease_id = $1 FOR UPDATE",
+                )
+                .bind(lease_id as i64)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if let Some(SqlJson(mut record)) = record {
+                    record.trust_class = class_for_lease(
+                        lease_id,
+                        &record.node_id,
+                        record.trust_class,
+                        Some(&verdict),
+                        now,
+                    );
+                    record.updated_at = now;
+                    query(
+                        "UPDATE leases SET document = $2, updated_at = NOW() WHERE lease_id = $1",
+                    )
+                    .bind(lease_id as i64)
+                    .bind(SqlJson(record))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                }
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(verdict)
+            }
+        }
+    }
+
+    /// The lease a guest report claims to be about, read without an account:
+    /// the caller here is the node carrying the report, not the renter.
+    async fn lease_record(&self, lease_id: u64) -> Result<Option<LeaseRecord>, StoreError> {
+        match self {
+            Self::Memory(market) => Ok(market
+                .read()
+                .await
+                .leases
+                .get(&lease_id)
+                .map(|(_, lease)| lease.clone())),
+            Self::Postgres(pool) => Ok(query_scalar::<_, SqlJson<LeaseRecord>>(
+                "SELECT document FROM leases WHERE lease_id = $1",
+            )
+            .bind(lease_id as i64)
+            .fetch_optional(pool)
+            .await
+            .map_err(StoreError::Storage)?
+            .map(|SqlJson(lease)| lease)),
+        }
+    }
+
     async fn quote(
         &self,
         subject: &str,
@@ -3063,17 +3918,29 @@ impl MarketplaceStore {
                         .filter(|(_, lease)| occupies_node(lease))
                         .map(|(_, lease)| lease.node_id.clone()),
                 );
-                let cutoff = Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS);
+                let now = Utc::now();
+                let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
                 let offers = market
                     .offers
                     .values()
                     .filter(|offer| !market.suspended_nodes.contains(&offer.node_id))
                     .cloned()
                     .map(|mut offer| {
-                        offer.online = market
+                        let tunneled = market
                             .tunnels
                             .get(&offer.node_id)
                             .is_some_and(|observed_at| *observed_at >= cutoff);
+                        offer.online = tunneled;
+                        // The stored class is the floor enrolment wrote and
+                        // nothing ever rewrites it. Deriving it here is what
+                        // stops the matcher stamping every lease `Open`.
+                        offer.trust_class = class_for_verdict(
+                            &offer.node_id,
+                            tunneled,
+                            fresh_posture(&market, &offer.node_id, cutoff),
+                            market.verdicts.get(&offer.node_id),
+                            now,
+                        );
                         offer
                     })
                     .collect::<Vec<_>>();
@@ -3146,22 +4013,80 @@ impl MarketplaceStore {
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
+                let now = Utc::now();
+                let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
+                // Broker capacity is reachable without a tunnel, so being
+                // online and being tunneled are different questions and only
+                // the second one can carry a class above `Open`.
+                let tunneled: BTreeSet<String> =
+                    query_scalar("SELECT node_id FROM node_tunnels WHERE observed_at >= $1")
+                        .bind(cutoff)
+                        .fetch_all(&mut *transaction)
+                        .await
+                        .map_err(StoreError::Storage)?
+                        .into_iter()
+                        .collect();
                 let online: BTreeSet<String> = query_scalar(
-                    "SELECT node_id FROM node_tunnels WHERE observed_at >= $1 \
-                     UNION \
-                     SELECT node_id FROM cloud_capacity \
+                    "SELECT node_id FROM cloud_capacity \
                      WHERE provider = 'vast' AND available AND observed_at >= $1",
                 )
-                .bind(Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS))
+                .bind(cutoff)
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?
                 .into_iter()
+                .chain(tunneled.iter().cloned())
                 .collect();
+                let evidence: BTreeMap<String, (Option<NodePosture>, Option<AttestationVerdict>)> =
+                    query_as::<
+                        _,
+                        (
+                            String,
+                            Option<SqlJson<NodePosture>>,
+                            Option<SqlJson<AttestationVerdict>>,
+                        ),
+                    >(
+                        "SELECT o.node_id, \
+                            (SELECT nt.document->'posture' FROM node_telemetry nt \
+                             WHERE nt.node_id = o.node_id AND nt.observed_at >= $1), \
+                            (SELECT v.document FROM node_attestation_verdicts v \
+                             WHERE v.node_id = o.node_id AND v.expires_at > now()) \
+                         FROM node_offers o",
+                    )
+                    .bind(cutoff)
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?
+                    .into_iter()
+                    .map(|(node_id, posture, verdict)| {
+                        (
+                            node_id,
+                            (
+                                posture.map(|SqlJson(posture)| posture),
+                                verdict.map(|SqlJson(verdict)| verdict),
+                            ),
+                        )
+                    })
+                    .collect();
                 let offers: Vec<_> = documents
                     .into_iter()
                     .map(|SqlJson(mut offer)| {
                         offer.online = online.contains(&offer.node_id);
+                        // The stored class is the floor enrolment wrote and
+                        // nothing ever rewrites it. Deriving it here is what
+                        // stops the matcher stamping every lease `Open`.
+                        let (posture, verdict) = evidence
+                            .get(&offer.node_id)
+                            .map_or((None, None), |(posture, verdict)| {
+                                (posture.as_ref(), verdict.as_ref())
+                            });
+                        offer.trust_class = class_for_verdict(
+                            &offer.node_id,
+                            tunneled.contains(&offer.node_id),
+                            posture,
+                            verdict,
+                            now,
+                        );
                         offer
                     })
                     .collect();
@@ -3279,6 +4204,25 @@ impl MarketplaceStore {
                 if market.suspended_nodes.contains(&quote.node_id) {
                     return Err(StoreError::NodeSuspended);
                 }
+                // A quote is confirmable for a day, a verdict lives a day and a
+                // tunnel row ninety seconds, so a node can have lost everything
+                // that earned its class since the quote was cut. The renter
+                // funded against a stated class, so this refuses rather than
+                // quietly handing back a weaker lease.
+                let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
+                if class_for_verdict(
+                    &quote.node_id,
+                    market
+                        .tunnels
+                        .get(&quote.node_id)
+                        .is_some_and(|observed_at| *observed_at >= cutoff),
+                    fresh_posture(&market, &quote.node_id, cutoff),
+                    market.verdicts.get(&quote.node_id),
+                    now,
+                ) < quote.trust_class
+                {
+                    return Err(StoreError::TrustClassExpired);
+                }
                 if let Some((owner, current)) = market.leases.values().find(|(_, current)| {
                     current.escrow_address == lease.escrow_address
                         && current.chain_lease_id == lease.chain_lease_id
@@ -3304,6 +4248,13 @@ impl MarketplaceStore {
                     .unwrap_or(INTERNAL_LEASE_ID_FLOOR)
                     .saturating_add(1)
                     .max(INTERNAL_LEASE_ID_FLOOR);
+                // Nothing has booted for this renter yet, so there is no guest
+                // verdict to lift the class. Writing it through the same
+                // function that will read one later is what keeps the record
+                // inside what the network can substantiate without anybody
+                // having to remember the ceiling.
+                lease.trust_class =
+                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, now);
                 if market
                     .leases
                     .values()
@@ -3362,6 +4313,44 @@ impl MarketplaceStore {
                 if suspended {
                     return Err(StoreError::NodeSuspended);
                 }
+                // Suspension is not the only thing that can lapse between quote
+                // and funding. A verdict lives a day and a tunnel row ninety
+                // seconds, so the class is recomputed here too. The renter
+                // funded against a stated class, so this refuses rather than
+                // quietly handing back a weaker lease.
+                let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
+                let (tunneled, posture, verdict) = query_as::<
+                    _,
+                    (
+                        bool,
+                        Option<SqlJson<NodePosture>>,
+                        Option<SqlJson<AttestationVerdict>>,
+                    ),
+                >(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM node_tunnels t \
+                         WHERE t.node_id = $1 AND t.observed_at >= $2 \
+                     ), \
+                     (SELECT nt.document->'posture' FROM node_telemetry nt \
+                      WHERE nt.node_id = $1 AND nt.observed_at >= $2), \
+                     (SELECT v.document FROM node_attestation_verdicts v \
+                      WHERE v.node_id = $1 AND v.expires_at > now())",
+                )
+                .bind(&quote.node_id)
+                .bind(cutoff)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                if class_for_verdict(
+                    &quote.node_id,
+                    tunneled,
+                    posture.as_ref().map(|SqlJson(posture)| posture),
+                    verdict.as_ref().map(|SqlJson(verdict)| verdict),
+                    now,
+                ) < quote.trust_class
+                {
+                    return Err(StoreError::TrustClassExpired);
+                }
                 // Identity is the escrow plus the id it issued. Matching on the
                 // id alone treats a fresh escrow's lease 3 as a replay of a
                 // superseded escrow's lease 3 and rejects a renter who has
@@ -3390,6 +4379,13 @@ impl MarketplaceStore {
                     .fetch_one(&mut *transaction)
                     .await
                     .map_err(StoreError::Storage)? as u64;
+                // Nothing has booted for this renter yet, so there is no guest
+                // verdict to lift the class. Writing it through the same
+                // function that will read one later is what keeps the record
+                // inside what the network can substantiate without anybody
+                // having to remember the ceiling.
+                lease.trust_class =
+                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, now);
                 let node_busy = query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
@@ -4357,11 +5353,19 @@ impl MarketplaceStore {
         }
     }
 
+    /// Credentials are released only for a lease standing at the class it was
+    /// quoted at. Above `Isolated` that means a verdict from the guest running
+    /// this lease: a node-level report says which machine booted correctly at
+    /// some point, never which VM the renter is about to be handed a shell in.
+    /// A lease that never produces one gets no grant and can be refunded, which
+    /// is the honest outcome; running it a rung lower than it was sold at is
+    /// not.
     async fn lease_access(
         &self,
         subject: &str,
         lease_id: u64,
-    ) -> Result<Option<StoredLeaseAccess>, StoreError> {
+    ) -> Result<Option<LeaseAccessGrant>, StoreError> {
+        let now = Utc::now();
         match self {
             Self::Memory(market) => {
                 let market = market.read().await;
@@ -4370,6 +5374,20 @@ impl MarketplaceStore {
                 };
                 if owner != subject || lease.state != LeaseState::Active {
                     return Ok(None);
+                }
+                // What the renter bought is on the quote. The record carries
+                // what the network could substantiate when the lease was
+                // written, which is the same or weaker, so gating on the record
+                // would let a lease sold above the ceiling pass unnoticed.
+                let quoted_class = market
+                    .open_quotes
+                    .get(&lease.quote_id)
+                    .map_or(lease.trust_class, |quote| quote.trust_class);
+                let verdict = market.lease_verdicts.get(&lease_id);
+                if class_for_lease(lease_id, &lease.node_id, quoted_class, verdict, now)
+                    < quoted_class
+                {
+                    return Err(StoreError::LeaseUnattested);
                 }
                 let Some(lifecycle) = market.lifecycle.get(&lease_id) else {
                     return Ok(None);
@@ -4381,13 +5399,57 @@ impl MarketplaceStore {
                 ) else {
                     return Ok(None);
                 };
-                Ok(Some(StoredLeaseAccess::Gateway {
-                    token,
-                    jupyter_token,
-                    expires_at,
+                Ok(Some(LeaseAccessGrant {
+                    access: StoredLeaseAccess::Gateway {
+                        token,
+                        jupyter_token,
+                        expires_at,
+                    },
+                    channel_key_fingerprint: verdict
+                        .map(|verdict| verdict.guest.channel_key_fingerprint.clone()),
                 }))
             }
             Self::Postgres(pool) => {
+                let standing = query_as::<
+                    _,
+                    (
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        Option<SqlJson<LeaseAttestationVerdict>>,
+                    ),
+                >(
+                    "SELECT l.document->>'node_id', \
+                            l.document->>'trust_class', \
+                            q.document->>'trust_class', \
+                            (SELECT v.document FROM lease_attestation_verdicts v \
+                             WHERE v.lease_id = l.lease_id) \
+                     FROM leases l \
+                     LEFT JOIN lease_quotes q ON q.quote_id = l.quote_id \
+                     WHERE l.lease_id = $1 AND l.subject = $2 AND l.state = 'active'",
+                )
+                .bind(lease_id as i64)
+                .bind(subject)
+                .fetch_optional(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                let Some((node_id, recorded_class, quoted_class, verdict)) = standing else {
+                    return Ok(None);
+                };
+                // A lease predating trust classes is `open`, matching the serde
+                // default, which is the weakest class and so fails closed.
+                let recorded_class = recorded_class
+                    .map_or(Ok(TrustClass::Open), |class| parse_trust_class(&class))?;
+                let quoted_class =
+                    quoted_class.map_or(Ok(recorded_class), |class| parse_trust_class(&class))?;
+                let verdict = verdict.map(|SqlJson(verdict)| verdict);
+                if class_for_lease(lease_id, &node_id, quoted_class, verdict.as_ref(), now)
+                    < quoted_class
+                {
+                    return Err(StoreError::LeaseUnattested);
+                }
+                let channel_key_fingerprint =
+                    verdict.map(|verdict| verdict.guest.channel_key_fingerprint);
                 let direct = query_as::<_, (String, i32, chrono::DateTime<Utc>)>(
                     "SELECT ci.ssh_host, ci.ssh_port, \
                             lc.access_started_at + make_interval(secs => (l.document->>'duration_seconds')::integer) \
@@ -4406,12 +5468,15 @@ impl MarketplaceStore {
                 .await
                 .map_err(StoreError::Storage)?;
                 if let Some((host, port, expires_at)) = direct {
-                    return Ok(Some(StoredLeaseAccess::DirectSsh {
-                        host,
-                        port: u16::try_from(port).map_err(|_| {
-                            StoreError::InvalidStoredState("invalid SSH port".into())
-                        })?,
-                        expires_at,
+                    return Ok(Some(LeaseAccessGrant {
+                        access: StoredLeaseAccess::DirectSsh {
+                            host,
+                            port: u16::try_from(port).map_err(|_| {
+                                StoreError::InvalidStoredState("invalid SSH port".into())
+                            })?,
+                            expires_at,
+                        },
+                        channel_key_fingerprint,
                     }));
                 }
                 let stored = query_as::<
@@ -4437,10 +5502,13 @@ impl MarketplaceStore {
                 .map_err(StoreError::Storage)?;
                 Ok(
                     stored.map(|(SqlJson(token), SqlJson(jupyter_token), expires_at)| {
-                        StoredLeaseAccess::Gateway {
-                            token,
-                            jupyter_token,
-                            expires_at,
+                        LeaseAccessGrant {
+                            access: StoredLeaseAccess::Gateway {
+                                token,
+                                jupyter_token,
+                                expires_at,
+                            },
+                            channel_key_fingerprint,
                         }
                     }),
                 )
@@ -5558,6 +6626,102 @@ async fn record_telemetry(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The nonce a node's GPU has to sign over. It is ours, single use, and bound
+/// to this node id, which is what stops a report captured once, or taken from
+/// another machine, standing in for this one.
+async fn create_attestation_challenge(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<Json<AttestationChallenge>, (StatusCode, Json<ApiError>)> {
+    if !valid_node_id(&node_id) {
+        return Err(bad_request(
+            "invalid_node_id",
+            "node ID must be a bytes32 hex value",
+        ));
+    }
+    state
+        .store
+        .create_attestation_challenge(&node_id)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
+async fn record_attestation(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(attestation): Json<NodeAttestation>,
+) -> Result<Json<AttestationVerdict>, (StatusCode, Json<ApiError>)> {
+    if attestation.node_id != node_id {
+        return Err(bad_request(
+            "node_mismatch",
+            "path and payload node IDs differ",
+        ));
+    }
+    let Some(offer) = state.store.offer(&node_id).await.map_err(internal_error)? else {
+        return Err(not_found(
+            "node_not_found",
+            "node must be enrolled before it can attest",
+        ));
+    };
+    check_attestation_envelope(&offer, &attestation)?;
+    let verdict = state
+        .store
+        .record_attestation(AttestationSubmission {
+            attestation: &attestation,
+            device_public_key: &offer.device_public_key,
+            policy: &state.attestation_policy,
+        })
+        .await
+        .map_err(store_error)?;
+    Ok(Json(verdict))
+}
+
+/// Everything that can be judged from the envelope alone, before a challenge is
+/// spent or a certificate chain is walked. The key is the one the node enrolled
+/// with, so an attestation signed by anything else is somebody else's.
+fn check_attestation_envelope(
+    offer: &NodeOffer,
+    attestation: &NodeAttestation,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if attestation.validate().is_err() {
+        return Err(bad_request(
+            "invalid_attestation",
+            "attestation evidence is malformed or larger than this service accepts",
+        ));
+    }
+    // A GPU device report is the only evidence this network can check. A host
+    // launch measurement needs SEV-SNP, which needs a kernel this hardware is
+    // not running, so accepting one here would mean storing it unverified.
+    if attestation.kind != AttestationKind::NvidiaGpu {
+        return Err(bad_request(
+            "unsupported_attestation_kind",
+            "this endpoint verifies NVIDIA GPU device reports",
+        ));
+    }
+    let device_key = verifying_key(&offer.device_public_key)
+        .map_err(|_| bad_request("invalid_device_key", "node device key is invalid"))?;
+    if attestation.verify(&device_key).is_err() {
+        return Err(bad_request(
+            "unsigned_attestation",
+            "node attestation must be signed by the enrolled device identity",
+        ));
+    }
+    if attestation
+        .collected_at
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .abs()
+        > NODE_MESSAGE_MAX_AGE_SECONDS
+    {
+        return Err(bad_request(
+            "stale_attestation",
+            "node attestation is older than five minutes",
+        ));
+    }
+    Ok(())
+}
+
 async fn record_tunnel_observation(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
@@ -5833,26 +6997,26 @@ async fn get_lease_access(
     State(state): State<AppState>,
     Path(lease_id): Path<u64>,
     headers: HeaderMap,
-) -> Result<Json<LeaseAccess>, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<LeaseAccessResponse>, (StatusCode, Json<ApiError>)> {
     let path = format!("/v1/leases/{lease_id}/access");
     let account = require_account(&state, &headers, "GET", &path, &[]).await?;
-    let stored = state
+    let grant = state
         .store
         .lease_access(&account.subject, lease_id)
         .await
-        .map_err(internal_error)?
+        .map_err(store_error)?
         .ok_or_else(|| {
             not_found(
                 "access_not_ready",
                 "lease access is unavailable until provider readiness and onchain start are final",
             )
         })?;
-    match stored {
+    let access = match grant.access {
         StoredLeaseAccess::Gateway {
             token,
             jupyter_token,
             expires_at,
-        } => Ok(Json(LeaseAccess::Gateway {
+        } => LeaseAccess::Gateway {
             lease_id,
             token: state
                 .credential_cipher
@@ -5867,19 +7031,137 @@ async fn get_lease_access(
                 .decrypt(&jupyter_token)
                 .map_err(|_| credential_error())?,
             expires_at,
-        })),
+        },
         StoredLeaseAccess::DirectSsh {
             host,
             port,
             expires_at,
-        } => Ok(Json(LeaseAccess::DirectSsh {
+        } => LeaseAccess::DirectSsh {
             lease_id,
             ssh_host: host,
             ssh_port: port,
             ssh_user: "root".to_owned(),
             expires_at,
-        })),
+        },
+    };
+    Ok(Json(LeaseAccessResponse {
+        access,
+        channel_key_fingerprint: grant.channel_key_fingerprint,
+    }))
+}
+
+/// The nonce the guest serving this lease has to answer. Handed out without an
+/// account or a node signature, as on the node path: a nonce is worth nothing to
+/// anyone who cannot produce a report the processor signed over it.
+async fn create_lease_attestation_challenge(
+    State(state): State<AppState>,
+    Path(lease_id): Path<u64>,
+) -> Result<Json<AttestationChallenge>, (StatusCode, Json<ApiError>)> {
+    state
+        .store
+        .create_lease_attestation_challenge(lease_id)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
+async fn record_lease_attestation(
+    State(state): State<AppState>,
+    Path(lease_id): Path<u64>,
+    Json(attestation): Json<GuestAttestation>,
+) -> Result<Json<LeaseAttestationVerdict>, (StatusCode, Json<ApiError>)> {
+    if attestation.lease_id != lease_id {
+        return Err(bad_request(
+            "lease_mismatch",
+            "path and payload lease IDs differ",
+        ));
     }
+    let Some(lease) = state
+        .store
+        .lease_record(lease_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(not_found("lease_not_found", "no such lease"));
+    };
+    // A report is about one lease on one machine. A node presenting somebody
+    // else's lease is refused here rather than at the class check, so nothing
+    // downstream has to reason about a verdict that was never plausible.
+    if lease.node_id != attestation.node_id {
+        return Err(forbidden(
+            "node_mismatch",
+            "this lease is not running on the node presenting the report",
+        ));
+    }
+    if !accepts_guest_attestation(&lease.state) {
+        return Err(store_error(StoreError::LeaseNotAttestable));
+    }
+    let Some(offer) = state
+        .store
+        .offer(&lease.node_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(not_found(
+            "node_not_found",
+            "node must be enrolled before it can attest",
+        ));
+    };
+    check_guest_attestation_envelope(&offer, &attestation)?;
+    let verdict = state
+        .store
+        .record_lease_attestation(LeaseAttestationSubmission {
+            attestation: &attestation,
+            lease: &lease,
+            policy: &state.attestation_policy,
+        })
+        .await
+        .map_err(store_error)?;
+    Ok(Json(verdict))
+}
+
+/// Everything that can be judged from the envelope alone, before a challenge is
+/// spent or a certificate chain is walked. The node's key signs the envelope
+/// because the host carries the report; it does not vouch for what is inside,
+/// and cannot, since the report is signed by a processor it does not hold a key
+/// for.
+fn check_guest_attestation_envelope(
+    offer: &NodeOffer,
+    attestation: &GuestAttestation,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if attestation.validate().is_err() {
+        return Err(bad_request(
+            "invalid_attestation",
+            "attestation evidence is malformed or larger than this service accepts",
+        ));
+    }
+    if attestation.kind != AttestationKind::SevSnp {
+        return Err(bad_request(
+            "unsupported_attestation_kind",
+            "this endpoint verifies SEV-SNP guest reports",
+        ));
+    }
+    let device_key = verifying_key(&offer.device_public_key)
+        .map_err(|_| bad_request("invalid_device_key", "node device key is invalid"))?;
+    if attestation.verify(&device_key).is_err() {
+        return Err(bad_request(
+            "unsigned_attestation",
+            "guest attestation must be signed by the enrolled device identity",
+        ));
+    }
+    if attestation
+        .collected_at
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .abs()
+        > NODE_MESSAGE_MAX_AGE_SECONDS
+    {
+        return Err(bad_request(
+            "stale_attestation",
+            "guest attestation is older than five minutes",
+        ));
+    }
+    Ok(())
 }
 
 async fn confirm_lease(
@@ -6071,6 +7353,20 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("workspaces"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0016_workspaces.sql")),
+                false,
+            ),
+            Migration::new(
+                17,
+                Cow::Borrowed("node attestation"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0017_node_attestation.sql")),
+                false,
+            ),
+            Migration::new(
+                18,
+                Cow::Borrowed("lease attestation"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0018_lease_attestation.sql")),
                 false,
             ),
         ]),
@@ -6493,6 +7789,40 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
             "workspace_full",
             "this account is holding the maximum number of workspaces",
         ),
+        StoreError::AttestationChallengeUnavailable => conflict(
+            "attestation_challenge_unavailable",
+            "the attestation challenge does not exist, has expired, or was already used",
+        ),
+        // One code for every verification failure. Which check the evidence
+        // failed is a hint to whoever is trying to forge past it.
+        StoreError::AttestationUnverified => bad_request(
+            "attestation_unverified",
+            "the attestation evidence did not verify against the pinned vendor root",
+        ),
+        StoreError::AttestedDeviceConflict => conflict(
+            "attested_device_conflict",
+            "this device is already attested under a different node identity",
+        ),
+        StoreError::AttestedChipConflict => conflict(
+            "attested_chip_conflict",
+            "this processor is already attested under a different node identity",
+        ),
+        StoreError::LeaseNotAttestable => conflict(
+            "lease_not_attestable",
+            "the lease does not exist, or has moved past the point where a guest \
+             report can bind to it",
+        ),
+        StoreError::LeaseUnattested => conflict(
+            "lease_unattested",
+            "this machine has not proved itself for the class this lease was quoted \
+             at; no credentials are issued and the funding can be recovered with \
+             cancelUnprovisioned",
+        ),
+        StoreError::TrustClassExpired => conflict(
+            "trust_class_expired",
+            "the node no longer holds the trust class this quote was issued at; \
+             the funding was not claimed and can be recovered with cancelUnprovisioned",
+        ),
         StoreError::InvalidStoredState(message) => {
             tracing::error!(%message, "invalid stored marketplace state");
             internal_error(StoreError::InvalidStoredState(message))
@@ -6634,6 +7964,8 @@ async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::SigningKey;
     use prism_protocol::{
         DEFAULT_VAULT_TRUST_FLOOR, GpuSpec, IsolationMode, MAX_STAKE_DISCOUNT_BPS, NodePosture,
     };
@@ -6669,6 +8001,1226 @@ mod tests {
             staker_only: false,
             updated_at: Utc::now(),
         }
+    }
+
+    fn attestation_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7_u8; 32])
+    }
+
+    fn attested_node_id() -> String {
+        node_id(&attestation_signing_key().verifying_key())
+    }
+
+    fn attestation_device_key() -> String {
+        URL_SAFE_NO_PAD.encode(attestation_signing_key().verifying_key().as_bytes())
+    }
+
+    /// The one thing the test policy relaxes is the certificate validity
+    /// window, so checked-in vectors keep working as they age. No build of the
+    /// service can reach it.
+    fn attestation_policy() -> prism_attestation::Policy {
+        prism_attestation::Policy::for_tests()
+    }
+
+    /// The verifier's own vectors. Borrowing them is what makes these tests
+    /// walk a real chain to the pinned root instead of standing in for one.
+    fn attestation_fixture(name: &str) -> Vec<u8> {
+        let path = FilePath::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/attestation/tests/fixtures")
+            .join(name);
+        fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "missing fixture {}: {error}. Run: cargo test -p prism-attestation -- \
+                 --ignored regenerate_fixtures",
+                path.display()
+            )
+        })
+    }
+
+    fn reference_measurements() -> Vec<(u32, [u8; 48])> {
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/attestation/reference/h100-measurements.json"
+        ))
+        .expect("reference measurements are valid JSON");
+        file["measurements"]
+            .as_array()
+            .expect("reference measurements")
+            .iter()
+            .map(|entry| {
+                // A slot may list alternatives; a report carries one, so the
+                // fixture reports the first.
+                let first = entry["sha384"][0].as_str().expect("digest");
+                let digest: [u8; 48] = hex::decode(first)
+                    .expect("hex digest")
+                    .try_into()
+                    .expect("48 byte digest");
+                (entry["index"].as_u64().expect("index") as u32, digest)
+            })
+            .collect()
+    }
+
+    fn h100_evidence(report_nonce: [u8; 32], board_serial: &str) -> (String, Vec<String>) {
+        use p384::pkcs8::DecodePrivateKey;
+
+        let mut builder = prism_attestation::ReportBuilder::h100(report_nonce, board_serial);
+        for (index, digest) in reference_measurements() {
+            builder = builder.measurement(index, digest);
+        }
+        let device_key =
+            p384::ecdsa::SigningKey::from_pkcs8_der(&attestation_fixture("leaf-key.pkcs8.der"))
+                .expect("fixture leaf key");
+        let chain = ["leaf.der", "intermediate.der", "test-root.der"]
+            .iter()
+            .map(|name| URL_SAFE_NO_PAD.encode(attestation_fixture(name)))
+            .collect();
+        (
+            URL_SAFE_NO_PAD.encode(builder.signed_with(&device_key)),
+            chain,
+        )
+    }
+
+    /// A report answering this challenge, from this node, under this key. The
+    /// three are hashed together, so changing any one of them is what the
+    /// verifier sees as a relayed report.
+    fn attested_submission(
+        challenge: &AttestationChallenge,
+        key: &SigningKey,
+        report_key: &SigningKey,
+        board_serial: &str,
+    ) -> NodeAttestation {
+        let report_nonce = attestation_report_nonce(
+            &hex::decode(&challenge.nonce).expect("the nonce we issued is hex"),
+            &challenge.node_id,
+            &URL_SAFE_NO_PAD.encode(report_key.verifying_key().as_bytes()),
+        );
+        let (evidence_base64, certificate_chain_base64) = h100_evidence(report_nonce, board_serial);
+        NodeAttestation::sign(
+            prism_protocol::UnsignedNodeAttestation {
+                node_id: challenge.node_id.clone(),
+                challenge_id: challenge.challenge_id,
+                kind: AttestationKind::NvidiaGpu,
+                evidence_base64,
+                certificate_chain_base64,
+                capability: prism_protocol::HostTeeCapability {
+                    sev: true,
+                    sev_es: true,
+                    kata_runtime: true,
+                    ..Default::default()
+                },
+                pci_address: "0000:01:00.0".to_owned(),
+                collected_at: Utc::now(),
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    /// A well-formed envelope carrying evidence that cannot possibly verify.
+    /// These tests are about the challenge and the signature; the certificate
+    /// walk is the verifier crate's own subject.
+    fn signed_attestation(challenge_id: Uuid, key: &SigningKey) -> NodeAttestation {
+        NodeAttestation::sign(
+            prism_protocol::UnsignedNodeAttestation {
+                node_id: attested_node_id(),
+                challenge_id,
+                kind: AttestationKind::NvidiaGpu,
+                evidence_base64: URL_SAFE_NO_PAD.encode([0_u8; 64]),
+                certificate_chain_base64: vec![URL_SAFE_NO_PAD.encode([0_u8; 96])],
+                capability: prism_protocol::HostTeeCapability {
+                    sev: true,
+                    sev_es: true,
+                    kata_runtime: true,
+                    ..Default::default()
+                },
+                pci_address: "0000:01:00.0".to_owned(),
+                collected_at: Utc::now(),
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    fn attestation_verdict(node_id: &str, expires_at: chrono::DateTime<Utc>) -> AttestationVerdict {
+        AttestationVerdict {
+            node_id: node_id.to_owned(),
+            kind: prism_protocol::AttestationKind::NvidiaGpu,
+            device_identity: format!("{node_id}/h100"),
+            measurement_digest: "0".repeat(64),
+            claimed_capability: prism_protocol::HostTeeCapability {
+                sev: true,
+                sev_es: true,
+                kata_runtime: true,
+                ..Default::default()
+            },
+            granted_class: TrustClass::Isolated,
+            verifier_version: "test".to_owned(),
+            verified_at: expires_at - Duration::hours(24),
+            expires_at,
+        }
+    }
+
+    fn posture_telemetry(
+        node_id: &str,
+        isolation: IsolationMode,
+        observed_at: chrono::DateTime<Utc>,
+    ) -> NodeTelemetry {
+        NodeTelemetry {
+            node_id: node_id.to_owned(),
+            sequence: 1,
+            observed_at,
+            gpu_utilization_bps: 0,
+            gpu_memory_used_mib: 0,
+            active_lease: None,
+            tunnel_connected: true,
+            image_digest: None,
+            posture: Some(NodePosture {
+                isolation,
+                attestation: None,
+            }),
+            signature: String::new(),
+        }
+    }
+
+    /// Everything an `Isolated` grant rests on, in one place: a live tunnel,
+    /// a confirmed kata posture, and a verdict this service issued itself.
+    fn attested_market(
+        isolation: IsolationMode,
+        tunneled: bool,
+        posture_observed_at: chrono::DateTime<Utc>,
+        verdict: Option<AttestationVerdict>,
+    ) -> MarketplaceStore {
+        let node_id = attested_node_id();
+        let mut market = MemoryMarketplace::default();
+        let mut listing = offer(&node_id, 100, 10_000);
+        listing.device_public_key = attestation_device_key();
+        market.offers.insert(node_id.clone(), listing);
+        if tunneled {
+            market.tunnels.insert(node_id.clone(), Utc::now());
+        }
+        market.telemetry.insert(
+            node_id.clone(),
+            posture_telemetry(&node_id, isolation, posture_observed_at),
+        );
+        if let Some(verdict) = verdict {
+            market.verdicts.insert(node_id, verdict);
+        }
+        MarketplaceStore::Memory(Arc::new(RwLock::new(market)))
+    }
+
+    fn lease_request(min_trust_class: TrustClass, command: Option<&str>) -> LeaseRequest {
+        LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1,
+            preferred_node_id: None,
+            min_trust_class,
+            command: command.map(str::to_owned),
+        }
+    }
+
+    /// The load-bearing case. The matcher reads the class off the offer, and
+    /// what enrolment stored there is `Open` for every node that ever existed,
+    /// so until the class was derived at quote time every lease was stamped
+    /// `Open` no matter what the node had proved.
+    #[tokio::test]
+    async fn a_verified_node_is_quoted_isolated() {
+        let node_id = attested_node_id();
+        let store = attested_market(
+            IsolationMode::KataVfio,
+            true,
+            Utc::now(),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() + Duration::hours(1),
+            )),
+        );
+
+        let offers = store.list_offers().await.unwrap();
+        assert_eq!(offers[0].trust_class, TrustClass::Isolated);
+
+        let quote = store
+            .quote("renter", &lease_request(TrustClass::Isolated, None), 0)
+            .await
+            .unwrap();
+        assert_eq!(quote.node_id, node_id);
+        assert_eq!(quote.trust_class, TrustClass::Isolated);
+    }
+
+    /// Same node, same posture, same tunnel. Only the verdict has run out.
+    #[tokio::test]
+    async fn the_same_node_falls_back_to_open_once_its_verdict_expires() {
+        let node_id = attested_node_id();
+        let store = attested_market(
+            IsolationMode::KataVfio,
+            true,
+            Utc::now(),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() - Duration::minutes(1),
+            )),
+        );
+
+        assert_eq!(
+            store.list_offers().await.unwrap()[0].trust_class,
+            TrustClass::Open
+        );
+        assert!(matches!(
+            store
+                .quote("renter", &lease_request(TrustClass::Isolated, None), 0)
+                .await,
+            Err(StoreError::NoMatch)
+        ));
+        let quote = store
+            .quote("renter", &lease_request(TrustClass::Open, None), 0)
+            .await
+            .unwrap();
+        assert_eq!(quote.trust_class, TrustClass::Open);
+    }
+
+    /// Broker capacity reaches the renter over direct SSH with nothing of ours
+    /// in the path, so a verdict about its GPU changes nothing about what the
+    /// renter can rely on.
+    #[tokio::test]
+    async fn an_untunneled_node_stays_open_with_a_verdict_on_file() {
+        let node_id = attested_node_id();
+        let store = attested_market(
+            IsolationMode::KataVfio,
+            false,
+            Utc::now(),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() + Duration::hours(1),
+            )),
+        );
+
+        assert!(
+            store.list_offers().await.unwrap().is_empty(),
+            "an offer with no tunnel is not served at all"
+        );
+        assert!(matches!(
+            store
+                .quote("renter", &lease_request(TrustClass::Isolated, None), 0)
+                .await,
+            Err(StoreError::NoMatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_shared_node_is_open_however_good_its_verdict() {
+        let node_id = attested_node_id();
+        let store = attested_market(
+            IsolationMode::Shared,
+            true,
+            Utc::now(),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() + Duration::hours(1),
+            )),
+        );
+
+        assert_eq!(
+            store.list_offers().await.unwrap()[0].trust_class,
+            TrustClass::Open,
+            "a verified GPU in a shared host is still a shared host"
+        );
+    }
+
+    /// Posture rides on the heartbeat, and a node that stopped heart-beating
+    /// has stopped saying anything. Postgres has always bounded it at ninety
+    /// seconds; the memory store used to accept a posture of any age, so tests
+    /// passed on evidence production would have discarded.
+    #[tokio::test]
+    async fn a_stale_posture_no_longer_carries_a_class() {
+        let node_id = attested_node_id();
+        let store = attested_market(
+            IsolationMode::KataVfio,
+            true,
+            Utc::now() - Duration::seconds(OFFER_MAX_AGE_SECONDS + 1),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() + Duration::hours(1),
+            )),
+        );
+
+        assert_eq!(
+            store.list_offers().await.unwrap()[0].trust_class,
+            TrustClass::Open
+        );
+    }
+
+    /// The batch filter has been in the matcher since batch leases shipped and
+    /// has never once been satisfiable: nothing ever set an offer above `Open`,
+    /// so `min_trust_class >= Isolated` matched no capacity at all. This is the
+    /// first time a `command` can find a node.
+    #[tokio::test]
+    async fn a_batch_lease_finally_has_a_node_to_run_on() {
+        let node_id = attested_node_id();
+        let verified = attested_market(
+            IsolationMode::KataVfio,
+            true,
+            Utc::now(),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() + Duration::hours(1),
+            )),
+        );
+        let quote = verified
+            .quote(
+                "renter",
+                &lease_request(TrustClass::Open, Some("nvidia-smi")),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(quote.node_id, node_id);
+        assert_eq!(quote.command.as_deref(), Some("nvidia-smi"));
+
+        let unverified = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+        assert!(matches!(
+            unverified
+                .quote(
+                    "renter",
+                    &lease_request(TrustClass::Open, Some("nvidia-smi")),
+                    0
+                )
+                .await,
+            Err(StoreError::NoMatch)
+        ));
+    }
+
+    /// A quote is confirmable for a day. A verdict lives a day and a tunnel row
+    /// ninety seconds, so a node can lose everything that earned its class in
+    /// between. The renter funded against a stated class, so the answer is a
+    /// refusal, not a quieter lease.
+    #[tokio::test]
+    async fn confirm_refuses_a_quote_whose_class_no_longer_holds() {
+        let node_id = attested_node_id();
+        let store = attested_market(
+            IsolationMode::KataVfio,
+            true,
+            Utc::now(),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() + Duration::hours(1),
+            )),
+        );
+        let quote = store
+            .quote("renter", &lease_request(TrustClass::Isolated, None), 0)
+            .await
+            .unwrap();
+        assert_eq!(quote.trust_class, TrustClass::Isolated);
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market.write().await.verdicts.clear();
+
+        let confirmed = store
+            .confirm_funding(FundingConfirmation {
+                subject: "renter",
+                quote: &quote,
+                transaction_hash: &format!("0x{}", "ee".repeat(32)),
+                funding: ConfirmedFunding {
+                    lease_id: 91,
+                    escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+                    renter_wallet: format!("0x{}", "33".repeat(20)),
+                },
+                ssh_authorized_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA",
+                jupyter_token: "token",
+                encrypted_jupyter_token: EncryptedSecret {
+                    nonce: "bm9uY2U".to_owned(),
+                    ciphertext: "Y2lwaGVy".to_owned(),
+                },
+            })
+            .await;
+        assert!(
+            matches!(confirmed, Err(StoreError::TrustClassExpired)),
+            "expected a refusal, got {confirmed:?}"
+        );
+    }
+
+    /// The whole path, with a real chain walk in the middle: a nonce this
+    /// service chose, a report signed under a leaf that anchors at the pinned
+    /// root, and a class the node never got to name.
+    #[tokio::test]
+    async fn a_verified_report_turns_a_claim_into_a_class() {
+        let node_id = attested_node_id();
+        let store = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+        assert_eq!(
+            store.list_offers().await.unwrap()[0].trust_class,
+            TrustClass::Open,
+            "a kata posture on its own earns nothing"
+        );
+
+        let challenge = store.create_attestation_challenge(&node_id).await.unwrap();
+        let key = attestation_signing_key();
+        let attestation = attested_submission(&challenge, &key, &key, "1650223000001");
+        let verdict = store
+            .record_attestation(AttestationSubmission {
+                attestation: &attestation,
+                device_public_key: &attestation_device_key(),
+                policy: &attestation_policy(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(verdict.node_id, node_id);
+        assert_eq!(verdict.granted_class, TrustClass::Isolated);
+        assert!(verdict.device_identity.ends_with("1650223000001"));
+        assert!(verdict.claimed_capability.sev_es && !verdict.claimed_capability.sev_snp);
+        assert_eq!(
+            store.list_offers().await.unwrap()[0].trust_class,
+            TrustClass::Isolated
+        );
+        let quote = store
+            .quote("renter", &lease_request(TrustClass::Isolated, None), 0)
+            .await
+            .unwrap();
+        assert_eq!(quote.trust_class, TrustClass::Isolated);
+    }
+
+    /// The report is bound to the key the node enrolled with. A report built
+    /// against any other key hashes to a different nonce, which is what makes
+    /// one taken from another machine worthless here.
+    #[tokio::test]
+    async fn a_report_bound_to_another_device_key_does_not_verify() {
+        let node_id = attested_node_id();
+        let store = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+        let challenge = store.create_attestation_challenge(&node_id).await.unwrap();
+        let attestation = attested_submission(
+            &challenge,
+            &attestation_signing_key(),
+            &SigningKey::from_bytes(&[11_u8; 32]),
+            "1650223000001",
+        );
+
+        assert!(matches!(
+            store
+                .record_attestation(AttestationSubmission {
+                    attestation: &attestation,
+                    device_public_key: &attestation_device_key(),
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert_eq!(
+            store.list_offers().await.unwrap()[0].trust_class,
+            TrustClass::Open,
+            "a failed verification stores nothing"
+        );
+    }
+
+    /// One physical GPU cannot stand behind two node identities. An operator
+    /// who moves a card gets a conflict, not a second earned class.
+    #[tokio::test]
+    async fn the_same_device_cannot_back_two_nodes() {
+        let store = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+        let first = attestation_signing_key();
+        let second = SigningKey::from_bytes(&[13_u8; 32]);
+        let neighbour = node_id(&second.verifying_key());
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        let mut listing = offer(&neighbour, 100, 10_000);
+        listing.device_public_key = URL_SAFE_NO_PAD.encode(second.verifying_key().as_bytes());
+        market
+            .write()
+            .await
+            .offers
+            .insert(neighbour.clone(), listing);
+
+        let mine = store
+            .create_attestation_challenge(&attested_node_id())
+            .await
+            .unwrap();
+        store
+            .record_attestation(AttestationSubmission {
+                attestation: &attested_submission(&mine, &first, &first, "1650223000001"),
+                device_public_key: &attestation_device_key(),
+                policy: &attestation_policy(),
+            })
+            .await
+            .unwrap();
+
+        let theirs = store
+            .create_attestation_challenge(&neighbour)
+            .await
+            .unwrap();
+        let relayed = attested_submission(&theirs, &second, &second, "1650223000001");
+        assert!(matches!(
+            store
+                .record_attestation(AttestationSubmission {
+                    attestation: &relayed,
+                    device_public_key: &URL_SAFE_NO_PAD.encode(second.verifying_key().as_bytes()),
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestedDeviceConflict)
+        ));
+        assert_eq!(
+            store_error(StoreError::AttestedDeviceConflict).0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_challenge_needs_an_enrolled_node_and_only_one_lives_at_a_time() {
+        let node_id = attested_node_id();
+        let store = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+
+        assert!(matches!(
+            store.create_attestation_challenge("0xnot-enrolled").await,
+            Err(StoreError::NodeNotFound)
+        ));
+
+        let first = store.create_attestation_challenge(&node_id).await.unwrap();
+        assert_eq!(first.nonce.len(), 64, "32 random bytes, hex");
+
+        // Asking again returns the same one. Minting a second would let anyone
+        // who knows a node id keep cancelling the nonce that node is answering.
+        let second = store.create_attestation_challenge(&node_id).await.unwrap();
+        assert_eq!(second.challenge_id, first.challenge_id);
+        assert_eq!(second.nonce, first.nonce);
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        let live = market.read().await.attestation_challenges.len();
+        assert_eq!(live, 1, "one live nonce per node, never more");
+    }
+
+    #[test]
+    fn an_attestation_signed_by_another_key_is_refused() {
+        let mut listing = offer(&attested_node_id(), 100, 10_000);
+        listing.device_public_key = attestation_device_key();
+        let challenge_id = Uuid::now_v7();
+
+        assert!(
+            check_attestation_envelope(
+                &listing,
+                &signed_attestation(challenge_id, &attestation_signing_key())
+            )
+            .is_ok()
+        );
+
+        // The same envelope, signed by a key this node never enrolled.
+        let stranger = SigningKey::from_bytes(&[9_u8; 32]);
+        let refused =
+            check_attestation_envelope(&listing, &signed_attestation(challenge_id, &stranger))
+                .expect_err("a foreign signature is not this node");
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.1.0.code, "unsigned_attestation");
+    }
+
+    #[tokio::test]
+    async fn a_challenge_is_good_once_for_the_node_it_was_issued_to() {
+        let node_id = attested_node_id();
+        let store = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+        let policy = attestation_policy();
+        let submit = async |challenge_id: Uuid| {
+            let attestation = signed_attestation(challenge_id, &attestation_signing_key());
+            store
+                .record_attestation(AttestationSubmission {
+                    attestation: &attestation,
+                    device_public_key: &attestation_device_key(),
+                    policy: &policy,
+                })
+                .await
+        };
+
+        assert!(
+            matches!(
+                submit(Uuid::now_v7()).await,
+                Err(StoreError::AttestationChallengeUnavailable)
+            ),
+            "a challenge nobody issued is not a challenge"
+        );
+
+        let challenge = store.create_attestation_challenge(&node_id).await.unwrap();
+        // The evidence is nonsense, so this can only fail verification. What
+        // matters is that it got that far: the challenge was accepted and spent.
+        assert!(matches!(
+            submit(challenge.challenge_id).await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert!(
+            matches!(
+                submit(challenge.challenge_id).await,
+                Err(StoreError::AttestationChallengeUnavailable)
+            ),
+            "a spent challenge must not be usable a second time"
+        );
+
+        let expired = store.create_attestation_challenge(&node_id).await.unwrap();
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market
+            .write()
+            .await
+            .attestation_challenges
+            .get_mut(&expired.challenge_id)
+            .unwrap()
+            .challenge
+            .expires_at = Utc::now() - Duration::seconds(1);
+        assert!(matches!(
+            submit(expired.challenge_id).await,
+            Err(StoreError::AttestationChallengeUnavailable)
+        ));
+    }
+
+    /// A challenge is bound to the node it was issued to, so one operator
+    /// cannot answer on behalf of another node it also runs.
+    #[tokio::test]
+    async fn a_challenge_issued_to_another_node_is_refused() {
+        let node_id = attested_node_id();
+        let neighbour = format!("0x{}", "b".repeat(64));
+        let store = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market
+            .write()
+            .await
+            .offers
+            .insert(neighbour.clone(), offer(&neighbour, 100, 10_000));
+
+        let theirs = store
+            .create_attestation_challenge(&neighbour)
+            .await
+            .unwrap();
+        let attestation = signed_attestation(theirs.challenge_id, &attestation_signing_key());
+        assert_eq!(attestation.node_id, node_id);
+
+        assert!(matches!(
+            store
+                .record_attestation(AttestationSubmission {
+                    attestation: &attestation,
+                    device_public_key: &attestation_device_key(),
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationChallengeUnavailable)
+        ));
+    }
+
+    const GUEST_LEASE_ID: u64 = 4_663;
+    const GUEST_RENTER: &str = "renter";
+    /// The chip the checked-in VCEK is issued against. A second node presenting
+    /// this one is a node claiming somebody else's processor.
+    const GUEST_CHIP_ID: [u8; 64] = [0x5a; 64];
+
+    /// The OpenSSH line a guest would publish for its lease. Only the blob
+    /// matters: the fingerprint the renter pins is taken from it, so it has to
+    /// be a key line rather than a placeholder string.
+    fn guest_channel_key(lease_id: u64) -> String {
+        let mut blob = Vec::with_capacity(51);
+        blob.extend_from_slice(&11_u32.to_be_bytes());
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&32_u32.to_be_bytes());
+        blob.extend_from_slice(&[0x9e; 32]);
+        format!(
+            "ssh-ed25519 {} prism-lease-{lease_id}",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        )
+    }
+
+    fn guest_lease_image() -> String {
+        format!("registry.example/runtime@sha256:{}", "ab".repeat(32))
+    }
+
+    fn stored_secret(label: &str) -> EncryptedSecret {
+        EncryptedSecret {
+            nonce: URL_SAFE_NO_PAD.encode([1_u8; 12]),
+            ciphertext: URL_SAFE_NO_PAD.encode(label.as_bytes()),
+        }
+    }
+
+    /// A lease on the attested node carrying everything the access grant needs
+    /// except a guest verdict: the quote it was funded against, the lifecycle
+    /// row holding the relay token, and the renter's Jupyter secret.
+    fn guest_lease_market(quoted_class: TrustClass, state: LeaseState) -> MemoryMarketplace {
+        let node_id = attested_node_id();
+        let mut market = MemoryMarketplace::default();
+        let mut listing = offer(&node_id, 100, 10_000);
+        listing.device_public_key = attestation_device_key();
+        market.offers.insert(node_id.clone(), listing);
+        let quote_id = Uuid::now_v7();
+        market.open_quotes.insert(
+            quote_id,
+            LeaseQuote {
+                quote_id,
+                node_id: node_id.clone(),
+                image: guest_lease_image(),
+                duration_seconds: 60,
+                min_vram_mib: 1,
+                rate_per_second: 100,
+                maximum_escrow: 6_000,
+                trust_class: quoted_class,
+                command: None,
+                expires_at: Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES),
+            },
+        );
+        market.leases.insert(
+            GUEST_LEASE_ID,
+            (
+                GUEST_RENTER.to_owned(),
+                LeaseRecord {
+                    lease_id: GUEST_LEASE_ID,
+                    chain_lease_id: 1,
+                    escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+                    quote_id,
+                    node_id,
+                    renter_wallet: "0x1".to_owned(),
+                    image: guest_lease_image(),
+                    duration_seconds: 60,
+                    rate_per_second: 100,
+                    maximum_escrow: 6_000,
+                    trust_class: class_for_lease(
+                        GUEST_LEASE_ID,
+                        &attested_node_id(),
+                        quoted_class,
+                        None,
+                        Utc::now(),
+                    ),
+                    funding_transaction_hash: format!("0x{}", "cd".repeat(32)),
+                    state,
+                    command: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ),
+        );
+        market
+            .lease_secrets
+            .insert(GUEST_LEASE_ID, stored_secret("jupyter"));
+        market.lifecycle.insert(
+            GUEST_LEASE_ID,
+            MemoryLifecycle {
+                grant_token: Some(stored_secret("relay")),
+                grant_expires_at: Some(Utc::now() + Duration::hours(1)),
+            },
+        );
+        market
+    }
+
+    fn guest_verdict(
+        lease_id: u64,
+        node_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> LeaseAttestationVerdict {
+        LeaseAttestationVerdict {
+            lease_id,
+            node_id: node_id.to_owned(),
+            kind: AttestationKind::SevSnp,
+            guest: prism_protocol::AttestedGuest {
+                measurement: "a".repeat(96),
+                host_data: "b".repeat(64),
+                chip_id_digest: "c".repeat(64),
+                reported_tcb: prism_protocol::SnpTcb {
+                    bootloader: 4,
+                    tee: 0,
+                    snp: 22,
+                    microcode: 72,
+                },
+                policy_debug: false,
+                vmpl: 0,
+                channel_key_fingerprint: "SHA256:1IVsxwrSD9jbfOTfSHzBn7dFxHfKmzZBUS7EQ0zVCXY"
+                    .to_owned(),
+                image_digest: format!("sha256:{}", "ab".repeat(32)),
+            },
+            granted_class: TrustClass::Attested,
+            verifier_version: "test".to_owned(),
+            verified_at: expires_at - Duration::hours(24),
+            expires_at,
+        }
+    }
+
+    async fn lease_access_for(
+        market: MemoryMarketplace,
+    ) -> Result<Option<LeaseAccessGrant>, StoreError> {
+        MarketplaceStore::Memory(Arc::new(RwLock::new(market)))
+            .lease_access(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+    }
+
+    /// The point of the rung. A renter who paid for a machine that proves what
+    /// booted gets no credentials until the guest running their lease has
+    /// proved it, and an unproved lease is refundable rather than quietly
+    /// served a rung lower.
+    #[tokio::test]
+    async fn a_lease_quoted_above_isolated_opens_nothing_without_a_guest_verdict() {
+        assert!(matches!(
+            lease_access_for(guest_lease_market(TrustClass::Attested, LeaseState::Active)).await,
+            Err(StoreError::LeaseUnattested)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_verdict_for_another_lease_opens_nothing() {
+        let mut market = guest_lease_market(TrustClass::Attested, LeaseState::Active);
+        market.lease_verdicts.insert(
+            GUEST_LEASE_ID,
+            guest_verdict(
+                GUEST_LEASE_ID + 1,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+
+        assert!(matches!(
+            lease_access_for(market).await,
+            Err(StoreError::LeaseUnattested)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_verdict_from_another_node_opens_nothing() {
+        let mut market = guest_lease_market(TrustClass::Attested, LeaseState::Active);
+        market.lease_verdicts.insert(
+            GUEST_LEASE_ID,
+            guest_verdict(
+                GUEST_LEASE_ID,
+                &format!("0x{}", "b".repeat(64)),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+
+        assert!(matches!(
+            lease_access_for(market).await,
+            Err(StoreError::LeaseUnattested)
+        ));
+    }
+
+    /// The class is checked when credentials are asked for, not once at funding,
+    /// so a verdict that lapses mid-lease closes the session it was opening.
+    #[tokio::test]
+    async fn a_verdict_that_expired_mid_lease_opens_nothing() {
+        let mut market = guest_lease_market(TrustClass::Attested, LeaseState::Active);
+        market.lease_verdicts.insert(
+            GUEST_LEASE_ID,
+            guest_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() - Duration::minutes(1),
+            ),
+        );
+
+        assert!(matches!(
+            lease_access_for(market).await,
+            Err(StoreError::LeaseUnattested)
+        ));
+    }
+
+    /// The renter can only pin the host key if it reaches them, and it is the
+    /// key inside the report rather than whatever the relay presents.
+    #[tokio::test]
+    async fn a_bound_verdict_hands_back_the_host_key_to_pin() {
+        let mut market = guest_lease_market(TrustClass::Isolated, LeaseState::Active);
+        market.lease_verdicts.insert(
+            GUEST_LEASE_ID,
+            guest_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+
+        let grant = lease_access_for(market).await.unwrap().unwrap();
+        assert_eq!(
+            grant.channel_key_fingerprint,
+            Some(
+                guest_verdict(GUEST_LEASE_ID, &attested_node_id(), Utc::now())
+                    .guest
+                    .channel_key_fingerprint
+            )
+        );
+    }
+
+    /// A lease with no guest evidence at all still runs at `Isolated`, because
+    /// that rung rests on the node's own verdict and nothing here withdraws it.
+    #[tokio::test]
+    async fn an_isolated_lease_needs_no_guest_verdict() {
+        let grant = lease_access_for(guest_lease_market(TrustClass::Isolated, LeaseState::Active))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.channel_key_fingerprint, None);
+    }
+
+    /// A guest binds its report while the machine is being prepared for it.
+    /// Afterwards the grant has already been decided, and a report arriving then
+    /// would be asking for a class the renter is mid-session at.
+    #[tokio::test]
+    async fn a_lease_challenge_is_issued_while_the_machine_is_being_prepared() {
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Isolated,
+            LeaseState::Provisioning,
+        ))));
+        let challenge = store
+            .create_lease_attestation_challenge(GUEST_LEASE_ID)
+            .await
+            .unwrap();
+        assert_eq!(challenge.node_id, attested_node_id());
+        // One live nonce at a time, so a host cannot shop for the one a report
+        // it already holds happens to answer.
+        assert_eq!(
+            store
+                .create_lease_attestation_challenge(GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .challenge_id,
+            challenge.challenge_id
+        );
+
+        let running = MarketplaceStore::Memory(Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Isolated,
+            LeaseState::Active,
+        ))));
+        assert!(matches!(
+            running
+                .create_lease_attestation_challenge(GUEST_LEASE_ID)
+                .await,
+            Err(StoreError::LeaseNotAttestable)
+        ));
+        assert!(matches!(
+            running
+                .create_lease_attestation_challenge(GUEST_LEASE_ID + 7)
+                .await,
+            Err(StoreError::LeaseNotAttestable)
+        ));
+    }
+
+    /// A well-formed envelope carrying evidence that cannot verify. These tests
+    /// are about the challenge and the binding; the chain walk is the verifier
+    /// crate's own subject.
+    fn signed_guest_attestation(lease_id: u64, challenge_id: Uuid) -> GuestAttestation {
+        guest_attestation(
+            attested_node_id(),
+            lease_id,
+            challenge_id,
+            URL_SAFE_NO_PAD.encode([0_u8; 1_184]),
+            vec![URL_SAFE_NO_PAD.encode([0_u8; 96])],
+        )
+    }
+
+    fn guest_attestation(
+        node_id: String,
+        lease_id: u64,
+        challenge_id: Uuid,
+        report_base64: String,
+        certificate_chain_base64: Vec<String>,
+    ) -> GuestAttestation {
+        GuestAttestation::sign(
+            prism_protocol::UnsignedGuestAttestation {
+                node_id,
+                lease_id,
+                challenge_id,
+                kind: AttestationKind::SevSnp,
+                report_base64,
+                certificate_chain_base64,
+                guest_channel_key: guest_channel_key(lease_id),
+                collected_at: Utc::now(),
+            },
+            &attestation_signing_key(),
+        )
+        .unwrap()
+    }
+
+    fn snp_platform() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../crates/attestation/reference/snp-platform.json"
+        ))
+        .expect("the pinned platform is valid JSON")
+    }
+
+    /// The floor the platform file pins. Read rather than repeated, because the
+    /// checked-in VCEK carries these four numbers in its SVN extensions and a
+    /// report that disagrees with it is refused before anything here runs.
+    fn snp_tcb_floor() -> (u8, u8, u8, u8) {
+        let platform = snp_platform();
+        let floor = &platform["tcb_floor"];
+        let field = |name: &str| floor[name].as_u64().expect("tcb component") as u8;
+        (
+            field("bootloader"),
+            field("tee"),
+            field("snp"),
+            field("microcode"),
+        )
+    }
+
+    fn snp_launch_measurement() -> [u8; 48] {
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/attestation/reference/snp-launch-measurements.json"
+        ))
+        .expect("the reference measurements are valid JSON");
+        hex::decode(file["measurements"][0]["sha384"].as_str().expect("digest"))
+            .expect("hex digest")
+            .try_into()
+            .expect("48 byte digest")
+    }
+
+    /// A report the guest of this lease would have taken: the control plane's
+    /// own nonce, its lease, its channel key and the image it was quoted for,
+    /// signed by the VCEK the verifier's vectors are built around.
+    fn guest_evidence(lease_id: u64, nonce: &str) -> (String, Vec<String>) {
+        use p384::pkcs8::DecodePrivateKey;
+
+        let (bootloader, tee, snp, microcode) = snp_tcb_floor();
+        let report = prism_attestation::SnpReportBuilder::genoa(
+            snp_report_data(
+                &hex::decode(nonce).expect("the nonce we issued is hex"),
+                lease_id,
+                &guest_channel_key(lease_id),
+            ),
+            snp_launch_measurement(),
+            GUEST_CHIP_ID,
+        )
+        .host_data(lease_host_data(&guest_lease_image()).unwrap())
+        .tcb(bootloader, tee, snp, microcode);
+        let vcek =
+            p384::ecdsa::SigningKey::from_pkcs8_der(&attestation_fixture("snp/vcek-key.pkcs8.der"))
+                .expect("fixture VCEK key");
+        (
+            URL_SAFE_NO_PAD.encode(report.signed_with(&vcek)),
+            ["snp/vcek.der", "snp/ask.der", "snp/test-ark.der"]
+                .iter()
+                .map(|name| URL_SAFE_NO_PAD.encode(attestation_fixture(name)))
+                .collect(),
+        )
+    }
+
+    async fn attest_guest(
+        store: &MarketplaceStore,
+        lease: &LeaseRecord,
+    ) -> Result<LeaseAttestationVerdict, StoreError> {
+        let challenge = store
+            .create_lease_attestation_challenge(lease.lease_id)
+            .await
+            .unwrap();
+        let (report_base64, chain) = guest_evidence(lease.lease_id, &challenge.nonce);
+        let attestation = guest_attestation(
+            lease.node_id.clone(),
+            lease.lease_id,
+            challenge.challenge_id,
+            report_base64,
+            chain,
+        );
+        store
+            .record_lease_attestation(LeaseAttestationSubmission {
+                attestation: &attestation,
+                lease,
+                policy: &attestation_policy(),
+            })
+            .await
+    }
+
+    /// The rung is earned and then clamped. The verifier grants `Attested` for a
+    /// report that passes every check, and the lease still settles at
+    /// `Isolated`, because that is what the network can substantiate while the
+    /// reference material under the rung is a placeholder. If this test starts
+    /// failing, the ceiling moved and the claim moved with it.
+    #[tokio::test]
+    async fn a_fully_verified_guest_still_settles_at_the_ceiling() {
+        let market = guest_lease_market(TrustClass::Isolated, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        let verdict = attest_guest(&store, &lease).await.unwrap();
+        assert_eq!(verdict.granted_class, TrustClass::Attested);
+        assert_eq!(verdict.lease_id, GUEST_LEASE_ID);
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        let mut market = market.write().await;
+        assert_eq!(
+            market.leases[&GUEST_LEASE_ID].1.trust_class,
+            prism_protocol::MAX_VERIFIABLE_TRUST_CLASS
+        );
+        assert_eq!(
+            market.leases[&GUEST_LEASE_ID].1.trust_class,
+            TrustClass::Isolated
+        );
+
+        // The renter is handed the host key the report names, not whatever the
+        // relay happens to present.
+        market.leases.get_mut(&GUEST_LEASE_ID).unwrap().1.state = LeaseState::Active;
+        drop(market);
+        let grant = store
+            .lease_access(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            grant.channel_key_fingerprint,
+            Some(verdict.guest.channel_key_fingerprint)
+        );
+    }
+
+    /// One processor stands behind one node. A second node presenting a report
+    /// from the same chip is refused rather than granted a class off hardware
+    /// that is already spoken for.
+    #[tokio::test]
+    async fn the_same_processor_cannot_back_two_nodes() {
+        let neighbour_lease_id = GUEST_LEASE_ID + 1;
+        let neighbour = format!("0x{}", "b".repeat(64));
+        let mut market = guest_lease_market(TrustClass::Isolated, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let mut theirs = lease.clone();
+        theirs.lease_id = neighbour_lease_id;
+        theirs.node_id = neighbour.clone();
+        market
+            .offers
+            .insert(neighbour.clone(), offer(&neighbour, 100, 10_000));
+        market
+            .leases
+            .insert(neighbour_lease_id, ("neighbour".to_owned(), theirs.clone()));
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        attest_guest(&store, &lease).await.unwrap();
+
+        assert!(matches!(
+            attest_guest(&store, &theirs).await,
+            Err(StoreError::AttestedChipConflict)
+        ));
+    }
+
+    /// The nonce is spent whether or not the evidence stands up. Handing it back
+    /// on failure would let a host grind reports against one challenge until
+    /// something passed.
+    #[tokio::test]
+    async fn a_spent_lease_challenge_cannot_be_answered_twice() {
+        let market = guest_lease_market(TrustClass::Isolated, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let challenge = store
+            .create_lease_attestation_challenge(GUEST_LEASE_ID)
+            .await
+            .unwrap();
+        let attestation = signed_guest_attestation(GUEST_LEASE_ID, challenge.challenge_id);
+
+        assert!(matches!(
+            store
+                .record_lease_attestation(LeaseAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert!(matches!(
+            store
+                .record_lease_attestation(LeaseAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationChallengeUnavailable)
+        ));
     }
 
     #[tokio::test]
@@ -6858,25 +9410,58 @@ mod tests {
             isolation: IsolationMode::KataVfio,
             attestation: None,
         };
+        let verdict = attestation_verdict("node-1", Utc::now() + Duration::hours(24));
+        let now = Utc::now();
 
-        assert_eq!(trust_class_for(false, Some(&kata)), TrustClass::Open);
-        assert_eq!(trust_class_for(true, Some(&kata)), TrustClass::Isolated);
-        assert_eq!(trust_class_for(true, None), TrustClass::Open);
+        assert_eq!(
+            class_for_verdict("node-1", false, Some(&kata), Some(&verdict), now),
+            TrustClass::Open,
+            "capacity with no tunnel is broker capacity whatever it attests"
+        );
+        assert_eq!(
+            class_for_verdict("node-1", true, Some(&kata), Some(&verdict), now),
+            TrustClass::Isolated
+        );
+        assert_eq!(
+            class_for_verdict("node-1", true, None, Some(&verdict), now),
+            TrustClass::Open
+        );
+        assert_eq!(
+            class_for_verdict("node-1", true, Some(&kata), None, now),
+            TrustClass::Open,
+            "a kata posture on its own is still the node talking about itself"
+        );
+    }
+
+    #[test]
+    fn a_verdict_that_has_expired_carries_nothing() {
+        let kata = NodePosture {
+            isolation: IsolationMode::KataVfio,
+            attestation: None,
+        };
+        let expired = attestation_verdict("node-1", Utc::now() - Duration::minutes(1));
+
+        assert_eq!(
+            class_for_verdict("node-1", true, Some(&kata), Some(&expired), Utc::now()),
+            TrustClass::Open
+        );
     }
 
     #[test]
     fn attested_hardware_claims_are_capped_until_a_verifier_exists() {
-        let confidential = NodePosture {
+        let claimed = NodePosture {
             isolation: IsolationMode::KataVfio,
             attestation: Some(prism_protocol::AttestationRef {
                 kind: prism_protocol::AttestationKind::NvidiaCc,
                 quote_sha256: "0".repeat(64),
             }),
         };
+        let verdict = attestation_verdict("node-1", Utc::now() + Duration::hours(24));
 
         assert_eq!(
-            trust_class_for(true, Some(&confidential)),
-            prism_protocol::MAX_VERIFIABLE_TRUST_CLASS
+            class_for_verdict("node-1", true, Some(&claimed), Some(&verdict), Utc::now()),
+            prism_protocol::MAX_VERIFIABLE_TRUST_CLASS,
+            "naming a confidential kind is a claim, and a claim buys nothing"
         );
     }
 

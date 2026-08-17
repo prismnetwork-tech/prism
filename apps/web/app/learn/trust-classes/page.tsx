@@ -35,14 +35,31 @@ export default function TrustClassesPage() {
         </p>
         <h3>Isolated</h3>
         <p>
-          A virtual machine with the GPU passed through exclusively, running an image pinned to a
-          digest. It narrows what a mistake can reach. A host that decides to look inside the guest
-          still can.
+          The card is proven. A report signed by the GPU itself says which physical device answered
+          and what firmware it runs, and the network checks it against NVIDIA's root before the
+          grade is given. The virtual machine around it is the supplier's word, backed by their
+          bond, because a card cannot vouch for the software that booted beside it. A host that
+          decides to look inside the guest still can.
         </p>
         <h3>Attested</h3>
         <p>
-          The machine proves what it booted, checked against the hardware vendor&apos;s signing
-          keys. This tells you what ran. It says nothing about who was watching.
+          The machine proves which software it started, and the chip maker&apos;s keys sign that
+          proof. It covers the machine your own work ran on: the key your session connects to is
+          created inside it, so the proof describes your session and not a machine that started
+          correctly yesterday.
+        </p>
+        <p>
+          It does not stop the operator watching. Work on its way to the GPU leaves the protected
+          part of memory, so this grade tells you what ran. Who could see it is the next grade up.
+          No capacity is served at this grade yet.{" "}
+          <a
+            href="https://github.com/prismnetworkdottech/prism/blob/main/docs/ATTESTATION.md"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            How the proof is checked
+          </a>{" "}
+          covers the mechanism and what it leaves open.
         </p>
         <h3>Confidential</h3>
         <p>
@@ -58,24 +75,33 @@ export default function TrustClassesPage() {
           claim is a signed statement the dispute process can act on.
         </p>
         <p>
-          The grade is also capped at what the network can check today. Attestation evidence
-          travels end to end but nothing verifies it yet, so no offer is served above{" "}
-          <code>isolated</code> whatever a machine reports. Lifting that ceiling takes a verifier
-          in code.
+          Above <code>open</code>, that report comes from the GPU and is signed by NVIDIA&apos;s own
+          keys. The network checks the signature chain against a root it ships with, and checks
+          that the report answers a challenge it issued to that exact machine, so a report copied
+          from somewhere else does not pass. A machine that fails the check keeps the weakest
+          grade.
+        </p>
+        <p>
+          The grade is also capped at what the network can check today. Every offer is served at
+          open, whatever a machine reports about itself. The hardware the higher grades need is in
+          the fleet, so what is left is the checking: the network has to record what a correct
+          report from that hardware looks like, then confirm a real one against it. An unchecked
+          report earns nothing.
         </p>
       </InformationSection>
 
       <InformationSection index="04" title="What today's capacity gives you">
         <p>
           Every machine available right now is open class. The company hosting it can read what
-          runs there. This follows from the hardware in the fleet, so it will hold until different
-          hardware arrives.
+          runs there. The grade rises when the network can confirm the evidence for a stronger one,
+          which is a different date from the day the hardware landed.
         </p>
         <p>
           Two things follow. Anything that has to stay private belongs in your{" "}
           <Link href="/vault">vault</Link>, encrypted under a key derived on your own machine and
           never sent to us. And a request can require a minimum grade, so an agent handling
-          something sensitive refuses weak capacity on its own.
+          something sensitive refuses weak capacity on its own. When nothing in the fleet meets
+          the grade you ask for, the quote is refused and no funds move.
         </p>
         <p>
           <Link href="/learn/confidential-gpu-compute">

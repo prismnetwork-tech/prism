@@ -1,0 +1,37 @@
+FROM docker.io/library/debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+
+# Debian's rolling mirrors would give a different compiler on a different day,
+# and a different compiler gives a different kernel, a different root hash and a
+# different launch measurement. The snapshot archive is frozen, so a rebuild in
+# a year resolves the same package versions this one did.
+RUN printf '%s\n' \
+      'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260801T000000Z trixie main' \
+      'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260801T000000Z trixie-security main' \
+      > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/debian.sources
+
+RUN apt-get update -o Acquire::Check-Valid-Until=false \
+    && apt-get install --yes --no-install-recommends \
+        bc \
+        bison \
+        build-essential \
+        ca-certificates \
+        cpio \
+        cryptsetup-bin \
+        curl \
+        flex \
+        git \
+        iasl \
+        libelf-dev \
+        libssl-dev \
+        nasm \
+        python3 \
+        python3-pyelftools \
+        squashfs-tools \
+        uuid-dev \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV SOURCE_DATE_EPOCH=1767225600 \
+    LC_ALL=C \
+    TZ=UTC

@@ -1,9 +1,15 @@
 #!/usr/bin/env node
-// Prism x402 one-shot compute: pay-per-job GPU execution over HTTP 402.
-// POST /run with no payment -> 402 + payment requirements. Pay a stablecoin on
-// any offered network to its payTo, sign the tx hash to prove you sent it, retry
-// with X-PAYMENT: base64({txHash, signature}), get a job_id + token, poll
-// GET /jobs/{id}.
+// Prism x402 one-shot compute: pay-per-job GPU execution over HTTP 402, plus
+// the facilitator interface for anyone who needs to settle on Base themselves.
+//
+// POST /run with no payment answers 402 with what it costs on each network.
+// On Base you sign an EIP-3009 authorization and need no gas; the job is queued,
+// and the authorization is only broadcast once the job has actually succeeded.
+// A failed job therefore charges nothing and needs no refund.
+//
+// /verify, /settle and /supported are the facilitator half: the same verifier,
+// offered to other people's endpoints, because every public facilitator the
+// ecosystem lists is testnet-only.
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -11,8 +17,16 @@ import { base } from "viem/chains";
 import { createPublicClient, createWalletClient, erc20Abi, getAddress, http, recoverMessageAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
+import { jobInput, jobOutput } from "./schemas.mjs";
+import { createExactEvm } from "./exact-evm.mjs";
+import { createFacilitator, createBudget } from "./facilitator.mjs";
+import { detect, parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "./codec.mjs";
 
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+// Base USDC reports this as its EIP-712 domain. The published spec example
+// carries the testnet token's "USDC", and the domain feeds the signing hash, so
+// copying it signs against nothing.
+const USDC_BASE_DOMAIN = { name: "USD Coin", version: "2" };
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
@@ -31,6 +45,7 @@ function requireEnv(name) {
 let agent;
 let networks;
 let config;
+let facilitator = null;
 try {
   config = {
     port: Number(process.env.X402_PORT ?? 8402),
@@ -61,16 +76,38 @@ try {
     },
   ];
   if (process.env.X402_BASE_PAY_TO) {
+    // A list, tried in order: one free endpoint having a bad minute must not
+    // decide whether a payment settles.
+    const baseRpc = (process.env.X402_BASE_RPC_URL ?? "https://base.drpc.org,https://1rpc.io/base")
+      .split(",").map((u) => u.trim()).filter(Boolean);
+    const settlementKey = process.env.PRISM_X402_COLLECTOR_KEY;
+    if (!settlementKey) throw new Error("X402_BASE_PAY_TO needs PRISM_X402_COLLECTOR_KEY to broadcast with");
+    const assets = { [USDC_BASE]: USDC_BASE_DOMAIN };
+    const exactBase = createExactEvm({
+      [`eip155:${base.id}`]: { chain: base, rpcUrl: baseRpc, privateKey: settlementKey, assets },
+      base: { chain: base, rpcUrl: baseRpc, privateKey: settlementKey, assets },
+    });
     networks.push({
       id: `eip155:${base.id}`,
       label: "USDC on Base",
       asset: USDC_BASE,
       payTo: getAddress(process.env.X402_BASE_PAY_TO),
       confirmations: BASE_CONFIRMATIONS,
-      client: createPublicClient({ chain: base, transport: http(process.env.X402_BASE_RPC_URL) }),
-      // A payer who sent USDC on Base is owed USDC on Base. The server wallet is
-      // the same key on both chains, so it needs a USDC and gas balance here too.
+      client: createPublicClient({ chain: base, transport: http(baseRpc[0]) }),
+      domain: USDC_BASE_DOMAIN,
+      exact: exactBase,
+      // Only the legacy pay-first scheme can leave a debt. Under the exact
+      // scheme nothing is taken until the job succeeds, so there is nothing to
+      // give back.
       refund: refundOnBase,
+    });
+    facilitator = createFacilitator({
+      exact: exactBase,
+      budget: createBudget({
+        dailySettlements: Number(process.env.X402_FACILITATOR_DAILY ?? 2000),
+        perPayerPerHour: Number(process.env.X402_FACILITATOR_PER_PAYER ?? 60),
+      }),
+      log: (line) => console.error(`facilitator: ${line}`),
     });
   }
 } catch (err) {
@@ -133,23 +170,44 @@ function releasePayment(key) {
   consumed.delete(key);
 }
 
-function paymentRequirements(resource) {
-  return {
-    x402Version: 1,
-    accepts: networks.map((network) => ({
-      scheme: "exact",
-      network: network.id,
-      asset: network.asset,
-      payTo: network.payTo,
-      maxAmountRequired: config.priceMicros.toString(),
-      resource,
-      description:
-        `One GPU job, paid in ${network.label}. Pay maxAmountRequired to payTo, then retry with ` +
-        "header X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of the " +
-        "tx hash. Include the network you paid on to skip the lookup on the others.",
+// A job may run for the whole lease, and the authorization has to stay valid
+// until it finishes or there is nothing left to charge against.
+const JOB_TIMEOUT_SECONDS = () => config.durationSeconds + 120;
+
+function accepted(resource) {
+  return networks.map((network) => ({
+    scheme: "exact",
+    network: network.id,
+    asset: network.asset,
+    payTo: network.payTo,
+    amount: config.priceMicros.toString(),
+    resource,
+    description: network.exact
+      ? `One GPU job, paid in ${network.label}. Sign an EIP-3009 transferWithAuthorization for ` +
+        "the amount and send it as the payment header; you need no gas. The job is queued " +
+        "immediately and the payment is only taken once it has succeeded, so a failed job " +
+        `costs nothing. Sign it valid for at least ${JOB_TIMEOUT_SECONDS()} seconds.`
+      : `One GPU job, paid in ${network.label}. Pay the amount to payTo, then retry with ` +
+        "header X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of " +
+        "the tx hash.",
+    mimeType: "application/json",
+    maxTimeoutSeconds: JOB_TIMEOUT_SECONDS(),
+    ...(network.domain ? { extra: { ...network.domain, assetTransferMethod: "eip3009" } } : {}),
+  }));
+}
+
+function paymentRequirements(path, version = 2, error = null) {
+  const origin = process.env.PRISM_PUBLIC_ORIGIN ?? "https://api.prismnetwork.tech/x402";
+  return paymentRequired(version, {
+    error,
+    accepts: accepted(path),
+    resource: {
+      url: `${origin}${path}`,
+      description: "One shell command on a rented GPU, charged only if it succeeds.",
       mimeType: "application/json",
-    })),
-  };
+    },
+    schemas: { input: jobInput, output: jobOutput },
+  });
 }
 
 function decodeTransfer(log) {
@@ -158,6 +216,37 @@ function decodeTransfer(log) {
     from: `0x${log.topics[1].slice(26)}`,
     to: `0x${log.topics[2].slice(26)}`,
     value: BigInt(log.data),
+  };
+}
+
+// The exact scheme: the payer has signed an authorization and nothing has moved.
+// Verification is read-only, and the broadcast waits until the job has run, so a
+// job that fails leaves the payer untouched and needs no refund at all.
+async function verifyAuthorization(parsed, resource) {
+  const want = accepted(resource).find((entry) => sameNetwork(entry.network, parsed.accepted?.network));
+  if (!want) return { ok: false, reason: "invalid_network" };
+  const network = networks.find((n) => sameNetwork(n.id, want.network));
+  if (!network?.exact) return { ok: false, reason: "invalid_scheme" };
+
+  const authorization = parsed.payload?.authorization;
+  const from = authorization?.from;
+  const nonce = authorization?.nonce;
+  if (typeof from !== "string" || typeof nonce !== "string") return { ok: false, reason: "invalid_payload" };
+  const key = `${network.id}:${from}:${nonce}`.toLowerCase();
+  if (!reservePayment(key)) return { ok: false, reason: "payment_reused" };
+
+  const verdict = await network.exact.verify(parsed, want);
+  if (!verdict.isValid) {
+    releasePayment(key);
+    return { ok: false, reason: verdict.invalidReason };
+  }
+  return {
+    ok: true,
+    payer: verdict.payer,
+    network: network.id,
+    key,
+    // Held on the job and called only if the work succeeds.
+    settle: () => network.exact.settle(parsed, want),
   };
 }
 
@@ -233,7 +322,7 @@ async function settleOn(network, txHash, signer) {
   }
 }
 
-async function runJob(jobId, command, payer, networkId) {
+async function runJob(jobId, command, payer, networkId, payment) {
   const record = jobs.get(jobId);
   let lease;
   try {
@@ -253,19 +342,52 @@ async function runJob(jobId, command, payer, networkId) {
   } catch (err) {
     record.status = "failed";
     record.error = String(err.code ?? err.message ?? err);
-    const network = networks.find((candidate) => candidate.id === networkId);
-    try {
-      record.refund = await network.refund(payer, config.priceMicros);
-    } catch (refundErr) {
-      // The debt is real whether or not the transfer went through, so it is
-      // recorded on the job rather than swallowed into a log line.
-      record.refund_error = String(refundErr.message ?? refundErr);
-      record.refund_owed = { to: payer, amount: config.priceMicros.toString(), network: network.id };
-      console.error(`refund of ${config.priceMicros} to ${payer} on ${network.id} failed`);
+    if (payment?.settle) {
+      // Nothing was ever taken, so there is nothing to give back. The
+      // authorization is released so the caller can spend it on a retry.
+      releasePayment(payment.key);
+      record.charged = false;
+      record.note = "not charged: the authorization was never broadcast";
+    } else {
+      const network = networks.find((candidate) => candidate.id === networkId);
+      try {
+        record.refund = await network.refund(payer, config.priceMicros);
+      } catch (refundErr) {
+        // The debt is real whether or not the transfer went through, so it is
+        // recorded on the job rather than swallowed into a log line.
+        record.refund_error = String(refundErr.message ?? refundErr);
+        record.refund_owed = { to: payer, amount: config.priceMicros.toString(), network: network.id };
+        console.error(`refund of ${config.priceMicros} to ${payer} on ${network.id} failed`);
+      }
     }
   } finally {
     if (lease) agent.endLease(lease);
     record.finished_at = Date.now();
+  }
+
+  // Charged last, and only for work that succeeded.
+  if (record.status === "completed" && payment?.settle) {
+    try {
+      const settlement = await payment.settle();
+      record.charged = settlement.success;
+      record.settlement = {
+        network: settlement.network,
+        transaction: settlement.transaction || null,
+        ...(settlement.success ? {} : { error: settlement.errorReason }),
+      };
+      if (settlement.settled === false) releasePayment(payment.key);
+      if (!settlement.success) {
+        console.error(`job ${jobId} served but not charged: ${settlement.errorReason} detail=${settlement.detail ?? "none"}`);
+      }
+    } catch (err) {
+      // The broadcast may have landed, so the authorization is not released:
+      // treating it as unspent could charge the payer twice.
+      record.charged = null;
+      record.settlement = { error: "settlement_unconfirmed" };
+      console.error(`job ${jobId} settlement threw: ${err.message}`);
+    }
+  } else if (record.status === "completed" && !payment?.settle) {
+    record.charged = true;
   }
 }
 
@@ -279,6 +401,21 @@ function evictExpiredJobs() {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${config.port}`);
   if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, { status: "ok" });
+
+  // The facilitator interface, for endpoints that are not ours.
+  if (facilitator && ["/verify", "/settle", "/supported"].includes(url.pathname)) {
+    let body = null;
+    if (req.method === "POST") {
+      try {
+        body = await readJson(req);
+      } catch (err) {
+        return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
+      }
+    }
+    const out = await facilitator.handle(req.method, url.pathname, body);
+    if (out) return json(res, out.status, out.body);
+    return json(res, 405, { error: "method_not_allowed" });
+  }
 
   if (req.method === "GET" && url.pathname.startsWith("/jobs/")) {
     const job = jobs.get(url.pathname.slice(6));
@@ -296,17 +433,31 @@ const server = createServer(async (req, res) => {
     } catch (err) {
       return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
     }
+    const payment = detect(req.headers);
+    // v2 unless the caller showed us they speak v1.
+    const version = payment?.version ?? 2;
+    // The price comes before the complaint. A discovery probe sends no command,
+    // and answering "command_required" instead of the 402 leaves the endpoint
+    // undiscoverable; the command is checked once someone has paid to run one.
+    if (!payment) {
+      const required = paymentRequirements("/run", version);
+      return json(res, 402, required.body, required.headers);
+    }
     if (!body?.command || typeof body.command !== "string") return json(res, 400, { error: "command_required" });
-    const payment = req.headers["x-payment"];
-    if (!payment) return json(res, 402, paymentRequirements("/run"));
-    const check = await verifyPayment(String(payment));
-    if (!check.ok) return json(res, 402, { ...paymentRequirements("/run"), error: check.reason });
+    const parsed = parsePayment(payment.header);
+    const check = parsed?.payload?.authorization
+      ? await verifyAuthorization(parsed, "/run")
+      : await verifyPayment(String(payment.header));
+    if (!check.ok) {
+      const refused = paymentRequirements("/run", version, check.reason);
+      return json(res, 402, refused.body, refused.headers);
+    }
 
     evictExpiredJobs();
     const jobId = randomUUID();
     const token = randomUUID();
     jobs.set(jobId, { job_id: jobId, status: "queued", token, payer: check.payer, network: check.network });
-    runJob(jobId, body.command, check.payer, check.network);
+    runJob(jobId, body.command, check.payer, check.network, check);
     return json(res, 202, { job_id: jobId, status: "queued", token, poll: `/jobs/${jobId}` });
   }
 
@@ -318,9 +469,13 @@ function bearer(req) {
   return h?.toLowerCase().startsWith("bearer ") ? h.slice(7).trim() : null;
 }
 
-function json(res, status, obj) {
+function json(res, status, obj, extra = {}) {
   const payload = JSON.stringify(obj);
-  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(payload),
+    ...extra,
+  });
   res.end(payload);
 }
 

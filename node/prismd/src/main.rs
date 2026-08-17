@@ -15,9 +15,9 @@ use prism_chain::{
     EthereumSigner, Finality, RpcClient, address as chain_address, selector, word_u128,
 };
 use prism_protocol::{
-    CommandResult, GpuSpec, IsolationMode, NodeCertificateBundle, NodeCertificateRequest,
-    NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport,
-    NodeCommandReportPayload, NodeEnrollment, NodePosture, NodeTelemetry,
+    CommandResult, GpuSpec, HostTeeCapability, IsolationMode, NodeCertificateBundle,
+    NodeCertificateRequest, NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll,
+    NodeCommandReport, NodeCommandReportPayload, NodeEnrollment, NodePosture, NodeTelemetry,
     UnsignedNodeCertificateRequest, UnsignedNodeEnrollment, UnsignedTelemetry, node_id,
 };
 use rand::RngCore;
@@ -26,7 +26,10 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest as _, Keccak256};
 use tracing_subscriber::EnvFilter;
 
+mod attestation;
+mod probe;
 mod runtime;
+mod snp;
 mod tunnel;
 
 /// How long the signed device binding stays valid. Long enough to survive a
@@ -35,6 +38,9 @@ const REGISTRATION_WINDOW_SECONDS: u128 = 3_600;
 /// Seven static words precede the signature in register()'s calldata.
 const SIGNATURE_OFFSET: u128 = 7 * 32;
 const CONFIRMATION_ATTEMPTS: u32 = 40;
+/// A verdict outlives this comfortably, so the refresh is about proving the
+/// card is still the one that was verified, not about racing an expiry.
+const ATTESTATION_INTERVAL: Duration = Duration::from_secs(6 * 3_600);
 
 /// The registry reverts with custom errors, which reach the operator as a bare
 /// four-byte selector inside an RPC message. Translate the ones a registration
@@ -147,6 +153,12 @@ enum CommandName {
         #[arg(long, requires = "active_lease")]
         image_digest: Option<String>,
     },
+    Attest {
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        control_plane: String,
+    },
     Commands {
         #[arg(long)]
         identity: PathBuf,
@@ -162,6 +174,25 @@ enum CommandName {
         jupyter_port: u16,
         #[arg(long, default_value_t = 5)]
         poll_seconds: u64,
+        /// SHA-256 of the agent policy measured into the confidential guest
+        /// image installed on this host. Setting it is how an operator declares
+        /// the node can run leases as confidential guests; without it every
+        /// lease runs on the ordinary runtime and takes no report.
+        #[arg(long, env = "PRISM_AGENT_POLICY_DIGEST")]
+        agent_policy_digest: Option<String>,
+    },
+    /// Runs inside the guest, not on the host: it asks the processor for a
+    /// report over the challenge, the lease and the SSH host key this guest
+    /// generated, and leaves it where the daemon can carry it.
+    SnpReport {
+        #[arg(long)]
+        challenge_file: PathBuf,
+        #[arg(long)]
+        lease_id: u64,
+        #[arg(long)]
+        channel_key_file: PathBuf,
+        #[arg(long)]
+        output_directory: PathBuf,
     },
     Tunnel {
         #[arg(long)]
@@ -249,7 +280,22 @@ struct PreflightReport {
     nftables: bool,
     swap_disabled: bool,
     nvidia_container_toolkit: bool,
+    sev: bool,
+    sev_es: bool,
+    sev_snp: bool,
+    sev_guest_device: bool,
+    kata_confidential_runtime: bool,
     vfio_gpu_groups: Vec<runtime::VfioGroup>,
+    gpu_devices: Vec<PciIdentity>,
+}
+
+/// Which card, not what class of card. An operator reading this should see
+/// 10de:2331 rather than a 3D controller.
+#[derive(Debug, Serialize)]
+struct PciIdentity {
+    address: String,
+    vendor_id: String,
+    device_id: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -353,6 +399,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        CommandName::Attest {
+            identity,
+            control_plane,
+        } => {
+            attest_once(&identity, &control_plane).await?;
+            println!("attestation accepted");
+            Ok(())
+        }
         CommandName::Commands {
             identity,
             control_plane,
@@ -361,6 +415,7 @@ async fn main() -> anyhow::Result<()> {
             ssh_port,
             jupyter_port,
             poll_seconds,
+            agent_policy_digest,
         } => {
             command_loop(CommandLoopConfig {
                 identity,
@@ -370,9 +425,21 @@ async fn main() -> anyhow::Result<()> {
                 ssh_port,
                 jupyter_port,
                 poll_seconds,
+                agent_policy_digest,
             })
             .await
         }
+        CommandName::SnpReport {
+            challenge_file,
+            lease_id,
+            channel_key_file,
+            output_directory,
+        } => snp::take_report(&snp::ReportRequest {
+            challenge_file: &challenge_file,
+            lease_id,
+            channel_key_file: &channel_key_file,
+            output_directory: &output_directory,
+        }),
         CommandName::Tunnel {
             identity,
             gateway,
@@ -453,6 +520,8 @@ async fn main() -> anyhow::Result<()> {
                 jupyter_token: &jupyter_token,
                 ssh_port,
                 jupyter_port,
+                attestation_challenge: None,
+                agent_policy_digest: None,
             };
             let command = runtime::kata_command(&config, &workspace_root.join(&lease_id))?;
             if execute {
@@ -471,14 +540,27 @@ fn preflight() -> anyhow::Result<()> {
     let nvidia_smi = command_success("nvidia-smi", &["-L"]);
     let containerd = command_success("ctr", &["version"]);
     let nerdctl = command_success("nerdctl", &["version"]);
-    let kata_runtime = command_success("kata-runtime", &["--version"])
-        || command_success("kata-qemu", &["--version"]);
+    let capability = *host_capability();
+    let kata_runtime = capability.kata_runtime;
     let iommu = iommu_available();
     let vfio = Path::new("/dev/vfio/vfio").exists() && Path::new("/sys/module/vfio_pci").exists();
     let nftables = command_success("nft", &["--version"]);
     let swap_disabled = swap_disabled();
     let nvidia_container_toolkit = command_success("nvidia-ctk", &["--version"]);
     let vfio_gpu_groups = runtime::discover_vfio_gpu_groups()?;
+    let gpu_devices = vfio_gpu_groups
+        .iter()
+        .flat_map(|group| &group.pci_devices)
+        .filter_map(|address| {
+            probe::pci_identity(address)
+                .ok()
+                .map(|(vendor, device)| PciIdentity {
+                    address: address.clone(),
+                    vendor_id: format!("{vendor:04x}"),
+                    device_id: format!("{device:04x}"),
+                })
+        })
+        .collect();
     let report = PreflightReport {
         supported: linux
             && architecture == "x86_64"
@@ -501,9 +583,26 @@ fn preflight() -> anyhow::Result<()> {
         nftables,
         swap_disabled,
         nvidia_container_toolkit,
+        sev: capability.sev,
+        sev_es: capability.sev_es,
+        sev_snp: capability.sev_snp,
+        sev_guest_device: capability.sev_guest_device,
+        kata_confidential_runtime: capability.kata_confidential_runtime,
         vfio_gpu_groups,
+        gpu_devices,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
+    if capability.sev && !capability.sev_snp {
+        eprintln!(
+            "SEV is on but SEV-SNP is not exposed by this kernel; host SEV-SNP needs Linux 6.11 or newer, so this node can serve isolated but not attested"
+        );
+    }
+    if capability.sev_snp && !capability.kata_confidential_runtime {
+        eprintln!(
+            "SEV-SNP is available but containerd has no {} shim, so a lease that needs a guest report cannot run here",
+            probe::CONFIDENTIAL_RUNTIME
+        );
+    }
     if !report.supported {
         anyhow::bail!("host does not satisfy the GPU node baseline");
     }
@@ -824,16 +923,57 @@ fn persist_certificate_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> 
 }
 
 /// Reported under the device signature, so a node that overstates its
-/// isolation has signed the claim the network would slash it for.
-fn local_posture() -> NodePosture {
-    let isolation = match runtime::discover_vfio_gpu_groups() {
-        Ok(groups) if !groups.is_empty() => IsolationMode::KataVfio,
-        _ => IsolationMode::Shared,
+/// isolation has signed the claim the network would slash it for. A GPU bound
+/// to vfio-pci says nothing about what the workload runs inside, so the kata
+/// shim has to answer as well before this claims a sandbox.
+///
+/// Evidence never rides here. It goes on its own signed envelope, against a
+/// challenge the control plane issued.
+fn local_posture(capability: &HostTeeCapability) -> NodePosture {
+    posture_for(
+        runtime::discover_vfio_gpu_groups().is_ok_and(|groups| !groups.is_empty()),
+        capability,
+    )
+}
+
+fn posture_for(passthrough: bool, capability: &HostTeeCapability) -> NodePosture {
+    let isolation = if passthrough && capability.kata_runtime {
+        IsolationMode::KataVfio
+    } else {
+        IsolationMode::Shared
     };
     NodePosture {
         isolation,
         attestation: None,
     }
+}
+
+async fn attest_once(identity_path: &Path, control_plane: &str) -> anyhow::Result<()> {
+    let groups = runtime::discover_vfio_gpu_groups()?;
+    let group = groups
+        .first()
+        .context("no VFIO GPU group is available to attest")?;
+    attestation::refresh(identity_path, control_plane, group).await
+}
+
+/// Attestation keeps its own clock. A report costs a guest boot, which is far
+/// longer than a heartbeat, and a node that cannot produce one keeps serving at
+/// whatever class the control plane last granted rather than dropping out.
+async fn attestation_loop(identity_path: PathBuf, control_plane: String) {
+    loop {
+        match attest_once(&identity_path, &control_plane).await {
+            Ok(()) => tracing::info!("posted GPU attestation"),
+            Err(error) => tracing::warn!(%error, "GPU attestation failed; serving unchanged"),
+        }
+        tokio::time::sleep(ATTESTATION_INTERVAL).await;
+    }
+}
+
+/// The probe spawns processes and none of what it reads changes without a
+/// reboot, so a heartbeat every thirty seconds reuses the first answer.
+fn host_capability() -> &'static HostTeeCapability {
+    static CAPABILITY: std::sync::OnceLock<HostTeeCapability> = std::sync::OnceLock::new();
+    CAPABILITY.get_or_init(probe::host_tee_capability)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -864,7 +1004,7 @@ async fn publish_telemetry(
             active_lease,
             tunnel_connected,
             image_digest,
-            posture: Some(local_posture()),
+            posture: Some(local_posture(host_capability())),
         },
         &signing_key,
     )?;
@@ -886,6 +1026,7 @@ struct CommandLoopConfig {
     ssh_port: u16,
     jupyter_port: u16,
     poll_seconds: u64,
+    agent_policy_digest: Option<String>,
 }
 
 async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
@@ -903,6 +1044,18 @@ async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
     let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
     let client = http_client()?;
     let mut last_heartbeat = None;
+    let capability = host_capability();
+    tracing::info!(
+        kata_runtime = capability.kata_runtime,
+        sev = capability.sev,
+        sev_es = capability.sev_es,
+        sev_snp = capability.sev_snp,
+        "host TEE capability"
+    );
+    tokio::spawn(attestation_loop(
+        config.identity.clone(),
+        config.control_plane.clone(),
+    ));
 
     loop {
         let command =
@@ -1071,6 +1224,42 @@ async fn execute_node_command(
         format!("{}\n", jupyter_token.trim()).as_bytes(),
     )?;
 
+    // Whether this node serves confidential guests is the operator's declared
+    // configuration, not something inferred per lease: a host with no policy
+    // digest installed runs the ordinary runtime and earns no verdict, which
+    // costs the renter nothing they were promised. Once the node has declared
+    // it, a challenge it cannot fetch fails the command, because launching
+    // anyway spends the lease on a session no report will ever cover.
+    let challenge = match &config.agent_policy_digest {
+        None => None,
+        Some(_) => {
+            match snp::lease_challenge(&config.control_plane, command.lease_id, node).await {
+                Ok(challenge) => Some(challenge),
+                Err(error) => {
+                    let message = format!("lease attestation challenge unavailable: {error:#}");
+                    report_command(
+                        client,
+                        &config.control_plane,
+                        node,
+                        public_key,
+                        key,
+                        command.command_id,
+                        NodeCommandOutcome::Failed,
+                        Some(message.chars().take(512).collect()),
+                        None,
+                    )
+                    .await?;
+                    let _ = fs::remove_dir_all(&credential_root);
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let evidence = snp::evidence_directory(&runtime::workspace_path(
+        &config.workspace_root,
+        &command.lease_id.to_string(),
+    )?);
+
     let lease_id = command.lease_id.to_string();
     let workspace_root = config.workspace_root.clone();
     let state_root = config.state_root.clone();
@@ -1080,6 +1269,8 @@ async fn execute_node_command(
     let launch_lease_id = lease_id.clone();
     let launch_ssh_key = ssh_key_path.clone();
     let launch_jupyter_token = jupyter_token_path.clone();
+    let launch_challenge = challenge.as_ref().map(|challenge| challenge.nonce.clone());
+    let launch_policy_digest = config.agent_policy_digest.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         runtime::launch(runtime::LaunchConfig {
             image: &image,
@@ -1092,11 +1283,36 @@ async fn execute_node_command(
             jupyter_token: &launch_jupyter_token,
             ssh_port,
             jupyter_port,
+            attestation_challenge: launch_challenge.as_deref(),
+            agent_policy_digest: launch_policy_digest.as_deref(),
         })
     });
     let mut ready_reported_at = None;
     let mut telemetry_reported_at = None;
+    let mut attestation_attempted_at = None;
     while !task.is_finished() {
+        if let Some(challenge) = &challenge
+            && snp::report_ready(&evidence)
+            && attestation_attempted_at.is_none_or(|last: chrono::DateTime<Utc>| {
+                Utc::now().signed_duration_since(last) >= chrono::Duration::seconds(10)
+            })
+        {
+            attestation_attempted_at = Some(Utc::now());
+            match snp::forward(
+                &config.identity,
+                &config.control_plane,
+                command.lease_id,
+                challenge.challenge_id,
+                &evidence,
+            )
+            .await
+            {
+                Ok(()) => tracing::info!(lease_id = %lease_id, "forwarded the guest attestation"),
+                Err(error) => {
+                    tracing::warn!(%error, lease_id = %lease_id, "guest attestation forwarding failed; retrying")
+                }
+            }
+        }
         let ready = runtime::lease_phase(&config.state_root, &lease_id)?
             == Some(runtime::LeasePhase::Ready);
         if ready
@@ -1636,6 +1852,33 @@ mod tests {
                 "00",
             )
         );
+    }
+
+    /// A vfio-bound GPU with no kata shim is a bare host with a passed-through
+    /// card. Signing KataVfio for it is the claim this whole path exists to
+    /// stop making.
+    #[test]
+    fn posture_needs_the_kata_shim_and_not_only_a_bound_gpu() {
+        let without_kata = HostTeeCapability {
+            kata_runtime: false,
+            ..HostTeeCapability::default()
+        };
+        let with_kata = HostTeeCapability {
+            kata_runtime: true,
+            ..HostTeeCapability::default()
+        };
+
+        assert_eq!(
+            posture_for(true, &without_kata).isolation,
+            IsolationMode::Shared
+        );
+        assert_eq!(
+            posture_for(false, &with_kata).isolation,
+            IsolationMode::Shared
+        );
+        let isolated = posture_for(true, &with_kata);
+        assert_eq!(isolated.isolation, IsolationMode::KataVfio);
+        assert!(isolated.attestation.is_none());
     }
 
     #[test]

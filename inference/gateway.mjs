@@ -7,7 +7,7 @@
 // `spawnTunnel` (ssh -L to the box's ollama), `fetchOllama`, and `verify`
 // (on-chain payment verification).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import { parsePayment, paymentRequired, paymentResponse, requirementsFor } from "@prismnetwork/x402/codec";
+import { parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "@prismnetwork/x402/codec";
 
 export const DEFAULT_PRICE_MICROS = 10_000n;
 export const MAX_PROMPT_BYTES = 32 * 1024;
@@ -34,6 +34,11 @@ const TX_HASH = /^0x[0-9a-f]{64}$/i;
 // what the token contract itself refuses to reuse.
 const PAYMENT_KEY = /^(0x[0-9a-f]{64}|0x[0-9a-f]{40}:0x[0-9a-f]{64})$/i;
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/// Distinguishes "the wait elapsed" from "warming finished, with or without an
+/// error", which null and an Error already cover.
+const TIMED_OUT = Symbol("timed out");
+
 export const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 export const USDG_ROBINHOOD = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
 
@@ -59,6 +64,10 @@ export function createGateway({
   payTo,
   basePayTo = null,
   exact = null,
+  originUrl = "https://api.prismnetwork.tech/inference",
+  // Carried in every 402 so an agent that arrives cold learns the price and how
+  // to call the endpoint from one response, without fetching anything else.
+  schemas = null,
   priceMicros = DEFAULT_PRICE_MICROS,
   pricing: pricingIn = null,
   image,
@@ -68,6 +77,10 @@ export function createGateway({
   coolDownMs = 240_000,
   warmTimeoutMs = 480_000,
   generateTimeoutMs = 120_000,
+  // Long enough to catch a box whose tunnel is already coming up, short enough
+  // that no reasonable client gives up first.
+  readyWaitMs = 12_000,
+  retryAfterMs = 90_000,
   paymentsFile = null,
   verify,
   spawnTunnel,
@@ -92,6 +105,9 @@ export function createGateway({
     // A generation served whose settlement then failed. Nonzero means either
     // an rpc problem or someone racing the broadcast, and both are worth seeing.
     unsettled: 0, unsettled_micros: 0n,
+    // Broadcast, but the receipt could not be read. Neither revenue nor loss
+    // until someone checks the chain.
+    unconfirmed: 0,
   };
 
   const consumed = loadConsumed(paymentsFile);
@@ -238,6 +254,7 @@ export function createGateway({
           "You need no gas: the authorization is broadcast for you.",
         mimeType: "application/json",
         maxTimeoutSeconds: 60,
+        ...(schemas ? { outputSchema: schemas } : {}),
         extra: { ...USDC_BASE_DOMAIN, assetTransferMethod: "eip3009" },
       });
     }
@@ -254,6 +271,7 @@ export function createGateway({
         "X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of the tx hash.",
       mimeType: "application/json",
       maxTimeoutSeconds: 60,
+      ...(schemas ? { outputSchema: schemas } : {}),
     });
     return list;
   }
@@ -261,15 +279,24 @@ export function createGateway({
   /// `version` selects the wire shape: v1 wants `maxAmountRequired` and a chain
   /// name, v2 wants `amount` and CAIP-2. The prices and networks are the same
   /// either way.
-  function requirements(state, quote = null, version = 1) {
+  function requirements(state, quote = null, version = 2, error = null) {
     const amount = quote?.micros ?? maxPriceMicros;
-    const accepts = accepted(amount).map((entry) => requirementsFor(version, entry));
-    return {
-      x402Version: version,
-      state,
-      ...(quote ? { quote: { model: quote.model, output_cap: quote.cap, price_micros: amount.toString() } } : {}),
-      accepts,
-    };
+    return paymentRequired(version, {
+      error,
+      accepts: accepted(amount),
+      resource: {
+        url: `${originUrl}/v1/inference`,
+        description: "One LLM generation on a rented GPU, priced per request.",
+        mimeType: "application/json",
+      },
+      schemas,
+      // Ours, not the protocol's: the box state and the quote this price came
+      // from, which a human reading the 402 wants and a parser ignores.
+      extra: {
+        state,
+        ...(quote ? { quote: { model: quote.model, output_cap: quote.cap, price_micros: amount.toString() } } : {}),
+      },
+    });
   }
 
   /// The exact scheme: the payer signed an authorization but nothing has moved
@@ -289,8 +316,10 @@ export function createGateway({
     // The requirement we quoted, not the one the client echoed back: a payer
     // who rewrites the amount or the recipient must fail, and comparing their
     // copy against itself would always pass.
+    // Compared canonically: a client that read a v1 quote echoes back "base"
+    // while this list holds "eip155:8453", and they are the same chain.
     const want = accepted(quotedMicros).find(
-      (entry) => entry.network === parsed.accepted?.network,
+      (entry) => sameNetwork(entry.network, parsed.accepted?.network),
     );
     if (!want) return { ok: false, reason: "invalid_network" };
 
@@ -382,8 +411,30 @@ export function createGateway({
     };
   }
 
-  async function handleInference(body, paymentHeader, paymentVersion = 1) {
-    if (typeof body?.model !== "string" || !models.includes(body.model)) {
+  async function handleInference(body, paymentHeader, paymentVersion = null) {
+    // v2 unless the caller showed us they speak v1. The scanners and the
+    // agent tooling read v2 only, and an unpaid probe tells us nothing about
+    // itself, so the newer shape is the right thing to volunteer.
+    const version = paymentVersion ?? 2;
+    const known = typeof body?.model === "string" && models.includes(body.model);
+
+    // An unpaid request is answered with the price whatever else is wrong with
+    // it. A discovery probe sends an empty body on purpose, and answering "your
+    // request is malformed" instead of "here is what this costs" leaves the
+    // endpoint undiscoverable and unlistable. Quote the specific price when the
+    // request is complete enough to price, and the full-cap price otherwise,
+    // which clears any request.
+    if (!paymentHeader) {
+      const quote = known
+        ? { model: body.model, ...priceFor(pricing, body.model, Number(body.options?.num_predict)) }
+        : null;
+      const required = requirements(box.phase, quote, version);
+      return { status: 402, body: required.body, headers: required.headers };
+    }
+
+    // Past here the caller has paid, so a bad request is worth refusing in
+    // detail, and refusing it before anything is charged or leased.
+    if (!known) {
       return { status: 400, body: { error: "unknown_model", models } };
     }
     if (typeof body.prompt !== "string" || body.prompt.trim() === "") {
@@ -394,26 +445,37 @@ export function createGateway({
     }
     const { cap, micros } = priceFor(pricing, body.model, Number(body.options?.num_predict));
     const quote = { model: body.model, cap, micros };
-    const version = paymentVersion ?? 1;
-    if (!paymentHeader) {
-      const required = requirements(box.phase, quote, version);
-      return { status: 402, body: required, headers: paymentRequired(version, required).headers };
-    }
     const payment = await checkPayment(String(paymentHeader), micros, quote);
     if (!payment.ok) {
       if (payment.replay) return { status: 200, body: { ...payment.replay, replayed: true } };
       // A refused payment is still a 402, and a v2 client reads the terms from
       // the header rather than the body, so it has to carry them here too.
-      const required = requirements(box.phase, quote, version);
+      const refused = requirements(box.phase, quote, version, payment.reason);
+      return { status: 402, body: refused.body, headers: refused.headers };
+    }
+    // Warming leases a GPU and pulls models, which takes minutes. Holding the
+    // connection through that reads as a hang and times the caller out well
+    // before it finishes, so wait only long enough to catch a box that is
+    // nearly up and otherwise answer straight away with when to come back.
+    const warming = ensureWarm().then(() => null, (err) => err);
+    const failure = await Promise.race([warming, sleep(readyWaitMs).then(() => TIMED_OUT)]);
+    if (failure === TIMED_OUT) {
+      payment.release();
       return {
-        status: 402,
-        body: { ...required, error: payment.reason },
-        headers: paymentRequired(version, { ...required, error: payment.reason }).headers,
+        status: 503,
+        headers: { "retry-after": String(Math.ceil(retryAfterMs / 1000)) },
+        body: {
+          error: "warming_up",
+          detail: "A GPU is being leased and the models are being pulled.",
+          state: box.phase,
+          retry_after_seconds: Math.ceil(retryAfterMs / 1000),
+          retry: "nothing was charged; send the same payment header again.",
+        },
       };
     }
     let result;
     try {
-      await ensureWarm();
+      if (failure) throw failure;
       result = await generate(body, cap);
     } catch (err) {
       payment.release();
@@ -437,11 +499,28 @@ export function createGateway({
     // refund path that can fail on its own.
     let settlement = null;
     if (payment.settle) {
-      settlement = await payment.settle();
+      try {
+        settlement = await payment.settle();
+      } catch (err) {
+        // The broadcast may well have gone through, so this cannot throw out of
+        // here: the caller has already paid for work that is already done, and
+        // a 500 would hand them nothing for it.
+        settlement = { success: false, settled: null, errorReason: "settlement_unconfirmed", payer: payment.payer };
+        log(`settlement threw after serving: ${err.message}`);
+      }
       if (!settlement.success) {
-        stats.unsettled += 1;
-        stats.unsettled_micros += micros;
-        log(`settlement failed after serving: ${settlement.errorReason ?? "unknown"} payer=${payment.payer}`);
+        // `settled === null` means the money may have moved and we could not
+        // read whether it did, which is not the same as being unpaid. Counting
+        // it as revenue would overstate; counting it as a loss would understate.
+        // It is recorded apart from both.
+        if (settlement.settled === null) {
+          stats.unconfirmed += 1;
+          log(`settlement unconfirmed: tx=${settlement.transaction ?? "none"} payer=${payment.payer} detail=${settlement.detail ?? "none"}`);
+        } else {
+          stats.unsettled += 1;
+          stats.unsettled_micros += micros;
+          log(`settlement failed after serving: ${settlement.errorReason ?? "unknown"} payer=${payment.payer} detail=${settlement.detail ?? "none"}`);
+        }
         payment.commit(result);
         return { status: 200, body: result, headers: paymentResponse(version, settlement).headers };
       }
@@ -484,13 +563,14 @@ export function createGateway({
       // rpc fault or someone racing the broadcast.
       unsettled: stats.unsettled,
       unsettled_micros: stats.unsettled_micros.toString(),
+      unconfirmed: stats.unconfirmed,
       ...boxView(),
     }),
     ensureWarm,
     maintain,
     drain,
     handleInference,
-    requirements: () => requirements(box.phase),
+    requirements: () => requirements(box.phase).body,
   };
 
   function boxView() {

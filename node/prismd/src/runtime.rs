@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs::{self, OpenOptions},
     io::Write,
     net::{IpAddr, SocketAddr, TcpStream},
@@ -30,6 +31,14 @@ pub struct LaunchConfig<'a> {
     pub jupyter_token: &'a Path,
     pub ssh_port: u16,
     pub jupyter_port: u16,
+    /// The nonce the guest commits to in the report it takes of itself before
+    /// anything starts listening. Present only when this node runs leases as
+    /// confidential guests.
+    pub attestation_challenge: Option<&'a str>,
+    /// The agent policy the confidential guest must run under, named by digest
+    /// so it reaches `HOST_DATA`. A lease with a challenge and no digest does
+    /// not launch.
+    pub agent_policy_digest: Option<&'a str>,
 }
 
 pub fn validate_image_reference(image: &str) -> anyhow::Result<()> {
@@ -44,7 +53,11 @@ pub fn validate_image_reference(image: &str) -> anyhow::Result<()> {
     {
         anyhow::bail!("image digest is invalid");
     }
-    if image.chars().any(char::is_whitespace) || image.contains("..") {
+    // Quotes have no place in an OCI reference and the reference is written
+    // verbatim into the document Kata hashes into HOST_DATA, so one would let a
+    // registry name decide what that document says.
+    if image.chars().any(char::is_whitespace) || image.contains("..") || image.contains(['\'', '"'])
+    {
         anyhow::bail!("image reference contains unsafe characters");
     }
     if let Some(registry) = explicit_registry(repository)
@@ -192,6 +205,68 @@ pub fn kata_command(
     config: &LaunchConfig<'_>,
     control_directory: &Path,
 ) -> anyhow::Result<Command> {
+    workspace_command(config, control_directory, None)
+}
+
+/// The same workspace, launched as a confidential guest so it can attest
+/// itself. Three things separate it from the ordinary runtime. The confidential
+/// shim is what actually gives the guest a report to take. Guest-side image
+/// pull keeps the rootfs out of the host's hands, so what the report measures
+/// is what the renter asked for rather than whatever was handed in over
+/// virtiofs. And the agent policy digest travels in the document Kata hashes
+/// into `HOST_DATA`, which is the only thing tying the report to the workload.
+///
+/// Any of the three missing is a refusal, never a quieter launch. Falling back
+/// to the ordinary runtime would start a guest that produces no report at all,
+/// or one that produces a genuine report about an unmeasured workload, and the
+/// second is worse than the first because it looks like evidence.
+///
+/// Nothing here touches the guest kernel or its command line, and nothing
+/// should. A passthrough H100 needs a large SWIOTLB because every DMA crosses
+/// into shared bounce buffers, but the command line feeds the launch digest, so
+/// a value chosen per launch is a measurement no published reference matches.
+/// It belongs in the pinned guest configuration that the reference measurement
+/// was computed from.
+pub fn kata_snp_command(
+    config: &LaunchConfig<'_>,
+    control_directory: &Path,
+    policy_digest: &str,
+) -> anyhow::Result<Command> {
+    kata_snp_command_in(
+        config,
+        control_directory,
+        policy_digest,
+        &crate::probe::search_path(),
+    )
+}
+
+fn kata_snp_command_in(
+    config: &LaunchConfig<'_>,
+    control_directory: &Path,
+    policy_digest: &str,
+    search_path: &OsStr,
+) -> anyhow::Result<Command> {
+    if policy_digest.len() != 64
+        || !policy_digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        anyhow::bail!("a confidential guest needs the agent policy digest that pins its workload");
+    }
+    if !crate::probe::confidential_runtime_registered_in(search_path) {
+        anyhow::bail!(
+            "containerd has no {} shim, so this host cannot start a confidential guest",
+            crate::probe::CONFIDENTIAL_RUNTIME
+        );
+    }
+    workspace_command(config, control_directory, Some(policy_digest))
+}
+
+fn workspace_command(
+    config: &LaunchConfig<'_>,
+    control_directory: &Path,
+    policy_digest: Option<&str>,
+) -> anyhow::Result<Command> {
     validate_launch_config(config)?;
     let vfio_device = format!("/dev/vfio/{}", config.vfio_group);
     let control_mount = format!(
@@ -200,6 +275,16 @@ pub fn kata_command(
     );
     let ssh_publish = format!("127.0.0.1:{}:2222", config.ssh_port);
     let jupyter_publish = format!("127.0.0.1:{}:8888", config.jupyter_port);
+    let evidence_mount = format!(
+        "type=bind,src={},dst=/run/prism/evidence",
+        crate::snp::evidence_directory(control_directory).display()
+    );
+    let initdata = policy_digest.map(|digest| {
+        format!(
+            "io.katacontainers.config.hypervisor.cc_init_data={}",
+            crate::snp::initdata_annotation(config.lease_id, config.image, digest)
+        )
+    });
     let mut command = Command::new("nerdctl");
     command.args([
         "--namespace",
@@ -209,7 +294,10 @@ pub fn kata_command(
         "--pull",
         "always",
         "--runtime",
-        "io.containerd.kata.v2",
+        match policy_digest {
+            Some(_) => crate::probe::CONFIDENTIAL_RUNTIME,
+            None => "io.containerd.kata.v2",
+        },
         "--read-only",
         "--security-opt",
         "no-new-privileges:true",
@@ -251,6 +339,16 @@ pub fn kata_command(
         &jupyter_publish,
         "--hostname",
         config.lease_id,
+    ]);
+    if let Some(initdata) = &initdata {
+        // The rootfs is pulled by the guest rather than unpacked on the host,
+        // so the image the report measures is the one the renter named.
+        command.args(["--snapshotter", "nydus", "--annotation", initdata]);
+        // The report has to outlive the guest, and the control mount it reads
+        // the challenge from is read-only.
+        command.args(["--mount", &evidence_mount]);
+    }
+    command.args([
         "--entrypoint",
         "/bin/sh",
         "--name",
@@ -258,6 +356,88 @@ pub fn kata_command(
         config.image,
         "/run/prism/control/bootstrap.sh",
     ]);
+    Ok(command)
+}
+
+/// The collector that talks to the GPU and writes the report. Pinned by digest
+/// and not configurable: a host that can choose what produces the evidence can
+/// produce evidence of whatever it likes. The digest is filled in from the
+/// published reporter build, and an unset one fails the pull rather than
+/// resolving to a moving tag.
+const ATTESTATION_IMAGE: &str = "ghcr.io/prismnetwork-tech/prism/gpu-attest@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Same isolation a lease gets, with the workspace ports and credentials
+/// removed and one writable directory added. The lease control mount is
+/// read-only, so the report needs a mount of its own to land in.
+pub fn attestation_command(
+    group: &VfioGroup,
+    evidence_directory: &Path,
+    nonce_hex: &str,
+) -> anyhow::Result<Command> {
+    validate_image_reference(ATTESTATION_IMAGE)?;
+    if nonce_hex.len() != 64
+        || !nonce_hex
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        anyhow::bail!("attestation nonce must be a 32-byte hex digest");
+    }
+    let vfio_device = group
+        .device
+        .to_str()
+        .context("VFIO device path is not valid UTF-8")?
+        .to_owned();
+    let evidence_mount = format!(
+        "type=bind,src={},dst=/run/prism/evidence",
+        evidence_directory
+            .to_str()
+            .context("evidence directory is not valid UTF-8")?
+    );
+    let name = format!("prism-attest-{}", group.id);
+    let mut command = Command::new("nerdctl");
+    command.args([
+        "--namespace",
+        "prism",
+        "run",
+        "--rm",
+        "--pull",
+        "always",
+        "--runtime",
+        "io.containerd.kata.v2",
+        "--read-only",
+        "--net",
+        "none",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--cap-drop",
+        "ALL",
+        "--pids-limit",
+        "256",
+        "--user",
+        "0:0",
+        "--device",
+        "/dev/vfio/vfio",
+        "--device",
+        &vfio_device,
+        "--tmpfs",
+        "/run:rw,nosuid,nodev,mode=0755",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+        "--mount",
+        &evidence_mount,
+        "--name",
+        &name,
+        ATTESTATION_IMAGE,
+        "--nonce",
+        nonce_hex,
+        "--output",
+        "/run/prism/evidence",
+    ]);
+    command.stdin(Stdio::null());
+    // The report comes back through the mount, so nothing here reads the pipes.
+    // Leaving stderr with the daemon keeps a failed collection diagnosable
+    // without a reader that would have to drain it to avoid a stall.
+    command.stdout(Stdio::null());
     Ok(command)
 }
 
@@ -276,9 +456,17 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
     if state_path.exists() {
         recover_interrupted_lease(config.lease_id, &workspace, &state_path)?;
     }
-    let mut command = kata_command(&config, &workspace)?;
+    let mut command = match config.attestation_challenge {
+        Some(_) => {
+            let policy_digest = config.agent_policy_digest.context(
+                "this lease needs a confidential guest and no agent policy digest is configured",
+            )?;
+            kata_snp_command(&config, &workspace, policy_digest)?
+        }
+        None => kata_command(&config, &workspace)?,
+    };
     fs::create_dir_all(&workspace)?;
-    prepare_control_directory(&workspace, config.ssh_authorized_key, config.jupyter_token)?;
+    prepare_control_directory(&config, &workspace)?;
     persist_state(
         &state_path,
         &LeaseState::new(&config, &group, LeasePhase::Provisioning, None, None),
@@ -342,24 +530,40 @@ fn validate_launch_config(config: &LaunchConfig<'_>) -> anyhow::Result<()> {
     if config.ssh_port == 0 || config.jupyter_port == 0 || config.ssh_port == config.jupyter_port {
         anyhow::bail!("workspace access ports are invalid");
     }
+    if let Some(challenge) = config.attestation_challenge
+        && (challenge.len() != 64
+            || !challenge
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+    {
+        anyhow::bail!("the lease attestation challenge must be a 32-byte hex nonce");
+    }
     validate_authorized_key(&fs::read_to_string(config.ssh_authorized_key)?)?;
     validate_jupyter_token(&fs::read_to_string(config.jupyter_token)?)?;
     Ok(())
 }
 
-fn prepare_control_directory(
-    workspace: &Path,
-    authorized_key: &Path,
-    jupyter_token: &Path,
-) -> anyhow::Result<()> {
+fn prepare_control_directory(config: &LaunchConfig<'_>, workspace: &Path) -> anyhow::Result<()> {
     write_secret(
         &workspace.join("authorized_keys"),
-        fs::read(authorized_key)?.as_slice(),
+        fs::read(config.ssh_authorized_key)?.as_slice(),
     )?;
     write_secret(
         &workspace.join("jupyter_token"),
-        fs::read(jupyter_token)?.as_slice(),
+        fs::read(config.jupyter_token)?.as_slice(),
     )?;
+    if let Some(challenge) = config.attestation_challenge {
+        fs::create_dir_all(crate::snp::evidence_directory(workspace))
+            .context("create the guest evidence directory")?;
+        write_secret(
+            &workspace.join("attestation_challenge"),
+            format!("{challenge}\n").as_bytes(),
+        )?;
+        write_secret(
+            &workspace.join("lease_id"),
+            format!("{}\n", config.lease_id).as_bytes(),
+        )?;
+    }
     write_secret(
         &workspace.join("bootstrap.sh"),
         WORKSPACE_BOOTSTRAP.as_bytes(),
@@ -880,6 +1084,8 @@ mod tests {
             jupyter_token,
             ssh_port: 2_222,
             jupyter_port: 8_888,
+            attestation_challenge: None,
+            agent_policy_digest: None,
         }
     }
 
@@ -891,6 +1097,7 @@ mod tests {
     #[test]
     fn rejects_mutable_images_and_path_traversal() {
         assert!(validate_image_reference("registry.example/runtime:latest").is_err());
+        assert!(validate_image_reference("registry.example/run'''time@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(validate_image_reference("localhost/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(validate_image_reference("10.0.0.5/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(validate_lease_id("../../outside").is_err());
@@ -1020,6 +1227,241 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "127.0.0.1:8888:8888")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A confidential launch has to pick the shim that can produce a report,
+    /// pull the rootfs inside the guest, and carry the policy digest into the
+    /// document Kata hashes into HOST_DATA. Anything less starts a guest whose
+    /// report says nothing about the workload.
+    #[test]
+    #[cfg(unix)]
+    fn kata_snp_command_takes_the_confidential_shim_and_pins_the_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory("snp-command");
+        let authorized_key = root.join("authorized-key");
+        let jupyter_token = root.join("jupyter-token");
+        fs::write(
+            &authorized_key,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest lease\n",
+        )
+        .unwrap();
+        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("containerd-shim-kata-qemu-snp-v2");
+        fs::write(&shim, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let digest = "d".repeat(64);
+        let config = launch_config(&root, &authorized_key, &jupyter_token);
+        let command = kata_snp_command_in(&config, &root, &digest, bin.as_os_str()).unwrap();
+        let arguments = command
+            .get_args()
+            .map(OsStr::to_string_lossy)
+            .collect::<Vec<_>>();
+
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--runtime", "io.containerd.kata-qemu-snp.v2"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--snapshotter", "nydus"])
+        );
+        let evidence = format!(
+            "type=bind,src={},dst=/run/prism/evidence",
+            crate::snp::evidence_directory(&root).display()
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.as_ref() == evidence)
+        );
+        let annotation = arguments
+            .iter()
+            .find(|argument| {
+                argument.starts_with("io.katacontainers.config.hypervisor.cc_init_data=")
+            })
+            .expect("the initdata annotation is what reaches HOST_DATA");
+        assert_eq!(
+            annotation.as_ref(),
+            format!(
+                "io.katacontainers.config.hypervisor.cc_init_data={}",
+                crate::snp::initdata_annotation(config.lease_id, config.image, &digest)
+            )
+        );
+        // The flags still have to sit ahead of the image, or nerdctl reads them
+        // as arguments to the entrypoint.
+        let image = arguments
+            .iter()
+            .position(|argument| argument.as_ref() == config.image)
+            .unwrap();
+        assert!(
+            arguments[..image]
+                .iter()
+                .any(|argument| argument == "--snapshotter")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Without a policy digest the report would be genuine and the workload
+    /// unmeasured, and without a shim there would be no report at all. Both
+    /// refuse rather than quietly starting an ordinary Kata guest.
+    #[test]
+    #[cfg(unix)]
+    fn kata_snp_command_refuses_rather_than_falling_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory("snp-refusal");
+        let authorized_key = root.join("authorized-key");
+        let jupyter_token = root.join("jupyter-token");
+        fs::write(
+            &authorized_key,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest lease\n",
+        )
+        .unwrap();
+        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let config = launch_config(&root, &authorized_key, &jupyter_token);
+        let digest = "d".repeat(64);
+
+        assert!(kata_snp_command_in(&config, &root, "", bin.as_os_str()).is_err());
+        assert!(kata_snp_command_in(&config, &root, "not-a-digest", bin.as_os_str()).is_err());
+        assert!(kata_snp_command_in(&config, &root, &digest, bin.as_os_str()).is_err());
+
+        let shim = bin.join("containerd-shim-kata-qemu-snp-v2");
+        fs::write(&shim, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(kata_snp_command_in(&config, &root, &digest, bin.as_os_str()).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The report commits to the host key the renter's session terminates on,
+    /// so the key has to exist before the report and the report has to be
+    /// written before anything accepts a connection.
+    #[test]
+    fn the_bootstrap_reports_between_the_host_key_and_the_first_listener() {
+        let keygen = WORKSPACE_BOOTSTRAP
+            .find("ssh-keygen")
+            .expect("the guest generates its own host key");
+        let report = WORKSPACE_BOOTSTRAP
+            .find("prismd snp-report")
+            .expect("the guest takes its own report");
+        let sshd = WORKSPACE_BOOTSTRAP
+            .find("\"$sshd_path\" -D")
+            .expect("sshd is what starts listening");
+        let jupyter = WORKSPACE_BOOTSTRAP
+            .find("jupyter lab")
+            .expect("jupyter is the other listener");
+
+        assert!(keygen < report);
+        assert!(report < sshd);
+        assert!(report < jupyter);
+        assert!(WORKSPACE_BOOTSTRAP.contains("set -eu"));
+        assert!(WORKSPACE_BOOTSTRAP.contains("/run/prism/ssh_host_key.pub"));
+    }
+
+    /// A confidential lease writes the challenge the guest has to commit to and
+    /// a directory for the report to land in. An ordinary lease writes neither,
+    /// and its bootstrap therefore takes no report.
+    #[test]
+    fn the_control_directory_carries_the_challenge_only_when_there_is_one() {
+        let root = temporary_directory("control-directory");
+        let authorized_key = root.join("authorized-key");
+        let jupyter_token = root.join("jupyter-token");
+        fs::write(
+            &authorized_key,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest lease\n",
+        )
+        .unwrap();
+        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
+
+        let plain = root.join("plain");
+        fs::create_dir(&plain).unwrap();
+        prepare_control_directory(
+            &launch_config(&root, &authorized_key, &jupyter_token),
+            &plain,
+        )
+        .unwrap();
+        assert!(!plain.join("attestation_challenge").exists());
+        assert!(!crate::snp::evidence_directory(&plain).exists());
+
+        let attested = root.join("attested");
+        fs::create_dir(&attested).unwrap();
+        let nonce = "b".repeat(64);
+        prepare_control_directory(
+            &LaunchConfig {
+                attestation_challenge: Some(&nonce),
+                agent_policy_digest: Some(&"d".repeat(64)),
+                ..launch_config(&root, &authorized_key, &jupyter_token)
+            },
+            &attested,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(attested.join("attestation_challenge"))
+                .unwrap()
+                .trim(),
+            nonce
+        );
+        assert_eq!(
+            fs::read_to_string(attested.join("lease_id"))
+                .unwrap()
+                .trim(),
+            "lease-1"
+        );
+        assert!(crate::snp::evidence_directory(&attested).is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The report has to be readable after the guest exits, which is the one
+    /// thing the lease control mount cannot do, and it has to come from the
+    /// collector the control plane expects rather than any image on the host.
+    #[test]
+    fn attestation_command_mounts_a_writable_evidence_directory() {
+        let root = temporary_directory("attestation-command");
+        let group = VfioGroup {
+            id: 42,
+            device: PathBuf::from("/dev/vfio/42"),
+            pci_devices: vec!["0000:01:00.0".to_owned()],
+        };
+        let nonce = "b".repeat(64);
+        let command = attestation_command(&group, &root, &nonce).unwrap();
+        let arguments = command
+            .get_args()
+            .map(OsStr::to_string_lossy)
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "nerdctl");
+        let mount = format!("type=bind,src={},dst=/run/prism/evidence", root.display());
+        assert!(arguments.iter().any(|argument| argument.as_ref() == mount));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--device", "/dev/vfio/42"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--device", "/dev/vfio/vfio"])
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == ATTESTATION_IMAGE)
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--nonce", nonce.as_str()])
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--publish"));
+        assert!(attestation_command(&group, &root, "not-a-nonce").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

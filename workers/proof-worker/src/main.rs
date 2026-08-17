@@ -8,7 +8,10 @@ use std::{
 use anyhow::Context;
 use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
 use chrono::{Datelike, Days, NaiveDate, Utc};
-use prism_protocol::{PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, receipt_hash_matches};
+use prism_protocol::{
+    MAX_VERIFIABLE_TRUST_CLASS, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, TrustClass,
+    receipt_hash_matches,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
@@ -380,6 +383,30 @@ fn validate_receipts(receipts: &[PublicReceipt]) -> anyhow::Result<()> {
         {
             anyhow::bail!("non-final receipt contains a provider payment");
         }
+        if receipt
+            .trust_class
+            .is_some_and(|class| class > MAX_VERIFIABLE_TRUST_CLASS)
+        {
+            anyhow::bail!("public receipt claims a trust class the network cannot verify");
+        }
+        // A class at or above `Attested` is a statement about verified evidence,
+        // so a receipt making one has to carry the digest that backs it. Kept
+        // separate from the ceiling check above so raising the ceiling does not
+        // silently let unbacked claims through.
+        if receipt
+            .trust_class
+            .is_some_and(|class| class >= TrustClass::Attested)
+            && receipt.attestation.is_none()
+        {
+            anyhow::bail!("public receipt claims an attested class with no attestation");
+        }
+        if receipt.attestation.as_ref().is_some_and(|attestation| {
+            !is_digest(&attestation.verdict_digest)
+                || attestation.verifier_version.is_empty()
+                || attestation.verifier_version.len() > 64
+        }) {
+            anyhow::bail!("public receipt contains a malformed attestation");
+        }
         if receipt.failure_class.as_ref().is_some_and(|class| {
             class.is_empty()
                 || class.len() > 64
@@ -694,6 +721,10 @@ fn is_hash(value: &str) -> bool {
         && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn is_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 async fn post_to_x(text: &str) -> anyhow::Result<String> {
     validate_x_post(text)?;
     let token = required_env("PRISM_X_USER_ACCESS_TOKEN")?;
@@ -841,7 +872,9 @@ fn parse_https_url(value: &str) -> anyhow::Result<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_protocol::{PublicReceipt, ReceiptOutcome, receipt_hash};
+    use prism_protocol::{
+        AttestationKind, PublicReceipt, ReceiptAttestation, ReceiptOutcome, receipt_hash,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -859,6 +892,7 @@ mod tests {
                 failure_class: None,
                 outcome: ReceiptOutcome::Finalized,
                 trust_class: None,
+                attestation: None,
                 receipt_hash: String::new(),
                 transaction_hash: format!("0x{}", "a".repeat(64)),
             },
@@ -874,6 +908,7 @@ mod tests {
                 failure_class: Some("provisioning_timeout".to_owned()),
                 outcome: ReceiptOutcome::Refunded,
                 trust_class: None,
+                attestation: None,
                 receipt_hash: String::new(),
                 transaction_hash: format!("0x{}", "b".repeat(64)),
             },
@@ -904,11 +939,64 @@ mod tests {
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
+            attestation: None,
             receipt_hash: String::new(),
             transaction_hash: format!("0x{}", "b".repeat(64)),
         };
         receipt.receipt_hash = receipt_hash(&receipt).unwrap();
 
+        assert!(validate_receipts(&[receipt]).is_err());
+    }
+
+    #[test]
+    fn receipt_validation_rejects_a_class_the_network_cannot_verify() {
+        for class in [TrustClass::Attested, TrustClass::Confidential] {
+            let mut receipt = valid_receipt("1", 'a');
+            receipt.trust_class = Some(class);
+            receipt.attestation = Some(attestation());
+            receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+            assert!(
+                validate_receipts(&[receipt]).is_err(),
+                "{} published above the ceiling",
+                class.label()
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_validation_rejects_an_attested_class_with_no_attestation() {
+        let mut receipt = valid_receipt("1", 'a');
+        receipt.trust_class = Some(TrustClass::Attested);
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+        assert!(validate_receipts(&[receipt]).is_err());
+    }
+
+    /// Every receipt published so far predates attestation and carries none.
+    /// The new rules have to leave those alone, or turning them on retracts
+    /// artifacts that are already committed on chain.
+    #[test]
+    fn receipt_validation_still_accepts_the_classes_served_today() {
+        for class in [
+            None,
+            Some(TrustClass::Open),
+            Some(MAX_VERIFIABLE_TRUST_CLASS),
+        ] {
+            let mut receipt = valid_receipt("1", 'a');
+            receipt.trust_class = class;
+            receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+            validate_receipts(&[receipt]).unwrap();
+        }
+    }
+
+    #[test]
+    fn receipt_validation_rejects_a_malformed_attestation() {
+        let mut receipt = valid_receipt("1", 'a');
+        receipt.trust_class = Some(TrustClass::Isolated);
+        receipt.attestation = Some(ReceiptAttestation {
+            verdict_digest: "not-a-digest".to_owned(),
+            ..attestation()
+        });
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
         assert!(validate_receipts(&[receipt]).is_err());
     }
 
@@ -1033,6 +1121,14 @@ mod tests {
         assert!(validate_x_post("  \n").is_err());
     }
 
+    fn attestation() -> ReceiptAttestation {
+        ReceiptAttestation {
+            kind: AttestationKind::NvidiaGpu,
+            verdict_digest: "d".repeat(64),
+            verifier_version: "prism-attestation/0.1.0".to_owned(),
+        }
+    }
+
     fn valid_receipt(lease_id: &str, transaction: char) -> PublicReceipt {
         PublicReceipt {
             receipt_id: Uuid::now_v7(),
@@ -1046,6 +1142,7 @@ mod tests {
             failure_class: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
+            attestation: None,
             receipt_hash: String::new(),
             transaction_hash: format!("0x{}", transaction.to_string().repeat(64)),
         }

@@ -1,0 +1,29 @@
+#!/bin/sh
+# PID 1 in the workspace guest.
+#
+# Everything below runs from the verity protected root filesystem, which the
+# kernel assembled from a root hash carried in the measured command line. There
+# is no writable filesystem in the boot path and nothing is fetched before this
+# point, so the first instruction that could differ between two boots of the
+# same measurement is inside the agent.
+
+set -eu
+
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sys /sys
+mount -t devtmpfs -o nosuid,mode=0755 dev /dev
+mount -t tmpfs -o nosuid,nodev,mode=0755 run /run
+mount -t tmpfs -o nosuid,nodev,noexec,mode=1777 tmp /tmp
+
+mkdir -p /run/prism
+chmod 0700 /run/prism
+
+# /dev/sev-guest is how the guest asks the PSP for a report about itself. A
+# guest that cannot reach it cannot prove what it is, and serving the lease
+# anyway would be serving an unattested machine under an attested class.
+if [ ! -c /dev/sev-guest ]; then
+    echo "no SEV-SNP guest device; this guest cannot attest itself" >&2
+    poweroff -f
+fi
+
+exec /usr/libexec/prism-guest-agent

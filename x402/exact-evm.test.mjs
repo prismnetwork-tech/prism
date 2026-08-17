@@ -4,7 +4,7 @@ import { base } from "viem/chains";
 import { keccak256, toHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { AUTHORIZATION_TYPES, createExactEvm } from "./exact-evm.mjs";
-import { detect, parsePayment, paymentRequired, paymentResponse, requirementsFor, v1Network } from "./codec.mjs";
+import { canonicalNetwork, detect, parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork, v1Network } from "./codec.mjs";
 
 const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const PAY_TO = "0xe67a61f8e2aC4057aa22e64306107E7120078447";
@@ -262,4 +262,66 @@ test("the signed digest matches the domain Base USDC actually reports", async ()
   });
   const right = (await signed()).payload.signature;
   assert.notEqual(wrongDomain, right, "domain name must change the signature");
+});
+
+test("network names and CAIP-2 ids compare as the same chain", () => {
+  assert.ok(sameNetwork("base", "eip155:8453"));
+  assert.ok(sameNetwork("eip155:8453", "BASE"));
+  assert.ok(sameNetwork("eip155:4663", "eip155:4663"));
+  assert.equal(sameNetwork("base", "eip155:4663"), false);
+  assert.equal(canonicalNetwork("base"), "eip155:8453");
+  // An unknown name is not silently mapped onto some other chain.
+  assert.equal(canonicalNetwork("bogus"), "bogus");
+});
+
+test("a list of rpc urls is accepted wherever one is", () => {
+  const meta = { name: "USD Coin", version: "2" };
+  const many = createExactEvm({
+    "eip155:8453": { chain: base, rpcUrl: ["http://127.0.0.1:1", "http://127.0.0.1:2"], assets: { [USDC]: meta } },
+  });
+  const one = createExactEvm({
+    "eip155:8453": { chain: base, rpcUrl: "http://127.0.0.1:1", assets: { [USDC]: meta } },
+  });
+  // Both configure the same chain; the difference is only how many endpoints
+  // back it, which must not change what the module offers.
+  assert.deepEqual(many.supported().kinds, one.supported().kinds);
+});
+
+test("supported reports one chain however many names it answers to", () => {
+  const { evm } = harness();
+  const kinds = evm.supported().kinds;
+  // The harness registers Base under both "eip155:8453" and "base".
+  assert.equal(kinds.length, 2, "two protocol versions of one chain, not four of two");
+  assert.ok(kinds.every((k) => k.network === "eip155:8453"), "always the CAIP-2 form");
+  assert.deepEqual(new Set(kinds.map((k) => k.x402Version)), new Set([1, 2]));
+  assert.ok(kinds[0].extra.assets.includes(USDC));
+});
+
+test("the bazaar extension nests where the readers actually look", () => {
+  const input = { type: "object", properties: { command: { type: "string" } }, required: ["command"] };
+  const output = { type: "object", properties: { job_id: { type: "string" } } };
+  const { body } = paymentRequired(2, {
+    accepts: [requirements()],
+    resource: { url: "https://example.test/run", mimeType: "application/json" },
+    schemas: { input, output },
+  });
+  // Readers descend to input.properties.body and output.properties.example.
+  // Putting the schemas one level up parses as "no schema" and blocks listing.
+  const props = body.extensions.bazaar.schema.properties;
+  assert.deepEqual(props.input.properties.body, input);
+  assert.deepEqual(props.output.properties.example, output);
+  assert.ok(body.extensions.bazaar.info, "info is required alongside schema");
+});
+
+test("a v2 challenge carries the resource as an object and nothing v1-only in its entries", () => {
+  const { body } = paymentRequired(2, {
+    accepts: [requirements({ resource: "/run", description: "x", mimeType: "application/json", outputSchema: {} })],
+    resource: { url: "https://example.test/run", description: "One job", mimeType: "application/json" },
+  });
+  assert.equal(typeof body.resource, "object");
+  assert.equal(body.resource.url, "https://example.test/run");
+  for (const key of ["resource", "description", "mimeType", "outputSchema"]) {
+    assert.equal(body.accepts[0][key], undefined, `${key} does not belong in a v2 entry`);
+  }
+  assert.equal(body.accepts[0].amount, "35600");
 });

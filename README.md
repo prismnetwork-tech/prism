@@ -46,9 +46,9 @@ This is an unaudited pre-production system, so do not put production traffic or
 serious money on it yet.
 
 What a supplier protects is stated per offer rather than as one blanket
-warning. Every offer, quote, lease and receipt carries a trust class —
-`open`, `isolated`, `attested` or `confidential` — and renters can require a
-minimum instead of trusting prose:
+warning. Every offer, quote, lease and receipt carries a trust class (`open`,
+`isolated`, `attested` or `confidential`), and renters can require a minimum
+instead of trusting prose:
 
 ```bash
 curl https://api.prismnetwork.tech/v1/offers?min_trust=isolated
@@ -56,9 +56,16 @@ curl https://api.prismnetwork.tech/v1/offers?min_trust=isolated
 
 The class is derived by the control plane from evidence it can check, never
 asserted by a supplier, and it is clamped to what the network can currently
-verify. All capacity live today is `open`, which means the host operator can
-read anything the workload touches. Reaching `confidential` requires hardware
-the network does not have yet, not a software change. See
+verify. `isolated` requires a GPU attestation report that validates to a pinned
+NVIDIA root and answers a challenge issued to the node presenting it, so a
+machine cannot claim that class for itself. `attested` requires a launch
+measurement of the guest that ran the lease, verified to AMD's root and bound to
+the SSH host key generated inside that guest, so the proof is about the session
+the renter is in. It proves what started and not that nobody watched. All
+capacity live today is `open`, which means the host operator can read anything
+the workload touches, and nothing above it is served until the reference
+material both classes check against is captured from real hardware and verifies.
+See [docs/ATTESTATION.md](docs/ATTESTATION.md) for what is checked and
 [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for what each class does and
 does not promise.
 

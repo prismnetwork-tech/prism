@@ -21,19 +21,19 @@ type MarketplaceOffer = {
 const trustCopy: Record<TrustClass, { label: string; detail: string }> = {
   open: {
     label: "Open",
-    detail: "The host operator can read anything this workload touches. Keep credentials in your vault, where they stay sealed, rather than on the box.",
+    detail: "The host operator can read anything this workload touches. Keep credentials in your vault, where they stay sealed, rather than on the box. The settled receipt records this lease as open.",
   },
   isolated: {
     label: "Isolated",
-    detail: "Kata VM with exclusive GPU passthrough and a digest-pinned image. A privileged host can still reach the workload.",
+    detail: "A specific physical GPU, proven by a report checked against NVIDIA's root and bound to this node. The VM and the exclusive passthrough are the supplier's claim, backed by their bond, not by that report. A privileged host can still reach the workload. The settled receipt carries the verdict's digest.",
   },
   attested: {
     label: "Attested",
-    detail: "Launch measurement and GPU identity verified against vendor roots, so you can check what booted.",
+    detail: "Requires a launch measurement of the virtual machine the work ran in, signed by the chip maker's keys and bound to the key your session terminates on, so you can check what booted rather than take our word for it. No capacity can produce that evidence yet.",
   },
   confidential: {
     label: "Confidential",
-    detail: "Guest memory and GPU memory are encrypted against the host.",
+    detail: "Requires guest memory and GPU memory encrypted against the host, on top of everything attested requires. No capacity can produce that evidence yet.",
   },
 };
 

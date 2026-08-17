@@ -10,6 +10,8 @@
     "README.md",
     "codec.mjs",
     "exact-evm.mjs",
+    "facilitator.mjs",
+    "schemas.mjs",
     "server.mjs"
   ],
   "engines": {
@@ -46,6 +48,8 @@
   "exports": {
     ".": "./server.mjs",
     "./exact-evm": "./exact-evm.mjs",
-    "./codec": "./codec.mjs"
+    "./codec": "./codec.mjs",
+    "./schemas": "./schemas.mjs",
+    "./facilitator": "./facilitator.mjs"
   }
 }

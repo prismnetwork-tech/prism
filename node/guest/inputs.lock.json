@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "guest_image": "prism-guest-2026.08",
+  "source_date_epoch": 1767225600,
+  "inputs": {
+    "builder": {
+      "image": "docker.io/library/debian:trixie-slim",
+      "digest": "sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258",
+      "packages": "snapshot.debian.org/archive/debian/20260801T000000Z"
+    },
+    "firmware": {
+      "source": "https://github.com/tianocore/edk2",
+      "tag": "edk2-stable202605",
+      "commit": "b03a21a63e3bd001f52c527e5a57feddb53a690b",
+      "platform": "OvmfPkg/AmdSev/AmdSevX64.dsc"
+    },
+    "kernel": {
+      "source": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.44.tar.xz",
+      "version": "6.18.44",
+      "sha256": "0f72d938f06828e82c90405174fe572287db7bfe089e2fc46572a99a7f240d43"
+    },
+    "rootfs_base": {
+      "source": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz",
+      "repository": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main",
+      "sha256": "41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081"
+    }
+  },
+  "verity": {
+    "hash_algorithm": "sha256",
+    "data_block_size": 4096,
+    "hash_block_size": 4096,
+    "salt": "707269736d2d67756573742d7665726974792d76310000000000000000000000"
+  },
+  "outputs": {
+    "firmware": null,
+    "kernel": null,
+    "rootfs": null,
+    "verity_root_hash": null,
+    "cmdline": null
+  }
+}

@@ -16,6 +16,7 @@ matching settlement event. It is intentionally pseudonymous.
   "failure_class": null,
   "outcome": "finalized | refunded | disputed",
   "trust_class": "open | isolated | attested | confidential",
+  "attestation": "sha256 digest of the attestation verdict",
   "receipt_hash": "sha256 canonical JSON hash",
   "transaction_hash": "Robinhood Chain transaction hash"
 }
@@ -26,6 +27,14 @@ so a receipt states the terms it settled under and not just the amount. It is
 omitted entirely on receipts minted before the field existed, which keeps their
 canonical payload, and therefore the receipt hash already committed by their
 settlement transaction, byte-identical.
+
+`attestation` commits the receipt to the hardware verdict the class was granted
+from, so the terms and the evidence behind them settle in the same hash. It is
+omitted entirely when no verdict backed the lease, including on receipts minted
+before the field existed, which keeps those payloads and their published hashes
+byte-identical. The verdict digest is all that is published. Raw attestation
+reports are not, because a report carries the GPU's device serial and would
+deanonymize the host.
 
 `receipt_hash` is the SHA-256 hash of the canonical payload with the
 `receipt_hash` and `transaction_hash` fields omitted. The transaction hash
@@ -45,8 +54,11 @@ output or private telemetry.
 Proof establishes an onchain payment event paired with a platform-attested
 usage record, under a stated trust class. It does not establish that a supplier
 executed a workload faithfully, that hardware was unmodified, or that the
-deployed contracts have no defect. Until hardware attestation is verified, a
-trust class above `open` is never published.
+deployed contracts have no defect. No receipt states a class above `isolated`,
+which is the ceiling `MAX_VERIFIABLE_TRUST_CLASS` enforces on both paths that
+publish a class: the offer listing and the quote, rechecked when funding is
+confirmed. `isolated` is published only for a lease whose node held a verified
+GPU attestation verdict at quote time.
 
 The checked-in proof worker provides receipt-file aggregation, safe-chain
 event verification, public artifact generation and a daily X outbox.

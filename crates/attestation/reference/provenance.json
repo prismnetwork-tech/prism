@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "note": "What every pinned artifact in this crate actually is. `placeholder` means the file was generated in this repository and matches nothing real; `vendor-published` means it came from the vendor that signs it; `captured` means it was read off our own hardware. A placeholder so evidence from genuine hardware fails closed against it. The trust ceiling in prism_protocol::MAX_VERIFIABLE_TRUST_CLASS may not sit above a rung whose artifacts are still placeholders, and tests in this crate fail the build if it does.",
+  "artifacts": [
+    {
+      "path": "roots/nvidia-device-identity-root.der",
+      "rung": "isolated",
+      "state": "vendor-published",
+      "captured_from": "NVIDIA/nvtrust, guest_tools/gpu_verifiers/local_gpu_verifier/src/verifier/certs/verifier_device_root.pem, fetched 2026-08-17",
+      "subject": "CN=NVIDIA Device Identity CA, O=NVIDIA",
+      "sha256_der": "102bf659d5419614c9d8e6aecebc80454eb26b1df6a769ac720b9a690b167b48",
+      "self_signed_verified": true,
+      "caveat": "Taken from NVIDIA's own verifier repository rather than from an NVIDIA PKI endpoint. Confirm against a second NVIDIA-published copy before treating the pin as authoritative."
+    },
+    {
+      "path": "reference/h100-measurements.json",
+      "rung": "isolated",
+      "state": "vendor-published",
+      "captured_from": "NVIDIA RIM service, /v1/rim/NV_GPU_DRIVER_GH100_580.173.02, fetched 2026-08-17",
+      "rim_sha256": "62d8b2371976b15b9fa49dcfdfec8cd730efa42df39a5f7cd97127b1963173e3",
+      "caveat": "Golden digests NVIDIA publishes for this driver, not values read off our own card, so they say what an H100 running this driver should report. The RIM is an XML-signed document and this verifier does not check that signature yet, so their integrity rests on the transport."
+    },
+    {
+      "path": "roots/amd-ark-genoa.der",
+      "rung": "attested",
+      "state": "vendor-published",
+      "captured_from": "AMD KDS, https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain, fetched 2026-08-17",
+      "subject": "CN=ARK-Genoa, O=Advanced Micro Devices",
+      "sha256_der": "4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1",
+      "self_signed_verified": true,
+      "ask_chains_to_it": true
+    },
+    {
+      "path": "reference/snp-platform.json",
+      "rung": "attested",
+      "state": "placeholder",
+      "captured_from": null,
+      "replaced_by": "the ARK digest that follows from the real root, and a TCB floor taken from AMD's published Genoa TCB and the Dallas platform"
+    },
+    {
+      "path": "reference/snp-launch-measurements.json",
+      "rung": "attested",
+      "state": "placeholder",
+      "captured_from": null,
+      "replaced_by": "measurements tools/snp-measure computes from the recorded firmware, kernel, initrd and cmdline, reproduced by someone who did not build the image"
+    }
+  ]
+}

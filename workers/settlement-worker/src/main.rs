@@ -9,8 +9,8 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use prism_chain::EthereumSigner;
 use prism_protocol::{
-    ExecutionEvidence, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, SettlementEvidence,
-    node_id, receipt_hash, verifying_key,
+    ExecutionEvidence, MAX_VERIFIABLE_TRUST_CLASS, PublicReceipt, ROBINHOOD_CHAIN_ID,
+    ReceiptOutcome, SettlementEvidence, TrustClass, node_id, receipt_hash, verifying_key,
 };
 use rlp::RlpStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -486,6 +486,7 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         anyhow::bail!("lease {} has an invalid metering window", evidence.lease_id);
     }
     validate_execution_evidence(evidence, start, end)?;
+    let trust_class = settled_trust_class(evidence)?;
     let maximum_by_deposit = evidence.deposit_base_units / evidence.rate_per_second;
     let usage_seconds = end
         .saturating_sub(start)
@@ -515,7 +516,8 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         provider_paid_base_units: charged_base_units - charged_base_units * 1_000 / 10_000,
         failure_class: None,
         outcome: ReceiptOutcome::Finalized,
-        trust_class: evidence.trust_class,
+        trust_class,
+        attestation: None,
         receipt_hash: String::new(),
         transaction_hash: String::new(),
     };
@@ -530,6 +532,23 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         evidence_hash,
         receipt,
     })
+}
+
+/// Settlement is where a trust class stops being a row in a database and
+/// becomes a signed artifact the chain commits to through `receiptHash`, so the
+/// ceiling is enforced here instead of being taken on trust from whatever built
+/// the evidence. A claim above it is refused rather than quietly downgraded: a
+/// receipt settling a lease under a weaker class than the renter agreed to is a
+/// worse artifact than no receipt at all, and the difference has to be visible.
+fn settled_trust_class(evidence: &SettlementEvidence) -> anyhow::Result<Option<TrustClass>> {
+    match evidence.trust_class {
+        Some(class) if class > MAX_VERIFIABLE_TRUST_CLASS => anyhow::bail!(
+            "lease {} claims trust class {} with no verified attestation",
+            evidence.lease_id,
+            class.label()
+        ),
+        class => Ok(class),
+    }
 }
 
 fn validate_execution_evidence(
@@ -1099,6 +1118,34 @@ mod tests {
             hourly_cost_micros: 3_600_000,
         };
         assert!(reconcile(&evidence).is_err());
+    }
+
+    #[test]
+    fn a_class_above_the_ceiling_is_never_minted() {
+        for class in [TrustClass::Attested, TrustClass::Confidential] {
+            let mut evidence = evidence();
+            evidence.trust_class = Some(class);
+            assert!(
+                reconcile(&evidence).is_err(),
+                "{} settled without verified attestation",
+                class.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_servable_class_reaches_the_receipt_unchanged() {
+        let mut evidence = evidence();
+        evidence.trust_class = Some(MAX_VERIFIABLE_TRUST_CLASS);
+        let proposal = reconcile(&evidence).unwrap();
+        assert_eq!(
+            proposal.receipt.trust_class,
+            Some(MAX_VERIFIABLE_TRUST_CLASS)
+        );
+        assert_eq!(
+            proposal.receipt.receipt_hash,
+            receipt_hash(&proposal.receipt).unwrap()
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ chrono.workspace = true
 hex.workspace = true
 hmac.workspace = true
 k256.workspace = true
+prism-attestation = { path = "../../crates/attestation" }
 prism-protocol = { path = "../../crates/protocol" }
 rand.workspace = true
 rcgen.workspace = true
@@ -31,3 +32,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+p384.workspace = true
+# The verifier's own vectors, so the control-plane tests exercise a real chain
+# walk rather than a stand-in for one.
+prism-attestation = { path = "../../crates/attestation", features = ["test-vectors"] }

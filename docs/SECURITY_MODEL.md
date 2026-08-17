@@ -71,8 +71,8 @@ require a minimum one instead of reading a disclaimer.
 | Class | The renter can rely on | The renter cannot rely on |
 | --- | --- | --- |
 | `open` | A bonded, device-signed supplier identity and metered billing against escrow | Anything about confidentiality. The host operator can read memory, disk and VRAM |
-| `isolated` | A Kata VM with exclusive VFIO passthrough, a digest-pinned public image and memory-backed scratch | Protection from a privileged host that chooses to inspect the guest |
-| `attested` | A launch measurement and GPU device identity checked against vendor roots, so the software that booted is the software we published | Secrecy. Attestation proves what ran, not that nobody watched |
+| `isolated` | A specific physical GPU, its identity and firmware verified against a pinned NVIDIA root and bound to this node | The VM and the exclusive passthrough, which remain the supplier's claim backed by their bond. Protection from a privileged host that chooses to inspect the guest |
+| `attested` | Requires a launch measurement of the guest that ran the lease, verified to AMD's root and bound to the SSH host key generated inside it, alongside GPU device identity | Secrecy. The report covers what started, and data bound for the GPU leaves encrypted memory. Jupyter is outside the report |
 | `confidential` | Guest memory and VRAM encrypted against the host | Correctness of the workload itself, or the absence of contract defects |
 
 The class is derived by the control plane, never asserted by a supplier.
@@ -82,11 +82,37 @@ tunnel, so it is pinned to `open` regardless of what it claims. Anything above
 for, which makes an overstated claim a signed statement the dispute queue can
 act on.
 
-Attestation evidence is carried end to end but is not yet verified, so
-`MAX_VERIFIABLE_TRUST_CLASS` in `prism-protocol` clamps every served class to
-`isolated`. Nothing is published above what the network can check, and raising
-the ceiling requires a verifier, not a configuration change. All capacity live
-today is `open`.
+Attestation evidence is verified for GPU device identity. An NVIDIA H100 report
+is checked against a pinned NVIDIA root, bound to the node presenting it by a
+control-plane nonce, and matched against a reference measurement set, so
+`isolated` is granted from a verdict the control plane reached itself rather
+than from a node's description of its own configuration. A verdict lasts 24
+hours and a node falls back to `open` when it lapses. The vendor root and the
+reference measurements checked into the repository are still placeholders, so a
+genuine report fails today and no node holds a verdict.
+
+`attested` measures the guest, not the host. SEV-SNP has no host measurement and
+assumes the hypervisor is hostile, so every field it signs describes the guest
+that asked for the report. A report harvested from a blessed VM on a schedule
+would therefore be genuine and worthless, because the renter can be served from
+somewhere else. The report has to come from the guest running the lease, with
+its `REPORT_DATA` committing to the control plane's challenge, the lease id and
+the SSH host key that guest generated at boot, and the access grant is withheld
+until that verdict exists.
+
+`MAX_VERIFIABLE_TRUST_CLASS` in `prism-protocol` still clamps every served class
+to `isolated`, and the clamp is applied on both paths that publish a class: the
+offer listing and the quote, with a recheck when funding is confirmed. What
+holds it there is no longer missing hardware: the network's bare metal runs
+SEV-SNP host support today. What holds it is evidence. A reference launch
+measurement has to be computed from pinned inputs and reproduced by someone who
+did not build the image, and a genuine capture from that hardware has to verify
+as a checked-in vector. The ceiling moves when the evidence exists and not when
+the hardware arrives, which is the same principle as before and now cuts the
+other way. [ATTESTATION.md](ATTESTATION.md) has the checks, the failure modes,
+and what each class does and does not cover.
+
+All capacity live today is `open`.
 
 ## Private data
 
@@ -129,6 +155,9 @@ cheaply. AMD SEV-SNP reports and the NVIDIA attestation chain use P-384, which
 the precompile does not cover; proving that verification inside a zkVM and
 checking the resulting proof against the bn254 pairing precompile at `0x0008`
 is the affordable route to `attested` without a trusted attestation service.
+The NVIDIA chain walk that backs `isolated` today runs in the control plane, so
+a renter relying on that class is relying on our verifier being honest; moving
+that walk into a zkVM is what removes it from the trusted set.
 
 ## Contract non-guarantees
 

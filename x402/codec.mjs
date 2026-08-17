@@ -21,6 +21,25 @@ export function v1Network(caip2) {
   return V1_NETWORK_NAMES[caip2] ?? caip2;
 }
 
+const CANONICAL_NETWORKS = Object.fromEntries(
+  Object.entries(V1_NETWORK_NAMES).map(([caip2, name]) => [name, caip2]),
+);
+
+/**
+ * Any spelling of a network to its CAIP-2 form, so the two versions can be
+ * compared. A client that read a v1 quote echoes back "base" while the server
+ * holds "eip155:8453", and treating those as different chains refuses payments
+ * that are perfectly good.
+ */
+export function canonicalNetwork(network) {
+  const key = String(network ?? "");
+  return CANONICAL_NETWORKS[key.toLowerCase()] ?? key;
+}
+
+export function sameNetwork(a, b) {
+  return canonicalNetwork(a).toLowerCase() === canonicalNetwork(b).toLowerCase();
+}
+
 const decode = (value) => JSON.parse(Buffer.from(value, "base64").toString("utf8"));
 const encode = (value) => Buffer.from(JSON.stringify(value), "utf8").toString("base64");
 
@@ -63,32 +82,78 @@ export function parsePayment(header) {
   return { x402Version: decoded.x402Version ?? 1, accepted, payload: decoded.payload, raw: decoded };
 }
 
+/// v2 keeps the accepts entry to payment terms alone. Everything describing the
+/// resource moved up a level in v2, and sending the v1 spelling alongside makes
+/// the entry fail schema validation rather than being ignored.
+const V2_ENTRY_FIELDS = ["scheme", "network", "amount", "asset", "payTo", "maxTimeoutSeconds", "extra"];
+
 /**
- * Payment requirements in the shape a given version expects. `requirements` is
- * always written in v2 terms (CAIP-2 network, `amount`); this renames for v1.
+ * Payment requirements in the shape a given version expects. Entries are always
+ * written in v2 terms (CAIP-2 network, `amount`); this renames for v1 and
+ * strips the v1-only fields for v2.
  */
 export function requirementsFor(version, requirements) {
-  if (version === 2) return requirements;
+  if (version === 2) {
+    const entry = {};
+    for (const field of V2_ENTRY_FIELDS) {
+      if (requirements[field] !== undefined) entry[field] = requirements[field];
+    }
+    return entry;
+  }
   const { amount, network, ...rest } = requirements;
   return { ...rest, network: v1Network(network), maxAmountRequired: String(amount) };
+}
+
+/// The bazaar extension is how a v2 challenge says what the call looks like.
+///
+/// The nesting is not obvious and is not in the prose spec: readers descend to
+/// `schema.properties.input.properties.body` for the request and to
+/// `schema.properties.output.properties.example` for the response. `input`
+/// describes the whole request, of which the JSON body is one part, so the
+/// wrapper is where query parameters and headers would go too.
+function bazaar({ input, output }) {
+  const shape = {
+    type: "object",
+    properties: {
+      input: {
+        type: "object",
+        properties: { body: input },
+        required: ["body"],
+      },
+      output: {
+        type: "object",
+        properties: { example: output },
+      },
+    },
+    required: ["input"],
+  };
+  return { bazaar: { info: { input: { body: input }, output: { example: output } }, schema: shape } };
 }
 
 /**
  * The 402 a server sends. v1 answers with a JSON body; v2 answers with a
  * base64 `PAYMENT-REQUIRED` header and leaves the body to the application.
  */
-export function paymentRequired(version, { accepts, error, resource }) {
+export function paymentRequired(version, { accepts, error, resource, schemas, extra = {} }) {
   if (version === 2) {
-    const body = { x402Version: 2, error, accepts: accepts.map((a) => requirementsFor(2, a)) };
-    if (resource) body.resource = resource;
+    const body = {
+      x402Version: 2,
+      ...(error ? { error } : {}),
+      // Required in v2, and an object rather than the v1 path string.
+      ...(resource ? { resource } : {}),
+      accepts: accepts.map((a) => requirementsFor(2, a)),
+      ...(schemas ? { extensions: bazaar(schemas) } : {}),
+      ...extra,
+    };
     return { headers: { "PAYMENT-REQUIRED": encode(body) }, body };
   }
   return {
     headers: {},
     body: {
       x402Version: 1,
-      error,
+      ...(error ? { error } : {}),
       accepts: accepts.map((a) => requirementsFor(1, a)),
+      ...extra,
     },
   };
 }

@@ -1,0 +1,34 @@
+[package]
+name = "prism-attestation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Test roots and the relaxed-validity policy live behind a feature so the
+# integration tests in tests/ can reach them; nothing in a service build turns
+# it on and no runtime switch can.
+test-vectors = []
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+hex.workspace = true
+p384.workspace = true
+prism-protocol = { path = "../protocol" }
+# AMD's ARK and ASK are RSA-4096 signing with PSS over SHA-384. Only the VCEK's
+# own key is P-384, so the AMD walk needs an RSA verifier the NVIDIA walk does
+# not. Declared here rather than in the workspace table because no other crate
+# in the tree touches RSA.
+rsa = { version = "0.9.8", features = ["sha2"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+prism-attestation = { path = ".", features = ["test-vectors"] }
+rand.workspace = true
+rcgen.workspace = true
+uuid.workspace = true

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/attestation",
   "crates/chain",
   "crates/protocol",
   "services/control-plane",
@@ -7,6 +8,7 @@ members = [
   "services/operations-monitor",
   "services/reconciliation-monitor",
   "node/prismd",
+  "tools/snp-measure",
   "workers/lifecycle-worker",
   "workers/proof-worker",
   "workers/settlement-worker",
@@ -36,6 +38,7 @@ futures = "0.3.31"
 hex = "0.4.3"
 hmac = "0.12.1"
 k256 = { version = "0.13.4", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13.1", features = ["ecdsa", "pkcs8"] }
 rand = "0.8.5"
 rcgen = { version = "0.14.8", features = ["pem", "x509-parser"] }
 redis = { version = "1.4.1", default-features = false, features = ["script", "tokio-rustls-comp"] }
@@ -57,3 +60,4 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 url = "2.5.4"
 uuid = { version = "1.17.0", features = ["serde", "v7"] }
+x509-parser = "0.18.1"
