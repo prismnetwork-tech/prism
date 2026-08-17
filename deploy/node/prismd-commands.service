@@ -21,7 +21,7 @@ ProtectSystem=strict
 # nerdctl keeps its own volume and container state outside the daemon's, and it
 # talks to containerd over a socket, so both have to stay writable or every
 # workspace dies at `mkdir ... read-only file system`.
-ReadWritePaths=/var/lib/prismd /run/lock/prismd /var/lib/nerdctl /run/containerd
+ReadWritePaths=/var/lib/prismd /run/lock/prismd /var/lib/nerdctl /run/containerd /etc/cni/net.d /var/lib/cni /run/cni /run/netns
 PrivateTmp=true
 UMask=0077
 

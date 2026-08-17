@@ -1212,6 +1212,15 @@ async fn execute_node_command(
     let credential_root = config
         .state_root
         .join(format!(".credentials-{}", command.command_id));
+    // The control plane redelivers a command whose lease expired, and it keeps
+    // the same id, so this directory can outlive the process that made it. Its
+    // contents come from the command being handled right now, which makes
+    // clearing it safe and leaving it fatal: a plain create fails with
+    // `AlreadyExists` on every retry, and the lease that owns the command can
+    // never run again.
+    if credential_root.exists() {
+        fs::remove_dir_all(&credential_root).context("clear stale lease credentials")?;
+    }
     fs::create_dir(&credential_root)?;
     let ssh_key_path = credential_root.join("authorized_keys");
     let jupyter_token_path = credential_root.join("jupyter_token");
@@ -1749,11 +1758,34 @@ fn save_identity(path: &Path, identity: &DeviceIdentity) -> anyhow::Result<()> {
         .write_all(&serde_json::to_vec(identity)?)
         .and_then(|()| file.sync_all())
         .context("write device identity")
+        .and_then(|()| keep_owner(path, &temporary))
         .and_then(|()| fs::rename(&temporary, path).context("persist device identity"));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// The identity is shared by services that do not run as the same user: the
+/// command supervisor needs root to drive containerd, while the tunnel and the
+/// certificate renewal drop to `prismd`. Every one of them bumps a sequence and
+/// rewrites the file, and a rename hands the replacement whichever owner did the
+/// writing. Root writing it once is enough to lock `prismd` out of its own
+/// identity, which takes the node off the network until someone chowns it back.
+#[cfg(unix)]
+fn keep_owner(path: &Path, temporary: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(existing) = fs::metadata(path) else {
+        return Ok(());
+    };
+    std::os::unix::fs::chown(temporary, Some(existing.uid()), Some(existing.gid()))
+        .context("preserve device identity ownership")
+}
+
+#[cfg(not(unix))]
+fn keep_owner(_path: &Path, _temporary: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn command_success(command: &str, arguments: &[&str]) -> bool {
