@@ -53,11 +53,27 @@ ssh-keygen -q -t ed25519 -N "" -f /run/prism/ssh_host_key
 # hashes into report data the control plane refuses.
 if [ -f "$control/attestation_challenge" ]; then
     command -v prismd >/dev/null
+
+    # The kernel exposes the report through configfs and nothing mounts it for
+    # us. Mounting is the only way to reach it: /dev/sev-guest is a guest device
+    # the host cannot hand over. Unmount before the renter can reach anything,
+    # so the session they get holds no route to the interface that signs for it.
+    mounted_tsm=
+    if [ ! -d /sys/kernel/config/tsm ]; then
+        mkdir -p /sys/kernel/config
+        mount -t configfs none /sys/kernel/config
+        mounted_tsm=yes
+    fi
+
     prismd snp-report \
         --challenge-file "$control/attestation_challenge" \
         --lease-id "$(cat "$control/lease_id")" \
         --channel-key-file /run/prism/ssh_host_key.pub \
         --output-directory /run/prism/evidence
+
+    if [ -n "$mounted_tsm" ]; then
+        umount /sys/kernel/config
+    fi
 fi
 
 cat >/run/prism/sshd_config <<'EOF'

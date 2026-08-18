@@ -347,6 +347,14 @@ fn workspace_command(
         // The report has to outlive the guest, and the control mount it reads
         // the challenge from is read-only.
         command.args(["--mount", &evidence_mount]);
+        // The guest kernel carries the SEV driver and configfs-tsm, but nothing
+        // mounts configfs in the container, and `/dev/sev-guest` cannot be
+        // passed through because nerdctl resolves a device path on the host,
+        // where a guest-only node does not exist. Mounting is the way in and it
+        // needs this. Only the bootstrap holds it: it takes the report before
+        // anything listens, unmounts, and everything the renter reaches runs as
+        // an unprivileged account with no capabilities at all.
+        command.args(["--cap-add", "SYS_ADMIN"]);
     }
     command.args([
         "--entrypoint",
@@ -1186,6 +1194,14 @@ mod tests {
                 .any(|pair| pair == ["--runtime", "io.containerd.kata.v2"])
         );
         assert!(!arguments.iter().any(|argument| argument == "--publish"));
+        // An ordinary workspace has no report to take, so it never gets the
+        // capability that would let it mount its way to one.
+        assert!(
+            !arguments
+                .windows(2)
+                .any(|pair| pair == ["--cap-add", "SYS_ADMIN"]),
+            "a batch lease must not be granted SYS_ADMIN"
+        );
         assert_eq!(arguments.last().unwrap(), "nvidia-smi -L");
     }
 
@@ -1251,6 +1267,14 @@ mod tests {
                 .any(|pair| pair == ["--device", "/dev/vfio/42"])
         );
         assert!(!arguments.iter().any(|argument| argument == "--gpus"));
+        // The workspace a renter is handed has no report to take, so it never
+        // gets the capability that would let it mount its way to one.
+        assert!(
+            !arguments
+                .windows(2)
+                .any(|pair| pair == ["--cap-add", "SYS_ADMIN"]),
+            "an ordinary workspace must not be granted SYS_ADMIN"
+        );
         assert!(
             arguments
                 .iter()
@@ -1321,6 +1345,13 @@ mod tests {
             arguments
                 .windows(2)
                 .any(|pair| pair == ["--snapshotter", "nydus"])
+        );
+        // Only a confidential guest gets this, and only so the bootstrap can
+        // mount configfs to reach the report interface.
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--cap-add", "SYS_ADMIN"])
         );
         let evidence = format!(
             "type=bind,src={},dst=/run/prism/evidence",
