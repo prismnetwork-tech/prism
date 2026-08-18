@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/agent-sdk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Headless GPU leasing and renter-encrypted storage on Prism Network for wallet-holding agents.",
   "type": "module",
   "main": "prism.mjs",
@@ -24,6 +24,7 @@
   },
   "files": [
     "prism.mjs",
+    "relay.mjs",
     "toolset.d.mts",
     "prism.d.mts",
     "toolset.mjs",

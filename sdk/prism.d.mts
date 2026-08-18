@@ -3,13 +3,31 @@ export declare const USDG: string;
 export declare const DEFAULT_IMAGE: string;
 export declare const TRUST_CLASSES: readonly ["open", "isolated", "attested", "confidential"];
 
+/// `mode` says which of the two shapes arrived. Brokered capacity fills in
+/// `ssh_host` and `ssh_port`; a node that accepts nothing inbound fills in the
+/// gateway fields instead and is reached through a relay.
 export interface LeaseAccess {
-  mode?: string;
+  mode?: "direct_ssh" | "gateway" | string;
   ssh_host?: string;
   ssh_port?: number;
   ssh_user?: string;
+  gateway_host?: string;
+  relay_port?: number;
+  /// The root the relay's certificate chains to, in PEM. It is served under a
+  /// private CA, so this is what the client pins.
+  gateway_ca?: string;
+  token?: string;
+  jupyter_path?: string;
+  jupyter_token?: string;
   expires_at?: string;
   [key: string]: unknown;
+}
+
+/// A local address that forwards to the workspace until it is closed.
+export interface RelayForwarder {
+  host: string;
+  port: number;
+  close(): Promise<void>;
 }
 
 export interface LeaseHandle {
@@ -74,6 +92,9 @@ export declare class PrismAgent {
     command: string,
     options?: { timeoutMs?: number; connectRetries?: number; connectDelayMs?: number; stdin?: string | null },
   ): Promise<RunResult>;
+  /// Only for a lease reached through the gateway. Use it for anything that is
+  /// not a one-shot command: scp, a notebook client, an interactive shell.
+  forward(lease: LeaseHandle, options?: { service?: "ssh" | "jupyter" }): Promise<RelayForwarder>;
   endLease(lease: LeaseHandle): void;
 }
 
