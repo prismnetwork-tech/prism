@@ -1293,6 +1293,14 @@ pub enum LeaseAccess {
         ssh_user: String,
         jupyter_path: String,
         jupyter_token: String,
+        /// The root the relay's certificate chains to, in PEM. The relay is
+        /// served under a private CA, so without this a renter has nothing to
+        /// verify it against and is left choosing between trusting whatever
+        /// answers and not connecting at all. It travels inside a response the
+        /// caller already authenticated, which is what makes it worth pinning.
+        /// Defaulted so a client reading an older response still parses.
+        #[serde(default)]
+        gateway_ca: String,
         expires_at: DateTime<Utc>,
     },
     DirectSsh {

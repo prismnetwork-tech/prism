@@ -15,7 +15,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://prismnetwork.tech"
-Repository = "https://github.com/prismnetworkdottech/prism"
+Repository = "https://github.com/prismnetwork-tech/prism"
 
 [build-system]
 requires = ["hatchling"]

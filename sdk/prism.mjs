@@ -14,6 +14,7 @@ import {
   stringToBytes,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { openRelayForwarder } from "./relay.mjs";
 import { PrismVault } from "./vault.mjs";
 import { PrismWorkspace } from "./workspace.mjs";
 
@@ -419,28 +420,66 @@ export class PrismAgent {
   // can lag a few minutes after the box reports ready. `stdin` feeds the command
   // its input, which keeps anything sensitive out of the remote process table.
   async run(lease, command, { timeoutMs = 120_000, connectRetries = 24, connectDelayMs = 10_000, stdin = null } = {}) {
-    if (!lease?.access?.ssh_host || !lease.access.ssh_port || !lease.keyPath) {
+    if (typeof command !== "string" || command.length === 0) throw new PrismError(400, "command_required");
+    if (!lease?.keyPath) {
       throw new PrismError(400, "invalid_lease_handle", {
         mode: lease?.access?.mode ?? null,
         lease_id: lease?.leaseId ?? null,
-        hint: "gateway-mode access has no ssh endpoint",
+        hint: "the lease handle carries no ssh key",
       });
     }
-    if (typeof command !== "string" || command.length === 0) throw new PrismError(400, "command_required");
-    const target = {
-      host: lease.access.ssh_host,
-      port: lease.access.ssh_port,
-      user: lease.access.ssh_user ?? "root",
-      keyPath: lease.keyPath,
-    };
-    let last;
-    for (let attempt = 0; attempt <= connectRetries; attempt++) {
-      const res = await this.#ssh(target, command, timeoutMs, stdin);
-      if (!isSshWarmup(res)) return res;
-      last = res;
-      if (attempt < connectRetries) await sleep(connectDelayMs);
+
+    // A physical node accepts nothing inbound, so its session arrives through
+    // the gateway. Opening the renter's half of that tunnel gives a local port
+    // that behaves like any other host, which is why the retry loop below does
+    // not care which kind of capacity it is talking to.
+    const forwarder =
+      lease.access?.mode === "gateway" ? await openRelayForwarder(lease.access) : null;
+    try {
+      const target = forwarder
+        ? {
+            host: forwarder.host,
+            port: forwarder.port,
+            user: lease.access.ssh_user ?? "workspace",
+            keyPath: lease.keyPath,
+          }
+        : {
+            host: lease.access?.ssh_host,
+            port: lease.access?.ssh_port,
+            user: lease.access?.ssh_user ?? "root",
+            keyPath: lease.keyPath,
+          };
+      if (!target.host || !target.port) {
+        throw new PrismError(400, "invalid_lease_handle", {
+          mode: lease.access?.mode ?? null,
+          lease_id: lease.leaseId ?? null,
+          hint: "the access grant names no reachable endpoint",
+        });
+      }
+      let last;
+      for (let attempt = 0; attempt <= connectRetries; attempt++) {
+        const res = await this.#ssh(target, command, timeoutMs, stdin);
+        if (!isSshWarmup(res)) return res;
+        last = res;
+        if (attempt < connectRetries) await sleep(connectDelayMs);
+      }
+      return last;
+    } finally {
+      if (forwarder) await forwarder.close();
     }
-    return last;
+  }
+
+  /// A local address that forwards to the workspace for as long as it is open.
+  /// Use it for anything that is not a one-shot command: `scp`, port forwards,
+  /// an interactive shell, a notebook client. The caller closes it.
+  async forward(lease, { service = "ssh" } = {}) {
+    if (lease?.access?.mode !== "gateway") {
+      throw new PrismError(400, "forward_not_supported", {
+        mode: lease?.access?.mode ?? null,
+        hint: "this lease is reachable directly and needs no relay",
+      });
+    }
+    return openRelayForwarder(lease.access, { service });
   }
 
   // Releases local key material. The on-chain lease settles at the end of its duration.

@@ -53,7 +53,7 @@ export default function TrustClassesPage() {
           part of memory, so this grade tells you what ran. Who could see it is the next grade up.
           No capacity is served at this grade yet.{" "}
           <a
-            href="https://github.com/prismnetworkdottech/prism/blob/main/docs/ATTESTATION.md"
+            href="https://github.com/prismnetwork-tech/prism/blob/main/docs/ATTESTATION.md"
             target="_blank"
             rel="noopener noreferrer"
           >

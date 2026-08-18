@@ -22,6 +22,23 @@ python3 -m jupyter --version >/dev/null
 id workspace >/dev/null
 nvidia-smi -L >/dev/null
 
+# The device nodes arrive owned by root with nothing granted to anyone else, and
+# the renter's session is not root, so without this they get a shell that cannot
+# open the GPU they are paying for: `nvidia-smi` answers "Failed to initialize
+# NVML: Insufficient Permissions". NVIDIA's own tooling opens these to everyone
+# on an ordinary host. Here it is narrower than that sounds, because the
+# workspace is a single-tenant VM holding one card and there is nobody else in
+# it to widen them to.
+for node in /dev/nvidia*; do
+    [ -c "$node" ] && chmod 0666 "$node"
+done
+if [ -d /dev/nvidia-caps ]; then
+    chmod 0755 /dev/nvidia-caps
+    for node in /dev/nvidia-caps/*; do
+        [ -c "$node" ] && chmod 0444 "$node"
+    done
+fi
+
 install -d -m 0700 -o workspace -g workspace /workspace
 install -d -m 0755 /run/sshd
 install -m 0400 "$control/authorized_keys" /run/prism/authorized_keys

@@ -7067,6 +7067,11 @@ async fn get_lease_access(
             relay_port: state.public_relay_port,
             ssh_user: "workspace".to_owned(),
             jupyter_path: "/lab".to_owned(),
+            gateway_ca: state
+                .certificate_authority
+                .certificate_pem
+                .as_ref()
+                .clone(),
             jupyter_token: state
                 .credential_cipher
                 .decrypt(&jupyter_token)

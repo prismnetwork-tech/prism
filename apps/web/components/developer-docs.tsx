@@ -131,7 +131,7 @@ export function DeveloperDocs() {
           <span>prism.</span>
         </Link>
         <nav aria-label="Documentation header">
-          <a href="https://github.com/prismnetworkdottech/prism" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+          <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
           <Link href={new URL("/activity", siteUrl).href}>Activity</Link>
           <Link href={new URL("/proof", siteUrl).href}>Receipts</Link>
           <Link className="docs-console-link" href={new URL("/compute", siteUrl).href}>Open console ↗</Link>
@@ -164,7 +164,7 @@ export function DeveloperDocs() {
             </p>
             <div className="docs-hero-actions">
               <a className="landing-button primary" href="#quickstart">Start integration <span>↓</span></a>
-              <a className="landing-button secondary" href="https://github.com/prismnetworkdottech/prism" target="_blank" rel="noopener noreferrer">Read source <span>↗</span></a>
+              <a className="landing-button secondary" href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">Read source <span>↗</span></a>
             </div>
             <dl className="docs-facts">
               <div><dt>Execution</dt><dd>L40S cloud</dd></div>

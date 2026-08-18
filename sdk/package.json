@@ -51,11 +51,11 @@
   "homepage": "https://prismnetwork.tech",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/prismnetworkdottech/prism.git",
+    "url": "git+https://github.com/prismnetwork-tech/prism.git",
     "directory": "sdk"
   },
   "bugs": {
-    "url": "https://github.com/prismnetworkdottech/prism/issues"
+    "url": "https://github.com/prismnetwork-tech/prism/issues"
   },
   "license": "Apache-2.0",
   "publishConfig": {
