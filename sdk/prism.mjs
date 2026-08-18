@@ -325,7 +325,10 @@ export class PrismAgent {
         return res.body;
       }
       if (res.status !== 404 && res.status !== 429 && res.status < 500) {
-        throw new PrismError(res.status, res.body?.error ?? "access_error", res.body);
+        // The control plane names the reason in `code`; without it a lease that
+        // will never open access reports as a generic `access_error` and the
+        // caller has to go and read the body to learn anything.
+        throw new PrismError(res.status, res.body?.error ?? res.body?.code ?? "access_error", res.body);
       }
       await sleep(intervalMs);
     }

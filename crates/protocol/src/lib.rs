@@ -931,6 +931,18 @@ pub enum LeaseState {
     Failed,
 }
 
+impl LeaseState {
+    /// Whether a lease standing here could still hand out credentials. False
+    /// once it is closing or settled, which is what lets a caller stop waiting
+    /// for access that is never coming rather than poll until its own timeout.
+    pub fn can_still_open_access(&self) -> bool {
+        matches!(
+            self,
+            Self::Funded | Self::Provisioning | Self::Ready | Self::Active
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeaseRecord {
     pub lease_id: u64,

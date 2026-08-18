@@ -5353,6 +5353,41 @@ impl MarketplaceStore {
         }
     }
 
+    /// Where the lease stands, for the account that owns it. Absent for anyone
+    /// else, so asking about a stranger's lease cannot tell you whether it
+    /// exists.
+    async fn lease_state(
+        &self,
+        subject: &str,
+        lease_id: u64,
+    ) -> Result<Option<LeaseState>, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let market = market.read().await;
+                let Some((owner, lease)) = market.leases.get(&lease_id) else {
+                    return Ok(None);
+                };
+                Ok((owner == subject).then_some(lease.state.clone()))
+            }
+            Self::Postgres(pool) => {
+                let stored: Option<String> = query_scalar(
+                    "SELECT state FROM leases WHERE lease_id = $1 AND subject = $2",
+                )
+                .bind(lease_id as i64)
+                .bind(subject)
+                .fetch_optional(pool)
+                .await
+                .map_err(StoreError::Storage)?;
+                stored
+                    .map(|state| {
+                        serde_json::from_value(serde_json::Value::String(state))
+                            .map_err(|_| StoreError::InvalidStoredState("unknown lease state".to_owned()))
+                    })
+                    .transpose()
+            }
+        }
+    }
+
     /// Credentials are released only for a lease standing at the class it was
     /// quoted at. Above `Isolated` that means a verdict from the guest running
     /// this lease: a node-level report says which machine booted correctly at
@@ -7041,17 +7076,36 @@ async fn get_lease_access(
 ) -> Result<Json<LeaseAccessResponse>, (StatusCode, Json<ApiError>)> {
     let path = format!("/v1/leases/{lease_id}/access");
     let account = require_account(&state, &headers, "GET", &path, &[]).await?;
-    let grant = state
+    let grant = match state
         .store
         .lease_access(&account.subject, lease_id)
         .await
         .map_err(store_error)?
-        .ok_or_else(|| {
-            not_found(
-                "access_not_ready",
-                "lease access is unavailable until provider readiness and onchain start are final",
-            )
-        })?;
+    {
+        Some(grant) => grant,
+        None => {
+            // "Not yet" and "never" look identical from here, and a caller that
+            // cannot tell them apart waits out the whole provisioning window on
+            // a lease that already failed. The escrow times the refund and
+            // nothing here can pay it sooner, but the renter can at least stop
+            // waiting and say why.
+            let state = state
+                .store
+                .lease_state(&account.subject, lease_id)
+                .await
+                .map_err(store_error)?;
+            return Err(match state {
+                Some(ref state) if !state.can_still_open_access() => conflict(
+                    "lease_not_servable",
+                    "this lease will not open access: it is closing or already settled, and its escrow refunds on the contract's own schedule",
+                ),
+                _ => not_found(
+                    "access_not_ready",
+                    "lease access is unavailable until provider readiness and onchain start are final",
+                ),
+            });
+        }
+    };
     let access = match grant.access {
         StoredLeaseAccess::Gateway {
             token,
@@ -8969,6 +9023,53 @@ mod tests {
             lease_access_for(market).await,
             Err(StoreError::LeaseUnattested)
         ));
+    }
+
+    /// A lease that has stopped being servable has to be distinguishable from
+    /// one that is merely slow, or the renter waits out the whole provisioning
+    /// window on a session that is never opening.
+    #[tokio::test]
+    async fn a_closing_lease_reports_where_it_stands_to_its_owner() {
+        let market = guest_lease_market(TrustClass::Open, LeaseState::Closing);
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        assert!(
+            store
+                .lease_access(GUEST_RENTER, GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .is_none(),
+            "a closing lease opens nothing"
+        );
+        let state = store
+            .lease_state(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .expect("the owner can see where their lease stands");
+        assert!(!state.can_still_open_access());
+    }
+
+    /// Asking about someone else's lease answers the same way whether or not it
+    /// exists.
+    #[tokio::test]
+    async fn a_stranger_learns_nothing_about_a_lease() {
+        let market = guest_lease_market(TrustClass::Open, LeaseState::Closing);
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        assert!(
+            store
+                .lease_state("somebody-else", GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .lease_state("somebody-else", GUEST_LEASE_ID + 999)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The renter can only pin the host key if it reaches them, and it is the
