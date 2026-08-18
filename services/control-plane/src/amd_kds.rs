@@ -28,6 +28,8 @@ use tokio::sync::Mutex;
 /// is long.
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// AMD answers 429 to a third rapid request from one address.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(2);
 /// A certificate is a couple of kilobytes. Anything approaching this is not one.
 const MAX_CERTIFICATE_BYTES: usize = 64 * 1_024;
 /// The key is a chip and TCB read out of a report nobody has verified yet, so
@@ -174,12 +176,19 @@ impl AmdKds {
     }
 
     async fn get(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .context("reach AMD KDS")?;
+        // AMD rate limits per source address, and a fleet's attestations all
+        // leave from this one. The cache is what keeps that rare; this is for
+        // the burst that gets through it.
+        let mut response = self.client.get(url).send().await.context("reach AMD KDS")?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
+            response = self
+                .client
+                .get(url)
+                .send()
+                .await
+                .context("reach AMD KDS after backing off")?;
+        }
         if !response.status().is_success() {
             anyhow::bail!("AMD KDS answered {}", response.status());
         }

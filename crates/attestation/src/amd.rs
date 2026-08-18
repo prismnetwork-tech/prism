@@ -34,10 +34,13 @@ use crate::policy::Policy;
 /// The AMD root every VCEK must chain to, pinned by content rather than by
 /// name so a certificate that merely calls itself an ARK gets nowhere.
 ///
-/// The file currently in the tree is a placeholder generated in this repository
-/// with its private key discarded. Until it is replaced with the ARK AMD
-/// publishes for this product line, no genuine report can anchor and no lease
-/// can be granted Attested.
+/// The file in the tree is the ARK AMD publishes for this product line, taken
+/// from the chain it serves at `/vcek/v1/Genoa/cert_chain`. It is self-signed,
+/// names AMD, and its digest is recorded in `reference/snp-platform.json` and
+/// asserted at load, so a swapped file panics rather than being trusted. This
+/// note used to say the file was a locally generated placeholder and that no
+/// lease could reach Attested; both stopped being true once the real root
+/// landed, and a comment claiming a root is fake is one somebody acts on.
 const PINNED_ARK: &[u8] = include_bytes!("../roots/amd-ark-genoa.der");
 
 #[cfg(any(test, feature = "test-vectors"))]
