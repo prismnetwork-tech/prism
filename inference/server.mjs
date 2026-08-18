@@ -15,7 +15,7 @@ import { createExactEvm } from "@prismnetwork/x402/exact-evm";
 import { createCdpFacilitator, routeByNetwork } from "@prismnetwork/x402/cdp-facilitator";
 import { bazaar, detect } from "@prismnetwork/x402/codec";
 import { base as baseChain } from "viem/chains";
-import { createGateway, USDC_BASE, USDC_BASE_DOMAIN } from "./gateway.mjs";
+import { createGateway, USDC_BASE, USDC_BASE_DOMAIN, USDG_ROBINHOOD_DOMAIN } from "./gateway.mjs";
 import { inferenceExample, inferenceInput, inferenceInputExample, inferenceOutput, openApiDocument } from "./openapi.mjs";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -129,22 +129,35 @@ function spawnTunnel(lease) {
 
 const fetchOllama = (path, init) => fetch(`http://127.0.0.1:${config.tunnelPort}${path}`, init);
 
-const localExact = config.basePayTo
-  ? createExactEvm({
-      "eip155:8453": {
-        chain: baseChain,
-        rpcUrl: config.baseRpcUrl,
-        privateKey: process.env.PRISM_X402_COLLECTOR_KEY,
-        assets: { [USDC_BASE]: USDC_BASE_DOMAIN },
-      },
-      base: {
-        chain: baseChain,
-        rpcUrl: config.baseRpcUrl,
-        privateKey: process.env.PRISM_X402_COLLECTOR_KEY,
-        assets: { [USDC_BASE]: USDC_BASE_DOMAIN },
-      },
-    })
-  : null;
+// Robinhood Chain is always verifiable: the agent key that leases GPUs also
+// holds the gas to broadcast an authorization there. Base is offered only when
+// there is somewhere to collect it.
+const exactNetworks = {
+  "eip155:4663": {
+    chain: robinhoodChain,
+    rpcUrl: process.env.PRISM_RPC_URL,
+    privateKey: process.env.PRISM_AGENT_KEY,
+    assets: { [USDG]: USDG_ROBINHOOD_DOMAIN },
+  },
+  ...(config.basePayTo
+    ? {
+        "eip155:8453": {
+          chain: baseChain,
+          rpcUrl: config.baseRpcUrl,
+          privateKey: process.env.PRISM_X402_COLLECTOR_KEY,
+          assets: { [USDC_BASE]: USDC_BASE_DOMAIN },
+        },
+        base: {
+          chain: baseChain,
+          rpcUrl: config.baseRpcUrl,
+          privateKey: process.env.PRISM_X402_COLLECTOR_KEY,
+          assets: { [USDC_BASE]: USDC_BASE_DOMAIN },
+        },
+      }
+    : {}),
+};
+
+const localExact = createExactEvm(exactNetworks);
 
 // Base settles at Coinbase when a key is configured, because the Bazaar only
 // indexes endpoints its own facilitator has settled for. Everything else, and

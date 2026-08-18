@@ -46,6 +46,11 @@ export const USDG_ROBINHOOD = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
 /// signing hash. The published spec example carries the testnet token's
 /// "USDC", which signs against nothing here.
 export const USDC_BASE_DOMAIN = { name: "USD Coin", version: "2" };
+/// Read off the contract, not guessed: USDG's `name()` is "Global Dollar" and it
+/// exposes no `version()`, so the version was recovered by reproducing the
+/// on-chain DOMAIN_SEPARATOR. A client that signs against the wrong domain
+/// produces a well-formed signature the token rejects.
+export const USDG_ROBINHOOD_DOMAIN = { name: "Global Dollar", version: "1" };
 
 export function loadConsumed(file) {
   const set = new Set();
@@ -147,7 +152,10 @@ export function createGateway({
       lease = await agent.lease({ image, durationSeconds, minVramMib });
     } catch (err) {
       // Nothing was funded when the match itself fails, but hammering the
-      // network with fresh quote attempts helps nobody.
+      // network with fresh quote attempts helps nobody. Say why: every later
+      // caller is told only that a cooldown is running, so a cause that is not
+      // written down here cannot be recovered from outside at all.
+      log(`warmup failed while leasing: ${err.message}`);
       box.phase = "cold";
       coolUntil = now() + coolDownMs;
       throw err;
@@ -194,6 +202,9 @@ export function createGateway({
       agent.endLease(lease);
       box.phase = "cold";
       coolUntil = now() + coolDownMs;
+      // A lease was paid for and is being dropped, so this is the expensive
+      // failure and the one worth naming precisely.
+      log(`warmup failed after lease ${lease.leaseId}: ${err.message}`);
       throw err;
     }
   }
@@ -267,11 +278,16 @@ export function createGateway({
       resource: `${originUrl}/v1/inference`,
       description:
         "One generation on a Prism GPU, paid in USDG on Robinhood Chain, which is where the " +
-        "serving lease settles. Send the amount to payTo, then retry with " +
-        "X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of the tx hash.",
+        "serving lease settles. Sign an EIP-3009 transferWithAuthorization for the quoted amount " +
+        "and send it as the payment header; you need no gas, because the authorization is " +
+        "broadcast for you. The older flow, a direct transfer plus a signed tx hash, still works.",
       mimeType: "application/json",
       maxTimeoutSeconds: 60,
       ...(schemas ? { outputSchema: schemas } : {}),
+      // Without the EIP-712 domain a strict client cannot sign an authorization
+      // it can trust, and the careful ones refuse rather than read the domain
+      // off-chain and risk signing the wrong one.
+      extra: { ...USDG_ROBINHOOD_DOMAIN, assetTransferMethod: "eip3009" },
     });
     return list;
   }

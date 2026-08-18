@@ -316,6 +316,20 @@ test("both rails are offered when Base is configured, Robinhood alone when it is
   assert.deepEqual(only.map((a) => a.network), ["eip155:4663"]);
 });
 
+test("the Robinhood offer carries the EIP-712 domain a signer needs", async () => {
+  const only = (
+    await build(fakeDeps()).handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)
+  ).body.accepts;
+  const rh = only.find((a) => a.network === "eip155:4663");
+
+  // A client that cannot see the domain either signs against a guess or, if it
+  // is careful, refuses the offer. Both leave the rail unpayable, and the
+  // symptom is a signature the token rejects rather than an error naming this.
+  assert.equal(rh.extra.name, "Global Dollar");
+  assert.equal(rh.extra.version, "1");
+  assert.equal(rh.extra.assetTransferMethod, "eip3009");
+});
+
 test("a Base authorization is settled only after a generation exists", async () => {
   const deps = fakeDeps();
   const exact = fakeExact();
