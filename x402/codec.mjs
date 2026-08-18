@@ -111,45 +111,52 @@ export function requirementsFor(version, requirements) {
 /// `schema.properties.output.properties.example` for the response. `input`
 /// describes the whole request, of which the JSON body is one part, so the
 /// wrapper is where query parameters and headers would go too.
+/// This mirrors `createBodyDiscoveryExtension` in @x402/extensions/bazaar field
+/// for field, deliberately. The indexer validates the extension against the
+/// schema that function emits, and a shape that merely looks equivalent is
+/// rejected: `bodyType` is what marks the declaration as a body call rather than
+/// a query one, and `info.output.type` and the four required input keys are all
+/// checked. Ours omitted them and the only symptom was a parse failure that
+/// named a field we were already sending.
 export function bazaar({ input, output, example, inputExample, method = "POST" }) {
-  // Mirrors the shape listed services actually publish: a declared JSON Schema
-  // draft, and every field `info` carries declared here. A field present in the
-  // instance but absent from the schema is what makes a parser report the
-  // instance as incomplete.
   const shape = {
     $schema: "https://json-schema.org/draft/2020-12/schema",
     type: "object",
     properties: {
       input: {
         type: "object",
-        additionalProperties: false,
         properties: {
-          type: { type: "string", enum: ["http"] },
-          method: { type: "string", enum: [method] },
+          type: { type: "string", const: "http" },
+          method: { type: "string", enum: ["POST", "PUT", "PATCH"] },
+          bodyType: { type: "string", enum: ["json", "form-data", "text"] },
           body: input,
         },
-        required: ["body"],
-      },
-      output: {
-        type: "object",
+        required: ["type", "method", "bodyType", "body"],
         additionalProperties: false,
-        properties: { example: output },
       },
+      ...(example || output
+        ? {
+            output: {
+              type: "object",
+              properties: {
+                type: { type: "string" },
+                example: { type: "object", ...(output && typeof output === "object" ? output : {}) },
+              },
+              required: ["type"],
+            },
+          }
+        : {}),
     },
     required: ["input"],
   };
-  // `schema` describes the call for readers that walk properties; `info` is the
-  // filled-in instance of it. They are not interchangeable: `info.input` needs
-  // the transport (`type`, `method`) that a schema has no place for, and
-  // `info.output.example` wants a literal sample rather than another schema.
+  // `schema` describes the call; `info` is the filled-in instance of it. They
+  // are not interchangeable: `info` carries samples where `schema` carries
+  // types.
   return {
     bazaar: {
       info: {
-        // `info` is the instance, so both halves carry samples rather than
-        // schemas. Putting the schema here reads as a body that is missing its
-        // fields, because a schema has none of them at the top level.
-        input: { type: "http", method, body: inputExample ?? input },
-        output: example ? { example } : { example: output },
+        input: { type: "http", method, bodyType: "json", body: inputExample ?? input },
+        ...(example || output ? { output: { type: "json", example: example ?? output } } : {}),
       },
       schema: shape,
     },
