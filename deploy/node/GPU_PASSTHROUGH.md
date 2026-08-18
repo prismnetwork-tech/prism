@@ -56,6 +56,33 @@ back silently:
 
     journalctl -t kata | grep -oE 'configuration[a-z-]*\.toml|kata-ubuntu[a-z0-9.-]*\.image'
 
+## The same error, a different cause
+
+A card left in confidential mode fails identically. The guest image is right,
+the driver is present, and the launch still dies on the CDI timeout, because a
+CC-mode card refuses to attach outside a confidential guest and the driver
+gives up before anything writes a device spec. Read the guest's own console
+rather than the host log, which says nothing about it:
+
+    NVRM: GPU0 confComputeConstructEngine_IMPL: CPU does not support confidential compute.
+    NVRM: osInitNvMapping: *** Cannot attach gpu
+    NVRC panic: /bin/nvidia-ctk failed with status: exit status: 1
+
+Nothing on the host reports the mode either once the card is on `vfio-pci`, so
+ask the card:
+
+    python3 ./nvidia_gpu_tools.py --gpu-bdf=<bdf> --query-cc-mode
+    python3 ./nvidia_gpu_tools.py --gpu-bdf=<bdf> --set-cc-mode=off \
+      --reset-after-cc-mode-switch
+
+The mode is persistent across reboots, so a node that once served confidential
+guests keeps refusing ordinary ones until it is switched back. `isolated` and
+`confidential` are exclusive settings of the same card, not layers.
+
+Getting the console at all takes connecting to the socket while the VM is up;
+it lives at `/run/vc/vm/<sandbox>/console.sock` and the shim does not copy it
+into the journal.
+
 ## Settings the card forces
 
 `cold_plug_vfio = "root-port"`, so the workload never observes a machine without
