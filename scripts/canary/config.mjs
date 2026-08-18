@@ -7,11 +7,18 @@ export function readCanaryConfig(env = process.env) {
   const maxUsdg = decimal(env.CANARY_MAX_USDG, DEFAULT_MAX_USDG, "CANARY_MAX_USDG");
   const minVram = integer(env.CANARY_MIN_VRAM, DEFAULT_MIN_VRAM, "CANARY_MIN_VRAM");
   const node = env.CANARY_NODE || null;
+  // Brokered capacity hands the renter SSH on the host, so any image runs.
+  // A physical node runs the renter's image as the workspace and expects it to
+  // carry sshd and a notebook, so checking that path needs a different one.
+  const image = env.CANARY_IMAGE || null;
 
   if (duration > 3600) throw new Error("duration is capped at 1 hour");
   if (maxUsdg > 5) throw new Error("spend is capped at 5 USDG");
   if (node && !/^0x[0-9a-fA-F]{64}$/.test(node)) {
     throw new Error("CANARY_NODE must be a 32-byte hex node id");
+  }
+  if (image && !/@sha256:[0-9a-f]{64}$/.test(image)) {
+    throw new Error("CANARY_IMAGE must be pinned to a sha256 digest");
   }
 
   const capMicros = Math.round(maxUsdg * 1e6);
@@ -22,6 +29,7 @@ export function readCanaryConfig(env = process.env) {
     maxUsdg,
     minVram,
     node,
+    image,
     capMicros,
   };
 }

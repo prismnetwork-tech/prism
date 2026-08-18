@@ -9,6 +9,7 @@ test("uses capped defaults", () => {
     maxUsdg: 0.5,
     minVram: 16000,
     node: null,
+    image: null,
     capMicros: 500000,
   });
 });
@@ -27,6 +28,7 @@ test("accepts values at the caps", () => {
       maxUsdg: 5,
       minVram: 24576,
       node,
+      image: null,
       capMicros: 5000000,
     },
   );
@@ -47,4 +49,13 @@ test("rejects invalid or unsafe values", () => {
   for (const [env, expected] of cases) {
     assert.throws(() => readCanaryConfig(env), expected);
   }
+});
+
+test("takes a digest-pinned image and refuses a floating tag", () => {
+  const image = `registry.example/workspace@sha256:${"a".repeat(64)}`;
+  assert.equal(readCanaryConfig({ CANARY_IMAGE: image }).image, image);
+  assert.throws(
+    () => readCanaryConfig({ CANARY_IMAGE: "registry.example/workspace:latest" }),
+    { message: "CANARY_IMAGE must be pinned to a sha256 digest" },
+  );
 });

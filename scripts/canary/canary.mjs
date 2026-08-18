@@ -23,6 +23,7 @@ const {
   maxUsdg: MAX_USDG,
   minVram: MIN_VRAM,
   node: NODE,
+  image: IMAGE,
   capMicros,
 } = config;
 const TX = "https://robinhoodchain.blockscout.com/tx/";
@@ -58,7 +59,7 @@ let failure;
 try {
   log(`leasing ${MIN_VRAM} MiB for ${DURATION}s (cap ${MAX_USDG} USDG)...`);
   lease = await agent.lease({
-    image: DEFAULT_IMAGE,
+    image: IMAGE || DEFAULT_IMAGE,
     durationSeconds: DURATION,
     minVramMib: MIN_VRAM,
     preferredNodeId: NODE,

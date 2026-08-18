@@ -449,6 +449,7 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
         config.vfio_group,
         config.lease_id,
     )?;
+    release_stale_host_ports(config.ssh_port, config.jupyter_port);
     fs::create_dir_all(config.workspace_root)?;
     fs::create_dir_all(config.state_root)?;
     let workspace = workspace_path(config.workspace_root, config.lease_id)?;
@@ -505,6 +506,55 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
         &LeaseState::new(&config, &group, phase, error, ready_at),
     )?;
     outcome
+}
+
+/// Drop any port forward left over from a previous workspace.
+///
+/// The portmap plugin is supposed to remove its DNAT rules when a container
+/// goes away and on some hosts it does not, including after an explicit
+/// `nerdctl rm --force`. A node publishes the same two ports for every lease it
+/// ever serves, so a single leaked rule makes every later launch fail with
+/// "port is already allocated" and takes the node out of service permanently.
+/// One lease runs at a time here, so any rule naming these ports before we
+/// start belongs to a workspace that is already gone.
+///
+/// Best effort by design: a host with no iptables, or one where nothing leaked,
+/// should launch normally rather than fail on a cleanup that was not needed.
+fn release_stale_host_ports(ssh_port: u16, jupyter_port: u16) {
+    // The port list is `--dports 2222,8888` and the rule continues past it, so
+    // this reads the list and compares each entry rather than matching the
+    // number in place. A node with several GPUs serves several leases at once,
+    // and a rule naming somebody else's ports has to survive.
+    let script = format!(
+        "iptables -t nat -S CNI-HOSTPORT-DNAT 2>/dev/null | while read -r rule; do \
+           ports=$(printf '%s' \"$rule\" | sed -n 's/.*--dports \\([0-9,]*\\).*/\\1/p'); \
+           [ -n \"$ports\" ] || continue; \
+           mine=0; \
+           old=$IFS; IFS=','; \
+           for port in $ports; do \
+             if [ \"$port\" = \"{ssh}\" ] || [ \"$port\" = \"{jupyter}\" ]; then mine=1; fi; \
+           done; \
+           IFS=$old; \
+           [ \"$mine\" = 1 ] || continue; \
+           target=$(printf '%s' \"$rule\" | grep -oE 'CNI-DN-[a-f0-9]+' || true); \
+           iptables -t nat $(printf '%s' \"$rule\" | sed 's/^-A/-D/') 2>/dev/null || true; \
+           [ -n \"$target\" ] || continue; \
+           iptables -t nat -F \"$target\" 2>/dev/null || true; \
+           iptables -t nat -X \"$target\" 2>/dev/null || true; \
+         done",
+        ssh = ssh_port,
+        jupyter = jupyter_port,
+    );
+    match Command::new("sh").arg("-c").arg(script).output() {
+        Ok(output) if !output.status.success() => {
+            tracing::warn!(
+                status = %output.status,
+                "could not clear stale host port forwards; a leaked one will fail the launch"
+            );
+        }
+        Err(error) => tracing::warn!(%error, "could not run the host port cleanup"),
+        _ => {}
+    }
 }
 
 fn recover_interrupted_lease(

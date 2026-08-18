@@ -18,11 +18,21 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinSet,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_rustls::TlsConnector;
 
 const MAX_FRAME_BYTES: usize = 16 * 1_024;
+
+/// How long a slot waits for a renter before reconnecting. The gateway only
+/// counts a node as connected while it holds a tunnel inserted in the last 90
+/// seconds, and it decides that from the pool rather than from the socket, so a
+/// slot parked on a read the whole time is a node that quietly leaves the offer
+/// list ninety seconds after it joined. Recycling under that window keeps the
+/// registration fresh, and reconnecting is also what proves the path still
+/// works: a half-open TCP connection reads as healthy until something is
+/// written to it.
+const SLOT_REFRESH: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
 pub struct TunnelConfig {
@@ -173,7 +183,12 @@ async fn serve_once(
         signing_key,
     )?;
     write_json_frame(&mut stream, &registration).await?;
-    let request: RelayOpen = read_json_frame(&mut stream).await?;
+    let request: RelayOpen = match timeout(SLOT_REFRESH, read_json_frame(&mut stream)).await {
+        Ok(request) => request?,
+        // Nobody asked for this slot in time. Drop it and take a new one, which
+        // is what keeps the node visible.
+        Err(_) => return Ok(()),
+    };
     let target = match request.service {
         RelayService::Ssh => &config.ssh_target,
         RelayService::Jupyter => &config.jupyter_target,
