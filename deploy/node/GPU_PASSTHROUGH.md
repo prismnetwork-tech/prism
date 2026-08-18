@@ -172,8 +172,28 @@ boot. The guest's own dmesg is the authority, and the QEMU line should carry
 
 ## What is still missing for `attested`
 
-The guest cannot take an SNP attestation report yet. Kata's guest kernel has no
-`sev-guest` driver and no `/sys/kernel/config/tsm`, so there is no interface to
-ask the PSP for one. Encrypted memory is running; the evidence that proves it to
-someone else is not available. That needs a guest kernel built with
-`CONFIG_SEV_GUEST`, or the CoCo attestation agent inside the guest image.
+Not the kernel, which is where this document sent people for a while. Kata's
+guest kernel already carries the driver: `config-6.18.35-200` and
+`config-6.18.35-200-nvidia-gpu` both set `CONFIG_SEV_GUEST=y` and
+`CONFIG_TSM_REPORTS=y`, and a confidential guest logs
+
+    sev-guest sev-guest: Initialized SEV guest driver (using VMPCK0 communication key)
+
+What is missing is reaching that interface from the workload. `configfs` is not
+mounted in the container, so `/sys/kernel/config/tsm/report` is not there to
+open, and `/dev/sev-guest` is a guest device that `nerdctl --device` cannot pass
+because it resolves the path on the host, where it does not exist. Mount it
+inside the guest and the report comes straight out:
+
+    mount -t configfs none /sys/kernel/config
+    mkdir /sys/kernel/config/tsm/report/prism
+    head -c 64 /dev/urandom > /sys/kernel/config/tsm/report/prism/inblob
+    wc -c < /sys/kernel/config/tsm/report/prism/outblob      # 1184, provider sev_guest
+
+Mounting needs `CAP_SYS_ADMIN`, which the bootstrap holds as root and the
+renter's session does not, so the report can be taken before anything is
+listening and the mount dropped before the renter arrives.
+
+The remaining work is that sequence in the launch path, plus `prismd` being
+present in a confidential guest's image, since the bootstrap calls
+`prismd snp-report` and the image is the renter's.
