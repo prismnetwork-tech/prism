@@ -35,6 +35,9 @@ pub use policy::Policy;
 pub use nvidia::ReportBuilder;
 #[cfg(any(test, feature = "test-vectors"))]
 pub use snp::SnpReportBuilder;
+/// Not a test helper: the control plane reads this before verification to work
+/// out which certificate to fetch.
+pub use snp::{ClaimedOrigin, claimed_origin};
 
 /// Bumped whenever a check changes, so a verdict recorded by an older verifier
 /// can be told apart from one this build would issue today.

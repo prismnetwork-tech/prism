@@ -155,6 +155,45 @@ pub(crate) struct Report {
     signature: Signature,
 }
 
+/// What a report claims about the chip that produced it, read before anything
+/// has been verified.
+///
+/// This exists so a caller can go and fetch the certificate that would settle
+/// the claim. Nothing here is trusted: an attacker can put any chip id in an
+/// unsigned report, and all that buys them is a certificate whose key cannot
+/// sign what they sent. The claim is settled by
+/// [`verify_sev_snp_attestation`](crate::verify_sev_snp_attestation), never by
+/// this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimedOrigin {
+    pub chip_id: [u8; 64],
+    pub reported_tcb: SnpTcb,
+}
+
+/// Reads the chip and TCB a report names, checking only that the bytes are the
+/// right shape to be a report at all.
+pub fn claimed_origin(raw: &[u8]) -> Result<ClaimedOrigin, VerificationError> {
+    if raw.len() != REPORT_LEN {
+        return Err(VerificationError::SnpReportWrongSize);
+    }
+    if !REPORT_VERSIONS.contains(&u32_at(raw, OFF_VERSION)) {
+        return Err(VerificationError::SnpReportVersionUnsupported);
+    }
+    // Everything a report must be before it is worth going to AMD about. A
+    // fetch costs a request against a service that rate limits, so a report
+    // that cannot verify under any certificate is refused before one is spent.
+    if u32_at(raw, OFF_SIGNATURE_ALGO) != SIGNATURE_ALGO_ECDSA_P384_SHA384 {
+        return Err(VerificationError::SnpReportSignatureAlgorithm);
+    }
+    if (u32_at(raw, OFF_FLAGS) >> 2) & 0b111 != SIGNING_KEY_VCEK {
+        return Err(VerificationError::SnpReportNotVcekSigned);
+    }
+    Ok(ClaimedOrigin {
+        chip_id: field(raw, OFF_CHIP_ID),
+        reported_tcb: ProductLine::Genoa.decode_tcb(u64_at(raw, OFF_REPORTED_TCB)),
+    })
+}
+
 pub(crate) fn parse_report(raw: &[u8], line: ProductLine) -> Result<Report, VerificationError> {
     if raw.len() != REPORT_LEN {
         return Err(VerificationError::SnpReportWrongSize);

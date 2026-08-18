@@ -8,9 +8,11 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+mod amd_kds;
 mod workspaces;
 
 use anyhow::Context;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -117,6 +119,9 @@ struct AppState {
     stake: StakeReader,
     workspaces: Option<Arc<workspaces::WorkspaceStorage>>,
     attestation_policy: Arc<prism_attestation::Policy>,
+    /// Absent only where the deployment has no route to AMD, in which case a
+    /// guest that sends no chain is refused rather than quietly downgraded.
+    amd_kds: Option<amd_kds::AmdKds>,
 }
 
 #[derive(Debug, Clone)]
@@ -1012,6 +1017,16 @@ async fn main() -> anyhow::Result<()> {
             prism_attestation::Policy::default()
                 .with_verdict_ttl(Duration::hours(ATTESTATION_VERDICT_TTL_HOURS)),
         ),
+        // A guest whose firmware carries no certificates sends a report alone,
+        // and this is what turns it into something that can be walked to the
+        // AMD root.
+        amd_kds: match amd_kds::AmdKds::from_environment() {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::warn!(%error, "no AMD certificate service; reports must carry their own chain");
+                None
+            }
+        },
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -7165,10 +7180,61 @@ async fn create_lease_attestation_challenge(
         .map_err(store_error)
 }
 
+/// A guest whose firmware was never loaded with certificates has none to send,
+/// so the report arrives alone and there is nothing to walk to the AMD root.
+/// The chip and TCB it names are enough to ask AMD for the certificate that
+/// would settle it.
+///
+/// Steering this with a claimed chip id gains an attacker nothing. The
+/// certificate they point us at carries a public key that cannot verify the
+/// signature they sent, so the report is refused a moment later by the check
+/// that was always going to decide it.
+async fn fill_missing_certificate_chain(
+    state: &AppState,
+    attestation: &mut GuestAttestation,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if !attestation.certificate_chain_base64.is_empty() {
+        return Ok(());
+    }
+    let Some(kds) = state.amd_kds.as_ref() else {
+        return Err(bad_request(
+            "certificate_chain_required",
+            "this report carries no certificate chain and no certificate service is configured",
+        ));
+    };
+    let report = STANDARD
+        .decode(&attestation.report_base64)
+        .map_err(|_| bad_request("malformed_report", "the report is not base64"))?;
+    let origin = prism_attestation::claimed_origin(&report).map_err(|_| {
+        bad_request(
+            "malformed_report",
+            "the report does not name a chip to fetch a certificate for",
+        )
+    })?;
+    let chain = kds
+        .chain_for(&origin.chip_id, &origin.reported_tcb)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, lease_id = attestation.lease_id, "could not fetch the AMD certificate chain");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    code: "certificate_chain_unavailable",
+                    message: "the certificate that would settle this report could not be fetched",
+                }),
+            )
+        })?;
+    attestation.certificate_chain_base64 = chain
+        .into_iter()
+        .map(|certificate| STANDARD.encode(certificate))
+        .collect();
+    Ok(())
+}
+
 async fn record_lease_attestation(
     State(state): State<AppState>,
     Path(lease_id): Path<u64>,
-    Json(attestation): Json<GuestAttestation>,
+    Json(mut attestation): Json<GuestAttestation>,
 ) -> Result<Json<LeaseAttestationVerdict>, (StatusCode, Json<ApiError>)> {
     if attestation.lease_id != lease_id {
         return Err(bad_request(
@@ -7208,6 +7274,7 @@ async fn record_lease_attestation(
         ));
     };
     check_guest_attestation_envelope(&offer, &attestation)?;
+    fill_missing_certificate_chain(&state, &mut attestation).await?;
     let verdict = state
         .store
         .record_lease_attestation(LeaseAttestationSubmission {
@@ -8064,7 +8131,7 @@ async fn record_service_version(pool: &PgPool, service: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::SigningKey;
     use prism_protocol::{
         DEFAULT_VAULT_TRUST_FLOOR, GpuSpec, IsolationMode, MAX_STAKE_DISCOUNT_BPS, NodePosture,

@@ -1076,3 +1076,26 @@ fn a_genuine_lease_report_earns_attested() {
         hex::encode(reference_measurement())
     );
 }
+
+/// The chip a report names has to be readable before the report is verified,
+/// because that is what decides which certificate to go and fetch. The values
+/// here are the ones AMD's KDS answers to for the genuine capture: chip
+/// a93b917d…, TCB 7/0/23/72.
+#[test]
+fn a_report_names_the_chip_to_fetch_a_certificate_for() {
+    let report = fs::read(fixtures().join("genuine-lease/report.bin")).expect("genuine report");
+    let origin = prism_attestation::claimed_origin(&report).expect("origin");
+
+    assert_eq!(&hex::encode(origin.chip_id)[..8], "a93b917d");
+    assert_eq!(origin.reported_tcb.bootloader, 7);
+    assert_eq!(origin.reported_tcb.tee, 0);
+    assert_eq!(origin.reported_tcb.snp, 23);
+    assert_eq!(origin.reported_tcb.microcode, 72);
+}
+
+/// Nothing about the claim is trusted, so a report that is not even the right
+/// size is refused rather than producing a chip id to chase.
+#[test]
+fn a_malformed_report_names_no_chip() {
+    assert!(prism_attestation::claimed_origin(&[0_u8; 16]).is_err());
+}
