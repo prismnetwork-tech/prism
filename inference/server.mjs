@@ -13,7 +13,7 @@ import { createPublicClient, getAddress, http, recoverMessageAddress } from "vie
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
 import { createExactEvm } from "@prismnetwork/x402/exact-evm";
 import { createCdpFacilitator, routeByNetwork } from "@prismnetwork/x402/cdp-facilitator";
-import { detect } from "@prismnetwork/x402/codec";
+import { bazaar, detect } from "@prismnetwork/x402/codec";
 import { base as baseChain } from "viem/chains";
 import { createGateway, USDC_BASE, USDC_BASE_DOMAIN } from "./gateway.mjs";
 import { inferenceExample, inferenceInput, inferenceInputExample, inferenceOutput, openApiDocument } from "./openapi.mjs";
@@ -149,11 +149,29 @@ const localExact = config.basePayTo
 // Base settles at Coinbase when a key is configured, because the Bazaar only
 // indexes endpoints its own facilitator has settled for. Everything else, and
 // Base itself when no key is set, stays on ours.
+const inferenceSchemas = {
+  input: inferenceInput(config.models),
+  output: inferenceOutput,
+  example: inferenceExample,
+  inputExample: inferenceInputExample,
+  method: "POST",
+};
+
 const cdp = process.env.CDP_API_KEY_ID && process.env.CDP_API_KEY_SECRET
   ? createCdpFacilitator({
       keyId: process.env.CDP_API_KEY_ID,
       keySecret: process.env.CDP_API_KEY_SECRET,
       networks: ["eip155:8453", "base"],
+      // The Bazaar builds its entry from what the settle call carries rather
+      // than by crawling us afterwards. `outputSchema` on the requirements is
+      // the v1 spelling of the same description and rides along already; this
+      // adds the v2 one, because indexed entries in the wild use both.
+      describe: () => ({
+        resource: `${process.env.PRISM_PUBLIC_ORIGIN ?? "https://api.prismnetwork.tech"}/inference/v1/inference`,
+        description: "One LLM generation on a rented GPU, priced per request.",
+        mimeType: "application/json",
+        extensions: bazaar(inferenceSchemas),
+      }),
     })
   : null;
 
@@ -165,7 +183,7 @@ const gateway = createGateway({
   payTo: config.payTo,
   basePayTo: config.basePayTo,
   exact,
-  schemas: { input: inferenceInput(config.models), output: inferenceOutput, example: inferenceExample, inputExample: inferenceInputExample, method: "POST" },
+  schemas: inferenceSchemas,
   priceMicros: config.priceMicros,
   pricing: config.pricing,
   image: process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE,

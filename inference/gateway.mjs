@@ -264,7 +264,7 @@ export function createGateway({
       asset: USDG_ROBINHOOD,
       payTo,
       amount: amount.toString(),
-      resource: "/v1/inference",
+      resource: `${originUrl}/v1/inference`,
       description:
         "One generation on a Prism GPU, paid in USDG on Robinhood Chain, which is where the " +
         "serving lease settles. Send the amount to payTo, then retry with " +

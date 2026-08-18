@@ -111,7 +111,7 @@ export function requirementsFor(version, requirements) {
 /// `schema.properties.output.properties.example` for the response. `input`
 /// describes the whole request, of which the JSON body is one part, so the
 /// wrapper is where query parameters and headers would go too.
-function bazaar({ input, output, example, inputExample, method = "POST" }) {
+export function bazaar({ input, output, example, inputExample, method = "POST" }) {
   // Mirrors the shape listed services actually publish: a declared JSON Schema
   // draft, and every field `info` carries declared here. A field present in the
   // instance but absent from the schema is what makes a parser report the
