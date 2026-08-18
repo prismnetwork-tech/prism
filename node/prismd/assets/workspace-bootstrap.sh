@@ -74,6 +74,20 @@ if [ -f "$control/attestation_challenge" ]; then
     if [ -n "$mounted_tsm" ]; then
         umount /sys/kernel/config
     fi
+
+    # A confidential guest is given its own copy of every directory the host
+    # offers it, so anything written into that mount stays inside and the node
+    # never sees the report it is supposed to forward. Standard output is the
+    # one channel out that does not ask the host to reach in. Nothing is
+    # disclosed by it: the report is a public statement about this guest, and it
+    # is signed by the processor, so a node relaying it cannot alter a byte
+    # without the control plane noticing.
+    for artifact in guest-report.bin guest-chain.b64 guest-channel-key.pub; do
+        if [ -f "/run/prism/evidence/$artifact" ]; then
+            printf 'prism-evidence %s %s\n' \
+                "$artifact" "$(base64 -w0 < "/run/prism/evidence/$artifact")"
+        fi
+    done
 fi
 
 cat >/run/prism/sshd_config <<'EOF'

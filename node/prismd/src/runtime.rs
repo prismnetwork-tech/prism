@@ -340,6 +340,10 @@ fn workspace_command(
         "--hostname",
         config.lease_id,
     ]);
+    if policy_digest.is_some() {
+        // The only launch that prints anything the node needs to read back.
+        command.stdout(Stdio::piped());
+    }
     if let Some(initdata) = &initdata {
         // The rootfs is pulled by the guest rather than unpacked on the host,
         // so the image the report measures is the one the renter named.
@@ -486,6 +490,10 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
         .context("failed to start the Kata workspace through nerdctl")
     {
         Ok(mut child) => {
+            let printed = child
+                .stdout
+                .take()
+                .map(|stdout| collect_printed_evidence(stdout, crate::snp::evidence_directory(&workspace)));
             let result = run_workspace(
                 &config,
                 &workspace,
@@ -494,6 +502,9 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
                 &mut child,
                 &mut ready_at,
             );
+            if let Some(printed) = printed {
+                let _ = printed.join();
+            }
             let _ = remove_egress_policy();
             if child.try_wait().ok().flatten().is_none() {
                 let _ = stop_container(config.lease_id);
@@ -640,6 +651,67 @@ fn write_secret(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     file.write_all(contents)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Catches the evidence a confidential guest prints on its way up.
+///
+/// The guest cannot leave it anywhere the node can read: Kata gives a
+/// confidential guest a private copy of every directory the host offers, so a
+/// bind mount carries data in and nothing out. Standard output is the one path
+/// that does not require the host to reach into the guest, which is the thing a
+/// confidential guest exists to prevent.
+///
+/// Relaying is safe. The processor signs the report and REPORT_DATA binds it to
+/// this lease, this challenge and the key the session terminates on, so a node
+/// that alters a byte produces something the control plane refuses.
+fn collect_printed_evidence(
+    stdout: std::process::ChildStdout,
+    evidence_directory: PathBuf,
+) -> thread::JoinHandle<()> {
+    use std::io::{BufRead, BufReader};
+
+    thread::spawn(move || {
+        // Drained continuously whether or not anything is wanted from it: a
+        // full pipe stops the workspace.
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("prism-evidence") {
+                continue;
+            }
+            let (Some(name), Some(encoded)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            // The name decides a path, so it is matched against what the guest
+            // is allowed to send rather than joined onto a directory.
+            let Some(name) = EVIDENCE_ARTIFACTS.iter().find(|artifact| **artifact == name) else {
+                tracing::warn!(%name, "ignoring an evidence artifact this node does not expect");
+                continue;
+            };
+            match base64_standard(encoded) {
+                Ok(bytes) => {
+                    if let Err(error) = fs::create_dir_all(&evidence_directory)
+                        .and_then(|()| fs::write(evidence_directory.join(name), bytes))
+                    {
+                        tracing::warn!(%error, %name, "could not store the printed evidence");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, %name, "printed evidence is not base64"),
+            }
+        }
+    })
+}
+
+/// Exactly what a guest may hand back, so a name it chooses cannot decide a
+/// path outside the evidence directory.
+const EVIDENCE_ARTIFACTS: [&str; 3] = [
+    "guest-report.bin",
+    "guest-chain.b64",
+    "guest-channel-key.pub",
+];
+
+fn base64_standard(value: &str) -> anyhow::Result<Vec<u8>> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    Ok(STANDARD.decode(value)?)
 }
 
 fn run_workspace(
@@ -1308,6 +1380,49 @@ mod tests {
     /// pull the rootfs inside the guest, and carry the policy digest into the
     /// document Kata hashes into HOST_DATA. Anything less starts a guest whose
     /// report says nothing about the workload.
+    /// A confidential guest hands its report back on standard output, because
+    /// the mount it wrote to is private to the guest. The node stores exactly
+    /// the artifacts it expects and nothing else, so a name the guest chooses
+    /// cannot decide where a file lands.
+    #[test]
+    fn printed_evidence_is_stored_under_the_names_the_node_expects() {
+        let root = temporary_directory("printed-evidence");
+        let evidence = root.join("evidence");
+        let script = root.join("emit.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             printf 'noise before\\n'\n\
+             printf 'prism-evidence guest-report.bin %s\\n' \"$(printf 'report' | base64)\"\n\
+             printf 'prism-evidence ../escape.bin %s\\n' \"$(printf 'nope' | base64)\"\n\
+             printf 'prism-evidence guest-chain.b64 %s\\n' \"$(printf 'chain' | base64)\"\n\
+             printf 'noise after\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut child = Command::new("sh")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let handle = collect_printed_evidence(child.stdout.take().unwrap(), evidence.clone());
+        handle.join().unwrap();
+        let _ = child.wait();
+
+        assert_eq!(fs::read(evidence.join("guest-report.bin")).unwrap(), b"report");
+        assert_eq!(fs::read(evidence.join("guest-chain.b64")).unwrap(), b"chain");
+        assert!(
+            !root.join("escape.bin").exists() && !evidence.join("../escape.bin").exists(),
+            "a guest must not be able to name a path outside the evidence directory"
+        );
+        let _ = fs::write(root.join("emit.sh"), "");
+    }
+
     #[test]
     #[cfg(unix)]
     fn kata_snp_command_takes_the_confidential_shim_and_pins_the_policy() {
