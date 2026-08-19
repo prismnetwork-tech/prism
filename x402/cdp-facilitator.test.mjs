@@ -35,22 +35,37 @@ function withFetch(handler, run) {
 const respond = (body, init = {}) =>
   new Response(JSON.stringify(body), { status: init.status ?? 200, headers: { "Content-Type": "application/json" } });
 
-test("the chain is renamed to the spelling CDP understands", async () => {
+test("the discovery block rides on the payload, where v2 declares it", async () => {
   let sent;
   await withFetch(async (_url, init) => {
     sent = JSON.parse(init.body);
     return respond({ isValid: true, payer: "0xF1" });
   }, async () => {
-    const f = createCdpFacilitator({ keyId: KEY_ID, keySecret: SECRET });
+    const f = createCdpFacilitator({
+      keyId: KEY_ID,
+      keySecret: SECRET,
+      describe: () => ({
+        resource: "https://example.test/thing",
+        description: "a thing",
+        extensions: { bazaar: { info: {}, schema: {} } },
+      }),
+    });
     await f.verify(payload, requirements);
   });
 
-  assert.equal(sent.x402Version, 1);
-  assert.equal(sent.paymentPayload.network, "base");
-  assert.equal(sent.paymentRequirements.network, "base");
-  // v1 names the ceiling maxAmountRequired; sending `amount` fails their schema.
-  assert.equal(sent.paymentRequirements.maxAmountRequired, "35600");
-  assert.equal(sent.paymentRequirements.amount, undefined);
+  assert.equal(sent.x402Version, 2);
+  assert.equal(sent.paymentPayload.accepted.network, "eip155:8453");
+  // v2 names the ceiling `amount`; `maxAmountRequired` is the v1 spelling.
+  assert.equal(sent.paymentPayload.accepted.amount, "35600");
+  assert.equal(sent.paymentPayload.accepted.maxAmountRequired, undefined);
+  assert.equal(sent.paymentPayload.resource.url, "https://example.test/thing");
+
+  // The one that matters. Neither version declares `extensions` on
+  // paymentRequirements, and the schema drops undeclared keys, so a block put
+  // there is discarded before the facilitator reads it: the payment settles and
+  // nothing is ever indexed. v2 declares it on the payload.
+  assert.ok(sent.paymentPayload.extensions?.bazaar);
+  assert.equal(sent.paymentRequirements.extensions, undefined);
 });
 
 test("the request is signed for exactly the path it is sent to", async () => {

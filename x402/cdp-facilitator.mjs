@@ -9,15 +9,15 @@
 // not learn which one it is talking to.
 
 import { createPrivateKey, randomBytes, sign } from "node:crypto";
-import { requirementsFor, v1Network } from "./codec.mjs";
+import { requirementsFor } from "./codec.mjs";
 
 const CDP_HOST = "api.cdp.coinbase.com";
 const CDP_PREFIX = "/platform/v2/x402";
 
-/// CDP speaks x402 v1 and names the chain "base". Our internal form is v2 with
-/// CAIP-2 identifiers, so everything crossing this boundary is converted once
-/// here rather than at each call site.
-const V1_VERSION = 1;
+/// CDP accepts both protocol versions. v2 is used because the Bazaar reads the
+/// discovery block from `paymentPayload.extensions`, which only exists in v2,
+/// and because every entry in the catalog is a v2 entry.
+const V2_VERSION = 2;
 
 const b64url = (buf) => Buffer.from(buf).toString("base64url");
 
@@ -94,34 +94,34 @@ export function createCdpFacilitator({
     }
   }
 
-  /// The v1 wire shape. `requirementsFor` already renames amount and network;
-  /// the resource fields are what the Bazaar indexes on.
+  /// The v2 wire shape, and the placement of `extensions` is the whole point.
   ///
-  /// This is the whole reason the integration exists, so it is worth being
-  /// blunt: the indexer builds its entry from what arrives here, not by
-  /// crawling us afterwards. A settle carrying an empty resource and no
-  /// extensions settles the money and indexes nothing, which looks like
-  /// success and achieves none of the point.
+  /// The Bazaar builds its entry from what arrives here, not by crawling us
+  /// afterwards, and it reads the discovery block from exactly one place per
+  /// version: `paymentPayload.extensions` in v2, `paymentRequirements
+  /// .outputSchema` in v1. Neither version's `paymentRequirements` declares an
+  /// `extensions` field, and the schema strips keys it does not declare, so a
+  /// block put there is discarded before the facilitator ever sees it. The
+  /// settle still succeeds, the money still moves, and nothing is indexed.
+  ///
+  /// v2 is what is sent, so the block goes on the payload. The v1 placement is
+  /// not populated here because v1 is no longer used for this hop.
   function wire(payload, requirements) {
-    const v1 = requirementsFor(1, requirements);
     const meta = describe?.(requirements) ?? {};
+    const resource = meta.resource ?? requirements.resource ?? "";
+    const description = meta.description ?? requirements.description ?? "";
+    const mimeType = meta.mimeType ?? requirements.mimeType ?? "application/json";
     return {
-      x402Version: V1_VERSION,
+      x402Version: V2_VERSION,
       paymentPayload: {
-        x402Version: V1_VERSION,
-        scheme: payload.accepted?.scheme ?? "exact",
-        network: v1Network(requirements.network),
+        x402Version: V2_VERSION,
+        // v2 carries the resource as an object rather than a bare URL.
+        resource: { url: resource, description, mimeType },
+        accepted: requirementsFor(2, requirements),
         payload: payload.payload,
-      },
-      paymentRequirements: {
-        ...v1,
-        // The indexer keys on `resource` and will not take a relative path, so
-        // the caller's description wins over whatever the requirements carry.
-        resource: meta.resource ?? v1.resource ?? requirements.resource ?? "",
-        description: meta.description ?? v1.description ?? requirements.description ?? "",
-        mimeType: meta.mimeType ?? v1.mimeType ?? requirements.mimeType ?? "application/json",
         ...(meta.extensions ? { extensions: meta.extensions } : {}),
       },
+      paymentRequirements: requirementsFor(2, requirements),
     };
   }
 
