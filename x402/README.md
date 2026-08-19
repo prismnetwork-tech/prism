@@ -35,6 +35,11 @@ X402_PAY_TO=0x..         \    # collects USDG on Robinhood Chain
 X402_BASE_PAY_TO=0x..    \    # collects USDC on Base; omit to not offer Base
 X402_BASE_RPC_URL=https://mainnet.base.org \
 X402_PRICE_MICROS=300000       # 0.30 of either stablecoin per job
+                               # must cover the lease deposit for the
+                               # configured duration: rate_per_second x
+                               # X402_DURATION_SECONDS. The service checks
+                               # this at boot against live offers and says
+                               # so if the price is short.
 node server.mjs
 ```
 
@@ -45,4 +50,4 @@ with the address, amount and network rather than losing it to a log line.
 
 Install with `npm install @prismnetwork/x402`, or run it directly with `npx @prismnetwork/x402`.
 
-Other env: `X402_PORT` (8402), `X402_DURATION_SECONDS` (900), `X402_MIN_VRAM_MIB` (16000), `X402_PAYMENTS_FILE`, `PRISM_API_BASE`, `PRISM_RPC_URL`. The consumed-payments file makes replay protection survive a restart; a multi-instance deployment needs a shared store instead.
+Other env: `X402_PORT` (8402), `X402_DURATION_SECONDS` (300), `X402_MIN_VRAM_MIB` (16000), `X402_PAYMENTS_FILE`, `PRISM_API_BASE`, `PRISM_RPC_URL`. The consumed-payments file makes replay protection survive a restart; a multi-instance deployment needs a shared store instead.

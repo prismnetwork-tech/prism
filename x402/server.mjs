@@ -42,6 +42,28 @@ const BASE_CONFIRMATIONS = 30;
 const MAX_BODY_BYTES = 16 * 1_024;
 const JOB_RETENTION_MS = 60 * 60 * 1_000;
 
+
+/// Warn, loudly, when the endpoint is selling a job for less than the lease it
+/// must fund. Not fatal: a rate rise should degrade into a clear message rather
+/// than take the service down, and the per-job error names the same two knobs.
+async function checkPriceCoversLease({ priceMicros, durationSeconds }) {
+  const base = process.env.PRISM_API_BASE ?? "https://prismnetwork.tech";
+  const res = await fetch(`${base}/api/offers`, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`offers responded ${res.status}`);
+  const body = await res.json();
+  const offers = Array.isArray(body) ? body : (body.offers ?? []);
+  const rates = offers.map((o) => Number(o.rate_per_second)).filter((r) => Number.isFinite(r) && r > 0);
+  if (rates.length === 0) throw new Error("no offers to price against");
+  const dearest = Math.max(...rates);
+  const needed = BigInt(Math.ceil(dearest * durationSeconds));
+  if (needed > priceMicros) {
+    console.error(
+      `X402_PRICE_MICROS=${priceMicros} cannot fund a ${durationSeconds}s lease: ` +
+        `the dearest offer needs ${needed}. Raise the price or lower the duration.`,
+    );
+  }
+}
+
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`${name} is required`);
@@ -57,7 +79,7 @@ try {
     port: Number(process.env.X402_PORT ?? 8402),
     priceMicros: BigInt(process.env.X402_PRICE_MICROS ?? "300000"),
     payTo: getAddress(requireEnv("X402_PAY_TO")),
-    durationSeconds: Number(process.env.X402_DURATION_SECONDS ?? 900),
+    durationSeconds: Number(process.env.X402_DURATION_SECONDS ?? 300),
     minVramMib: Number(process.env.X402_MIN_VRAM_MIB ?? 16000),
     paymentsFile: process.env.X402_PAYMENTS_FILE ?? "./x402-consumed.log",
   };
@@ -67,6 +89,13 @@ try {
     apiBase: process.env.PRISM_API_BASE ?? "https://prismnetwork.tech",
     rpcUrl: process.env.PRISM_RPC_URL,
   });
+  // The price has to cover the deposit the lease needs, or every request fails
+  // the same way once the job is already queued. Checked here against the rates
+  // actually offered, because the two knobs are set independently and a price
+  // that no longer covers the window is invisible until someone tries to buy.
+  checkPriceCoversLease(config).catch((err) =>
+    console.error(`price check skipped: ${err.message}`),
+  );
   // The same job is offered on both rails and the agent picks. Robinhood used to
   // be the one no client would pay, which was our fault rather than theirs: the
   // offer named no EIP-712 domain, so a careful wallet refused it.
