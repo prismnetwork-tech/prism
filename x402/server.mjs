@@ -19,14 +19,20 @@ import { privateKeyToAccount } from "viem/accounts";
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
 import { jobExample, jobInput, jobInputExample, jobOutput } from "./schemas.mjs";
 import { createExactEvm } from "./exact-evm.mjs";
+import { createCdpFacilitator, routeByNetwork } from "./cdp-facilitator.mjs";
 import { createFacilitator, createBudget } from "./facilitator.mjs";
-import { detect, parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "./codec.mjs";
+import { bazaar, detect, parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "./codec.mjs";
 
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 // Base USDC reports this as its EIP-712 domain. The published spec example
 // carries the testnet token's "USDC", and the domain feeds the signing hash, so
 // copying it signs against nothing.
 const USDC_BASE_DOMAIN = { name: "USD Coin", version: "2" };
+/// Read off the contract: USDG's `name()` is "Global Dollar" and it exposes no
+/// `version()`, so the version was recovered by reproducing the on-chain
+/// DOMAIN_SEPARATOR. Signing against a guessed domain produces a well-formed
+/// signature the token rejects.
+const USDG_ROBINHOOD_DOMAIN = { name: "Global Dollar", version: "1" };
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
@@ -61,9 +67,9 @@ try {
     apiBase: process.env.PRISM_API_BASE ?? "https://prismnetwork.tech",
     rpcUrl: process.env.PRISM_RPC_URL,
   });
-  // Every x402 client in the wild pays on Base or Solana. A Robinhood Chain
-  // endpoint is unpayable by all of them, so the same job is offered on both and
-  // the agent picks.
+  // The same job is offered on both rails and the agent picks. Robinhood used to
+  // be the one no client would pay, which was our fault rather than theirs: the
+  // offer named no EIP-712 domain, so a careful wallet refused it.
   networks = [
     {
       id: `eip155:${robinhoodChain.id}`,
@@ -72,6 +78,26 @@ try {
       payTo: config.payTo,
       confirmations: CONFIRMATIONS,
       client: createPublicClient({ chain: robinhoodChain, transport: http(process.env.PRISM_RPC_URL) }),
+      // Robinhood was the unpayable rail because the offer carried no EIP-712
+      // domain, and a careful client refuses that rather than guess one. USDG
+      // implements the same EIP-3009 as USDC, so it is quoted with a domain and
+      // an exact-scheme verifier, and a renter pays gaslessly with one
+      // signature. The legacy transfer-then-sign flow still works.
+      //
+      // The domain and the verifier travel together: advertising the domain
+      // without something to settle against invites a signature nothing here
+      // can honour, which is the failure this whole change exists to remove.
+      domain: USDG_ROBINHOOD_DOMAIN,
+      exact: createExactEvm({
+        [`eip155:${robinhoodChain.id}`]: {
+          chain: robinhoodChain,
+          // The env var is optional here, as it is for the read client above;
+          // without it the chain's own published RPC is used.
+          rpcUrl: process.env.PRISM_RPC_URL ?? robinhoodChain.rpcUrls.default.http[0],
+          privateKey: requireEnv("PRISM_AGENT_KEY"),
+          assets: { [USDG]: USDG_ROBINHOOD_DOMAIN },
+        },
+      }),
       refund: (to, amount) => agent.transferUsdg(to, amount),
     },
   ];
@@ -83,10 +109,35 @@ try {
     const settlementKey = process.env.PRISM_X402_COLLECTOR_KEY;
     if (!settlementKey) throw new Error("X402_BASE_PAY_TO needs PRISM_X402_COLLECTOR_KEY to broadcast with");
     const assets = { [USDC_BASE]: USDC_BASE_DOMAIN };
-    const exactBase = createExactEvm({
+    const localBase = createExactEvm({
       [`eip155:${base.id}`]: { chain: base, rpcUrl: baseRpc, privateKey: settlementKey, assets },
       base: { chain: base, rpcUrl: baseRpc, privateKey: settlementKey, assets },
     });
+    // Settling Base at Coinbase is what puts this endpoint in the Bazaar: their
+    // indexer only sees payments their own facilitator settles. Without this the
+    // jobs run, the money moves, and the endpoint stays invisible to every agent
+    // searching the catalog. Falls back to settling here when no key is set.
+    const cdpBase =
+      process.env.CDP_API_KEY_ID && process.env.CDP_API_KEY_SECRET
+        ? createCdpFacilitator({
+            keyId: process.env.CDP_API_KEY_ID,
+            keySecret: process.env.CDP_API_KEY_SECRET,
+            networks: [`eip155:${base.id}`, "base"],
+            describe: () => ({
+              resource: `${process.env.PRISM_PUBLIC_ORIGIN ?? "https://api.prismnetwork.tech/x402"}/run`,
+              description: "One shell command on a rented GPU, charged only if it succeeds.",
+              mimeType: "application/json",
+              extensions: bazaar({
+                input: jobInput,
+                output: jobOutput,
+                example: jobExample,
+                inputExample: jobInputExample,
+                method: "POST",
+              }),
+            }),
+          })
+        : null;
+    const exactBase = cdpBase ? routeByNetwork(cdpBase, localBase) : localBase;
     networks.push({
       id: `eip155:${base.id}`,
       label: "USDC on Base",
@@ -348,6 +399,14 @@ async function runJob(jobId, command, payer, networkId, payment) {
   } catch (err) {
     record.status = "failed";
     record.error = String(err.code ?? err.message ?? err);
+    // `cost_exceeds_max` means this endpoint is selling a job for less than the
+    // lease it has to fund, so every request fails the same way and the code
+    // alone does not say by how much. Carrying the two numbers turns a config
+    // mistake that looks like a job failure into one that reads as a price
+    // that is too low for the configured duration.
+    if (err.code === "cost_exceeds_max" && err.body) {
+      record.detail = `the lease needs ${err.body.required} but this endpoint collects ${err.body.max}; raise X402_PRICE_MICROS or lower X402_DURATION_SECONDS`;
+    }
     if (payment?.settle) {
       // Nothing was ever taken, so there is nothing to give back. The
       // authorization is released so the caller can spend it on a retry.
