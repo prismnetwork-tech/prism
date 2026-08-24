@@ -16,11 +16,24 @@ import { createCdpFacilitator, routeByNetwork } from "@prismnetwork/x402/cdp-fac
 import { bazaar, detect } from "@prismnetwork/x402/codec";
 import { base as baseChain } from "viem/chains";
 import { createGateway, USDC_BASE, USDC_BASE_DOMAIN, USDG_ROBINHOOD_DOMAIN } from "./gateway.mjs";
-import { inferenceExample, inferenceInput, inferenceInputExample, inferenceOutput, openApiDocument } from "./openapi.mjs";
+import {
+  batchExample,
+  batchInput,
+  batchInputExample,
+  batchOutput,
+  inferenceExample,
+  inferenceInput,
+  inferenceInputExample,
+  inferenceOutput,
+  openApiDocument,
+} from "./openapi.mjs";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
 const MAX_BODY_BYTES = 64 * 1024;
+// A batch carries one prompt per item, so it needs room the single endpoint
+// never does. Still bounded by the per-prompt and per-batch limits below it.
+const MAX_BATCH_BODY_BYTES = 2 * 1024 * 1024;
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -41,6 +54,12 @@ try {
     minVramMib: Number(process.env.INFERENCE_MIN_VRAM_MIB ?? 16000),
     idleMs: Number(process.env.INFERENCE_IDLE_SECONDS ?? 600) * 1000,
     tunnelPort: Number(process.env.INFERENCE_TUNNEL_PORT ?? 11435),
+    // Every extra box in the pool is another prepaid lease running whether or
+    // not anything asks for it, so the default is one and growing it is a
+    // deliberate choice.
+    poolMax: Number(process.env.INFERENCE_POOL_MAX ?? 1),
+    maxBatchItems: Number(process.env.INFERENCE_BATCH_MAX_ITEMS ?? 64),
+    itemsPerBox: Number(process.env.INFERENCE_BATCH_ITEMS_PER_BOX ?? 25),
     paymentsFile: process.env.INFERENCE_PAYMENTS_FILE ?? "./inference-consumed.log",
     // Base is offered only when there is somewhere to collect it. Omitting the
     // address leaves the endpoint exactly as it was.
@@ -110,7 +129,7 @@ async function verify(txHash, signature, priceMicros) {
 // ssh -N -L keeps the box's ollama reachable only from this process's host.
 // The child is restarted by the next warmup rather than in place; a dead
 // tunnel surfaces as a failed generation, which does not consume the payment.
-function spawnTunnel(lease) {
+function spawnTunnel(lease, slot) {
   const child = spawn("ssh", [
     "-i", lease.keyPath,
     "-p", String(lease.access.ssh_port),
@@ -120,14 +139,14 @@ function spawnTunnel(lease) {
     "-o", "ServerAliveInterval=15",
     "-o", "ExitOnForwardFailure=yes",
     "-N",
-    "-L", `127.0.0.1:${config.tunnelPort}:127.0.0.1:11434`,
+    "-L", `127.0.0.1:${config.tunnelPort + slot}:127.0.0.1:11434`,
     `${lease.access.ssh_user ?? "root"}@${lease.access.ssh_host}`,
   ]);
   child.on("error", (err) => console.error(`tunnel error: ${err.message}`));
   return { close: () => child.kill("SIGTERM") };
 }
 
-const fetchOllama = (path, init) => fetch(`http://127.0.0.1:${config.tunnelPort}${path}`, init);
+const fetchOllama = (slot, path, init) => fetch(`http://127.0.0.1:${config.tunnelPort + slot}${path}`, init);
 
 // Robinhood Chain is always verifiable: the agent key that leases GPUs also
 // holds the gas to broadcast an authorization there. Base is offered only when
@@ -170,6 +189,14 @@ const inferenceSchemas = {
   method: "POST",
 };
 
+const batchSchemas = {
+  input: batchInput(config.models),
+  output: batchOutput,
+  example: batchExample,
+  inputExample: batchInputExample,
+  method: "POST",
+};
+
 const cdp = process.env.CDP_API_KEY_ID && process.env.CDP_API_KEY_SECRET
   ? createCdpFacilitator({
       keyId: process.env.CDP_API_KEY_ID,
@@ -197,12 +224,16 @@ const gateway = createGateway({
   basePayTo: config.basePayTo,
   exact,
   schemas: inferenceSchemas,
+  batchSchemas,
   priceMicros: config.priceMicros,
   pricing: config.pricing,
   image: process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE,
   durationSeconds: config.durationSeconds,
   minVramMib: config.minVramMib,
   idleMs: config.idleMs,
+  poolMax: config.poolMax,
+  maxBatchItems: config.maxBatchItems,
+  itemsPerBox: config.itemsPerBox,
   paymentsFile: config.paymentsFile,
   verify,
   spawnTunnel,
@@ -280,6 +311,22 @@ const server = createServer(async (req, res) => {
           },
         },
         {
+          path: "/inference/v1/batch",
+          method: "POST",
+          description:
+            "Many independent prompts in one paid call. The price is the single-request price " +
+            "times the number of prompts, and the unpaid 402 quotes the exact figure. Each prompt " +
+            "runs whole on one rented GPU, and the gateway spreads them over every GPU it holds, " +
+            "so a batch finishes in roughly the time the slowest box needs rather than the sum of " +
+            "all of them. The response carries a Merkle receipt over the set: each item comes with " +
+            "the digests it was committed under and an audit path, so any one answer can be proved " +
+            "to belong to the batch without disclosing the others, and the receipt names the leases " +
+            "that did the work, which settle on-chain with their own public receipts.",
+          price: `the per-generation price times the number of prompts, quoted per request`,
+          accepts: gateway.batchRequirements().accepts,
+          inputSchema: batchInput(m.models),
+        },
+        {
           path: "/inference/v1/models",
           method: "GET",
           description: "Models, per-model pricing, and the gateway's current state. Free.",
@@ -297,6 +344,21 @@ const server = createServer(async (req, res) => {
   // it carries, because a safe method must stay safe; it only quotes.
   if (req.method === "GET" && url.pathname === "/v1/inference") {
     const out = await gateway.handleInference({}, undefined, detect(req.headers)?.version ?? 2);
+    return json(res, out.status, out.body, out.headers);
+  }
+  if (req.method === "GET" && url.pathname === "/v1/batch") {
+    const out = await gateway.handleBatch({}, undefined, detect(req.headers)?.version ?? 2);
+    return json(res, out.status, out.body, out.headers);
+  }
+  if (req.method === "POST" && url.pathname === "/v1/batch") {
+    let body;
+    try {
+      body = await readJson(req, MAX_BATCH_BODY_BYTES);
+    } catch (err) {
+      return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
+    }
+    const payment = detect(req.headers);
+    const out = await gateway.handleBatch(body, payment?.header, payment?.version ?? null);
     return json(res, out.status, out.body, out.headers);
   }
   if (req.method === "POST" && url.pathname === "/v1/inference") {
@@ -326,15 +388,15 @@ function json(res, status, obj, extra = {}) {
   res.end(payload);
 }
 
-async function readJson(req) {
-  if (Number(req.headers["content-length"] ?? "0") > MAX_BODY_BYTES) {
+async function readJson(req, limit = MAX_BODY_BYTES) {
+  if (Number(req.headers["content-length"] ?? "0") > limit) {
     throw Object.assign(new Error("body too large"), { code: "too_large" });
   }
   const chunks = [];
   let total = 0;
   for await (const chunk of req) {
     total += chunk.length;
-    if (total > MAX_BODY_BYTES) {
+    if (total > limit) {
       req.destroy();
       throw Object.assign(new Error("body too large"), { code: "too_large" });
     }

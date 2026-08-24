@@ -1,9 +1,13 @@
 # @prismnetwork/inference-gateway
 
-Managed inference on Prism Network GPUs. The gateway keeps a leased GPU warm
-with ollama and the configured models, and sells single generations over HTTP
-for USDG on Robinhood Chain via x402. Callers never touch a lease, an SSH key,
-or an image digest: pay the quoted price, get the generation.
+Managed inference on Prism Network GPUs. The gateway keeps leased GPUs warm
+with ollama and the configured models, and sells generations over HTTP for USDG
+on Robinhood Chain via x402. Callers never touch a lease, an SSH key, or an
+image digest: pay the quoted price, get the generation.
+
+Ask for one prompt and one GPU answers it. Ask for a hundred and they go out
+across every GPU the gateway holds at once, so the batch finishes in about the
+time the slowest box needs rather than the sum of all of them.
 
 The gateway is itself a renter. It leases through the same escrow as everyone
 else with its own funded wallet, pays per second, and its leases settle with
@@ -45,7 +49,65 @@ revenue, and leases warmed since boot.
 
 The first paid request on a cold gateway waits through provisioning, usually
 one to four minutes. `POST /v1/warm` (free) starts the warmup early, and
-`GET /v1/models` reports the models, price, and current state.
+`GET /v1/models` reports the models, price, current state, and how many GPUs
+are warm behind the endpoint.
+
+## Batches
+
+`POST /v1/batch` takes a list of prompts and one payment:
+
+```sh
+curl -s -X POST http://localhost:8500/v1/batch \
+  -H 'content-type: application/json' \
+  -d '{"model": "llama3.2:3b", "prompts": ["What is a prism?", "What is a GPU?"]}'
+```
+
+The price is the single-request price times the number of prompts, and the
+unpaid `402` quotes the exact figure. Every prompt runs whole on one GPU, the
+same way a single request does; what the batch adds is that they run on all the
+gateway's GPUs at once, and a box still warming joins the work as it comes up
+rather than after the batch has finished without it. A batch is all or nothing:
+if a prompt cannot be answered even after a retry on another box, the answer is
+`503` and the same payment header works on the retry.
+
+### The receipt
+
+A batch comes back with a Merkle receipt over the set:
+
+```json
+{
+  "version": 1,
+  "algorithm": "rfc6962-sha256",
+  "model": "llama3.2:3b",
+  "count": 2,
+  "merkle_root": "sha256:...",
+  "lease_ids": [1041, 1042],
+  "payer": "0x...",
+  "paid_micros": "30480",
+  "settlement_tx": "0x...",
+  "issued_at": "2026-08-24T09:00:00.000Z"
+}
+```
+
+Each item carries the `commitment` its leaf was hashed over and the
+`merkle_proof` from that leaf to the root, so one answer can be shown to belong
+to the batch without disclosing any of the other prompts:
+
+```js
+import { verifyItem } from "@prismnetwork/inference-gateway/receipt";
+
+verifyItem(item.commitment, item.merkle_proof, batch.receipt.merkle_root);
+```
+
+The tree is the RFC 6962 construction: a leaf is
+`sha256(0x00 || canonical_json)`, an interior node is
+`sha256(0x01 || left || right)`, and an odd node is promoted to the next level
+rather than hashed against a copy of itself. The canonical JSON is the
+`commitment` object with its fields in the order `index`, `model`, `prompt`,
+`response`, `prompt_tokens`, `completion_tokens`, `lease_id`, where `prompt`
+and `response` are `sha256:` digests of the text. `lease_ids` names the leases
+that did the work, and those settle on-chain with their own public receipts, so
+the chain runs batch root to item to lease to settlement.
 
 ## Configuration
 
@@ -57,13 +119,22 @@ one to four minutes. `POST /v1/warm` (free) starts the warmup early, and
 | `INFERENCE_PRICE_MICROS` | Default base price in USDG micros (default 10000 = 0.01 USDG). |
 | `INFERENCE_PRICING` | Per-model JSON, e.g. `{"llama3.2:3b":{"base":5000,"per_token":10}}`. |
 | `INFERENCE_WARM_SECONDS` | Lease length per warm window (default 1800). |
-| `INFERENCE_IDLE_SECONDS` | Idle time before the box is allowed to lapse (default 600). |
+| `INFERENCE_IDLE_SECONDS` | Idle time before a box is allowed to lapse (default 600). |
+| `INFERENCE_POOL_MAX` | How many GPUs the gateway may hold at once (default 1). |
+| `INFERENCE_BATCH_MAX_ITEMS` | Prompts allowed in one batch (default 64). |
+| `INFERENCE_BATCH_ITEMS_PER_BOX` | Prompts a batch must carry before it is worth another GPU (default 25). |
 | `INFERENCE_PORT` / `INFERENCE_TUNNEL_PORT` | HTTP port (8500) and local ollama tunnel port (11435). |
 | `INFERENCE_PAYMENTS_FILE` | Consumed-payment ledger (default `./inference-consumed.log`). |
 
 Generations are capped at 1024 output tokens and prompts at 32 KiB, so the
-flat price bounds what one request can spend of the warm window. `ssh` must be
-on `PATH`; the box's ollama is reachable only through the gateway's tunnel.
+price bounds what one request can spend of the warm window. `ssh` must be on
+`PATH`; each box's ollama is reachable only through its own tunnel, on
+`INFERENCE_TUNNEL_PORT` plus the slot number.
+
+Every GPU in the pool is a separate prepaid lease running whether or not
+anything asks for it, which is why the default pool is one. Raise
+`INFERENCE_POOL_MAX` when there is batch traffic to pay for it; a batch small
+enough to run on the GPUs already warm never leases another.
 
 Prism is pre-production and unaudited. The gateway wallet should hold only
 what you are prepared to lose.

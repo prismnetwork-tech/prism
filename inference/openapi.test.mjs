@@ -26,7 +26,7 @@ test("it carries every field the scanners require", () => {
 test("every paid operation declares a price, a protocol and a 402", () => {
   const d = doc();
   const paid = Object.values(d.paths).flatMap((p) => Object.values(p)).filter((op) => op["x-payment-info"]);
-  assert.equal(paid.length, 2, "inference and the job runner");
+  assert.equal(paid.length, 3, "single inference, batch inference, and the job runner");
   for (const op of paid) {
     const info = op["x-payment-info"];
     assert.equal(info.price.currency, "USD");

@@ -23,6 +23,7 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 | `prism_wallet` | yes |
 | `prism_leases` | yes |
 | `prism_infer` | yes |
+| `prism_infer_batch` | yes |
 | `prism_lease_and_run` | yes |
 | `prism_lease` | yes |
 | `prism_run` | yes |
@@ -44,6 +45,12 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
   paying the quoted USDG price from this wallet (about 0.01 USDG). Waits
   through a cold start; an unconsumed payment is kept and reused on the next
   call instead of paying twice.
+- `prism_infer_batch`: buy many generations in one paid call, at the
+  single-generation price times the number of prompts. Each prompt runs whole on
+  a rented GPU and they are spread across every GPU the endpoint holds, so a
+  list of prompts finishes far sooner than the same prompts sent one at a time.
+  Returns every answer in order with a Merkle receipt naming the leases that did
+  the work.
 - `prism_lease_and_run`: lease a GPU, run a command, return the output (one shot).
 - `prism_lease`: lease a GPU and keep it; returns a `lease_id` and SSH access.
 - `prism_run`: run a command on an existing lease.

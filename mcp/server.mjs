@@ -89,6 +89,72 @@ const pendingInference = new Map();
 const usdg = (micros) =>
   micros == null || !Number.isFinite(Number(micros)) ? null : `${(Number(micros) / 1e6).toFixed(6)} USDG`;
 
+/// Pays once and keeps the header until the endpoint actually serves. A 503
+/// means the box is warming and a 402 for a payment that is merely too young
+/// heals by itself, so both retry with the same payment; everything else is
+/// final, and the header stays cached for the next call rather than paying
+/// twice for work that was never done.
+async function payAndPost({ base, path, price, payTo, body, tool }) {
+  const pendingKey = `${base}${path}:${price}`;
+  let pending = pendingInference.get(pendingKey);
+  if (!pending) {
+    const paymentTx = await agent.transferUsdg(payTo, price);
+    const signature = await agent.account.signMessage({ message: paymentTx });
+    pending = {
+      tx: paymentTx,
+      header: Buffer.from(JSON.stringify({ txHash: paymentTx, signature })).toString("base64"),
+    };
+    pendingInference.set(pendingKey, pending);
+  }
+  const deadline = Date.now() + 600_000;
+  for (;;) {
+    const res = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-payment": pending.header },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(620_000),
+    });
+    const answered = await res.json().catch(() => null);
+    if (res.status === 200 && answered) {
+      pendingInference.delete(pendingKey);
+      return { ...answered, paid: usdg(price), payment_tx: pending.tx };
+    }
+    const last = answered?.detail ?? answered?.error ?? `status ${res.status}`;
+    const retryable =
+      res.status === 503 ||
+      (res.status === 402 && ["insufficient_confirmations", "tx_not_found"].includes(answered?.error));
+    if (!retryable || Date.now() > deadline) {
+      throw new Error(
+        `inference failed: ${last}. The payment (tx ${pending.tx}) was not consumed and is kept; the next ${tool} call retries with it instead of paying again.`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 15_000));
+  }
+}
+
+const inferenceBase = () =>
+  (process.env.PRISM_INFERENCE_URL ?? "https://api.prismnetwork.tech/inference").replace(/\/$/, "");
+
+/// What the endpoint currently offers, and the model this call should use.
+async function inferenceOffer(base, requested) {
+  const offer = await publicJson(`${base}/v1/models`, "inference endpoint");
+  const model = requested ?? offer.models?.[0];
+  if (!model || (Array.isArray(offer.models) && !offer.models.includes(model))) {
+    throw new Error(`model must be one of ${offer.models?.join(", ") ?? "(endpoint offered none)"}`);
+  }
+  return { offer, model, unit: BigInt(offer.price_micros ?? 0) };
+}
+
+function withinCap(price, maxUsdg, fallback, what) {
+  const cap = maxUsdg ?? fallback;
+  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+    throw new Error("max_usdg must be a positive number of USDG.");
+  }
+  if (price <= 0n || price > BigInt(Math.round(cap * 1e6))) {
+    throw new Error(`the endpoint quotes ${usdg(price)} ${what}, past the ${cap} USDG cap.`);
+  }
+}
+
 function sweepExpiredLeases() {
   const now = Date.now();
   for (const [id, lease] of leases) {
@@ -182,6 +248,25 @@ const TOOLS = [
         max_usdg: { type: "number", description: "Refuse if the quoted price exceeds this (default 0.05)." },
       },
       required: ["prompt"],
+    },
+  },
+  {
+    name: "prism_infer_batch",
+    description: "Buy many LLM generations from Prism's managed inference endpoint in one paid call. Every prompt runs whole on a rented GPU, spread across every GPU the endpoint holds, so a list of prompts finishes far sooner than the same prompts sent one at a time. Costs the single-generation price times the number of prompts. Returns every answer in order plus a Merkle receipt naming the leases that did the work. Use it for evals, dataset passes, rollouts, or anything with more than a handful of independent prompts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompts: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          maxItems: 64,
+          description: "Independent prompts, answered in the order given (each max 32 KiB).",
+        },
+        model: { type: "string", description: "Model to use; defaults to the endpoint's first offered model." },
+        max_usdg: { type: "number", description: "Refuse if the quoted total exceeds this (default 0.5)." },
+      },
+      required: ["prompts"],
     },
   },
   {
@@ -414,60 +499,42 @@ async function handle(name, args) {
       throw new Error("prompt is required.");
     }
     requireWallet(name);
-    const base = (process.env.PRISM_INFERENCE_URL ?? "https://api.prismnetwork.tech/inference").replace(/\/$/, "");
-    const offer = await publicJson(`${base}/v1/models`, "inference endpoint");
-    const model = args.model ?? offer.models?.[0];
-    if (!model || (Array.isArray(offer.models) && !offer.models.includes(model))) {
-      throw new Error(`model must be one of ${offer.models?.join(", ") ?? "(endpoint offered none)"}`);
+    const base = inferenceBase();
+    const { offer, model, unit } = await inferenceOffer(base, args.model);
+    withinCap(unit, args.max_usdg, 0.05, "per generation");
+    return payAndPost({
+      base,
+      path: "/v1/inference",
+      price: unit,
+      payTo: offer.pay_to,
+      body: { model, prompt: args.prompt },
+      tool: "prism_infer",
+    });
+  }
+  if (name === "prism_infer_batch") {
+    const prompts = args.prompts;
+    if (!Array.isArray(prompts) || !prompts.length) {
+      throw new Error("prompts must be a non-empty array of strings.");
     }
-    const price = BigInt(offer.price_micros ?? 0);
-    const cap = args.max_usdg ?? 0.05;
-    if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
-      throw new Error("max_usdg must be a positive number of USDG.");
+    if (prompts.some((p) => typeof p !== "string" || p.trim() === "")) {
+      throw new Error("every prompt must be a non-empty string.");
     }
-    if (price <= 0n || price > BigInt(Math.round(cap * 1e6))) {
-      throw new Error(`the endpoint quotes ${usdg(price)} per generation, past the ${cap} USDG cap.`);
+    if (prompts.length > 64) {
+      throw new Error(`a batch takes at most 64 prompts; ${prompts.length} were given.`);
     }
-    const pendingKey = `${base}:${price}`;
-    let pending = pendingInference.get(pendingKey);
-    if (!pending) {
-      const paymentTx = await agent.transferUsdg(offer.pay_to, price);
-      const signature = await agent.account.signMessage({ message: paymentTx });
-      pending = {
-        tx: paymentTx,
-        header: Buffer.from(JSON.stringify({ txHash: paymentTx, signature })).toString("base64"),
-      };
-      pendingInference.set(pendingKey, pending);
-    }
-    // A cold endpoint holds the request through provisioning; when it answers
-    // 503 instead, the payment is not consumed and the same header retries.
-    const deadline = Date.now() + 600_000;
-    for (;;) {
-      const res = await fetch(`${base}/v1/inference`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-payment": pending.header },
-        body: JSON.stringify({ model, prompt: args.prompt }),
-        signal: AbortSignal.timeout(620_000),
-      });
-      const body = await res.json().catch(() => null);
-      if (res.status === 200 && body) {
-        pendingInference.delete(pendingKey);
-        return { ...body, paid: usdg(price), payment_tx: pending.tx };
-      }
-      const last = body?.detail ?? body?.error ?? `status ${res.status}`;
-      // 503 means the box is warming; a 402 for a payment that is merely too
-      // young (confirmations still landing, receipt not yet visible) heals by
-      // itself. Everything else is final.
-      const retryable =
-        res.status === 503 ||
-        (res.status === 402 && ["insufficient_confirmations", "tx_not_found"].includes(body?.error));
-      if (!retryable || Date.now() > deadline) {
-        throw new Error(
-          `inference failed: ${last}. The payment (tx ${pending.tx}) was not consumed and is kept; the next prism_infer call retries with it instead of paying again.`,
-        );
-      }
-      await new Promise((r) => setTimeout(r, 15_000));
-    }
+    requireWallet(name);
+    const base = inferenceBase();
+    const { offer, model, unit } = await inferenceOffer(base, args.model);
+    const price = unit * BigInt(prompts.length);
+    withinCap(price, args.max_usdg, 0.5, `for ${prompts.length} generations`);
+    return payAndPost({
+      base,
+      path: "/v1/batch",
+      price,
+      payTo: offer.pay_to,
+      body: { model, prompts },
+      tool: "prism_infer_batch",
+    });
   }
   if (name === "prism_lease_and_run" || name === "prism_lease") {
     if (name === "prism_lease_and_run") requireCommand(args.command);
@@ -577,7 +644,7 @@ async function handleVault(name, args) {
   throw new Error(`unknown tool ${name}`);
 }
 
-const server = new Server({ name: "prism", version: "0.7.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "prism", version: "0.8.0" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {

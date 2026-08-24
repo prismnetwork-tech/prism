@@ -8,10 +8,12 @@
 // (on-chain payment verification).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "@prismnetwork/x402/codec";
+import { batchReceipt, digest } from "./receipt.mjs";
 
 export const DEFAULT_PRICE_MICROS = 10_000n;
 export const MAX_PROMPT_BYTES = 32 * 1024;
 export const MAX_PREDICT_TOKENS = 1_024;
+export const MAX_BATCH_ITEMS = 64;
 
 // A request's price is the model's base plus its per-token rate over the
 // output cap the caller asked for. The full-cap price is what /v1/models
@@ -33,6 +35,21 @@ const TX_HASH = /^0x[0-9a-f]{64}$/i;
 // first, so its key is the payer and the authorization nonce, which is also
 // what the token contract itself refuses to reuse.
 const PAYMENT_KEY = /^(0x[0-9a-f]{64}|0x[0-9a-f]{40}:0x[0-9a-f]{64})$/i;
+
+const ROUTES = {
+  single: {
+    path: "/v1/inference",
+    unit: "One generation",
+    resource: "One LLM generation on a rented GPU, priced per request.",
+  },
+  batch: {
+    path: "/v1/batch",
+    unit: "A batch of independent generations",
+    resource:
+      "Many independent prompts in one paid call, spread across the rented GPUs the gateway " +
+      "holds, returned with a Merkle receipt over the set.",
+  },
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /// Distinguishes "the wait elapsed" from "warming finished, with or without an
@@ -73,6 +90,9 @@ export function createGateway({
   // Carried in every 402 so an agent that arrives cold learns the price and how
   // to call the endpoint from one response, without fetching anything else.
   schemas = null,
+  // The batch takes a different body, and an indexer that reads the single
+  // request's schema off a batch 402 publishes a call that cannot work.
+  batchSchemas = null,
   priceMicros = DEFAULT_PRICE_MICROS,
   pricing: pricingIn = null,
   image,
@@ -86,6 +106,15 @@ export function createGateway({
   // that no reasonable client gives up first.
   readyWaitMs = 12_000,
   retryAfterMs = 90_000,
+  // How many boxes the gateway may hold at once. One by default: a second box
+  // is a second prepaid lease, so growing the pool is a cost the operator opts
+  // into rather than something a single caller can trigger.
+  poolMax = 1,
+  maxBatchItems = MAX_BATCH_ITEMS,
+  // A batch has to be worth a second lease before it gets one. Below this many
+  // prompts per box the batch runs on the capacity already warm.
+  itemsPerBox = 25,
+  batchTimeoutMs = 600_000,
   paymentsFile = null,
   verify,
   spawnTunnel,
@@ -113,6 +142,7 @@ export function createGateway({
     // Broadcast, but the receipt could not be read. Neither revenue nor loss
     // until someone checks the chain.
     unconfirmed: 0,
+    batches: 0, batch_items: 0,
   };
 
   const consumed = loadConsumed(paymentsFile);
@@ -120,8 +150,13 @@ export function createGateway({
   // it paid for: a consumed tx hash answers with its own result, not a refusal.
   const served = new Map();
   const SERVED_CAP = 200;
-  const box = { phase: "cold", lease: null, tunnel: null, expiresAt: 0, lastUsed: 0 };
-  let warming = null;
+  // One slot per box the gateway is allowed to hold at once. A slot owns its
+  // own lease and its own tunnel, and the slot number is what tells the tunnel
+  // which local port to bind, so two boxes never contend for one.
+  const pool = Array.from({ length: Math.max(1, Math.floor(poolMax)) }, (_, slot) => ({
+    slot, phase: "cold", lease: null, tunnel: null, expiresAt: 0, lastUsed: 0, inFlight: 0,
+  }));
+  const warming = new Map();
   let coolUntil = 0;
 
   function reservePayment(key) {
@@ -145,7 +180,7 @@ export function createGateway({
     }
   }
 
-  async function warmUp() {
+  async function warmUp(box) {
     box.phase = "warming";
     let lease;
     try {
@@ -172,12 +207,12 @@ export function createGateway({
       if (out.code !== 0) {
         throw new Error(`model pull exit ${out.code}: ${(out.stderr || out.stdout).slice(-300)}`);
       }
-      const tunnel = await spawnTunnel(lease);
+      const tunnel = await spawnTunnel(lease, box.slot);
       // The tunnel is up when ollama answers through it.
       const deadline = now() + 60_000;
       for (;;) {
         try {
-          const res = await fetchOllama("/api/tags", { method: "GET" });
+          const res = await fetchOllama(box.slot, "/api/tags", { method: "GET" });
           if (res.ok) break;
         } catch {
           /* not up yet */
@@ -194,7 +229,7 @@ export function createGateway({
       box.lastUsed = now();
       box.phase = "warm";
       stats.leases_warmed += 1;
-      log(`warm: lease ${lease.leaseId}, models ${models.join(", ")}`);
+      log(`warm: slot ${box.slot}, lease ${lease.leaseId}, models ${models.join(", ")}`);
     } catch (err) {
       // The lease is paid for either way; drop only what this process holds,
       // and hold off before leasing again: every failed warmup costs a full
@@ -209,47 +244,116 @@ export function createGateway({
     }
   }
 
-  function ensureWarm() {
-    if (box.phase === "warm") return Promise.resolve();
-    if (now() < coolUntil) {
-      return Promise.reject(
-        new Error(`warmup is cooling down after a failure; retry in ${Math.ceil((coolUntil - now()) / 1000)}s`),
-      );
-    }
-    if (!warming) {
-      warming = warmUp().finally(() => {
-        warming = null;
-      });
-    }
-    return warming;
+  const warmBoxes = () => pool.filter((b) => b.phase === "warm");
+
+  function startWarm(box) {
+    const existing = warming.get(box.slot);
+    if (existing) return existing;
+    const attempt = warmUp(box).finally(() => warming.delete(box.slot));
+    warming.set(box.slot, attempt);
+    return attempt;
   }
 
-  function drain(reason) {
+  /// Bring the pool toward `target` warm boxes and hand back what is already in
+  /// flight. A cooldown blocks starting new ones but never the boxes already
+  /// warm, so a batch keeps running on the capacity it has.
+  function grow(target) {
+    const want = Math.min(Math.max(target, 1), pool.length);
+    if (now() >= coolUntil) {
+      for (const box of pool) {
+        if (warmBoxes().length + warming.size >= want) break;
+        if (box.phase === "cold") startWarm(box);
+      }
+    }
+    return [...warming.values()];
+  }
+
+  /// Resolves once the pool has somewhere to run a generation.
+  function ensureWarm(target = 1) {
+    const pending = grow(target);
+    if (warmBoxes().length) return Promise.resolve();
+    if (!pending.length) {
+      return Promise.reject(
+        now() < coolUntil
+          ? new Error(`warmup is cooling down after a failure; retry in ${Math.ceil((coolUntil - now()) / 1000)}s`)
+          : new Error("no slot is free to warm"),
+      );
+    }
+    // Any one of them is enough, and the aggregate error hides the cause.
+    return Promise.any(pending).then(
+      () => undefined,
+      (err) => {
+        throw err?.errors?.[0] ?? err;
+      },
+    );
+  }
+
+  function drain(box, reason) {
     if (box.tunnel) box.tunnel.close();
     if (box.lease) agent.endLease(box.lease);
-    log(`drained (${reason})`);
+    log(`drained slot ${box.slot} (${reason})`);
     box.phase = "cold";
     box.lease = null;
     box.tunnel = null;
     box.expiresAt = 0;
+    box.inFlight = 0;
+  }
+
+  /// The box with the least on it. Leases are prepaid for a fixed window, so
+  /// spreading work over the boxes we already hold costs nothing extra.
+  function pick() {
+    let best = null;
+    for (const box of pool) {
+      if (box.phase !== "warm") continue;
+      if (!best || box.inFlight < best.inFlight) best = box;
+    }
+    return best;
+  }
+
+  /// One word for a pool: warm if anything can serve now, warming if a box is
+  /// on its way, cold otherwise.
+  function phase() {
+    if (warmBoxes().length) return "warm";
+    if (warming.size) return "warming";
+    return "cold";
+  }
+
+  function drainAll(reason) {
+    for (const box of pool) if (box.phase === "warm") drain(box, reason);
   }
 
   // Called on an interval by the server (and directly by tests): let an idle
   // box lapse, renew a busy one before its lease expires.
   async function maintain() {
-    if (box.phase !== "warm") return;
-    const idle = now() - box.lastUsed > idleMs;
-    const nearExpiry = now() > box.expiresAt - 120_000;
-    if (now() > box.expiresAt) return drain("lease expired");
-    if (!nearExpiry) return;
-    if (idle) return drain("idle at renewal time");
-    drain("renewing");
-    await ensureWarm().catch((err) => log(`renewal failed: ${err.message}`));
+    let renew = 0;
+    for (const box of pool) {
+      if (box.phase !== "warm") continue;
+      if (now() > box.expiresAt) {
+        drain(box, "lease expired");
+        continue;
+      }
+      if (now() <= box.expiresAt - 120_000) continue;
+      if (now() - box.lastUsed > idleMs) {
+        drain(box, "idle at renewal time");
+        continue;
+      }
+      drain(box, "renewing");
+      renew += 1;
+    }
+    // A renewal is a fresh lease on a fresh slot, so it goes through the same
+    // path as any other warmup rather than reusing the drained one in place.
+    // Every box that was busy enough to renew is worth replacing, not just one.
+    if (renew) {
+      await ensureWarm(warmBoxes().length + renew).catch((err) => log(`renewal failed: ${err.message}`));
+    }
   }
 
   /// Both stablecoins carry six decimals, so one price in micros is the price
   /// on either rail with no conversion.
-  function accepted(amount) {
+  const schemasFor = (route) => (route === ROUTES.batch ? batchSchemas ?? schemas : schemas);
+
+  function accepted(amount, route = ROUTES.single) {
+    const shape = schemasFor(route);
     const list = [];
     if (basePayTo) {
       list.push({
@@ -258,14 +362,14 @@ export function createGateway({
         asset: USDC_BASE,
         payTo: basePayTo,
         amount: amount.toString(),
-        resource: `${originUrl}/v1/inference`,
+        resource: `${originUrl}${route.path}`,
         description:
-          "One generation on a Prism GPU, paid in USDC on Base. Sign an EIP-3009 " +
+          `${route.unit} on Prism GPUs, paid in USDC on Base. Sign an EIP-3009 ` +
           "transferWithAuthorization for the quoted amount and send it as the payment header. " +
           "You need no gas: the authorization is broadcast for you.",
         mimeType: "application/json",
         maxTimeoutSeconds: 60,
-        ...(schemas ? { outputSchema: schemas } : {}),
+        ...(shape ? { outputSchema: shape } : {}),
         extra: { ...USDC_BASE_DOMAIN, assetTransferMethod: "eip3009" },
       });
     }
@@ -275,15 +379,15 @@ export function createGateway({
       asset: USDG_ROBINHOOD,
       payTo,
       amount: amount.toString(),
-      resource: `${originUrl}/v1/inference`,
+      resource: `${originUrl}${route.path}`,
       description:
-        "One generation on a Prism GPU, paid in USDG on Robinhood Chain, which is where the " +
-        "serving lease settles. Sign an EIP-3009 transferWithAuthorization for the quoted amount " +
+        `${route.unit} on Prism GPUs, paid in USDG on Robinhood Chain, which is where the ` +
+        "serving leases settle. Sign an EIP-3009 transferWithAuthorization for the quoted amount " +
         "and send it as the payment header; you need no gas, because the authorization is " +
         "broadcast for you. The older flow, a direct transfer plus a signed tx hash, still works.",
       mimeType: "application/json",
       maxTimeoutSeconds: 60,
-      ...(schemas ? { outputSchema: schemas } : {}),
+      ...(shape ? { outputSchema: shape } : {}),
       // Without the EIP-712 domain a strict client cannot sign an authorization
       // it can trust, and the careful ones refuse rather than read the domain
       // off-chain and risk signing the wrong one.
@@ -295,22 +399,31 @@ export function createGateway({
   /// `version` selects the wire shape: v1 wants `maxAmountRequired` and a chain
   /// name, v2 wants `amount` and CAIP-2. The prices and networks are the same
   /// either way.
-  function requirements(state, quote = null, version = 2, error = null) {
+  function requirements(state, quote = null, version = 2, error = null, route = ROUTES.single) {
     const amount = quote?.micros ?? maxPriceMicros;
     return paymentRequired(version, {
       error,
-      accepts: accepted(amount),
+      accepts: accepted(amount, route),
       resource: {
-        url: `${originUrl}/v1/inference`,
-        description: "One LLM generation on a rented GPU, priced per request.",
+        url: `${originUrl}${route.path}`,
+        description: route.resource,
         mimeType: "application/json",
       },
-      schemas,
+      schemas: schemasFor(route),
       // Ours, not the protocol's: the box state and the quote this price came
       // from, which a human reading the 402 wants and a parser ignores.
       extra: {
         state,
-        ...(quote ? { quote: { model: quote.model, output_cap: quote.cap, price_micros: amount.toString() } } : {}),
+        ...(quote
+          ? {
+              quote: {
+                model: quote.model,
+                output_cap: quote.cap,
+                price_micros: amount.toString(),
+                ...(quote.count ? { count: quote.count } : {}),
+              },
+            }
+          : {}),
       },
     });
   }
@@ -319,7 +432,7 @@ export function createGateway({
   /// yet, so verification is read-only and the broadcast happens only once a
   /// generation exists to pay for. A failed generation therefore costs the
   /// payer nothing and needs no refund, which the legacy scheme cannot offer.
-  async function checkAuthorization(parsed, quotedMicros, quote) {
+  async function checkAuthorization(parsed, quotedMicros, route) {
     const authorization = parsed.payload?.authorization;
     const from = authorization?.from;
     const nonce = authorization?.nonce;
@@ -334,7 +447,7 @@ export function createGateway({
     // copy against itself would always pass.
     // Compared canonically: a client that read a v1 quote echoes back "base"
     // while this list holds "eip155:8453", and they are the same chain.
-    const want = accepted(quotedMicros).find(
+    const want = accepted(quotedMicros, route).find(
       (entry) => sameNetwork(entry.network, parsed.accepted?.network),
     );
     if (!want) return { ok: false, reason: "invalid_network" };
@@ -363,14 +476,14 @@ export function createGateway({
     };
   }
 
-  async function checkPayment(header, quotedMicros, quote) {
+  async function checkPayment(header, quotedMicros, route = ROUTES.single) {
     const parsed = parsePayment(header);
     if (!parsed) return { ok: false, reason: "invalid_payload" };
     // An authorization means the exact scheme; a bare tx hash is the legacy
     // one, kept working for a release so anything already integrated survives.
     if (parsed.payload?.authorization) {
       if (!exact) return { ok: false, reason: "invalid_scheme" };
-      return checkAuthorization(parsed, quotedMicros, quote);
+      return checkAuthorization(parsed, quotedMicros, route);
     }
     const { txHash, signature } = parsed.raw ?? {};
     if (!TX_HASH.test(txHash ?? "") || typeof signature !== "string") {
@@ -401,17 +514,24 @@ export function createGateway({
     };
   }
 
-  async function generate(body, cap) {
+  async function generate(body, cap, box) {
     const options = { ...(body.options ?? {}), num_predict: cap };
-    const res = await fetchOllama("/api/generate", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: body.model, prompt: body.prompt, stream: false, options }),
-      signal: AbortSignal.timeout(generateTimeoutMs),
-    });
-    if (!res.ok) throw new Error(`ollama answered ${res.status}`);
-    const out = await res.json();
+    box.inFlight += 1;
     box.lastUsed = now();
+    let out;
+    try {
+      const res = await fetchOllama(box.slot, "/api/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: body.model, prompt: body.prompt, stream: false, options }),
+        signal: AbortSignal.timeout(generateTimeoutMs),
+      });
+      if (!res.ok) throw new Error(`ollama answered ${res.status}`);
+      out = await res.json();
+    } finally {
+      box.inFlight -= 1;
+      box.lastUsed = now();
+    }
     stats.generations += 1;
     stats.tokens_in += out.prompt_eval_count ?? 0;
     stats.tokens_out += out.eval_count ?? 0;
@@ -444,7 +564,7 @@ export function createGateway({
       const quote = known
         ? { model: body.model, ...priceFor(pricing, body.model, Number(body.options?.num_predict)) }
         : null;
-      const required = requirements(box.phase, quote, version);
+      const required = requirements(phase(), quote, version);
       return { status: 402, body: required.body, headers: required.headers };
     }
 
@@ -461,12 +581,12 @@ export function createGateway({
     }
     const { cap, micros } = priceFor(pricing, body.model, Number(body.options?.num_predict));
     const quote = { model: body.model, cap, micros };
-    const payment = await checkPayment(String(paymentHeader), micros, quote);
+    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.single);
     if (!payment.ok) {
       if (payment.replay) return { status: 200, body: { ...payment.replay, replayed: true } };
       // A refused payment is still a 402, and a v2 client reads the terms from
       // the header rather than the body, so it has to carry them here too.
-      const refused = requirements(box.phase, quote, version, payment.reason);
+      const refused = requirements(phase(), quote, version, payment.reason);
       return { status: 402, body: refused.body, headers: refused.headers };
     }
     // Warming leases a GPU and pulls models, which takes minutes. Holding the
@@ -483,7 +603,7 @@ export function createGateway({
         body: {
           error: "warming_up",
           detail: "A GPU is being leased and the models are being pulled.",
-          state: box.phase,
+          state: phase(),
           retry_after_seconds: Math.ceil(retryAfterMs / 1000),
           retry: "nothing was charged; send the same payment header again.",
         },
@@ -492,7 +612,9 @@ export function createGateway({
     let result;
     try {
       if (failure) throw failure;
-      result = await generate(body, cap);
+      const target = pick();
+      if (!target) throw new Error("the warm box went away before the request reached it");
+      result = await generate(body, cap, target);
     } catch (err) {
       payment.release();
       log(`inference failed: ${err.message}`);
@@ -501,7 +623,7 @@ export function createGateway({
         body: {
           error: "inference_unavailable",
           detail: String(err.message ?? err),
-          state: box.phase,
+          state: phase(),
           retry: "the payment was not consumed; retry with the same payment header",
         },
       };
@@ -551,8 +673,236 @@ export function createGateway({
     };
   }
 
+  const batchRequirements = (state, quote = null, version = 2, error = null) =>
+    requirements(state, quote, version, error, ROUTES.batch);
+
+  /// Every prompt in a batch runs whole on one box, exactly as a single request
+  /// does. What the batch adds is that the prompts go out to every box the
+  /// gateway holds at once, and that boxes still warming join the work as they
+  /// come up rather than after the batch has finished without them.
+  async function runBatch({ model, prompts, cap, options }) {
+    const results = new Array(prompts.length);
+    const queue = prompts.map((prompt, index) => ({ index, prompt, attempts: 0 }));
+    const pending = new Set();
+    const deadline = now() + batchTimeoutMs;
+    let failure = null;
+
+    while (!failure && (queue.length || pending.size)) {
+      while (queue.length) {
+        const box = pick();
+        // One generation per box at a time: a second concurrent request on the
+        // same GPU queues inside ollama and buys nothing.
+        if (!box || box.inFlight > 0) break;
+        const job = queue.shift();
+        // The entry, not the promise, is what identifies a running item: two
+        // items finishing in the same tick both have to be collected, and a
+        // race only ever hands back one of them.
+        const entry = {};
+        entry.promise = generate({ model, prompt: job.prompt, options }, cap, box).then(
+          (result) => ({ entry, job, box, result }),
+          (err) => ({ entry, job, box, err }),
+        );
+        pending.add(entry);
+      }
+
+      if (!pending.size) {
+        // Nothing warm to hand the rest of the batch to. Worth waiting only
+        // while a box is actually on its way up.
+        if (!warming.size || now() > deadline) {
+          failure = new Error(
+            warming.size ? "the batch ran out of time waiting for a GPU" : "no GPU was available to finish the batch",
+          );
+          break;
+        }
+        await sleep(250);
+        continue;
+      }
+
+      const outcome = await Promise.race([...pending].map((entry) => entry.promise));
+      pending.delete(outcome.entry);
+      if (!outcome.err) {
+        results[outcome.job.index] = { ...outcome.result, index: outcome.job.index };
+        continue;
+      }
+      // A box that fails one prompt is usually about to fail the rest, so the
+      // retry goes to whichever box is free next, not back to the same one.
+      log(`batch item ${outcome.job.index} failed on lease ${outcome.box.lease?.leaseId ?? "?"}: ${outcome.err.message}`);
+      if (outcome.job.attempts >= 1) {
+        failure = outcome.err;
+        break;
+      }
+      queue.unshift({ ...outcome.job, attempts: outcome.job.attempts + 1 });
+    }
+
+    // Anything still running was paid for by the same payment as the rest, and
+    // the batch is all-or-nothing, so its result is discarded rather than
+    // returned half-formed.
+    if (failure) {
+      await Promise.allSettled([...pending].map((entry) => entry.promise));
+      throw failure;
+    }
+    return results;
+  }
+
+  async function handleBatch(body, paymentHeader, paymentVersion = null) {
+    const version = paymentVersion ?? 2;
+    const known = typeof body?.model === "string" && models.includes(body.model);
+    const prompts = Array.isArray(body?.prompts) ? body.prompts : null;
+    const priced = known && prompts?.length ? priceFor(pricing, body.model, Number(body.options?.num_predict)) : null;
+    const count = prompts?.length ?? 0;
+
+    if (!paymentHeader) {
+      const quote = priced
+        ? { model: body.model, cap: priced.cap, micros: priced.micros * BigInt(count), count }
+        : null;
+      const required = batchRequirements(phase(), quote, version);
+      return { status: 402, body: required.body, headers: required.headers };
+    }
+
+    if (!known) return { status: 400, body: { error: "unknown_model", models } };
+    if (!prompts?.length) {
+      return { status: 400, body: { error: "prompts_required", detail: "send a non-empty array of prompts" } };
+    }
+    if (prompts.length > maxBatchItems) {
+      return { status: 400, body: { error: "batch_too_large", max_items: maxBatchItems } };
+    }
+    if (prompts.some((prompt) => typeof prompt !== "string" || prompt.trim() === "")) {
+      return { status: 400, body: { error: "prompt_required", detail: "every prompt must be a non-empty string" } };
+    }
+    if (prompts.some((prompt) => Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES)) {
+      return { status: 413, body: { error: "prompt_too_large", max_bytes: MAX_PROMPT_BYTES } };
+    }
+
+    const { cap, micros: unit } = priceFor(pricing, body.model, Number(body.options?.num_predict));
+    const micros = unit * BigInt(prompts.length);
+    const quote = { model: body.model, cap, micros, count: prompts.length };
+    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.batch);
+    if (!payment.ok) {
+      if (payment.replay) return { status: 200, body: { ...payment.replay, replayed: true } };
+      const refused = batchRequirements(phase(), quote, version, payment.reason);
+      return { status: 402, body: refused.body, headers: refused.headers };
+    }
+
+    // Enough boxes for the work, capped by what the operator allows. A batch
+    // small enough to run on one box never leases a second.
+    const wanted = Math.min(pool.length, Math.max(1, Math.ceil(prompts.length / itemsPerBox)));
+    const warmingUp = ensureWarm(wanted).then(() => null, (err) => err);
+    const failure = await Promise.race([warmingUp, sleep(readyWaitMs).then(() => TIMED_OUT)]);
+    if (failure === TIMED_OUT) {
+      payment.release();
+      return {
+        status: 503,
+        headers: { "retry-after": String(Math.ceil(retryAfterMs / 1000)) },
+        body: {
+          error: "warming_up",
+          detail: "GPUs are being leased and the models are being pulled.",
+          state: phase(),
+          retry_after_seconds: Math.ceil(retryAfterMs / 1000),
+          retry: "nothing was charged; send the same payment header again.",
+        },
+      };
+    }
+
+    let items;
+    try {
+      if (failure) throw failure;
+      items = await runBatch({ model: body.model, prompts, cap, options: body.options });
+    } catch (err) {
+      payment.release();
+      log(`batch failed: ${err.message}`);
+      return {
+        status: 503,
+        body: {
+          error: "batch_unavailable",
+          detail: String(err.message ?? err),
+          state: phase(),
+          retry: "nothing was charged; retry with the same payment header",
+        },
+      };
+    }
+
+    let settlement = null;
+    if (payment.settle) {
+      try {
+        settlement = await payment.settle();
+      } catch (err) {
+        settlement = { success: false, settled: null, errorReason: "settlement_unconfirmed", payer: payment.payer };
+        log(`settlement threw after serving a batch: ${err.message}`);
+      }
+      if (!settlement.success) {
+        if (settlement.settled === null) {
+          stats.unconfirmed += 1;
+          log(`batch settlement unconfirmed: tx=${settlement.transaction ?? "none"} payer=${payment.payer}`);
+        } else {
+          stats.unsettled += 1;
+          stats.unsettled_micros += micros;
+          log(`batch settlement failed after serving: ${settlement.errorReason ?? "unknown"} payer=${payment.payer}`);
+        }
+      }
+    }
+
+    const result = assembleBatch({ items, prompts, model: body.model, payment, micros, settlement });
+    stats.batches += 1;
+    stats.batch_items += items.length;
+    if (!settlement || settlement.success) stats.revenue_micros += micros;
+    payment.commit(result);
+    return {
+      status: 200,
+      body: result,
+      headers: settlement ? paymentResponse(version, settlement).headers : {},
+    };
+  }
+
+  /// The response and its receipt. `commitment` is the exact object the leaf
+  /// hash is taken over, so verifying an item is a matter of hashing what you
+  /// were handed and walking the path to the root.
+  function assembleBatch({ items, prompts, model, payment, micros, settlement }) {
+    const commitments = items.map((item, index) => ({
+      index,
+      model,
+      prompt: digest(prompts[index]),
+      response: digest(item.response ?? ""),
+      prompt_tokens: item.usage?.prompt_tokens ?? null,
+      completion_tokens: item.usage?.completion_tokens ?? null,
+      lease_id: item.lease_id ?? null,
+    }));
+    const { receipt, proofs } = batchReceipt({
+      items: commitments,
+      model,
+      payer: payment.payer ?? null,
+      paidMicros: micros,
+      settlement: settlement?.success ? settlement : null,
+      issuedAt: now(),
+    });
+    return {
+      model,
+      count: items.length,
+      items: items.map((item, index) => ({
+        index,
+        response: item.response,
+        usage: item.usage,
+        lease_id: item.lease_id,
+        commitment: commitments[index],
+        merkle_proof: proofs[index],
+      })),
+      usage: {
+        prompt_tokens: items.reduce((n, i) => n + (i.usage?.prompt_tokens ?? 0), 0),
+        completion_tokens: items.reduce((n, i) => n + (i.usage?.completion_tokens ?? 0), 0),
+      },
+      receipt,
+    };
+  }
+
   return {
-    state: () => ({ phase: box.phase, lease_id: box.lease?.leaseId ?? null, expires_at: box.expiresAt || null }),
+    state: () => {
+      const first = warmBoxes()[0] ?? null;
+      return {
+        phase: phase(),
+        lease_id: first?.lease?.leaseId ?? null,
+        expires_at: first?.expiresAt || null,
+        ...poolView(),
+      };
+    },
     models: () => ({
       models,
       // The highest full-cap price: paying it clears any request. Per-model
@@ -580,16 +930,35 @@ export function createGateway({
       unsettled: stats.unsettled,
       unsettled_micros: stats.unsettled_micros.toString(),
       unconfirmed: stats.unconfirmed,
+      batches: stats.batches,
+      batch_items: stats.batch_items,
       ...boxView(),
     }),
     ensureWarm,
     maintain,
-    drain,
+    drainAll,
     handleInference,
-    requirements: () => requirements(box.phase).body,
+    handleBatch,
+    requirements: () => requirements(phase()).body,
+    batchRequirements: () => batchRequirements(phase()).body,
   };
 
+  /// One line for the whole pool, so a caller reading `/v1/models` learns how
+  /// much of the network is behind the endpoint right now.
+  function poolView() {
+    const warm = warmBoxes();
+    return {
+      pool: {
+        warm: warm.length,
+        max: pool.length,
+        in_flight: pool.reduce((n, b) => n + b.inFlight, 0),
+        lease_ids: warm.map((b) => b.lease?.leaseId ?? null).filter((id) => id != null),
+      },
+    };
+  }
+
   function boxView() {
-    return { state: box.phase, lease_id: box.lease?.leaseId ?? null };
+    const first = warmBoxes()[0] ?? null;
+    return { state: phase(), lease_id: first?.lease?.leaseId ?? null, ...poolView() };
   }
 }

@@ -6,7 +6,7 @@ const TX = `0x${"ab".repeat(32)}`;
 const payment = Buffer.from(JSON.stringify({ txHash: TX, signature: "0xsig" })).toString("base64");
 
 function fakeDeps(overrides = {}) {
-  const calls = { leases: 0, pulls: [], generations: [], ended: [], tunnels: 0, closed: 0 };
+  const calls = { leases: 0, pulls: [], generations: [], ended: [], tunnels: 0, closed: 0, slots: [] };
   let clock = 1_000_000;
   const deps = {
     calls,
@@ -31,13 +31,14 @@ function fakeDeps(overrides = {}) {
         calls.ended.push(lease.leaseId);
       },
     },
-    spawnTunnel: async () => {
+    spawnTunnel: async (_lease, slot) => {
       calls.tunnels += 1;
+      calls.slots.push(slot);
       return { close: () => (calls.closed += 1) };
     },
-    fetchOllama: async (path, init) => {
+    fetchOllama: async (slot, path, init) => {
       if (path === "/api/tags") return { ok: true, json: async () => ({ models: [] }) };
-      calls.generations.push(JSON.parse(init.body));
+      calls.generations.push({ slot, ...JSON.parse(init.body) });
       return {
         ok: true,
         json: async () => ({ response: "hello", prompt_eval_count: 5, eval_count: 7, total_duration: 2e9 }),
@@ -166,7 +167,7 @@ test("a replayed tx hash answers with the result it already bought", async () =>
 
 test("a failed generation does not consume the payment", async () => {
   const deps = fakeDeps({
-    fetchOllama: async (path) => {
+    fetchOllama: async (_slot, path) => {
       if (path === "/api/tags") return { ok: true, json: async () => ({}) };
       return { ok: false, status: 500 };
     },
@@ -348,7 +349,7 @@ test("a Base authorization is settled only after a generation exists", async () 
 test("a failed generation never broadcasts, so the payer keeps their money", async () => {
   const exact = fakeExact();
   const deps = fakeDeps({
-    fetchOllama: async (path) => {
+    fetchOllama: async (_slot, path) => {
       if (path === "/api/tags") return { ok: true, json: async () => ({ models: [] }) };
       return { ok: false, status: 500 };
     },

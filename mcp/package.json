@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/mcp",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "MCP server for leasing and running on Prism Network GPUs.",
   "mcpName": "io.github.prismnetwork-tech/mcp",
   "type": "module",
