@@ -492,6 +492,7 @@ pub fn verify_sev_snp_attestation(
 /// earns Attested, the guest half of confidential; the GPU CC verdict is the
 /// other half.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn verify_tdx_lease_attestation(
     lease_id: u64,
     node_id: &str,
@@ -500,9 +501,15 @@ pub fn verify_tdx_lease_attestation(
     events: &[TdxEvent],
     expected_report_data: &[u8; 64],
     expected_compose_hash: &[u8; 32],
+    guest_channel_key: &str,
     now: DateTime<Utc>,
     policy: &Policy,
 ) -> Result<LeaseTdxGuestVerdict, VerificationError> {
+    // Established before the quote is opened: a report data the caller built
+    // with a malformed key line could otherwise pass the binding check and
+    // then leave the verdict with no fingerprint the renter can pin.
+    let channel_key_fingerprint = channel_key_fingerprint(guest_channel_key)?;
+
     let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
     let report = tdx::verify_quote(quote, collateral_json, now_unix)?;
 
@@ -523,6 +530,7 @@ pub fn verify_tdx_lease_attestation(
         kind: AttestationKind::Tdx,
         device_identity: format!("tdx/{}", hex::encode(&bindings.instance_id)),
         compose_hash: hex::encode(bindings.compose_hash),
+        channel_key_fingerprint,
         measurement_digest: tdx_measurement_digest(&report),
         granted_class: TDX_GRANTABLE_CLASS,
         verifier_version: TDX_VERIFIER_VERSION.to_string(),

@@ -13,10 +13,10 @@ use base64::{
 };
 use chrono::Utc;
 use prism_protocol::{
-    AttestationChallenge, AttestationKind, AttestationVerdict, GpuCcAttestation,
-    LeaseGpuCcVerdict, LeaseTdxGuestVerdict, NodeAttestation, TdxLeaseAttestation,
-    UnsignedGpuCcAttestation, UnsignedNodeAttestation, UnsignedTdxLeaseAttestation,
-    attestation_report_nonce, node_id, tdx_lease_report_data, tdx_report_data,
+    AttestationChallenge, AttestationKind, AttestationVerdict, GpuCcAttestation, LeaseGpuCcVerdict,
+    LeaseTdxGuestVerdict, NodeAttestation, TdxLeaseAttestation, UnsignedGpuCcAttestation,
+    UnsignedNodeAttestation, UnsignedTdxLeaseAttestation, attestation_report_nonce, node_id,
+    tdx_lease_report_data, tdx_report_data,
 };
 use rand::RngCore;
 
@@ -195,23 +195,35 @@ pub async fn refresh_tdx(
 /// Fail-closed throughout: a challenge that cannot be fetched, a guest agent
 /// that does not answer, or collateral that cannot be assembled aborts the
 /// attestation rather than submitting a report that could never verify.
+#[allow(clippy::too_many_arguments)]
 pub async fn attest_lease_confidential(
     identity_path: &Path,
     control_plane: &str,
     socket: &Path,
     pccs_url: &str,
     lease_id: u64,
+    guest_channel_key: &str,
 ) -> anyhow::Result<()> {
     let identity = load_identity(identity_path)?;
     let key = signing_key(&identity)?;
     let node = node_id(&key.verifying_key());
     let client = attestation_client()?;
 
-    let challenge = lease_challenge(&client, control_plane, lease_id, "attestation/challenge", &node)
-        .await
-        .context("fetch the lease guest challenge")?;
-    let challenge_nonce = hex::decode(&challenge.nonce).context("lease challenge nonce is not hex")?;
-    let report_data = tdx_lease_report_data(&challenge_nonce, lease_id, &node);
+    let challenge = lease_challenge(
+        &client,
+        control_plane,
+        lease_id,
+        "attestation/challenge",
+        &node,
+    )
+    .await
+    .context("fetch the lease guest challenge")?;
+    let challenge_nonce =
+        hex::decode(&challenge.nonce).context("lease challenge nonce is not hex")?;
+    // The SSH host key the renter's session terminates on is bound into the
+    // quote, so a valid quote proves the renter is inside this measured TD and
+    // not a bare container beside it.
+    let report_data = tdx_lease_report_data(&challenge_nonce, lease_id, &node, guest_channel_key);
 
     let quoted = crate::dstack::get_quote(socket, &report_data)
         .await
@@ -229,12 +241,15 @@ pub async fn attest_lease_confidential(
             quote_base64: STANDARD.encode(&quoted.quote),
             tdx_event_log: quoted.event_log,
             tdx_collateral_json: collateral,
+            guest_channel_key: guest_channel_key.to_owned(),
             collected_at: Utc::now(),
         },
         &key,
     )?;
-    let endpoint =
-        control_plane_endpoint(control_plane, &format!("v1/leases/{lease_id}/tdx-attestation"))?;
+    let endpoint = control_plane_endpoint(
+        control_plane,
+        &format!("v1/leases/{lease_id}/tdx-attestation"),
+    )?;
     let response = client.post(endpoint).json(&tdx).send().await?;
     if !response.status().is_success() {
         return require_success(response).await;
@@ -247,7 +262,9 @@ pub async fn attest_lease_confidential(
             expires_at = %verdict.expires_at,
             "lease TDX guest verdict recorded"
         ),
-        Err(error) => tracing::info!(lease_id, %error, "lease TDX attestation accepted without a verdict body"),
+        Err(error) => {
+            tracing::info!(lease_id, %error, "lease TDX attestation accepted without a verdict body")
+        }
     }
 
     let gpu_challenge = lease_challenge(
@@ -259,7 +276,8 @@ pub async fn attest_lease_confidential(
     )
     .await
     .context("fetch the lease GPU-CC challenge")?;
-    let gpu_nonce = hex::decode(&gpu_challenge.nonce).context("GPU-CC challenge nonce is not hex")?;
+    let gpu_nonce =
+        hex::decode(&gpu_challenge.nonce).context("GPU-CC challenge nonce is not hex")?;
     let gpu_nonce: [u8; 32] = gpu_nonce
         .try_into()
         .map_err(|_| anyhow::anyhow!("GPU-CC challenge nonce is not 32 bytes"))?;
@@ -278,8 +296,10 @@ pub async fn attest_lease_confidential(
         },
         &key,
     )?;
-    let endpoint =
-        control_plane_endpoint(control_plane, &format!("v1/leases/{lease_id}/gpu-attestation"))?;
+    let endpoint = control_plane_endpoint(
+        control_plane,
+        &format!("v1/leases/{lease_id}/gpu-attestation"),
+    )?;
     let response = client.post(endpoint).json(&gpu).send().await?;
     if !response.status().is_success() {
         return require_success(response).await;
@@ -292,7 +312,9 @@ pub async fn attest_lease_confidential(
             expires_at = %verdict.expires_at,
             "lease GPU-CC verdict recorded"
         ),
-        Err(error) => tracing::info!(lease_id, %error, "lease GPU-CC attestation accepted without a verdict body"),
+        Err(error) => {
+            tracing::info!(lease_id, %error, "lease GPU-CC attestation accepted without a verdict body")
+        }
     }
     Ok(())
 }

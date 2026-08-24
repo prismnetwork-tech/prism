@@ -279,14 +279,22 @@ pub const TDX_LEASE_REPORT_DATA_DOMAIN: &[u8] = b"prism.tdx.lease-report-data.v1
 
 /// The `REPORT_DATA` a TD quotes for one lease. The lease id is in the digest
 /// because a quote taken for one renter's session must not be presentable for
-/// another's, the same reason it is in the SEV-SNP report data. SHA-512 fills
-/// all 64 bytes.
-pub fn tdx_lease_report_data(challenge_nonce: &[u8], lease_id: u64, node_id: &str) -> [u8; 64] {
+/// another's; the guest channel key is in it for the reason it is in the
+/// SEV-SNP report data, so the quote proves the renter's own session
+/// terminates inside the measured TD rather than that some measured TD merely
+/// booted on the node. SHA-512 fills all 64 bytes.
+pub fn tdx_lease_report_data(
+    challenge_nonce: &[u8],
+    lease_id: u64,
+    node_id: &str,
+    guest_channel_key: &str,
+) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(TDX_LEASE_REPORT_DATA_DOMAIN);
     hasher.update(challenge_nonce);
     hasher.update(lease_id.to_be_bytes());
     hasher.update(node_id.as_bytes());
+    hasher.update(guest_channel_key.as_bytes());
     let mut report_data = [0_u8; 64];
     report_data.copy_from_slice(&hasher.finalize());
     report_data
@@ -668,6 +676,9 @@ pub struct TdxLeaseAttestation {
     pub tdx_event_log: Vec<TdxEventEntry>,
     /// Intel PCS collateral bundle as JSON, so the verifier need not fetch it.
     pub tdx_collateral_json: String,
+    /// The OpenSSH public key line the TD generated for this lease, bound into
+    /// the quote's report data so the renter can pin the session's endpoint.
+    pub guest_channel_key: String,
     pub collected_at: DateTime<Utc>,
     pub signature: String,
 }
@@ -680,6 +691,7 @@ pub struct UnsignedTdxLeaseAttestation {
     pub quote_base64: String,
     pub tdx_event_log: Vec<TdxEventEntry>,
     pub tdx_collateral_json: String,
+    pub guest_channel_key: String,
     pub collected_at: DateTime<Utc>,
 }
 
@@ -697,6 +709,7 @@ impl TdxLeaseAttestation {
             quote_base64: unsigned.quote_base64,
             tdx_event_log: unsigned.tdx_event_log,
             tdx_collateral_json: unsigned.tdx_collateral_json,
+            guest_channel_key: unsigned.guest_channel_key,
             collected_at: unsigned.collected_at,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         };
@@ -713,6 +726,7 @@ impl TdxLeaseAttestation {
                 quote_base64: self.quote_base64.clone(),
                 tdx_event_log: self.tdx_event_log.clone(),
                 tdx_collateral_json: self.tdx_collateral_json.clone(),
+                guest_channel_key: self.guest_channel_key.clone(),
                 collected_at: self.collected_at,
             },
             &self.signature,
@@ -732,7 +746,7 @@ impl TdxLeaseAttestation {
         if self.lease_id == 0 {
             return Err(ProtocolError::InvalidAttestation);
         }
-        if self.quote_base64.is_empty() {
+        if self.quote_base64.is_empty() || self.guest_channel_key.is_empty() {
             return Err(ProtocolError::InvalidAttestation);
         }
         if self.quote_base64.len() > MAX_ATTESTATION_EVIDENCE_BYTES {
@@ -944,6 +958,9 @@ pub struct LeaseTdxGuestVerdict {
     pub device_identity: String,
     /// The compose file the event log bound the TD to.
     pub compose_hash: String,
+    /// The fingerprint of the guest channel key bound into the quote, so the
+    /// renter can pin the endpoint their session terminates on.
+    pub channel_key_fingerprint: String,
     pub measurement_digest: String,
     pub granted_class: TrustClass,
     pub verifier_version: String,
@@ -2707,6 +2724,32 @@ mod tests {
         );
     }
 
+    // The TD's quote is bound to the session's endpoint the same way the SNP
+    // report is: drop or change the channel key and the report data changes, so
+    // a quote proving some measured TD booted cannot answer a lease whose
+    // renter terminates on a different key.
+    #[test]
+    fn tdx_lease_report_data_binds_the_channel_key() {
+        let nonce = [0x22_u8; 32];
+        let bound = tdx_lease_report_data(&nonce, 7, "0xnode", GUEST_CHANNEL_KEY);
+        assert_ne!(
+            bound,
+            tdx_lease_report_data(&nonce, 7, "0xnode", "ssh-ed25519 AAAAother key")
+        );
+        assert_ne!(
+            bound,
+            tdx_lease_report_data(&nonce, 8, "0xnode", GUEST_CHANNEL_KEY)
+        );
+        assert_ne!(
+            bound,
+            tdx_lease_report_data(&nonce, 7, "0xother", GUEST_CHANNEL_KEY)
+        );
+        assert_ne!(
+            bound,
+            tdx_lease_report_data(&[0x23_u8; 32], 7, "0xnode", GUEST_CHANNEL_KEY)
+        );
+    }
+
     // Drop any one of the three and the report stops being about this guest, on
     // this lease, reachable at this key.
     #[test]
@@ -2803,6 +2846,7 @@ mod tests {
                 event_payload: String::new(),
             }],
             tdx_collateral_json: "{\"pck\":\"...\"}".to_owned(),
+            guest_channel_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 prism-lease".to_owned(),
             collected_at: Utc::now(),
         }
     }
@@ -3083,6 +3127,8 @@ mod tests {
             kind: AttestationKind::Tdx,
             device_identity: "tdx/instance".to_owned(),
             compose_hash: "a".repeat(64),
+            channel_key_fingerprint: "SHA256:0000000000000000000000000000000000000000000"
+                .to_owned(),
             measurement_digest: "c".repeat(64),
             granted_class: granted,
             verifier_version: "intel-tdx-guest/1".to_owned(),

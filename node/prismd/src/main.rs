@@ -188,6 +188,11 @@ enum CommandName {
         control_plane: String,
         #[arg(long)]
         lease_id: u64,
+        /// Path to the OpenSSH public host-key line the lease's SSH endpoint
+        /// presents. It is bound into the TDX quote so the renter can pin the
+        /// session's endpoint to the measured TD.
+        #[arg(long)]
+        guest_channel_key_file: PathBuf,
     },
     Commands {
         #[arg(long)]
@@ -689,17 +694,23 @@ async fn main() -> anyhow::Result<()> {
             identity,
             control_plane,
             lease_id,
+            guest_channel_key_file,
         } => {
             let socket = dstack::socket()
                 .context("no dstack guest agent socket: this is not a confidential VM")?;
             let pccs = std::env::var("PRISM_PCCS_URL")
                 .unwrap_or_else(|_| prism_pccs::PHALA_PCCS_URL.to_owned());
+            let guest_channel_key = fs::read_to_string(&guest_channel_key_file)
+                .context("read the guest channel key file")?
+                .trim()
+                .to_owned();
             attestation::attest_lease_confidential(
                 &identity,
                 &control_plane,
                 &socket,
                 &pccs,
                 lease_id,
+                &guest_channel_key,
             )
             .await?;
             println!("lease attestation accepted");

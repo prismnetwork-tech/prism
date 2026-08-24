@@ -132,7 +132,11 @@ pub async fn get_gpu_evidence(socket: &Path, nonce: &[u8; 32]) -> anyhow::Result
 
     let gpu = gpus
         .into_iter()
-        .find(|gpu| gpu.nonce.trim_start_matches("0x").eq_ignore_ascii_case(&requested))
+        .find(|gpu| {
+            gpu.nonce
+                .trim_start_matches("0x")
+                .eq_ignore_ascii_case(&requested)
+        })
         .context("no GPU answered the requested nonce")?;
     let report = STANDARD
         .decode(gpu.evidence.trim())
@@ -316,7 +320,10 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\n{leaf}\n-----END CERTIFICATE-----\n\
              -----BEGIN CERTIFICATE-----\n{root}\n-----END CERTIFICATE-----\n"
         );
-        assert_eq!(certificate_chain(&pem).unwrap(), vec![leaf.clone(), root.clone()]);
+        assert_eq!(
+            certificate_chain(&pem).unwrap(),
+            vec![leaf.clone(), root.clone()]
+        );
         assert_eq!(
             certificate_chain(&pem.replace('\n', "%0A")).unwrap(),
             vec![leaf, root]

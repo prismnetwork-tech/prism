@@ -29,14 +29,15 @@ use prism_protocol::{
     GuestAttestation, LeaseAccess, LeaseAttestationVerdict, LeaseGpuCcVerdict, LeaseQuote,
     LeaseRecord, LeaseRequest, LeaseState, LeaseTdxGuestVerdict, MAX_ESCROW_BASE_UNITS,
     MAX_LEASE_SECONDS, MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
-    MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_NAME_BYTES, MAX_WORKSPACES_PER_ACCOUNT,
-    NodeAttestation, NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
-    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture,
-    NodeTelemetry, STANDARD_RATE_PER_SECOND, SettlementEvidence, TdxEventEntry, TdxLeaseAttestation,
-    TrustClass, VaultEnvelope, VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot,
-    attestation_report_nonce, class_for_lease, class_for_verdict, discounted_rate, node_id,
-    snp_report_data, stake_discount_bps, tdx_lease_report_data, tdx_report_data,
-    vault_release_permitted, verifying_key,
+    MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_NAME_BYTES,
+    MAX_WORKSPACES_PER_ACCOUNT, NodeAttestation, NodeCertificateBundle, NodeCertificateRequest,
+    NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport,
+    NodeEnrollment, NodeOffer, NodePosture, NodeTelemetry, STANDARD_RATE_PER_SECOND,
+    SettlementEvidence, TdxEventEntry, TdxLeaseAttestation, TrustClass, VaultEnvelope, VaultItem,
+    VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot, attestation_report_nonce,
+    class_for_lease, class_for_verdict, discounted_rate, node_id, snp_report_data,
+    stake_discount_bps, tdx_lease_report_data, tdx_report_data, vault_release_permitted,
+    verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -620,8 +621,12 @@ fn verify_lease_tdx_attestation(
     let quote = decode_attestation_evidence(&attestation.quote_base64)?;
     let raw_nonce = hex::decode(nonce)
         .map_err(|_| StoreError::InvalidStoredState("attestation nonce is not hex".to_owned()))?;
-    let report_data =
-        tdx_lease_report_data(&raw_nonce, attestation.lease_id, &attestation.node_id);
+    let report_data = tdx_lease_report_data(
+        &raw_nonce,
+        attestation.lease_id,
+        &attestation.node_id,
+        &attestation.guest_channel_key,
+    );
     prism_attestation::verify_tdx_lease_attestation(
         attestation.lease_id,
         &attestation.node_id,
@@ -630,6 +635,7 @@ fn verify_lease_tdx_attestation(
         events,
         &report_data,
         compose_hash,
+        &attestation.guest_channel_key,
         now,
         policy,
     )
@@ -687,11 +693,28 @@ fn rederive_lease_class(market: &mut MemoryMarketplace, lease_id: u64, now: Date
     let snp = market.lease_verdicts.get(&lease_id).cloned();
     let tdx = market.lease_tdx_guest_verdicts.get(&lease_id).cloned();
     let gpu = market.lease_gpu_cc_verdicts.get(&lease_id).cloned();
+    let Some(node_id) = market.leases.get(&lease_id).map(|(_, r)| r.node_id.clone()) else {
+        return;
+    };
+    // The node's live class, not the lease's recorded one: a guest verdict
+    // arriving after the node's tunnel lapsed must not ride the class the lease
+    // held while the node was still healthy.
+    let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
+    let node_class = class_for_verdict(
+        &node_id,
+        market
+            .tunnels
+            .get(&node_id)
+            .is_some_and(|observed_at| *observed_at >= cutoff),
+        fresh_posture(market, &node_id, cutoff),
+        market.verdicts.get(&node_id),
+        now,
+    );
     if let Some((_, record)) = market.leases.get_mut(&lease_id) {
         record.trust_class = class_for_lease(
             lease_id,
             &record.node_id,
-            record.trust_class,
+            node_class,
             snp.as_ref(),
             tdx.as_ref(),
             gpu.as_ref(),
@@ -738,10 +761,43 @@ async fn rederive_lease_class_pg(
     .await
     .map_err(StoreError::Storage)?;
     if let Some(SqlJson(mut record)) = record {
+        // The node's live class, not the lease's recorded one, so a verdict
+        // arriving after the node's tunnel lapsed cannot ride a stale standing.
+        let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
+        let tunneled = query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM node_tunnels WHERE node_id = $1 AND observed_at >= $2)",
+        )
+        .bind(&record.node_id)
+        .bind(cutoff)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(StoreError::Storage)?;
+        let posture = query_scalar::<_, SqlJson<NodePosture>>(
+            "SELECT document->'posture' FROM node_telemetry WHERE node_id = $1 AND observed_at >= $2",
+        )
+        .bind(&record.node_id)
+        .bind(cutoff)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(StoreError::Storage)?;
+        let node_verdict = query_scalar::<_, SqlJson<AttestationVerdict>>(
+            "SELECT document FROM node_attestation_verdicts WHERE node_id = $1 AND expires_at > now()",
+        )
+        .bind(&record.node_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(StoreError::Storage)?;
+        let node_class = class_for_verdict(
+            &record.node_id,
+            tunneled,
+            posture.as_ref().map(|SqlJson(posture)| posture),
+            node_verdict.as_ref().map(|SqlJson(verdict)| verdict),
+            now,
+        );
         record.trust_class = class_for_lease(
             lease_id,
             &record.node_id,
-            record.trust_class,
+            node_class,
             snp.as_ref().map(|SqlJson(verdict)| verdict),
             tdx.as_ref().map(|SqlJson(verdict)| verdict),
             gpu.as_ref().map(|SqlJson(verdict)| verdict),
@@ -4244,15 +4300,6 @@ impl MarketplaceStore {
         let lease_id = lease.lease_id;
         let now = Utc::now();
         let compose_hash = lease_compose_hash(&lease.image)?;
-        let events = decode_tdx_events(&attestation.tdx_event_log).map_err(|reason| {
-            tracing::warn!(
-                lease_id,
-                node_id = %attestation.node_id,
-                reason,
-                "guest tdx event log rejected"
-            );
-            StoreError::AttestationUnverified
-        })?;
         let policy = policy.clone().with_lease_verdict_ttl(
             Duration::seconds(i64::from(lease.duration_seconds))
                 + Duration::hours(LEASE_VERDICT_PROVISIONING_SLACK_HOURS),
@@ -4274,6 +4321,15 @@ impl MarketplaceStore {
                     stored.consumed_at = Some(now);
                     stored.challenge.nonce.clone()
                 };
+                let events = decode_tdx_events(&attestation.tdx_event_log).map_err(|reason| {
+                    tracing::warn!(
+                        lease_id,
+                        node_id = %attestation.node_id,
+                        reason,
+                        "guest tdx event log rejected"
+                    );
+                    StoreError::AttestationUnverified
+                })?;
                 let verdict = verify_lease_tdx_attestation(
                     attestation,
                     &nonce,
@@ -4307,6 +4363,19 @@ impl MarketplaceStore {
                 .map_err(StoreError::Storage)?
                 else {
                     return Err(StoreError::AttestationChallengeUnavailable);
+                };
+                let events = match decode_tdx_events(&attestation.tdx_event_log) {
+                    Ok(events) => events,
+                    Err(reason) => {
+                        tracing::warn!(
+                            lease_id,
+                            node_id = %attestation.node_id,
+                            reason,
+                            "guest tdx event log rejected"
+                        );
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(StoreError::AttestationUnverified);
+                    }
                 };
                 let verdict = match verify_lease_tdx_attestation(
                     attestation,
@@ -4384,9 +4453,13 @@ impl MarketplaceStore {
                     return Err(StoreError::LeaseNotAttestable);
                 }
                 let node_id = lease.node_id.clone();
-                if let Some(live) = market.lease_gpu_cc_challenges.get(&lease_id).filter(|stored| {
-                    stored.consumed_at.is_none() && stored.challenge.expires_at > issued_at
-                }) {
+                if let Some(live) = market
+                    .lease_gpu_cc_challenges
+                    .get(&lease_id)
+                    .filter(|stored| {
+                        stored.consumed_at.is_none() && stored.challenge.expires_at > issued_at
+                    })
+                {
                     return Ok(live.challenge.clone());
                 }
                 let challenge = AttestationChallenge {
@@ -4499,15 +4572,16 @@ impl MarketplaceStore {
             Self::Memory(market) => {
                 let mut market = market.write().await;
                 let nonce = {
-                    let Some(stored) = market
-                        .lease_gpu_cc_challenges
-                        .get_mut(&lease_id)
-                        .filter(|stored| {
-                            stored.consumed_at.is_none()
-                                && stored.challenge.challenge_id == attestation.challenge_id
-                                && stored.challenge.node_id == attestation.node_id
-                                && stored.challenge.expires_at > now
-                        })
+                    let Some(stored) =
+                        market
+                            .lease_gpu_cc_challenges
+                            .get_mut(&lease_id)
+                            .filter(|stored| {
+                                stored.consumed_at.is_none()
+                                    && stored.challenge.challenge_id == attestation.challenge_id
+                                    && stored.challenge.node_id == attestation.node_id
+                                    && stored.challenge.expires_at > now
+                            })
                     else {
                         return Err(StoreError::AttestationChallengeUnavailable);
                     };
@@ -4518,7 +4592,9 @@ impl MarketplaceStore {
                 if verdict.lease_id != lease_id || verdict.node_id != lease.node_id {
                     return Err(StoreError::AttestationUnverified);
                 }
-                market.lease_gpu_cc_verdicts.insert(lease_id, verdict.clone());
+                market
+                    .lease_gpu_cc_verdicts
+                    .insert(lease_id, verdict.clone());
                 rederive_lease_class(&mut market, lease_id, now);
                 Ok(verdict)
             }
@@ -4539,22 +4615,22 @@ impl MarketplaceStore {
                 else {
                     return Err(StoreError::AttestationChallengeUnavailable);
                 };
-                let verdict = match verify_lease_gpu_cc_attestation(attestation, &nonce, now, &policy)
-                {
-                    Ok(verdict)
-                        if verdict.lease_id == lease_id && verdict.node_id == lease.node_id =>
-                    {
-                        verdict
-                    }
-                    Ok(_) => {
-                        transaction.commit().await.map_err(StoreError::Storage)?;
-                        return Err(StoreError::AttestationUnverified);
-                    }
-                    Err(error) => {
-                        transaction.commit().await.map_err(StoreError::Storage)?;
-                        return Err(error);
-                    }
-                };
+                let verdict =
+                    match verify_lease_gpu_cc_attestation(attestation, &nonce, now, &policy) {
+                        Ok(verdict)
+                            if verdict.lease_id == lease_id && verdict.node_id == lease.node_id =>
+                        {
+                            verdict
+                        }
+                        Ok(_) => {
+                            transaction.commit().await.map_err(StoreError::Storage)?;
+                            return Err(StoreError::AttestationUnverified);
+                        }
+                        Err(error) => {
+                            transaction.commit().await.map_err(StoreError::Storage)?;
+                            return Err(error);
+                        }
+                    };
                 query(
                     "INSERT INTO lease_gpu_cc_verdicts \
                          (lease_id, node_id, document, device_identity, measurement_digest, \
@@ -6239,7 +6315,10 @@ impl MarketplaceStore {
                         expires_at,
                     },
                     channel_key_fingerprint: verdict
-                        .map(|verdict| verdict.guest.channel_key_fingerprint.clone()),
+                        .map(|verdict| verdict.guest.channel_key_fingerprint.clone())
+                        .or_else(|| {
+                            tdx_verdict.map(|verdict| verdict.channel_key_fingerprint.clone())
+                        }),
                 }))
             }
             Self::Postgres(pool) => {
@@ -6329,8 +6408,9 @@ impl MarketplaceStore {
                 {
                     return Err(StoreError::LeaseUnattested);
                 }
-                let channel_key_fingerprint =
-                    verdict.map(|verdict| verdict.guest.channel_key_fingerprint);
+                let channel_key_fingerprint = verdict
+                    .map(|verdict| verdict.guest.channel_key_fingerprint)
+                    .or_else(|| tdx_verdict.map(|verdict| verdict.channel_key_fingerprint));
                 let direct = query_as::<_, (String, i32, chrono::DateTime<Utc>)>(
                     "SELECT ci.ssh_host, ci.ssh_port, \
                             lc.access_started_at + make_interval(secs => (l.document->>'duration_seconds')::integer) \
@@ -10577,6 +10657,7 @@ mod tests {
             kind: AttestationKind::Tdx,
             device_identity: format!("tdx/{}", "e".repeat(64)),
             compose_hash: "f".repeat(64),
+            channel_key_fingerprint: "SHA256:testtesttesttesttesttesttesttesttesttestte".to_owned(),
             measurement_digest: "0".repeat(64),
             granted_class: TrustClass::Attested,
             verifier_version: "test".to_owned(),
@@ -10612,6 +10693,7 @@ mod tests {
                 quote_base64: URL_SAFE_NO_PAD.encode([0_u8; 128]),
                 tdx_event_log: Vec::new(),
                 tdx_collateral_json: "{}".to_owned(),
+                guest_channel_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 prism-lease".to_owned(),
                 collected_at: Utc::now(),
             },
             &attestation_signing_key(),
@@ -10866,6 +10948,7 @@ mod tests {
                 quote_base64: STANDARD.encode(quote),
                 tdx_event_log: events,
                 tdx_collateral_json: collateral,
+                guest_channel_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 prism-lease".to_owned(),
                 collected_at: Utc::now(),
             },
             &attestation_signing_key(),
