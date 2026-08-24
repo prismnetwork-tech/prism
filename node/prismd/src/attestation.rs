@@ -13,8 +13,10 @@ use base64::{
 };
 use chrono::Utc;
 use prism_protocol::{
-    AttestationChallenge, AttestationKind, AttestationVerdict, NodeAttestation,
-    UnsignedNodeAttestation, attestation_report_nonce, node_id, tdx_report_data,
+    AttestationChallenge, AttestationKind, AttestationVerdict, GpuCcAttestation,
+    LeaseGpuCcVerdict, LeaseTdxGuestVerdict, NodeAttestation, TdxLeaseAttestation,
+    UnsignedGpuCcAttestation, UnsignedNodeAttestation, UnsignedTdxLeaseAttestation,
+    attestation_report_nonce, node_id, tdx_lease_report_data, tdx_report_data,
 };
 use rand::RngCore;
 
@@ -179,6 +181,149 @@ pub async fn refresh_tdx(
     Ok(())
 }
 
+/// Attest one lease at the confidential rung from inside its own dstack CVM.
+///
+/// This is the per-lease counterpart of [`refresh_tdx`], and it earns a lease
+/// the confidential class over two independent axes. The guest half quotes the
+/// TD against the lease's challenge, so a quote taken for one renter's session
+/// cannot back another; the GPU half collects a fresh NVIDIA CC report bound to
+/// its own challenge, so the card the lease is running on proves it holds VRAM
+/// in a single-GPU confidential mode. The control plane grants Confidential
+/// only when both land, so a miss on either leaves the lease at whatever the
+/// evidence substantiates rather than over-granting.
+///
+/// Fail-closed throughout: a challenge that cannot be fetched, a guest agent
+/// that does not answer, or collateral that cannot be assembled aborts the
+/// attestation rather than submitting a report that could never verify.
+pub async fn attest_lease_confidential(
+    identity_path: &Path,
+    control_plane: &str,
+    socket: &Path,
+    pccs_url: &str,
+    lease_id: u64,
+) -> anyhow::Result<()> {
+    let identity = load_identity(identity_path)?;
+    let key = signing_key(&identity)?;
+    let node = node_id(&key.verifying_key());
+    let client = attestation_client()?;
+
+    let challenge = lease_challenge(&client, control_plane, lease_id, "attestation/challenge", &node)
+        .await
+        .context("fetch the lease guest challenge")?;
+    let challenge_nonce = hex::decode(&challenge.nonce).context("lease challenge nonce is not hex")?;
+    let report_data = tdx_lease_report_data(&challenge_nonce, lease_id, &node);
+
+    let quoted = crate::dstack::get_quote(socket, &report_data)
+        .await
+        .context("take a lease quote from the dstack guest agent")?;
+    let collateral = prism_pccs::PccsClient::new(pccs_url)?
+        .collateral_for(&quoted.quote)
+        .await
+        .context("fetch collateral for the lease quote")?;
+
+    let tdx = TdxLeaseAttestation::sign(
+        UnsignedTdxLeaseAttestation {
+            node_id: node.clone(),
+            lease_id,
+            challenge_id: challenge.challenge_id,
+            quote_base64: STANDARD.encode(&quoted.quote),
+            tdx_event_log: quoted.event_log,
+            tdx_collateral_json: collateral,
+            collected_at: Utc::now(),
+        },
+        &key,
+    )?;
+    let endpoint =
+        control_plane_endpoint(control_plane, &format!("v1/leases/{lease_id}/tdx-attestation"))?;
+    let response = client.post(endpoint).json(&tdx).send().await?;
+    if !response.status().is_success() {
+        return require_success(response).await;
+    }
+    match response.json::<LeaseTdxGuestVerdict>().await {
+        Ok(verdict) => tracing::info!(
+            lease_id,
+            device = %verdict.device_identity,
+            class = verdict.granted_class.label(),
+            expires_at = %verdict.expires_at,
+            "lease TDX guest verdict recorded"
+        ),
+        Err(error) => tracing::info!(lease_id, %error, "lease TDX attestation accepted without a verdict body"),
+    }
+
+    let gpu_challenge = lease_challenge(
+        &client,
+        control_plane,
+        lease_id,
+        "gpu-attestation/challenge",
+        &node,
+    )
+    .await
+    .context("fetch the lease GPU-CC challenge")?;
+    let gpu_nonce = hex::decode(&gpu_challenge.nonce).context("GPU-CC challenge nonce is not hex")?;
+    let gpu_nonce: [u8; 32] = gpu_nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("GPU-CC challenge nonce is not 32 bytes"))?;
+
+    let evidence = crate::dstack::get_gpu_evidence(socket, &gpu_nonce)
+        .await
+        .context("collect GPU confidential-computing evidence from the guest agent")?;
+    let gpu = GpuCcAttestation::sign(
+        UnsignedGpuCcAttestation {
+            node_id: node.clone(),
+            lease_id,
+            challenge_id: gpu_challenge.challenge_id,
+            report_base64: STANDARD.encode(&evidence.report),
+            certificate_chain_base64: evidence.certificate_chain,
+            collected_at: Utc::now(),
+        },
+        &key,
+    )?;
+    let endpoint =
+        control_plane_endpoint(control_plane, &format!("v1/leases/{lease_id}/gpu-attestation"))?;
+    let response = client.post(endpoint).json(&gpu).send().await?;
+    if !response.status().is_success() {
+        return require_success(response).await;
+    }
+    match response.json::<LeaseGpuCcVerdict>().await {
+        Ok(verdict) => tracing::info!(
+            lease_id,
+            device = %verdict.device_identity,
+            class = verdict.granted_class.label(),
+            expires_at = %verdict.expires_at,
+            "lease GPU-CC verdict recorded"
+        ),
+        Err(error) => tracing::info!(lease_id, %error, "lease GPU-CC attestation accepted without a verdict body"),
+    }
+    Ok(())
+}
+
+/// Fetch one lease challenge and confirm it names this node. A challenge issued
+/// for another node means the lease is not running here, which is refused rather
+/// than answered with a report that could never bind.
+async fn lease_challenge(
+    client: &reqwest::Client,
+    control_plane: &str,
+    lease_id: u64,
+    suffix: &str,
+    node: &str,
+) -> anyhow::Result<AttestationChallenge> {
+    let endpoint =
+        control_plane_endpoint(control_plane, &format!("v1/leases/{lease_id}/{suffix}"))?;
+    let response = client.get(endpoint).send().await?;
+    if !response.status().is_success() {
+        require_success(response).await?;
+        unreachable!("require_success returns an error for a non-success response");
+    }
+    let challenge: AttestationChallenge = response
+        .json()
+        .await
+        .context("decode the lease attestation challenge")?;
+    if challenge.node_id != node {
+        anyhow::bail!("the control plane issued a lease challenge for another node");
+    }
+    Ok(challenge)
+}
+
 fn attestation_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -214,7 +359,7 @@ fn collect(mut command: Command) -> anyhow::Result<()> {
 /// One base64 DER per certificate, which is each PEM body with its armour and
 /// line breaks removed. Decoding as we go means a truncated chain fails here
 /// rather than at the verifier.
-fn split_chain(pem: &str) -> anyhow::Result<Vec<String>> {
+pub(crate) fn split_chain(pem: &str) -> anyhow::Result<Vec<String>> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
     let mut certificates = Vec::new();

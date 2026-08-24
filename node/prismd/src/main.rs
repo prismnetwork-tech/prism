@@ -176,6 +176,19 @@ enum CommandName {
         #[arg(long)]
         control_plane: String,
     },
+    /// Runs inside a dstack CVM to attest one lease at the confidential rung:
+    /// the guest agent quotes the TD and collects the GPU report, both bound to
+    /// the lease's own challenges, and the signed evidence goes to the control
+    /// plane. Requires the guest agent socket, so it does nothing on a host that
+    /// is not a confidential VM.
+    AttestLease {
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        control_plane: String,
+        #[arg(long)]
+        lease_id: u64,
+    },
     Commands {
         #[arg(long)]
         identity: PathBuf,
@@ -670,6 +683,26 @@ async fn main() -> anyhow::Result<()> {
         } => {
             attest_once(&identity, &control_plane).await?;
             println!("attestation accepted");
+            Ok(())
+        }
+        CommandName::AttestLease {
+            identity,
+            control_plane,
+            lease_id,
+        } => {
+            let socket = dstack::socket()
+                .context("no dstack guest agent socket: this is not a confidential VM")?;
+            let pccs = std::env::var("PRISM_PCCS_URL")
+                .unwrap_or_else(|_| prism_pccs::PHALA_PCCS_URL.to_owned());
+            attestation::attest_lease_confidential(
+                &identity,
+                &control_plane,
+                &socket,
+                &pccs,
+                lease_id,
+            )
+            .await?;
+            println!("lease attestation accepted");
             Ok(())
         }
         CommandName::Commands {
