@@ -580,16 +580,38 @@ fn the_ceiling_matches_the_evidence_on_file() {
         // which is a different thing from `captured`, a measurement read off
         // our own hardware. Both are real enough to anchor a rung; conflating
         // them would let a downloaded certificate pass as evidence about this
-        // machine.
+        // machine. `empty-refuses-all` is a reference set with no entries: it
+        // can anchor nothing and refuses everything, which is safe at any
+        // ceiling exactly as long as it really is empty.
         assert!(
             matches!(
                 entry.state.as_str(),
-                "placeholder" | "captured" | "vendor-published"
+                "placeholder" | "captured" | "vendor-published" | "empty-refuses-all"
             ),
             "{} has an unrecognised provenance state {}",
             entry.path,
             entry.state
         );
+        if entry.state == "empty-refuses-all" {
+            let raw = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&entry.path),
+            )
+            .unwrap_or_else(|_| panic!("{} is recorded but not on disk", entry.path));
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("reference JSON");
+            let entries = value
+                .get("launch_measurements")
+                .and_then(|list| list.as_array())
+                .unwrap_or_else(|| {
+                    panic!("{} does not carry a launch_measurements list", entry.path)
+                });
+            assert!(
+                entries.is_empty(),
+                "{} says empty-refuses-all but carries {} entries; record what they are",
+                entry.path,
+                entries.len()
+            );
+            continue;
+        }
         if entry.state != "placeholder" {
             continue;
         }

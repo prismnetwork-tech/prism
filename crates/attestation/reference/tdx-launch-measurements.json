@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "note": "Launch identities a TDX quote may present: MRTD plus the three boot-time runtime registers, taken together as one entry. The set ships empty, and an empty set refuses every quote. It is populated by measurements computed from a pinned meta-dstack release with dstack-mr and reproduced by someone who did not build the image, the same bar reference/snp-launch-measurements.json sets for SNP.",
+  "launch_measurements": []
+}

@@ -13,6 +13,12 @@ test-vectors = []
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
+# Intel's DCAP verification, verify-only: the `report` feature is what pulls in
+# a PCCS client and an async runtime, and it stays off so this crate remains a
+# pure function over bytes. The rustcrypto backend keeps the signature stack on
+# the same crates the rest of the tree already compiles. Declared here rather
+# than in the workspace table because no other crate touches DCAP.
+dcap-qvl = { version = "0.6.1", default-features = false, features = ["std", "rustcrypto", "default-x509"] }
 hex.workspace = true
 p384.workspace = true
 prism-protocol = { path = "../protocol" }

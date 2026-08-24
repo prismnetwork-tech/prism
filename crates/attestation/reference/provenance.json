@@ -43,6 +43,13 @@
       "state": "captured",
       "captured_from": "computed by sev-snp-measure from recorded boot inputs, confirmed byte-equal to a live SNP report from prism-node-01, 2026-08-17",
       "replaced_by": "measurements tools/snp-measure computes from the recorded firmware, kernel, initrd and cmdline, reproduced by someone who did not build the image"
+    },
+    {
+      "path": "reference/tdx-launch-measurements.json",
+      "rung": "attested",
+      "state": "empty-refuses-all",
+      "caveat": "The set is deliberately empty, so every TDX quote fails the launch-measurement check and no verdict is minted from this file. Unlike a placeholder there is nothing here for genuine hardware to accidentally match or for a review to mistake for real material.",
+      "replaced_by": "MRTD and RTMR0-2 computed from a pinned meta-dstack release with dstack-mr, reproduced independently of whoever built the image, before any TDX verdict can grant attested"
     }
   ]
 }

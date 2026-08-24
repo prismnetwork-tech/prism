@@ -7,18 +7,21 @@ use prism_protocol::SnpTcb;
 use serde::Deserialize;
 
 use crate::snp::ProductLine;
+use crate::tdx::{TdxLaunchIdentity, TdxMeasurementSet};
 
 /// Reference measurements are compiled in rather than fetched, so a verdict
 /// cannot be widened by anything an operator can reach at runtime.
 const MEASUREMENT_ALLOWLIST: &str = include_str!("../reference/h100-measurements.json");
 const SNP_PLATFORM: &str = include_str!("../reference/snp-platform.json");
 const SNP_LAUNCH_MEASUREMENTS: &str = include_str!("../reference/snp-launch-measurements.json");
+const TDX_LAUNCH_MEASUREMENTS: &str = include_str!("../reference/tdx-launch-measurements.json");
 
 const ALLOWLIST_SCHEMA_VERSION: u32 = 2;
-// Three separate files, three separate schemas. Sharing one constant meant
-// widening the measurement format silently invalidated the other two.
+// Separate files, separate schemas. Sharing one constant meant widening the
+// measurement format silently invalidated the others.
 const PLATFORM_SCHEMA_VERSION: u32 = 1;
 const LAUNCH_SCHEMA_VERSION: u32 = 1;
+const TDX_LAUNCH_SCHEMA_VERSION: u32 = 1;
 
 const DEFAULT_VERDICT_TTL_HOURS: i64 = 24;
 
@@ -42,6 +45,13 @@ pub struct Policy {
     /// Not even present in a service build.
     #[cfg(any(test, feature = "test-vectors"))]
     trust_test_root: bool,
+    /// Launch identities the tests accept in place of the compiled reference
+    /// set. A genuine Intel-signed quote cannot be fabricated the way the
+    /// NVIDIA and SNP report builders fabricate reports, so the vectors verify
+    /// a real vendored quote and inject its identity here. Not even present in
+    /// a service build.
+    #[cfg(any(test, feature = "test-vectors"))]
+    tdx_test_identities: Option<TdxMeasurementSet>,
 }
 
 impl Default for Policy {
@@ -52,6 +62,8 @@ impl Default for Policy {
             allow_expired_certificates: false,
             #[cfg(any(test, feature = "test-vectors"))]
             trust_test_root: false,
+            #[cfg(any(test, feature = "test-vectors"))]
+            tdx_test_identities: None,
         }
     }
 }
@@ -93,6 +105,23 @@ impl Policy {
     pub fn allowing_expired_certificates(mut self) -> Self {
         self.allow_expired_certificates = true;
         self
+    }
+
+    /// Accepts these launch identities in place of the compiled TDX reference
+    /// set, which ships empty. Vectors verify a real vendored quote, so the
+    /// identity they inject is one a genuine platform actually produced.
+    #[cfg(any(test, feature = "test-vectors"))]
+    pub fn with_tdx_test_identities(mut self, identities: Vec<TdxLaunchIdentity>) -> Self {
+        self.tdx_test_identities = Some(TdxMeasurementSet::new(identities));
+        self
+    }
+
+    pub(crate) fn tdx_measurements(&self) -> &TdxMeasurementSet {
+        #[cfg(any(test, feature = "test-vectors"))]
+        if let Some(identities) = &self.tdx_test_identities {
+            return identities;
+        }
+        tdx_launch_measurements()
     }
 }
 
@@ -342,6 +371,58 @@ pub(crate) fn snp_launch_measurements() -> &'static SnpLaunchMeasurements {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct TdxLaunchFile {
+    schema_version: u32,
+    launch_measurements: Vec<TdxLaunchEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TdxLaunchEntry {
+    image_version: String,
+    mr_td: String,
+    rtmr0: String,
+    rtmr1: String,
+    rtmr2: String,
+}
+
+/// Unlike the SNP loader this one accepts an empty file: the set ships empty
+/// until measurements reproduced from a pinned dstack release exist, and an
+/// empty set refuses every quote rather than trusting anything. The SNP
+/// assert protects a rung that is served today; nothing is served off this
+/// file yet, and refusing all is the correct meaning of having no reference.
+pub(crate) fn tdx_launch_measurements() -> &'static TdxMeasurementSet {
+    static MEASUREMENTS: OnceLock<TdxMeasurementSet> = OnceLock::new();
+    MEASUREMENTS.get_or_init(|| {
+        let file: TdxLaunchFile = serde_json::from_str(TDX_LAUNCH_MEASUREMENTS)
+            .expect("reference/tdx-launch-measurements.json is not valid JSON");
+        assert_eq!(
+            file.schema_version, TDX_LAUNCH_SCHEMA_VERSION,
+            "reference/tdx-launch-measurements.json schema version is not understood by this verifier"
+        );
+
+        let digest = |label: &str, image: &str, hexed: &str| -> [u8; 48] {
+            hex::decode(hexed)
+                .ok()
+                .and_then(|raw| raw.try_into().ok())
+                .unwrap_or_else(|| {
+                    panic!("launch identity {image} carries a {label} that is not a 48 byte hex digest")
+                })
+        };
+        let identities = file
+            .launch_measurements
+            .iter()
+            .map(|entry| TdxLaunchIdentity {
+                mr_td: digest("mr_td", &entry.image_version, &entry.mr_td),
+                rtmr0: digest("rtmr0", &entry.image_version, &entry.rtmr0),
+                rtmr1: digest("rtmr1", &entry.image_version, &entry.rtmr1),
+                rtmr2: digest("rtmr2", &entry.image_version, &entry.rtmr2),
+            })
+            .collect();
+        TdxMeasurementSet::new(identities)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +430,14 @@ mod tests {
     #[test]
     fn allowlist_parses_and_is_not_empty() {
         assert!(measurement_allowlist().len() > 0);
+    }
+
+    /// The shipped TDX reference set is empty on purpose, and empty means
+    /// nothing verifies. Populating it is what flips this test, which is the
+    /// point: the change shows up here and in provenance.json together.
+    #[test]
+    fn the_tdx_reference_ships_empty_and_refuses_everything() {
+        assert!(tdx_launch_measurements().is_empty());
     }
 
     #[test]

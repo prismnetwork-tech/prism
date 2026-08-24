@@ -28,6 +28,7 @@ mod chain;
 mod nvidia;
 mod policy;
 mod snp;
+mod tdx;
 
 pub use policy::Policy;
 
@@ -38,11 +39,14 @@ pub use snp::SnpReportBuilder;
 /// Not a test helper: the control plane reads this before verification to work
 /// out which certificate to fetch.
 pub use snp::{ClaimedOrigin, claimed_origin};
+#[cfg(any(test, feature = "test-vectors"))]
+pub use tdx::TdxLaunchIdentity;
 
 /// Bumped whenever a check changes, so a verdict recorded by an older verifier
 /// can be told apart from one this build would issue today.
 pub const VERIFIER_VERSION: &str = "nvidia-gpu/1";
 pub const SNP_VERIFIER_VERSION: &str = "sev-snp-guest/1";
+pub const TDX_VERIFIER_VERSION: &str = "intel-tdx-guest/1";
 
 /// A device report proves which GPU signed it and what firmware that GPU runs.
 /// It says nothing about what host software booted, so GPU evidence stops at
@@ -60,6 +64,14 @@ pub const MAX_GRANTABLE_CLASS: TrustClass = TrustClass::Isolated;
 /// [`prism_protocol::class_for_lease`]. This constant says what the evidence
 /// earns; that one says what the network can substantiate.
 pub const SNP_GRANTABLE_CLASS: TrustClass = TrustClass::Attested;
+
+/// A verified TDX quote proves the same kind of thing a SNP report does: what
+/// image the TD was launched from, on a genuine processor at the collateral's
+/// patch level, with our challenge bound into `REPORT_DATA`. It stops at the
+/// same rung for the same reason. It says nothing about what has been extended
+/// into `RTMR3` at runtime and nothing about a GPU, and the confidential rung
+/// is exactly the claim those two missing checks would have to back.
+pub const TDX_GRANTABLE_CLASS: TrustClass = TrustClass::Attested;
 
 /// Vendor chains are short. Anything longer is either a mistake or an attempt
 /// to make the walk expensive.
@@ -143,6 +155,20 @@ pub enum VerificationError {
     SnpTcbBelowFloor,
     #[error("guest channel key is not an OpenSSH public key line")]
     SnpChannelKeyMalformed,
+    #[error("TDX collateral is not the JSON form Intel's verification consumes")]
+    TdxCollateralMalformed,
+    #[error("TDX quote did not survive Intel's DCAP verification against the supplied collateral")]
+    TdxQuoteRejected,
+    #[error(
+        "TDX platform TCB status is not UpToDate, or Intel has published advisories against it"
+    )]
+    TdxTcbStatusNotAccepted,
+    #[error("TDX quote does not carry a TD report this verifier decodes")]
+    TdxNotTdQuote,
+    #[error("TDX quote answers different report data")]
+    TdxReportDataMismatch,
+    #[error("TDX quote carries a launch identity that is not in the reference set")]
+    TdxUnknownLaunchMeasurement,
 }
 
 /// Verifies one GPU attestation and, on success, returns the class it earns.
@@ -191,6 +217,78 @@ pub fn verify_nvidia_gpu_attestation(
         verified_at: now,
         expires_at: now + policy.verdict_ttl,
     })
+}
+
+/// Verifies one TDX quote and, on success, returns the class it earns.
+///
+/// The collateral (Intel's TCB info, QE identity and revocation lists for the
+/// platform that produced the quote) is fetched by the caller, the way the
+/// control plane already fetches VCEKs from AMD. Passing it in keeps this
+/// crate offline; judging it stays here.
+///
+/// `expected_report_data` is the caller's binding of its own challenge to this
+/// node. Comparing it here is what makes a quote captured from another TD, or
+/// replayed from an earlier session, worthless.
+///
+/// The verdict's `device_identity` is the launch identity (`MRTD`), which
+/// names the image and not a physical machine: two TDs launched from one
+/// image share it. Nothing may treat it as unique per node until runtime
+/// register replay binds an instance identity, so TDX verdicts must not feed
+/// the unique-device index the GPU path relies on.
+pub fn verify_tdx_attestation(
+    attestation: &NodeAttestation,
+    collateral_json: &str,
+    expected_report_data: &[u8; 64],
+    now: DateTime<Utc>,
+    policy: &Policy,
+) -> Result<AttestationVerdict, VerificationError> {
+    if attestation.kind != AttestationKind::Tdx {
+        return Err(VerificationError::MalformedEvidence);
+    }
+
+    let quote = decode_base64(&attestation.evidence_base64)?;
+    // A clock before the epoch cannot be a real verification time; zero makes
+    // every collateral validity check fail, which refuses the quote.
+    let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
+    let report = tdx::verify_quote(&quote, collateral_json, now_unix)?;
+
+    if !bool::from(report.report_data.ct_eq(expected_report_data)) {
+        return Err(VerificationError::TdxReportDataMismatch);
+    }
+
+    if !policy.tdx_measurements().accepts(&report) {
+        return Err(VerificationError::TdxUnknownLaunchMeasurement);
+    }
+
+    Ok(AttestationVerdict {
+        node_id: attestation.node_id.clone(),
+        kind: AttestationKind::Tdx,
+        device_identity: format!("tdx/{}", hex::encode(report.mr_td)),
+        measurement_digest: tdx_measurement_digest(&report),
+        claimed_capability: attestation.capability,
+        granted_class: TDX_GRANTABLE_CLASS,
+        verifier_version: TDX_VERIFIER_VERSION.to_string(),
+        verified_at: now,
+        expires_at: now + policy.verdict_ttl,
+    })
+}
+
+/// `RTMR3` is folded in even though the launch check ignores it: a TD whose
+/// runtime registers moved is in a different state, and two verdicts over
+/// different states must not hash the same.
+fn tdx_measurement_digest(report: &tdx::TdReport) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"prism-attestation/tdx-measurements/1\n");
+    for (label, digest) in [
+        ("mr_td", &report.mr_td),
+        ("rtmr0", &report.rtmr0),
+        ("rtmr1", &report.rtmr1),
+        ("rtmr2", &report.rtmr2),
+        ("rtmr3", &report.rtmr3),
+    ] {
+        hasher.update(format!("{label} {}\n", hex::encode(digest)));
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// What the control plane already knows before it opens a report, and what the
@@ -417,6 +515,16 @@ mod tests {
     fn a_guest_report_earns_attested_and_never_outruns_the_ceiling() {
         assert_eq!(SNP_GRANTABLE_CLASS, TrustClass::Attested);
         assert!(SNP_GRANTABLE_CLASS <= prism_protocol::MAX_VERIFIABLE_TRUST_CLASS);
+    }
+
+    /// TDX evidence is host-boot integrity, the same claim SNP makes with
+    /// different silicon, so it earns the same rung and obeys the same clamp.
+    /// Confidential is what RTMR3 replay plus GPU CC evidence would have to
+    /// earn together, and neither verifier exists yet.
+    #[test]
+    fn a_tdx_quote_earns_attested_and_never_outruns_the_ceiling() {
+        assert_eq!(TDX_GRANTABLE_CLASS, TrustClass::Attested);
+        assert!(TDX_GRANTABLE_CLASS <= prism_protocol::MAX_VERIFIABLE_TRUST_CLASS);
     }
 
     #[test]
