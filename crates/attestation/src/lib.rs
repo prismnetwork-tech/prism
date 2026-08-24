@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use p384::elliptic_curve::subtle::ConstantTimeEq;
 use prism_protocol::{
     AttestationKind, AttestationVerdict, AttestedGuest, GuestAttestation, LeaseAttestationVerdict,
-    LeaseGpuCcVerdict, NodeAttestation, TrustClass,
+    LeaseGpuCcVerdict, LeaseTdxGuestVerdict, NodeAttestation, TrustClass,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -478,6 +478,54 @@ pub fn verify_sev_snp_attestation(
         },
         granted_class: SNP_GRANTABLE_CLASS,
         verifier_version: SNP_VERIFIER_VERSION.to_string(),
+        verified_at: now,
+        expires_at: now + policy.lease_verdict_ttl,
+    })
+}
+
+/// Verifies one TDX quote as the guest half of a lease and, on success,
+/// returns the guest verdict that lease earns.
+///
+/// This is the lease-bound counterpart of [`verify_tdx_attestation`]: the same
+/// quote, event log and collateral, but the report data binds the lease rather
+/// than the node, so a quote taken for one session cannot back another. It
+/// earns Attested, the guest half of confidential; the GPU CC verdict is the
+/// other half.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_tdx_lease_attestation(
+    lease_id: u64,
+    node_id: &str,
+    quote: &[u8],
+    collateral_json: &str,
+    events: &[TdxEvent],
+    expected_report_data: &[u8; 64],
+    expected_compose_hash: &[u8; 32],
+    now: DateTime<Utc>,
+    policy: &Policy,
+) -> Result<LeaseTdxGuestVerdict, VerificationError> {
+    let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
+    let report = tdx::verify_quote(quote, collateral_json, now_unix)?;
+
+    if !bool::from(report.report_data.ct_eq(expected_report_data)) {
+        return Err(VerificationError::TdxReportDataMismatch);
+    }
+    if !policy.tdx_measurements().accepts(&report) {
+        return Err(VerificationError::TdxUnknownLaunchMeasurement);
+    }
+    let bindings = tdx::verify_tdx_event_log(&report, events)?;
+    if !bool::from(bindings.compose_hash.ct_eq(expected_compose_hash)) {
+        return Err(VerificationError::TdxComposeHashMismatch);
+    }
+
+    Ok(LeaseTdxGuestVerdict {
+        lease_id,
+        node_id: node_id.to_string(),
+        kind: AttestationKind::Tdx,
+        device_identity: format!("tdx/{}", hex::encode(&bindings.instance_id)),
+        compose_hash: hex::encode(bindings.compose_hash),
+        measurement_digest: tdx_measurement_digest(&report),
+        granted_class: TDX_GRANTABLE_CLASS,
+        verifier_version: TDX_VERIFIER_VERSION.to_string(),
         verified_at: now,
         expires_at: now + policy.lease_verdict_ttl,
     })

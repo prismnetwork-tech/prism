@@ -3885,6 +3885,7 @@ impl MarketplaceStore {
                         record.trust_class,
                         Some(&verdict),
                         None,
+                        None,
                         now,
                     );
                     record.updated_at = now;
@@ -4005,6 +4006,7 @@ impl MarketplaceStore {
                         &record.node_id,
                         record.trust_class,
                         Some(&verdict),
+                        None,
                         None,
                         now,
                     );
@@ -4462,6 +4464,7 @@ impl MarketplaceStore {
                     quote.trust_class,
                     None,
                     None,
+                    None,
                     now,
                 );
                 if market
@@ -4597,6 +4600,7 @@ impl MarketplaceStore {
                     lease.lease_id,
                     &lease.node_id,
                     quote.trust_class,
+                    None,
                     None,
                     None,
                     now,
@@ -5645,7 +5649,7 @@ impl MarketplaceStore {
                     market.verdicts.get(&lease.node_id),
                     now,
                 );
-                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, None, now)
+                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, None, None, now)
                     < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
@@ -5735,7 +5739,7 @@ impl MarketplaceStore {
                     node_verdict.as_ref().map(|SqlJson(verdict)| verdict),
                     now,
                 );
-                if class_for_lease(lease_id, &node_id, node_class, verdict.as_ref(), None, now)
+                if class_for_lease(lease_id, &node_id, node_class, verdict.as_ref(), None, None, now)
                     < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
@@ -9286,6 +9290,7 @@ mod tests {
                         GUEST_LEASE_ID,
                         &attested_node_id(),
                         quoted_class,
+                        None,
                         None,
                         None,
                         Utc::now(),

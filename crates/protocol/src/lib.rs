@@ -273,6 +273,22 @@ pub const MAX_TDX_EVENT_PAYLOAD_BYTES: usize = 4 * 1_024;
 pub const MAX_TDX_COLLATERAL_BYTES: usize = 128 * 1_024;
 
 pub const TDX_REPORT_DATA_DOMAIN: &[u8] = b"prism.tdx.report-data.v1\0";
+pub const TDX_LEASE_REPORT_DATA_DOMAIN: &[u8] = b"prism.tdx.lease-report-data.v1\0";
+
+/// The `REPORT_DATA` a TD quotes for one lease. The lease id is in the digest
+/// because a quote taken for one renter's session must not be presentable for
+/// another's, the same reason it is in the SEV-SNP report data. SHA-512 fills
+/// all 64 bytes.
+pub fn tdx_lease_report_data(challenge_nonce: &[u8], lease_id: u64, node_id: &str) -> [u8; 64] {
+    let mut hasher = Sha512::new();
+    hasher.update(TDX_LEASE_REPORT_DATA_DOMAIN);
+    hasher.update(challenge_nonce);
+    hasher.update(lease_id.to_be_bytes());
+    hasher.update(node_id.as_bytes());
+    let mut report_data = [0_u8; 64];
+    report_data.copy_from_slice(&hasher.finalize());
+    report_data
+}
 
 /// REPORT_DATA is the only field of a TDX quote the guest chooses. Binding the
 /// control plane's nonce to the node id and the device key ties the quote to
@@ -714,6 +730,34 @@ pub fn lease_gpu_cc_verdict_digest(verdict: &LeaseGpuCcVerdict) -> Result<String
     Ok(hex::encode(Sha256::digest(canonical_json(verdict)?)))
 }
 
+/// What the control plane concluded about the guest of one lease from a TDX
+/// quote: the lease runs inside a genuine TD, launched from a known image,
+/// bound to this lease through the quote's report data. It is the TDX
+/// counterpart of the SEV-SNP guest half of [`LeaseAttestationVerdict`], kept
+/// as its own type because a TD's evidence is an image measurement and a
+/// runtime-register binding, not the SEV-SNP chip and VMSA columns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseTdxGuestVerdict {
+    pub lease_id: u64,
+    pub node_id: String,
+    pub kind: AttestationKind,
+    /// The instance identity the TD extended into RTMR3, unique per deployment.
+    pub device_identity: String,
+    /// The compose file the event log bound the TD to.
+    pub compose_hash: String,
+    pub measurement_digest: String,
+    pub granted_class: TrustClass,
+    pub verifier_version: String,
+    pub verified_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub fn lease_tdx_guest_verdict_digest(
+    verdict: &LeaseTdxGuestVerdict,
+) -> Result<String, ProtocolError> {
+    Ok(hex::encode(Sha256::digest(canonical_json(verdict)?)))
+}
+
 /// The class one lease is served at. A guest report is evidence about a single
 /// VM, so it lifts a single lease and never the node: an operator who boots the
 /// blessed image once and serves everyone else from a bare container gets
@@ -732,10 +776,14 @@ pub fn class_for_lease(
     node_id: &str,
     node_class: TrustClass,
     guest_verdict: Option<&LeaseAttestationVerdict>,
+    tdx_guest_verdict: Option<&LeaseTdxGuestVerdict>,
     gpu_cc_verdict: Option<&LeaseGpuCcVerdict>,
     now: DateTime<Utc>,
 ) -> TrustClass {
     let guest_bound = |verdict: &&LeaseAttestationVerdict| {
+        verdict.lease_id == lease_id && verdict.node_id == node_id && verdict.expires_at > now
+    };
+    let tdx_bound = |verdict: &&LeaseTdxGuestVerdict| {
         verdict.lease_id == lease_id && verdict.node_id == node_id && verdict.expires_at > now
     };
     let gpu_bound = |verdict: &&LeaseGpuCcVerdict| {
@@ -744,12 +792,16 @@ pub fn class_for_lease(
 
     // The node must already stand at `Isolated`, because a guest report says
     // nothing about the bonded identity, the live tunnel or the GPU
-    // underneath it and cannot stand in for them.
-    let guest_attested = guest_verdict.filter(guest_bound).is_some_and(|verdict| {
-        matches!(verdict.kind, AttestationKind::SevSnp | AttestationKind::Tdx)
-            && verdict.granted_class >= TrustClass::Attested
-            && node_class >= TrustClass::Isolated
+    // underneath it and cannot stand in for them. Either guest kind proves the
+    // same thing on its own silicon: a SEV-SNP guest report or a TDX quote,
+    // each bound to this lease and each earning Attested.
+    let snp_attested = guest_verdict.filter(guest_bound).is_some_and(|verdict| {
+        verdict.kind == AttestationKind::SevSnp && verdict.granted_class >= TrustClass::Attested
     });
+    let tdx_attested = tdx_guest_verdict.filter(tdx_bound).is_some_and(|verdict| {
+        verdict.kind == AttestationKind::Tdx && verdict.granted_class >= TrustClass::Attested
+    });
+    let guest_attested = (snp_attested || tdx_attested) && node_class >= TrustClass::Isolated;
     let vram_confidential = gpu_cc_verdict.filter(gpu_bound).is_some_and(|verdict| {
         verdict.kind == AttestationKind::NvidiaCc
             && verdict.granted_class >= TrustClass::Confidential
@@ -2648,7 +2700,7 @@ mod tests {
 
         for (name, node, node_class, verdict, expected) in cases {
             assert_eq!(
-                class_for_lease(7, node, node_class, verdict, None, now),
+                class_for_lease(7, node, node_class, verdict, None, None, now),
                 expected.min(MAX_VERIFIABLE_TRUST_CLASS),
                 "{name}"
             );
@@ -2673,7 +2725,7 @@ mod tests {
         ] {
             for verdict in [None, Some(&overreaching)] {
                 assert!(
-                    class_for_lease(7, "0xabc", node_class, verdict, None, now)
+                    class_for_lease(7, "0xabc", node_class, verdict, None, None, now)
                         <= MAX_VERIFIABLE_TRUST_CLASS
                 );
             }
@@ -2687,6 +2739,25 @@ mod tests {
     /// whether the network can serve what the evidence earned: today it
     /// clamps to Attested, and this test states both facts so moving the
     /// ceiling flips the second assertion and not the derivation.
+    fn tdx_guest_verdict_at(
+        lease_id: u64,
+        granted: TrustClass,
+        expires_at: DateTime<Utc>,
+    ) -> LeaseTdxGuestVerdict {
+        LeaseTdxGuestVerdict {
+            lease_id,
+            node_id: "0xabc".to_owned(),
+            kind: AttestationKind::Tdx,
+            device_identity: "tdx/instance".to_owned(),
+            compose_hash: "a".repeat(64),
+            measurement_digest: "c".repeat(64),
+            granted_class: granted,
+            verifier_version: "intel-tdx-guest/1".to_owned(),
+            verified_at: expires_at - chrono::Duration::hours(1),
+            expires_at,
+        }
+    }
+
     fn gpu_cc_verdict_at(
         lease_id: u64,
         kind: AttestationKind,
@@ -2711,7 +2782,7 @@ mod tests {
         let now = Utc::now();
         let fresh = now + chrono::Duration::hours(2);
         let snp = lease_verdict_at(7, AttestationKind::SevSnp, TrustClass::Attested, fresh);
-        let tdx = lease_verdict_at(7, AttestationKind::Tdx, TrustClass::Attested, fresh);
+        let tdx = tdx_guest_verdict_at(7, TrustClass::Attested, fresh);
         let cc = gpu_cc_verdict_at(
             7,
             AttestationKind::NvidiaCc,
@@ -2724,7 +2795,6 @@ mod tests {
             TrustClass::Confidential,
             now - chrono::Duration::minutes(1),
         );
-        // A GPU verdict of the wrong kind earns nothing in the CC slot.
         let cc_wrong_kind = gpu_cc_verdict_at(
             7,
             AttestationKind::NvidiaGpu,
@@ -2732,25 +2802,61 @@ mod tests {
             fresh,
         );
 
-        for guest in [&snp, &tdx] {
-            let derived = class_for_lease(
+        // Either guest half plus the GPU half reaches Confidential: SNP in the
+        // guest slot, TDX in its own slot.
+        assert_eq!(
+            class_for_lease(
                 7,
                 "0xabc",
                 TrustClass::Isolated,
-                Some(guest),
+                Some(&snp),
+                None,
                 Some(&cc),
-                now,
-            );
-            assert_eq!(derived, TrustClass::Confidential);
-        }
+                now
+            ),
+            TrustClass::Confidential
+        );
+        assert_eq!(
+            class_for_lease(
+                7,
+                "0xabc",
+                TrustClass::Isolated,
+                None,
+                Some(&tdx),
+                Some(&cc),
+                now
+            ),
+            TrustClass::Confidential
+        );
 
         assert_eq!(
-            class_for_lease(7, "0xabc", TrustClass::Isolated, None, Some(&cc), now),
+            class_for_lease(7, "0xabc", TrustClass::Isolated, None, None, Some(&cc), now),
             TrustClass::Isolated,
             "a CC verdict alone lifts nothing"
         );
+        // Either guest half alone earns Attested.
         assert_eq!(
-            class_for_lease(7, "0xabc", TrustClass::Isolated, Some(&tdx), None, now),
+            class_for_lease(
+                7,
+                "0xabc",
+                TrustClass::Isolated,
+                Some(&snp),
+                None,
+                None,
+                now
+            ),
+            TrustClass::Attested
+        );
+        assert_eq!(
+            class_for_lease(
+                7,
+                "0xabc",
+                TrustClass::Isolated,
+                None,
+                Some(&tdx),
+                None,
+                now
+            ),
             TrustClass::Attested
         );
         assert_eq!(
@@ -2759,24 +2865,38 @@ mod tests {
                 "0xabc",
                 TrustClass::Isolated,
                 Some(&snp),
+                None,
                 Some(&stale_cc),
                 now
             ),
             TrustClass::Attested,
             "a stale CC verdict subtracts the confidential half only"
         );
-        // A CC verdict of the wrong attestation kind is not the VRAM claim,
-        // so the pair does not reach Confidential.
+        // A CC verdict of the wrong attestation kind is not the VRAM claim.
         assert_eq!(
             class_for_lease(
                 7,
                 "0xabc",
                 TrustClass::Isolated,
                 Some(&snp),
+                None,
                 Some(&cc_wrong_kind),
                 now
             ),
             TrustClass::Attested
+        );
+        // The guest half still needs the node standing at Isolated.
+        assert_eq!(
+            class_for_lease(
+                7,
+                "0xabc",
+                TrustClass::Open,
+                None,
+                Some(&tdx),
+                Some(&cc),
+                now
+            ),
+            TrustClass::Open
         );
     }
 

@@ -225,6 +225,7 @@ fn a_good_report_and_chain_earn_attested_while_the_served_class_stays_clamped() 
             TrustClass::Isolated,
             Some(&verdict),
             None,
+            None,
             now()
         ),
         TrustClass::Attested
