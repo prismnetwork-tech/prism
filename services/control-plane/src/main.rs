@@ -25,17 +25,18 @@ use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use prism_protocol::{
     Account, AttestationChallenge, AttestationKind, AttestationVerdict, CommandResult,
-    CredentialCipher, DEFAULT_WORKSPACE_TRUST_FLOOR, EncryptedSecret, GuestAttestation,
-    LeaseAccess, LeaseAttestationVerdict, LeaseQuote, LeaseRecord, LeaseRequest, LeaseState,
-    MAX_ESCROW_BASE_UNITS, MAX_LEASE_SECONDS, MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES,
-    MAX_VAULT_ITEMS_PER_ACCOUNT, MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES,
-    MAX_WORKSPACE_NAME_BYTES, MAX_WORKSPACES_PER_ACCOUNT, NodeAttestation, NodeCertificateBundle,
-    NodeCertificateRequest, NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll,
-    NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture, NodeTelemetry,
-    STANDARD_RATE_PER_SECOND, SettlementEvidence, TdxEventEntry, TrustClass, VaultEnvelope,
-    VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot, attestation_report_nonce,
-    class_for_lease, class_for_verdict, discounted_rate, node_id, snp_report_data,
-    stake_discount_bps, tdx_report_data, vault_release_permitted, verifying_key,
+    CredentialCipher, DEFAULT_WORKSPACE_TRUST_FLOOR, EncryptedSecret, GpuCcAttestation,
+    GuestAttestation, LeaseAccess, LeaseAttestationVerdict, LeaseGpuCcVerdict, LeaseQuote,
+    LeaseRecord, LeaseRequest, LeaseState, LeaseTdxGuestVerdict, MAX_ESCROW_BASE_UNITS,
+    MAX_LEASE_SECONDS, MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
+    MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_NAME_BYTES, MAX_WORKSPACES_PER_ACCOUNT,
+    NodeAttestation, NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
+    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture,
+    NodeTelemetry, STANDARD_RATE_PER_SECOND, SettlementEvidence, TdxEventEntry, TdxLeaseAttestation,
+    TrustClass, VaultEnvelope, VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot,
+    attestation_report_nonce, class_for_lease, class_for_verdict, discounted_rate, node_id,
+    snp_report_data, stake_discount_bps, tdx_lease_report_data, tdx_report_data,
+    vault_release_permitted, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -247,6 +248,27 @@ struct LeaseAttestationSubmission<'a> {
     policy: &'a prism_attestation::Policy,
 }
 
+/// The TDX counterpart of `LeaseAttestationSubmission`. It carries its own wire
+/// type rather than sharing one: a TDX quote, its event log and Intel
+/// collateral answer nothing the SEV-SNP fields describe, so folding them into
+/// one shape would mean a submission full of columns the other kind never sets.
+struct LeaseTdxAttestationSubmission<'a> {
+    attestation: &'a TdxLeaseAttestation,
+    /// The lease this quote claims to be about. The image on it fixes the
+    /// compose the TD has to have launched from, and the node on it is who is
+    /// allowed to present the quote.
+    lease: &'a LeaseRecord,
+    policy: &'a prism_attestation::Policy,
+}
+
+/// The GPU-CC counterpart. The card signs a report over the control plane's
+/// nonce; the lease and node on the record are what the verdict is bound to.
+struct LeaseGpuCcAttestationSubmission<'a> {
+    attestation: &'a GpuCcAttestation,
+    lease: &'a LeaseRecord,
+    policy: &'a prism_attestation::Policy,
+}
+
 struct ConfirmedFunding {
     /// The id the escrow assigned. Unique only within the escrow that issued
     /// it, which is why the address travels with it.
@@ -308,6 +330,17 @@ struct MemoryMarketplace {
     verdicts: BTreeMap<String, AttestationVerdict>,
     lease_challenges: BTreeMap<u64, StoredChallenge>,
     lease_verdicts: BTreeMap<u64, LeaseAttestationVerdict>,
+    /// The TDX guest half of a lease, kept apart from the SEV-SNP half because a
+    /// TD's evidence is an image measurement and a runtime-register binding, not
+    /// the chip and VMSA columns an SNP verdict carries.
+    lease_tdx_guest_verdicts: BTreeMap<u64, LeaseTdxGuestVerdict>,
+    /// The GPU confidential-computing half of a lease. It rides its own axis
+    /// because encrypted VRAM behind an unmeasured guest earns nothing on its
+    /// own, so it never folds into a guest verdict.
+    lease_gpu_cc_verdicts: BTreeMap<u64, LeaseGpuCcVerdict>,
+    /// The GPU-CC submission answers a nonce of its own rather than the guest
+    /// one, so a report captured for the guest challenge cannot stand in for it.
+    lease_gpu_cc_challenges: BTreeMap<u64, StoredChallenge>,
     /// Which node a physical processor was last attested under, so the same
     /// chip cannot stand behind two identities.
     snp_chips: BTreeMap<String, String>,
@@ -488,6 +521,45 @@ fn lease_host_data(image: &str) -> Result<[u8; 32], StoreError> {
         })
 }
 
+/// The TDX counterpart of `lease_host_data`. A TD binds the compose it launched
+/// from into its event log, and the digest pinned on the lease image is what
+/// that has to match, read off the record rather than off the quote so a TD
+/// that launched a different compose fails rather than verifies.
+fn lease_compose_hash(image: &str) -> Result<[u8; 32], StoreError> {
+    image
+        .rsplit_once("@sha256:")
+        .and_then(|(_, digest)| hex::decode(digest).ok())
+        .and_then(|digest| <[u8; 32]>::try_from(digest).ok())
+        .ok_or_else(|| {
+            StoreError::InvalidStoredState(
+                "lease image is not pinned to a sha256 digest".to_owned(),
+            )
+        })
+}
+
+/// The GPU signs its report over the raw challenge nonce rather than over a
+/// digest that folds the lease in, the way the SEV-SNP and TDX report data do,
+/// so the stored nonce is decoded straight to the 32 bytes the card committed
+/// to. A stored nonce that is not 32 hex bytes is our own corruption.
+fn expected_gpu_cc_nonce(nonce: &str) -> Result<[u8; 32], StoreError> {
+    hex::decode(nonce)
+        .ok()
+        .and_then(|nonce| <[u8; 32]>::try_from(nonce).ok())
+        .ok_or_else(|| {
+            StoreError::InvalidStoredState("gpu-cc challenge nonce is not 32 hex bytes".to_owned())
+        })
+}
+
+/// Evidence a node carries base64 in either alphabet, as elsewhere in this
+/// tree. A body that does not decode is refused as unverifiable rather than
+/// surfaced as a storage fault, because it is the node's to get right.
+fn decode_attestation_evidence(encoded: &str) -> Result<Vec<u8>, StoreError> {
+    STANDARD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
+        .map_err(|_| StoreError::AttestationUnverified)
+}
+
 /// The processor this node was last attested on, if it has been. Passing it into
 /// verification is what stops a node that earned a class on one chip presenting
 /// a report from another: the first report binds the pair and every later one
@@ -532,6 +604,158 @@ fn verify_lease_attestation(
             StoreError::AttestationUnverified
         },
     )
+}
+
+/// The TDX guest half, judged the same way the SEV-SNP half is: one code for
+/// every failure so the kind of miss stays a hint the forger has to guess at,
+/// and the challenge is spent whatever comes back.
+fn verify_lease_tdx_attestation(
+    attestation: &TdxLeaseAttestation,
+    nonce: &str,
+    compose_hash: &[u8; 32],
+    events: &[prism_attestation::TdxEvent],
+    now: chrono::DateTime<Utc>,
+    policy: &prism_attestation::Policy,
+) -> Result<LeaseTdxGuestVerdict, StoreError> {
+    let quote = decode_attestation_evidence(&attestation.quote_base64)?;
+    let raw_nonce = hex::decode(nonce)
+        .map_err(|_| StoreError::InvalidStoredState("attestation nonce is not hex".to_owned()))?;
+    let report_data =
+        tdx_lease_report_data(&raw_nonce, attestation.lease_id, &attestation.node_id);
+    prism_attestation::verify_tdx_lease_attestation(
+        attestation.lease_id,
+        &attestation.node_id,
+        &quote,
+        &attestation.tdx_collateral_json,
+        events,
+        &report_data,
+        compose_hash,
+        now,
+        policy,
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            lease_id = attestation.lease_id,
+            node_id = %attestation.node_id,
+            %error,
+            "guest tdx attestation evidence rejected"
+        );
+        StoreError::AttestationUnverified
+    })
+}
+
+/// The GPU-CC half. The card signs over the challenge this service issued for
+/// it, so a report captured for another lease or another nonce fails here
+/// rather than lifting a class it was never bound to.
+fn verify_lease_gpu_cc_attestation(
+    attestation: &GpuCcAttestation,
+    nonce: &str,
+    now: chrono::DateTime<Utc>,
+    policy: &prism_attestation::Policy,
+) -> Result<LeaseGpuCcVerdict, StoreError> {
+    let report = decode_attestation_evidence(&attestation.report_base64)?;
+    let mut chain = Vec::with_capacity(attestation.certificate_chain_base64.len());
+    for encoded in &attestation.certificate_chain_base64 {
+        chain.push(decode_attestation_evidence(encoded)?);
+    }
+    let expected_nonce = expected_gpu_cc_nonce(nonce)?;
+    prism_attestation::verify_nvidia_cc_lease_attestation(
+        attestation.lease_id,
+        &attestation.node_id,
+        &report,
+        &chain,
+        &expected_nonce,
+        now,
+        policy,
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            lease_id = attestation.lease_id,
+            node_id = %attestation.node_id,
+            %error,
+            "gpu-cc attestation evidence rejected"
+        );
+        StoreError::AttestationUnverified
+    })
+}
+
+/// After any of the three lease verdicts is stored, the class is recomputed
+/// from all of them together: a verdict on one axis lifts exactly what the
+/// three substantiate and no single one over-grants. A missing or expired
+/// verdict reads as absent, so nothing here lifts a class the evidence dropped.
+fn rederive_lease_class(market: &mut MemoryMarketplace, lease_id: u64, now: DateTime<Utc>) {
+    let snp = market.lease_verdicts.get(&lease_id).cloned();
+    let tdx = market.lease_tdx_guest_verdicts.get(&lease_id).cloned();
+    let gpu = market.lease_gpu_cc_verdicts.get(&lease_id).cloned();
+    if let Some((_, record)) = market.leases.get_mut(&lease_id) {
+        record.trust_class = class_for_lease(
+            lease_id,
+            &record.node_id,
+            record.trust_class,
+            snp.as_ref(),
+            tdx.as_ref(),
+            gpu.as_ref(),
+            now,
+        );
+        record.updated_at = now;
+    }
+}
+
+/// The Postgres counterpart of `rederive_lease_class`. The three verdicts are
+/// read back inside the caller's transaction, so the one it just inserted is
+/// among them, and the lease row is rewritten at the class they earn together.
+async fn rederive_lease_class_pg(
+    transaction: &mut Transaction<'_, Postgres>,
+    lease_id: u64,
+    now: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let snp = query_scalar::<_, SqlJson<LeaseAttestationVerdict>>(
+        "SELECT document FROM lease_attestation_verdicts WHERE lease_id = $1",
+    )
+    .bind(lease_id as i64)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(StoreError::Storage)?;
+    let tdx = query_scalar::<_, SqlJson<LeaseTdxGuestVerdict>>(
+        "SELECT document FROM lease_tdx_guest_verdicts WHERE lease_id = $1",
+    )
+    .bind(lease_id as i64)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(StoreError::Storage)?;
+    let gpu = query_scalar::<_, SqlJson<LeaseGpuCcVerdict>>(
+        "SELECT document FROM lease_gpu_cc_verdicts WHERE lease_id = $1",
+    )
+    .bind(lease_id as i64)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(StoreError::Storage)?;
+    let record = query_scalar::<_, SqlJson<LeaseRecord>>(
+        "SELECT document FROM leases WHERE lease_id = $1 FOR UPDATE",
+    )
+    .bind(lease_id as i64)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(StoreError::Storage)?;
+    if let Some(SqlJson(mut record)) = record {
+        record.trust_class = class_for_lease(
+            lease_id,
+            &record.node_id,
+            record.trust_class,
+            snp.as_ref().map(|SqlJson(verdict)| verdict),
+            tdx.as_ref().map(|SqlJson(verdict)| verdict),
+            gpu.as_ref().map(|SqlJson(verdict)| verdict),
+            now,
+        );
+        record.updated_at = now;
+        query("UPDATE leases SET document = $2, updated_at = NOW() WHERE lease_id = $1")
+            .bind(lease_id as i64)
+            .bind(SqlJson(record))
+            .execute(&mut **transaction)
+            .await
+            .map_err(StoreError::Storage)?;
+    }
+    Ok(())
 }
 
 /// Posture counts only while the heartbeat that carried it is still current.
@@ -1227,6 +1451,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/leases/{lease_id}/attestation",
             post(record_lease_attestation),
+        )
+        .route(
+            "/v1/leases/{lease_id}/tdx-attestation",
+            post(record_lease_tdx_attestation),
+        )
+        .route(
+            "/v1/leases/{lease_id}/gpu-attestation/challenge",
+            get(create_lease_gpu_cc_attestation_challenge),
+        )
+        .route(
+            "/v1/leases/{lease_id}/gpu-attestation",
+            post(record_lease_gpu_cc_attestation),
         )
         .route("/v1/leases/{lease_id}/result", get(get_lease_result))
         .route("/v1/leases/confirm", post(confirm_lease))
@@ -3878,18 +4114,7 @@ impl MarketplaceStore {
                     verdict.node_id.clone(),
                 );
                 market.lease_verdicts.insert(lease_id, verdict.clone());
-                if let Some((_, record)) = market.leases.get_mut(&lease_id) {
-                    record.trust_class = class_for_lease(
-                        lease_id,
-                        &record.node_id,
-                        record.trust_class,
-                        Some(&verdict),
-                        None,
-                        None,
-                        now,
-                    );
-                    record.updated_at = now;
-                }
+                rederive_lease_class(&mut market, lease_id, now);
                 Ok(verdict)
             }
             Self::Postgres(pool) => {
@@ -3993,33 +4218,367 @@ impl MarketplaceStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
-                let record = query_scalar::<_, SqlJson<LeaseRecord>>(
-                    "SELECT document FROM leases WHERE lease_id = $1 FOR UPDATE",
+                rederive_lease_class_pg(&mut transaction, lease_id, now).await?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(verdict)
+            }
+        }
+    }
+
+    /// The TDX guest half of a lease, verified and stored the way the SEV-SNP
+    /// half is. It answers the same lease challenge the SEV-SNP guest would:
+    /// one guest report per lease, whichever silicon took it. The expectation
+    /// is computed here and never accepted from the submission: `REPORT_DATA`
+    /// from the nonce this service issued and the lease it issued it for, and
+    /// the compose from the image the renter paid for. The challenge is spent
+    /// whatever the evidence turns out to be, as on the SEV-SNP path.
+    async fn record_lease_tdx_attestation(
+        &self,
+        submission: LeaseTdxAttestationSubmission<'_>,
+    ) -> Result<LeaseTdxGuestVerdict, StoreError> {
+        let LeaseTdxAttestationSubmission {
+            attestation,
+            lease,
+            policy,
+        } = submission;
+        let lease_id = lease.lease_id;
+        let now = Utc::now();
+        let compose_hash = lease_compose_hash(&lease.image)?;
+        let events = decode_tdx_events(&attestation.tdx_event_log).map_err(|reason| {
+            tracing::warn!(
+                lease_id,
+                node_id = %attestation.node_id,
+                reason,
+                "guest tdx event log rejected"
+            );
+            StoreError::AttestationUnverified
+        })?;
+        let policy = policy.clone().with_lease_verdict_ttl(
+            Duration::seconds(i64::from(lease.duration_seconds))
+                + Duration::hours(LEASE_VERDICT_PROVISIONING_SLACK_HOURS),
+        );
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let nonce = {
+                    let Some(stored) =
+                        market.lease_challenges.get_mut(&lease_id).filter(|stored| {
+                            stored.consumed_at.is_none()
+                                && stored.challenge.challenge_id == attestation.challenge_id
+                                && stored.challenge.node_id == attestation.node_id
+                                && stored.challenge.expires_at > now
+                        })
+                    else {
+                        return Err(StoreError::AttestationChallengeUnavailable);
+                    };
+                    stored.consumed_at = Some(now);
+                    stored.challenge.nonce.clone()
+                };
+                let verdict = verify_lease_tdx_attestation(
+                    attestation,
+                    &nonce,
+                    &compose_hash,
+                    &events,
+                    now,
+                    &policy,
+                )?;
+                if verdict.lease_id != lease_id || verdict.node_id != lease.node_id {
+                    return Err(StoreError::AttestationUnverified);
+                }
+                market
+                    .lease_tdx_guest_verdicts
+                    .insert(lease_id, verdict.clone());
+                rederive_lease_class(&mut market, lease_id, now);
+                Ok(verdict)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let Some(nonce) = query_scalar::<_, String>(
+                    "UPDATE lease_attestation_challenges SET consumed_at = now() \
+                     WHERE lease_id = $1 AND challenge_id = $2 AND node_id = $3 \
+                       AND consumed_at IS NULL AND expires_at > now() \
+                     RETURNING nonce",
+                )
+                .bind(lease_id as i64)
+                .bind(attestation.challenge_id)
+                .bind(&attestation.node_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?
+                else {
+                    return Err(StoreError::AttestationChallengeUnavailable);
+                };
+                let verdict = match verify_lease_tdx_attestation(
+                    attestation,
+                    &nonce,
+                    &compose_hash,
+                    &events,
+                    now,
+                    &policy,
+                ) {
+                    Ok(verdict)
+                        if verdict.lease_id == lease_id && verdict.node_id == lease.node_id =>
+                    {
+                        verdict
+                    }
+                    Ok(_) => {
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(StoreError::AttestationUnverified);
+                    }
+                    Err(error) => {
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(error);
+                    }
+                };
+                query(
+                    "INSERT INTO lease_tdx_guest_verdicts \
+                         (lease_id, node_id, document, device_identity, compose_hash, \
+                          measurement_digest, verified_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                     ON CONFLICT (lease_id) DO UPDATE \
+                     SET node_id = EXCLUDED.node_id, \
+                         document = EXCLUDED.document, \
+                         device_identity = EXCLUDED.device_identity, \
+                         compose_hash = EXCLUDED.compose_hash, \
+                         measurement_digest = EXCLUDED.measurement_digest, \
+                         verified_at = EXCLUDED.verified_at, \
+                         expires_at = EXCLUDED.expires_at",
+                )
+                .bind(lease_id as i64)
+                .bind(&verdict.node_id)
+                .bind(SqlJson(verdict.clone()))
+                .bind(&verdict.device_identity)
+                .bind(&verdict.compose_hash)
+                .bind(&verdict.measurement_digest)
+                .bind(verdict.verified_at)
+                .bind(verdict.expires_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                rederive_lease_class_pg(&mut transaction, lease_id, now).await?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(verdict)
+            }
+        }
+    }
+
+    /// The nonce the GPU serving this lease has to answer. It is separate from
+    /// the guest challenge because the card signs its own report: one live
+    /// nonce at a time, keyed by the lease, so a report a host already holds
+    /// cannot be matched to a challenge it was never issued for.
+    async fn create_lease_gpu_cc_attestation_challenge(
+        &self,
+        lease_id: u64,
+    ) -> Result<AttestationChallenge, StoreError> {
+        let mut nonce = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let issued_at = Utc::now();
+        let expires_at = issued_at + Duration::minutes(LEASE_ATTESTATION_CHALLENGE_TTL_MINUTES);
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let Some((_, lease)) = market.leases.get(&lease_id) else {
+                    return Err(StoreError::LeaseNotAttestable);
+                };
+                if !accepts_guest_attestation(&lease.state) {
+                    return Err(StoreError::LeaseNotAttestable);
+                }
+                let node_id = lease.node_id.clone();
+                if let Some(live) = market.lease_gpu_cc_challenges.get(&lease_id).filter(|stored| {
+                    stored.consumed_at.is_none() && stored.challenge.expires_at > issued_at
+                }) {
+                    return Ok(live.challenge.clone());
+                }
+                let challenge = AttestationChallenge {
+                    challenge_id: Uuid::now_v7(),
+                    node_id,
+                    nonce: hex::encode(nonce),
+                    issued_at,
+                    expires_at,
+                };
+                market.lease_gpu_cc_challenges.insert(
+                    lease_id,
+                    StoredChallenge {
+                        challenge: challenge.clone(),
+                        consumed_at: None,
+                    },
+                );
+                Ok(challenge)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let Some((node_id, state)) = query_as::<_, (String, String)>(
+                    "SELECT document->>'node_id', state FROM leases \
+                     WHERE lease_id = $1 FOR UPDATE",
                 )
                 .bind(lease_id as i64)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(StoreError::Storage)?;
-                if let Some(SqlJson(mut record)) = record {
-                    record.trust_class = class_for_lease(
-                        lease_id,
-                        &record.node_id,
-                        record.trust_class,
-                        Some(&verdict),
-                        None,
-                        None,
-                        now,
-                    );
-                    record.updated_at = now;
-                    query(
-                        "UPDATE leases SET document = $2, updated_at = NOW() WHERE lease_id = $1",
+                .map_err(StoreError::Storage)?
+                else {
+                    return Err(StoreError::LeaseNotAttestable);
+                };
+                if !matches!(state.as_str(), "provisioning" | "ready") {
+                    return Err(StoreError::LeaseNotAttestable);
+                }
+                if let Some((challenge_id, nonce, issued_at, expires_at)) =
+                    query_as::<_, (Uuid, String, chrono::DateTime<Utc>, chrono::DateTime<Utc>)>(
+                        "SELECT challenge_id, nonce, issued_at, expires_at \
+                         FROM lease_gpu_cc_challenges \
+                         WHERE lease_id = $1 AND consumed_at IS NULL AND expires_at > now()",
                     )
                     .bind(lease_id as i64)
-                    .bind(SqlJson(record))
-                    .execute(&mut *transaction)
+                    .fetch_optional(&mut *transaction)
                     .await
-                    .map_err(StoreError::Storage)?;
+                    .map_err(StoreError::Storage)?
+                {
+                    transaction.commit().await.map_err(StoreError::Storage)?;
+                    return Ok(AttestationChallenge {
+                        challenge_id,
+                        node_id,
+                        nonce,
+                        issued_at,
+                        expires_at,
+                    });
                 }
+                let challenge = AttestationChallenge {
+                    challenge_id: Uuid::now_v7(),
+                    node_id,
+                    nonce: hex::encode(nonce),
+                    issued_at,
+                    expires_at,
+                };
+                query(
+                    "INSERT INTO lease_gpu_cc_challenges \
+                         (lease_id, challenge_id, node_id, nonce, issued_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (lease_id) DO UPDATE \
+                     SET challenge_id = EXCLUDED.challenge_id, \
+                         node_id = EXCLUDED.node_id, \
+                         nonce = EXCLUDED.nonce, \
+                         issued_at = EXCLUDED.issued_at, \
+                         expires_at = EXCLUDED.expires_at, \
+                         consumed_at = NULL",
+                )
+                .bind(lease_id as i64)
+                .bind(challenge.challenge_id)
+                .bind(&challenge.node_id)
+                .bind(&challenge.nonce)
+                .bind(challenge.issued_at)
+                .bind(challenge.expires_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(challenge)
+            }
+        }
+    }
+
+    /// The GPU-CC half of a lease. It answers its own challenge, so the nonce
+    /// consumed here is the one issued by `create_lease_gpu_cc_attestation_
+    /// challenge`, never the guest one. The expected nonce is the challenge
+    /// this service issued and nothing the submission carries, and the
+    /// challenge is spent whatever the evidence turns out to be.
+    async fn record_lease_gpu_cc_attestation(
+        &self,
+        submission: LeaseGpuCcAttestationSubmission<'_>,
+    ) -> Result<LeaseGpuCcVerdict, StoreError> {
+        let LeaseGpuCcAttestationSubmission {
+            attestation,
+            lease,
+            policy,
+        } = submission;
+        let lease_id = lease.lease_id;
+        let now = Utc::now();
+        let policy = policy.clone().with_lease_verdict_ttl(
+            Duration::seconds(i64::from(lease.duration_seconds))
+                + Duration::hours(LEASE_VERDICT_PROVISIONING_SLACK_HOURS),
+        );
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let nonce = {
+                    let Some(stored) = market
+                        .lease_gpu_cc_challenges
+                        .get_mut(&lease_id)
+                        .filter(|stored| {
+                            stored.consumed_at.is_none()
+                                && stored.challenge.challenge_id == attestation.challenge_id
+                                && stored.challenge.node_id == attestation.node_id
+                                && stored.challenge.expires_at > now
+                        })
+                    else {
+                        return Err(StoreError::AttestationChallengeUnavailable);
+                    };
+                    stored.consumed_at = Some(now);
+                    stored.challenge.nonce.clone()
+                };
+                let verdict = verify_lease_gpu_cc_attestation(attestation, &nonce, now, &policy)?;
+                if verdict.lease_id != lease_id || verdict.node_id != lease.node_id {
+                    return Err(StoreError::AttestationUnverified);
+                }
+                market.lease_gpu_cc_verdicts.insert(lease_id, verdict.clone());
+                rederive_lease_class(&mut market, lease_id, now);
+                Ok(verdict)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let Some(nonce) = query_scalar::<_, String>(
+                    "UPDATE lease_gpu_cc_challenges SET consumed_at = now() \
+                     WHERE lease_id = $1 AND challenge_id = $2 AND node_id = $3 \
+                       AND consumed_at IS NULL AND expires_at > now() \
+                     RETURNING nonce",
+                )
+                .bind(lease_id as i64)
+                .bind(attestation.challenge_id)
+                .bind(&attestation.node_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?
+                else {
+                    return Err(StoreError::AttestationChallengeUnavailable);
+                };
+                let verdict = match verify_lease_gpu_cc_attestation(attestation, &nonce, now, &policy)
+                {
+                    Ok(verdict)
+                        if verdict.lease_id == lease_id && verdict.node_id == lease.node_id =>
+                    {
+                        verdict
+                    }
+                    Ok(_) => {
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(StoreError::AttestationUnverified);
+                    }
+                    Err(error) => {
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Err(error);
+                    }
+                };
+                query(
+                    "INSERT INTO lease_gpu_cc_verdicts \
+                         (lease_id, node_id, document, device_identity, measurement_digest, \
+                          verified_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     ON CONFLICT (lease_id) DO UPDATE \
+                     SET node_id = EXCLUDED.node_id, \
+                         document = EXCLUDED.document, \
+                         device_identity = EXCLUDED.device_identity, \
+                         measurement_digest = EXCLUDED.measurement_digest, \
+                         verified_at = EXCLUDED.verified_at, \
+                         expires_at = EXCLUDED.expires_at",
+                )
+                .bind(lease_id as i64)
+                .bind(&verdict.node_id)
+                .bind(SqlJson(verdict.clone()))
+                .bind(&verdict.device_identity)
+                .bind(&verdict.measurement_digest)
+                .bind(verdict.verified_at)
+                .bind(verdict.expires_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                rederive_lease_class_pg(&mut transaction, lease_id, now).await?;
                 transaction.commit().await.map_err(StoreError::Storage)?;
                 Ok(verdict)
             }
@@ -5638,6 +6197,8 @@ impl MarketplaceStore {
                     .get(&lease.quote_id)
                     .map_or(lease.trust_class, |quote| quote.trust_class);
                 let verdict = market.lease_verdicts.get(&lease_id);
+                let tdx_verdict = market.lease_tdx_guest_verdicts.get(&lease_id);
+                let gpu_cc_verdict = market.lease_gpu_cc_verdicts.get(&lease_id);
                 let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
                 let node_class = class_for_verdict(
                     &lease.node_id,
@@ -5649,8 +6210,15 @@ impl MarketplaceStore {
                     market.verdicts.get(&lease.node_id),
                     now,
                 );
-                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, None, None, now)
-                    < quoted_class
+                if class_for_lease(
+                    lease_id,
+                    &lease.node_id,
+                    node_class,
+                    verdict,
+                    tdx_verdict,
+                    gpu_cc_verdict,
+                    now,
+                ) < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
                 }
@@ -5682,6 +6250,8 @@ impl MarketplaceStore {
                         Option<String>,
                         Option<String>,
                         Option<SqlJson<LeaseAttestationVerdict>>,
+                        Option<SqlJson<LeaseTdxGuestVerdict>>,
+                        Option<SqlJson<LeaseGpuCcVerdict>>,
                         bool,
                         Option<SqlJson<NodePosture>>,
                         Option<SqlJson<AttestationVerdict>>,
@@ -5692,6 +6262,10 @@ impl MarketplaceStore {
                             q.document->>'trust_class', \
                             (SELECT v.document FROM lease_attestation_verdicts v \
                              WHERE v.lease_id = l.lease_id), \
+                            (SELECT tv.document FROM lease_tdx_guest_verdicts tv \
+                             WHERE tv.lease_id = l.lease_id), \
+                            (SELECT gv.document FROM lease_gpu_cc_verdicts gv \
+                             WHERE gv.lease_id = l.lease_id), \
                             EXISTS ( \
                                 SELECT 1 FROM node_tunnels t \
                                 WHERE t.node_id = l.document->>'node_id' \
@@ -5718,6 +6292,8 @@ impl MarketplaceStore {
                     recorded_class,
                     quoted_class,
                     verdict,
+                    tdx_verdict,
+                    gpu_cc_verdict,
                     tunneled,
                     posture,
                     node_verdict,
@@ -5732,6 +6308,8 @@ impl MarketplaceStore {
                 let quoted_class =
                     quoted_class.map_or(Ok(recorded_class), |class| parse_trust_class(&class))?;
                 let verdict = verdict.map(|SqlJson(verdict)| verdict);
+                let tdx_verdict = tdx_verdict.map(|SqlJson(verdict)| verdict);
+                let gpu_cc_verdict = gpu_cc_verdict.map(|SqlJson(verdict)| verdict);
                 let node_class = class_for_verdict(
                     &node_id,
                     tunneled,
@@ -5739,8 +6317,15 @@ impl MarketplaceStore {
                     node_verdict.as_ref().map(|SqlJson(verdict)| verdict),
                     now,
                 );
-                if class_for_lease(lease_id, &node_id, node_class, verdict.as_ref(), None, None, now)
-                    < quoted_class
+                if class_for_lease(
+                    lease_id,
+                    &node_id,
+                    node_class,
+                    verdict.as_ref(),
+                    tdx_verdict.as_ref(),
+                    gpu_cc_verdict.as_ref(),
+                    now,
+                ) < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
                 }
@@ -7552,6 +8137,202 @@ fn check_guest_attestation_envelope(
     Ok(())
 }
 
+/// The TDX guest report for a lease. A TD answers the same lease challenge the
+/// SEV-SNP guest would, so the guest challenge endpoint serves both; only the
+/// quote it returns lands here.
+async fn record_lease_tdx_attestation(
+    State(state): State<AppState>,
+    Path(lease_id): Path<u64>,
+    Json(attestation): Json<TdxLeaseAttestation>,
+) -> Result<Json<LeaseTdxGuestVerdict>, (StatusCode, Json<ApiError>)> {
+    if attestation.lease_id != lease_id {
+        return Err(bad_request(
+            "lease_mismatch",
+            "path and payload lease IDs differ",
+        ));
+    }
+    let Some(lease) = state
+        .store
+        .lease_record(lease_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(not_found("lease_not_found", "no such lease"));
+    };
+    if lease.node_id != attestation.node_id {
+        return Err(forbidden(
+            "node_mismatch",
+            "this lease is not running on the node presenting the report",
+        ));
+    }
+    if !accepts_guest_attestation(&lease.state) {
+        return Err(store_error(StoreError::LeaseNotAttestable));
+    }
+    let Some(offer) = state
+        .store
+        .offer(&lease.node_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(not_found(
+            "node_not_found",
+            "node must be enrolled before it can attest",
+        ));
+    };
+    check_tdx_lease_attestation_envelope(&offer, &attestation)?;
+    let verdict = state
+        .store
+        .record_lease_tdx_attestation(LeaseTdxAttestationSubmission {
+            attestation: &attestation,
+            lease: &lease,
+            policy: &state.attestation_policy,
+        })
+        .await
+        .map_err(store_error)?;
+    Ok(Json(verdict))
+}
+
+/// The nonce the GPU serving this lease answers. Handed out without an account
+/// or a node signature, as on the guest path: a nonce is worth nothing to
+/// anyone who cannot produce a report the device signed over it.
+async fn create_lease_gpu_cc_attestation_challenge(
+    State(state): State<AppState>,
+    Path(lease_id): Path<u64>,
+) -> Result<Json<AttestationChallenge>, (StatusCode, Json<ApiError>)> {
+    state
+        .store
+        .create_lease_gpu_cc_attestation_challenge(lease_id)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
+/// The GPU confidential-computing report for a lease. It answers its own
+/// challenge, so the device signs over the nonce this endpoint's challenge
+/// counterpart issued, never the guest one.
+async fn record_lease_gpu_cc_attestation(
+    State(state): State<AppState>,
+    Path(lease_id): Path<u64>,
+    Json(attestation): Json<GpuCcAttestation>,
+) -> Result<Json<LeaseGpuCcVerdict>, (StatusCode, Json<ApiError>)> {
+    if attestation.lease_id != lease_id {
+        return Err(bad_request(
+            "lease_mismatch",
+            "path and payload lease IDs differ",
+        ));
+    }
+    let Some(lease) = state
+        .store
+        .lease_record(lease_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(not_found("lease_not_found", "no such lease"));
+    };
+    if lease.node_id != attestation.node_id {
+        return Err(forbidden(
+            "node_mismatch",
+            "this lease is not running on the node presenting the report",
+        ));
+    }
+    if !accepts_guest_attestation(&lease.state) {
+        return Err(store_error(StoreError::LeaseNotAttestable));
+    }
+    let Some(offer) = state
+        .store
+        .offer(&lease.node_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(not_found(
+            "node_not_found",
+            "node must be enrolled before it can attest",
+        ));
+    };
+    check_gpu_cc_attestation_envelope(&offer, &attestation)?;
+    let verdict = state
+        .store
+        .record_lease_gpu_cc_attestation(LeaseGpuCcAttestationSubmission {
+            attestation: &attestation,
+            lease: &lease,
+            policy: &state.attestation_policy,
+        })
+        .await
+        .map_err(store_error)?;
+    Ok(Json(verdict))
+}
+
+/// The TDX counterpart of `check_guest_attestation_envelope`. The node's key
+/// signs the courier envelope; it does not vouch for the quote inside, which
+/// the TD sealed with a key the host does not hold.
+fn check_tdx_lease_attestation_envelope(
+    offer: &NodeOffer,
+    attestation: &TdxLeaseAttestation,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if attestation.validate().is_err() {
+        return Err(bad_request(
+            "invalid_attestation",
+            "attestation evidence is malformed or larger than this service accepts",
+        ));
+    }
+    let device_key = verifying_key(&offer.device_public_key)
+        .map_err(|_| bad_request("invalid_device_key", "node device key is invalid"))?;
+    if attestation.verify(&device_key).is_err() {
+        return Err(bad_request(
+            "unsigned_attestation",
+            "guest attestation must be signed by the enrolled device identity",
+        ));
+    }
+    if attestation
+        .collected_at
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .abs()
+        > NODE_MESSAGE_MAX_AGE_SECONDS
+    {
+        return Err(bad_request(
+            "stale_attestation",
+            "guest attestation is older than five minutes",
+        ));
+    }
+    Ok(())
+}
+
+/// The GPU-CC counterpart. Same courier model: the node signs which node is
+/// presenting the report, the device signs the report itself.
+fn check_gpu_cc_attestation_envelope(
+    offer: &NodeOffer,
+    attestation: &GpuCcAttestation,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if attestation.validate().is_err() {
+        return Err(bad_request(
+            "invalid_attestation",
+            "attestation evidence is malformed or larger than this service accepts",
+        ));
+    }
+    let device_key = verifying_key(&offer.device_public_key)
+        .map_err(|_| bad_request("invalid_device_key", "node device key is invalid"))?;
+    if attestation.verify(&device_key).is_err() {
+        return Err(bad_request(
+            "unsigned_attestation",
+            "gpu attestation must be signed by the enrolled device identity",
+        ));
+    }
+    if attestation
+        .collected_at
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .abs()
+        > NODE_MESSAGE_MAX_AGE_SECONDS
+    {
+        return Err(bad_request(
+            "stale_attestation",
+            "gpu attestation is older than five minutes",
+        ));
+    }
+    Ok(())
+}
+
 async fn confirm_lease(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7762,6 +8543,15 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("node command polling"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0019_node_command_polling.sql")),
+                false,
+            ),
+            Migration::new(
+                20,
+                Cow::Borrowed("lease confidential attestation"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0020_lease_confidential_attestation.sql"
+                )),
                 false,
             ),
         ]),
@@ -9773,6 +10563,264 @@ mod tests {
                 })
                 .await,
             Err(StoreError::AttestationChallengeUnavailable)
+        ));
+    }
+
+    fn tdx_guest_verdict(
+        lease_id: u64,
+        node_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> LeaseTdxGuestVerdict {
+        LeaseTdxGuestVerdict {
+            lease_id,
+            node_id: node_id.to_owned(),
+            kind: AttestationKind::Tdx,
+            device_identity: format!("tdx/{}", "e".repeat(64)),
+            compose_hash: "f".repeat(64),
+            measurement_digest: "0".repeat(64),
+            granted_class: TrustClass::Attested,
+            verifier_version: "test".to_owned(),
+            verified_at: expires_at - Duration::hours(24),
+            expires_at,
+        }
+    }
+
+    fn gpu_cc_verdict(
+        lease_id: u64,
+        node_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> LeaseGpuCcVerdict {
+        LeaseGpuCcVerdict {
+            lease_id,
+            node_id: node_id.to_owned(),
+            kind: AttestationKind::NvidiaCc,
+            device_identity: "nvidia/H100".to_owned(),
+            measurement_digest: "1".repeat(64),
+            granted_class: TrustClass::Confidential,
+            verifier_version: "test".to_owned(),
+            verified_at: expires_at - Duration::hours(24),
+            expires_at,
+        }
+    }
+
+    fn signed_tdx_lease_attestation(lease_id: u64, challenge_id: Uuid) -> TdxLeaseAttestation {
+        TdxLeaseAttestation::sign(
+            prism_protocol::UnsignedTdxLeaseAttestation {
+                node_id: attested_node_id(),
+                lease_id,
+                challenge_id,
+                quote_base64: URL_SAFE_NO_PAD.encode([0_u8; 128]),
+                tdx_event_log: Vec::new(),
+                tdx_collateral_json: "{}".to_owned(),
+                collected_at: Utc::now(),
+            },
+            &attestation_signing_key(),
+        )
+        .unwrap()
+    }
+
+    fn signed_gpu_cc_attestation(lease_id: u64, challenge_id: Uuid) -> GpuCcAttestation {
+        GpuCcAttestation::sign(
+            prism_protocol::UnsignedGpuCcAttestation {
+                node_id: attested_node_id(),
+                lease_id,
+                challenge_id,
+                report_base64: URL_SAFE_NO_PAD.encode([0_u8; 256]),
+                certificate_chain_base64: vec![URL_SAFE_NO_PAD.encode([0_u8; 96])],
+                collected_at: Utc::now(),
+            },
+            &attestation_signing_key(),
+        )
+        .unwrap()
+    }
+
+    /// The GPU answers a challenge of its own, so the nonce is issued while the
+    /// machine is prepared and handed back rather than replaced while it lives,
+    /// the same lifecycle the guest challenge has.
+    #[tokio::test]
+    async fn a_gpu_cc_challenge_is_issued_while_the_machine_is_being_prepared() {
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Isolated,
+            LeaseState::Provisioning,
+        ))));
+        let challenge = store
+            .create_lease_gpu_cc_attestation_challenge(GUEST_LEASE_ID)
+            .await
+            .unwrap();
+        assert_eq!(challenge.node_id, attested_node_id());
+        assert_eq!(
+            store
+                .create_lease_gpu_cc_attestation_challenge(GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .challenge_id,
+            challenge.challenge_id
+        );
+
+        let running = MarketplaceStore::Memory(Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Isolated,
+            LeaseState::Active,
+        ))));
+        assert!(matches!(
+            running
+                .create_lease_gpu_cc_attestation_challenge(GUEST_LEASE_ID)
+                .await,
+            Err(StoreError::LeaseNotAttestable)
+        ));
+    }
+
+    /// A well-formed TDX envelope carrying a quote that cannot verify is
+    /// refused, and the guest challenge it answered is spent whichever way it
+    /// went, so a host cannot grind quotes against one nonce.
+    #[tokio::test]
+    async fn a_tdx_quote_that_cannot_verify_spends_the_guest_challenge() {
+        let market = guest_lease_market(TrustClass::Isolated, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let challenge = store
+            .create_lease_attestation_challenge(GUEST_LEASE_ID)
+            .await
+            .unwrap();
+        let attestation = signed_tdx_lease_attestation(GUEST_LEASE_ID, challenge.challenge_id);
+
+        assert!(matches!(
+            store
+                .record_lease_tdx_attestation(LeaseTdxAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert!(matches!(
+            store
+                .record_lease_tdx_attestation(LeaseTdxAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationChallengeUnavailable)
+        ));
+    }
+
+    /// The GPU-CC path is fail-closed the same way, against its own challenge.
+    #[tokio::test]
+    async fn a_gpu_cc_report_that_cannot_verify_spends_its_challenge() {
+        let market = guest_lease_market(TrustClass::Isolated, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let challenge = store
+            .create_lease_gpu_cc_attestation_challenge(GUEST_LEASE_ID)
+            .await
+            .unwrap();
+        let attestation = signed_gpu_cc_attestation(GUEST_LEASE_ID, challenge.challenge_id);
+
+        assert!(matches!(
+            store
+                .record_lease_gpu_cc_attestation(LeaseGpuCcAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert!(matches!(
+            store
+                .record_lease_gpu_cc_attestation(LeaseGpuCcAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationChallengeUnavailable)
+        ));
+    }
+
+    /// A TDX quote is the guest half on Intel silicon, so a lease quoted at
+    /// `Attested` opens once its TDX guest verdict stands, the same as it would
+    /// on a SEV-SNP guest report.
+    #[tokio::test]
+    async fn a_tdx_guest_verdict_opens_an_attested_lease() {
+        let mut market = guest_lease_market(TrustClass::Attested, LeaseState::Active);
+        market.lease_tdx_guest_verdicts.insert(
+            GUEST_LEASE_ID,
+            tdx_guest_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+
+        assert!(lease_access_for(market).await.unwrap().is_some());
+    }
+
+    /// `Confidential` is guest memory and VRAM together. A TDX guest verdict
+    /// alone stops at the guest rung, so a lease quoted at `Confidential` opens
+    /// nothing until a GPU-CC verdict stands beside it.
+    #[tokio::test]
+    async fn confidential_needs_the_gpu_verdict_beside_the_guest_one() {
+        let mut market = guest_lease_market(TrustClass::Confidential, LeaseState::Active);
+        market.lease_tdx_guest_verdicts.insert(
+            GUEST_LEASE_ID,
+            tdx_guest_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+        assert!(matches!(
+            lease_access_for(market).await,
+            Err(StoreError::LeaseUnattested)
+        ));
+
+        let mut market = guest_lease_market(TrustClass::Confidential, LeaseState::Active);
+        market.lease_tdx_guest_verdicts.insert(
+            GUEST_LEASE_ID,
+            tdx_guest_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+        market.lease_gpu_cc_verdicts.insert(
+            GUEST_LEASE_ID,
+            gpu_cc_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+        assert!(lease_access_for(market).await.unwrap().is_some());
+    }
+
+    /// A GPU-CC verdict for another lease lifts nothing: it is bound to the
+    /// lease it names, so a confidential-quoted lease with a verdict for its
+    /// neighbour opens nothing.
+    #[tokio::test]
+    async fn a_gpu_verdict_for_another_lease_lifts_nothing() {
+        let mut market = guest_lease_market(TrustClass::Confidential, LeaseState::Active);
+        market.lease_tdx_guest_verdicts.insert(
+            GUEST_LEASE_ID,
+            tdx_guest_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+        market.lease_gpu_cc_verdicts.insert(
+            GUEST_LEASE_ID,
+            gpu_cc_verdict(
+                GUEST_LEASE_ID + 1,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+        assert!(matches!(
+            lease_access_for(market).await,
+            Err(StoreError::LeaseUnattested)
         ));
     }
 
