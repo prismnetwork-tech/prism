@@ -14,7 +14,7 @@ use base64::{
 use chrono::Utc;
 use prism_protocol::{
     AttestationChallenge, AttestationKind, AttestationVerdict, NodeAttestation,
-    UnsignedNodeAttestation, attestation_report_nonce, node_id,
+    UnsignedNodeAttestation, attestation_report_nonce, node_id, tdx_report_data,
 };
 use rand::RngCore;
 
@@ -99,6 +99,80 @@ pub async fn refresh(
             class = verdict.granted_class.label(),
             expires_at = %verdict.expires_at,
             "attestation verified by the control plane"
+        ),
+        Err(error) => tracing::info!(%error, "attestation accepted without a verdict body"),
+    }
+    Ok(())
+}
+
+/// Prove to the control plane what this TD booted and what it is running,
+/// against a nonce the control plane just issued. The guest agent quotes our
+/// challenge binding, the event log rides along for the verifier's replay,
+/// and the collateral is fetched here so the control plane stays offline.
+pub async fn refresh_tdx(
+    identity_path: &Path,
+    control_plane: &str,
+    socket: &Path,
+    pccs_url: &str,
+) -> anyhow::Result<()> {
+    let identity = load_identity(identity_path)?;
+    let key = signing_key(&identity)?;
+    let node = node_id(&key.verifying_key());
+    let device_public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+    let client = attestation_client()?;
+
+    let endpoint = control_plane_endpoint(
+        control_plane,
+        &format!("v1/nodes/{node}/attestation/challenge"),
+    )?;
+    let response = client.get(endpoint).send().await?;
+    if !response.status().is_success() {
+        return require_success(response).await;
+    }
+    let challenge: AttestationChallenge = response
+        .json()
+        .await
+        .context("decode the attestation challenge")?;
+    if challenge.node_id != node {
+        anyhow::bail!("the control plane issued a challenge for another node");
+    }
+    let challenge_nonce = hex::decode(&challenge.nonce).context("challenge nonce is not hex")?;
+    let report_data = tdx_report_data(&challenge_nonce, &node, &device_public_key);
+
+    let quoted = crate::dstack::get_quote(socket, &report_data)
+        .await
+        .context("take a quote from the dstack guest agent")?;
+    let collateral = prism_pccs::PccsClient::new(pccs_url)?
+        .collateral_for(&quoted.quote)
+        .await
+        .context("fetch collateral for the quote")?;
+
+    let attestation = NodeAttestation::sign(
+        UnsignedNodeAttestation {
+            tdx_event_log: quoted.event_log,
+            tdx_collateral_json: Some(collateral),
+            node_id: node.clone(),
+            challenge_id: challenge.challenge_id,
+            kind: AttestationKind::Tdx,
+            evidence_base64: STANDARD.encode(&quoted.quote),
+            certificate_chain_base64: Vec::new(),
+            capability: *crate::host_capability(),
+            pci_address: String::new(),
+            collected_at: Utc::now(),
+        },
+        &key,
+    )?;
+    let endpoint = control_plane_endpoint(control_plane, &format!("v1/nodes/{node}/attestation"))?;
+    let response = client.post(endpoint).json(&attestation).send().await?;
+    if !response.status().is_success() {
+        return require_success(response).await;
+    }
+    match response.json::<AttestationVerdict>().await {
+        Ok(verdict) => tracing::info!(
+            device = %verdict.device_identity,
+            class = verdict.granted_class.label(),
+            expires_at = %verdict.expires_at,
+            "TDX attestation verified by the control plane"
         ),
         Err(error) => tracing::info!(%error, "attestation accepted without a verdict body"),
     }

@@ -2947,6 +2947,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-pccs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dcap-qvl",
+ "hex",
+ "reqwest",
+ "serde_json",
+ "x509-parser",
+]
+
+[[package]]
 name = "prism-proof-worker"
 version = "0.1.0"
 dependencies = [
@@ -3059,6 +3071,7 @@ dependencies = [
  "hex",
  "libc",
  "prism-chain",
+ "prism-pccs",
  "prism-protocol",
  "rand 0.8.7",
  "rcgen",

@@ -28,6 +28,7 @@ use sha3::{Digest as _, Keccak256};
 use tracing_subscriber::EnvFilter;
 
 mod attestation;
+mod dstack;
 mod gpu;
 mod idle;
 mod probe;
@@ -1365,6 +1366,13 @@ fn posture_for(passthrough: bool, capability: &HostTeeCapability) -> NodePosture
 }
 
 async fn attest_once(identity_path: &Path, control_plane: &str) -> anyhow::Result<()> {
+    // A dstack CVM has no VFIO group to hand over and nothing to boot: the
+    // TD itself is the evidence, and the guest agent is what can quote it.
+    if let Some(socket) = dstack::socket() {
+        let pccs = std::env::var("PRISM_PCCS_URL")
+            .unwrap_or_else(|_| prism_pccs::PHALA_PCCS_URL.to_owned());
+        return attestation::refresh_tdx(identity_path, control_plane, &socket, &pccs).await;
+    }
     let groups = runtime::discover_vfio_gpu_groups()?;
     let group = groups
         .first()
@@ -1479,7 +1487,9 @@ async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
     );
     // A shared lease runs on the host's own kernel, so there is nothing here
     // that could take a report and no reason to keep asking for a verdict.
-    if config.isolation.shared_gpu().is_none() {
+    // The exception is a dstack CVM: it serves in shared mode because the TD
+    // is the boundary, and the TD itself is what attests.
+    if config.isolation.shared_gpu().is_none() || dstack::socket().is_some() {
         tokio::spawn(attestation_loop(
             config.identity.clone(),
             config.control_plane.clone(),

@@ -13,6 +13,7 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 libc.workspace = true
 prism-chain = { path = "../../crates/chain" }
+prism-pccs = { path = "../../crates/pccs" }
 prism-protocol = { path = "../../crates/protocol" }
 rand.workspace = true
 rcgen.workspace = true

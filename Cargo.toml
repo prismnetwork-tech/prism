@@ -2,6 +2,7 @@
 members = [
   "crates/attestation",
   "crates/chain",
+  "crates/pccs",
   "crates/protocol",
   "services/control-plane",
   "services/access-gateway",

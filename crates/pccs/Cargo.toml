@@ -1,0 +1,18 @@
+[package]
+name = "prism-pccs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Quote parsing only: the verify-only feature set, the same one
+# prism-attestation compiles. The crate's own collateral client stays off
+# because its `report` feature drags in a second HTTP stack; the four PCS
+# endpoints are plain GETs and this crate makes them with the workspace's
+# own client instead.
+dcap-qvl = { version = "0.6.1", default-features = false, features = ["std", "rustcrypto", "default-x509"] }
+hex.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+x509-parser.workspace = true
