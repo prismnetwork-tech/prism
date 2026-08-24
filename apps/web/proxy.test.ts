@@ -28,4 +28,9 @@ describe("content security policy", () => {
     expect(publicPageRewrite("docs.prismnetwork.tech", "/api/healthz")).toBeNull();
     expect(publicPageRewrite("prismnetwork.tech", "/")).toBeNull();
   });
+
+  it("serves the node runbook at the docs subdomain", () => {
+    expect(publicPageRewrite("docs.prismnetwork.tech", "/open-mode")).toBe("/docs/open-mode");
+    expect(publicPageRewrite("prismnetwork.tech", "/open-mode")).toBeNull();
+  });
 });

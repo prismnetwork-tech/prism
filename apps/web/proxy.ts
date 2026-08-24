@@ -17,9 +17,10 @@ export function proxy(request: NextRequest) {
 }
 
 export function publicPageRewrite(hostname: string, pathname: string) {
-  return hostname.toLowerCase() === "docs.prismnetwork.tech" && pathname === "/"
-    ? "/docs"
-    : null;
+  if (hostname.toLowerCase() !== "docs.prismnetwork.tech") return null;
+  if (pathname === "/") return "/docs";
+  if (pathname === "/open-mode") return "/docs/open-mode";
+  return null;
 }
 
 /// The JSON-LD block is identical on every request, so it is allowed by hash
