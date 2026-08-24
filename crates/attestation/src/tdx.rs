@@ -83,20 +83,69 @@ impl TdxMeasurementSet {
     }
 }
 
-/// One entry of a dstack runtime event log, as the guest agent reports it.
+/// One entry of a dstack event log, as the guest agent reports it.
 ///
-/// The digests are what the TD actually extended into its runtime registers;
-/// the names and payloads are the log's claim about what each digest means.
-/// Nothing here is trusted as received: the fold across digests has to land
-/// on the register the quote signed, and a named event's digest has to be
-/// recomputable from its name and payload before the payload is believed.
+/// Two kinds of entry share this shape. A firmware event carries the digest
+/// the TD extended for it and nothing else worth reading. A dstack runtime
+/// event carries a name and payload, and its digest is derived from them
+/// rather than sent: the guest agent leaves the field empty and the client
+/// computes it, though the cloud attestation endpoint fills it in. Either
+/// way nothing here is trusted as received: the fold across the effective
+/// digests has to land on the register the quote signed.
 #[derive(Debug, Clone)]
 pub struct TdxEvent {
     pub imr: u32,
     pub event_type: u32,
     pub name: String,
-    pub digest: [u8; 48],
+    /// The digest as it arrived, which is empty for a runtime event whose
+    /// producer derives it. [`effective_digest`] resolves what actually folds
+    /// into the register.
+    pub digest: Vec<u8>,
     pub payload: Vec<u8>,
+}
+
+/// The event type dstack writes for every runtime event it extends into the
+/// application register. Its digest is derived from the name and payload, not
+/// carried; any other event type is a firmware event whose digest is the one
+/// on the wire.
+const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
+
+/// The digest that actually folds into a register for this event.
+///
+/// For a runtime event this is `sha384(event_type_le || ":" || name || ":" ||
+/// payload)`, the V1 dstack rule, computed here rather than trusted: a changed
+/// payload changes this digest, which changes the fold, which no longer meets
+/// the quoted register. A producer that also sent the digest (the cloud shape)
+/// must have sent the one this computes, or the event is rejected before the
+/// fold. For a firmware event the wire digest is authoritative and has to be a
+/// full SHA-384.
+fn effective_digest(event: &TdxEvent) -> Result<[u8; 48], VerificationError> {
+    if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
+        let mut hasher = Sha384::new();
+        hasher.update(event.event_type.to_le_bytes());
+        hasher.update(b":");
+        hasher.update(event.name.as_bytes());
+        hasher.update(b":");
+        hasher.update(&event.payload);
+        let computed: [u8; 48] = hasher.finalize().into();
+        if !event.digest.is_empty() {
+            let carried: [u8; 48] = event
+                .digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerificationError::TdxEventDigestMismatch)?;
+            if !bool::from(carried.ct_eq(&computed)) {
+                return Err(VerificationError::TdxEventDigestMismatch);
+            }
+        }
+        Ok(computed)
+    } else {
+        event
+            .digest
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerificationError::TdxEventLogMismatch)
+    }
 }
 
 /// What a verified event log binds this TD to, beyond the launch identity the
@@ -131,14 +180,14 @@ const APP_EVENT_IMR: u32 = 3;
 /// Verifies a runtime event log against the registers a verified quote signed
 /// and returns what the log binds the TD to.
 ///
-/// Three judgements, in order. Every register the report carries must equal
-/// the fold of the log's digests for it, from forty-eight zero bytes through
+/// Two judgements. Every register the report carries must equal the fold of
+/// the log's effective digests for it, from forty-eight zero bytes through
 /// `sha384(register || digest)` per event, so the log accounts for exactly
 /// what the TD extended: nothing missing, nothing invented, nothing
-/// reordered. Every named event in the application register must have
-/// `digest == sha384(event_type_le || ":" || name || ":" || payload)`, so a
-/// payload cannot ride on the digest of a different claim. And each required
-/// binding must appear exactly once.
+/// reordered. A runtime event's effective digest is derived from its own name
+/// and payload (see [`effective_digest`]), so a payload cannot ride on the
+/// digest of a different claim and survive the fold. And each required binding
+/// must appear exactly once.
 ///
 /// The caller compares the returned `compose_hash` against the workload it
 /// expected; this function establishes what the TD is bound to, not whether
@@ -149,12 +198,13 @@ pub(crate) fn verify_tdx_event_log(
 ) -> Result<TdxRuntimeBindings, VerificationError> {
     let mut folds = [[0u8; 48]; 4];
     for event in events {
+        let digest = effective_digest(event)?;
         let register = folds
             .get_mut(event.imr as usize)
             .ok_or(VerificationError::TdxEventLogMismatch)?;
         let mut hasher = Sha384::new();
         hasher.update(*register);
-        hasher.update(event.digest);
+        hasher.update(digest);
         *register = hasher.finalize().into();
     }
     for (fold, quoted) in
@@ -169,18 +219,8 @@ pub(crate) fn verify_tdx_event_log(
 
     let mut bindings: Vec<(&str, &[u8])> = Vec::new();
     for event in events {
-        if event.imr != APP_EVENT_IMR || event.name.is_empty() {
+        if event.event_type != DSTACK_RUNTIME_EVENT_TYPE || event.imr != APP_EVENT_IMR {
             continue;
-        }
-        let mut hasher = Sha384::new();
-        hasher.update(event.event_type.to_le_bytes());
-        hasher.update(b":");
-        hasher.update(event.name.as_bytes());
-        hasher.update(b":");
-        hasher.update(&event.payload);
-        let recomputed: [u8; 48] = hasher.finalize().into();
-        if !bool::from(recomputed.ct_eq(&event.digest)) {
-            return Err(VerificationError::TdxEventDigestMismatch);
         }
         if REQUIRED_BINDING_EVENTS.contains(&event.name.as_str()) {
             bindings.push((&event.name, &event.payload));

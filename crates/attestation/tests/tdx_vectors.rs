@@ -49,7 +49,7 @@ fn events() -> Vec<TdxEvent> {
             imr: entry["imr"].as_u64().unwrap() as u32,
             event_type: entry["event_type"].as_u64().unwrap() as u32,
             name: entry["event"].as_str().unwrap().to_string(),
-            digest: digest48(entry["digest"].as_str().unwrap()),
+            digest: hex::decode(entry["digest"].as_str().unwrap()).unwrap(),
             payload: hex::decode(entry["event_payload"].as_str().unwrap()).unwrap(),
         })
         .collect()
@@ -109,6 +109,59 @@ fn a_live_quote_with_its_log_verifies_and_earns_attested() {
     assert_eq!(verdict.verifier_version, TDX_VERIFIER_VERSION);
     assert_eq!(verdict.device_identity, format!("tdx/{INSTANCE_ID}"));
     assert_eq!(verdict.node_id, "0xtdxnode");
+}
+
+/// The guest agent's own shape: a runtime event carries its name and payload
+/// but leaves the digest empty, and the verifier derives it. Blanking every
+/// runtime-event digest is exactly what prismd receives over the socket, and
+/// it must verify identically to the cloud shape where the field is filled.
+#[test]
+fn the_guest_agent_shape_with_derived_digests_verifies() {
+    const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
+    let mut events = events();
+    for event in &mut events {
+        if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
+            event.digest.clear();
+        }
+    }
+    let verdict = verify_tdx_attestation(
+        &attestation(),
+        COLLATERAL,
+        &events,
+        &expectation(),
+        vector_time(),
+        &accepting_policy(),
+    )
+    .expect("the derived-digest shape verifies");
+    assert_eq!(verdict.device_identity, format!("tdx/{INSTANCE_ID}"));
+}
+
+/// A tampered payload is caught even in the derived-digest shape, and by the
+/// fold rather than a carried-digest comparison: the recomputed digest no
+/// longer folds to the quoted register.
+#[test]
+fn a_tampered_payload_breaks_the_fold_when_the_digest_is_derived() {
+    const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
+    let mut events = events();
+    for event in &mut events {
+        if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
+            event.digest.clear();
+        }
+    }
+    let compose = events
+        .iter_mut()
+        .find(|event| event.name == "compose-hash")
+        .unwrap();
+    compose.payload[0] ^= 1;
+    let refused = verify_tdx_attestation(
+        &attestation(),
+        COLLATERAL,
+        &events,
+        &expectation(),
+        vector_time(),
+        &accepting_policy(),
+    );
+    assert_eq!(refused, Err(VerificationError::TdxEventLogMismatch));
 }
 
 /// The same quote after the collateral's validity refuses. Stale collateral

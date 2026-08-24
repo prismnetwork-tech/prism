@@ -344,10 +344,7 @@ fn decode_tdx_events(
                 imr: entry.imr,
                 event_type: entry.event_type,
                 name: entry.event.clone(),
-                digest: hex::decode(&entry.digest)
-                    .ok()
-                    .and_then(|raw| raw.try_into().ok())
-                    .ok_or("an event digest is not a 48 byte hex digest")?,
+                digest: hex::decode(&entry.digest).map_err(|_| "an event digest is not hex")?,
                 payload: hex::decode(&entry.event_payload)
                     .map_err(|_| "an event payload is not hex")?,
             })
