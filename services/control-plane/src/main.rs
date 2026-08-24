@@ -10824,6 +10824,255 @@ mod tests {
         ));
     }
 
+    /// The genuine H100 CC report captured from confidential silicon, wrapped
+    /// in the courier envelope a node presents it under. Its nonce is the
+    /// provider's, taken when the card was captured, so it stands in for a real
+    /// report answering a challenge this store never issued.
+    fn genuine_gpu_cc_attestation(lease_id: u64, challenge_id: Uuid) -> GpuCcAttestation {
+        let report = attestation_fixture("nvidia-cc/genuine/report.bin");
+        let chain: Vec<String> =
+            serde_json::from_slice(&attestation_fixture("nvidia-cc/genuine/chain.json"))
+                .expect("genuine cc chain fixture");
+        GpuCcAttestation::sign(
+            prism_protocol::UnsignedGpuCcAttestation {
+                node_id: attested_node_id(),
+                lease_id,
+                challenge_id,
+                report_base64: STANDARD.encode(report),
+                certificate_chain_base64: chain,
+                collected_at: Utc::now(),
+            },
+            &attestation_signing_key(),
+        )
+        .unwrap()
+    }
+
+    /// The live TDX quote captured from a CVM we deployed and tore down, with
+    /// its collateral and event log, in the same courier envelope. Intel signed
+    /// it, but its REPORT_DATA answers the CVM's own binding rather than a
+    /// challenge this store issued.
+    fn live_tdx_lease_attestation(lease_id: u64, challenge_id: Uuid) -> TdxLeaseAttestation {
+        let quote = attestation_fixture("tdx/live-quote.bin");
+        let collateral =
+            String::from_utf8(attestation_fixture("tdx/live-collateral.json")).unwrap();
+        let events: Vec<TdxEventEntry> =
+            serde_json::from_slice(&attestation_fixture("tdx/live-events.json"))
+                .expect("live tdx event log fixture");
+        TdxLeaseAttestation::sign(
+            prism_protocol::UnsignedTdxLeaseAttestation {
+                node_id: attested_node_id(),
+                lease_id,
+                challenge_id,
+                quote_base64: STANDARD.encode(quote),
+                tdx_event_log: events,
+                tdx_collateral_json: collateral,
+                collected_at: Utc::now(),
+            },
+            &attestation_signing_key(),
+        )
+        .unwrap()
+    }
+
+    /// A lease reaches `Confidential` through the store's own methods. The guest
+    /// half is a real SEV-SNP report, built around the checked-in VCEK and
+    /// walked to the test root, submitted through the same record path a node
+    /// uses; it earns `Attested` on its own. The GPU half is a verified CC
+    /// verdict standing beside it, and the access gate fuses the two the last
+    /// rung to `Confidential`. The GPU verdict is placed rather than submitted
+    /// because the only real CC report we hold answers its capture nonce, not a
+    /// challenge this store issues; that report's verify path is exercised in
+    /// `the_gpu_cc_submission_refuses_a_report_bound_to_its_capture_nonce`, so
+    /// the full silicon-to-`Confidential` grant is what a live node closes and
+    /// everything short of the two lease-bound nonces is proved here.
+    #[tokio::test]
+    async fn a_lease_reaches_confidential_through_the_store() {
+        let market = guest_lease_market(TrustClass::Confidential, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        let guest = attest_guest(&store, &lease).await.unwrap();
+        assert_eq!(guest.kind, AttestationKind::SevSnp);
+        assert_eq!(
+            guest.granted_class,
+            TrustClass::Attested,
+            "the guest report earns the guest rung on its own"
+        );
+
+        let MarketplaceStore::Memory(handle) = &store else {
+            unreachable!()
+        };
+        handle
+            .write()
+            .await
+            .leases
+            .get_mut(&GUEST_LEASE_ID)
+            .unwrap()
+            .1
+            .state = LeaseState::Active;
+
+        // The guest half alone does not open a confidential lease: encrypted
+        // memory behind an unmeasured GPU is not what the renter paid for.
+        assert!(matches!(
+            store.lease_access(GUEST_RENTER, GUEST_LEASE_ID).await,
+            Err(StoreError::LeaseUnattested)
+        ));
+
+        handle.write().await.lease_gpu_cc_verdicts.insert(
+            GUEST_LEASE_ID,
+            gpu_cc_verdict(
+                GUEST_LEASE_ID,
+                &attested_node_id(),
+                Utc::now() + Duration::hours(1),
+            ),
+        );
+
+        // The fusion the gate runs, off the node's own earned floor rather than
+        // the record's optimistic class: the real guest verdict on file stops
+        // at `Attested`, and only the GPU verdict beside it reaches
+        // `Confidential`.
+        {
+            let market = handle.read().await;
+            let snp = market.lease_verdicts[&GUEST_LEASE_ID].clone();
+            let gpu = market.lease_gpu_cc_verdicts[&GUEST_LEASE_ID].clone();
+            let now = Utc::now();
+            assert_eq!(
+                class_for_lease(
+                    GUEST_LEASE_ID,
+                    &attested_node_id(),
+                    TrustClass::Isolated,
+                    Some(&snp),
+                    None,
+                    None,
+                    now,
+                ),
+                TrustClass::Attested
+            );
+            assert_eq!(
+                class_for_lease(
+                    GUEST_LEASE_ID,
+                    &attested_node_id(),
+                    TrustClass::Isolated,
+                    Some(&snp),
+                    None,
+                    Some(&gpu),
+                    now,
+                ),
+                TrustClass::Confidential
+            );
+        }
+
+        assert!(
+            store
+                .lease_access(GUEST_RENTER, GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .is_some(),
+            "with both halves proved the confidential lease opens"
+        );
+    }
+
+    /// The GPU-CC submission the `/v1/leases/{id}/gpu-attestation` handler
+    /// delegates to runs the real NVIDIA verifier and fails closed. The report
+    /// is the genuine H100 CC capture: its signature chains to NVIDIA's device
+    /// root and its confidential-mode flag is set, but it answers its capture
+    /// nonce, not the challenge this store just issued, so the submission
+    /// refuses at the nonce binding. The challenge is spent whichever way it
+    /// went, so a host cannot grind the one report it holds against a live
+    /// nonce.
+    #[tokio::test]
+    async fn the_gpu_cc_submission_refuses_a_report_bound_to_its_capture_nonce() {
+        let market = guest_lease_market(TrustClass::Confidential, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let challenge = store
+            .create_lease_gpu_cc_attestation_challenge(GUEST_LEASE_ID)
+            .await
+            .unwrap();
+        let attestation = genuine_gpu_cc_attestation(GUEST_LEASE_ID, challenge.challenge_id);
+
+        assert!(matches!(
+            store
+                .record_lease_gpu_cc_attestation(LeaseGpuCcAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert!(
+            matches!(
+                store
+                    .record_lease_gpu_cc_attestation(LeaseGpuCcAttestationSubmission {
+                        attestation: &attestation,
+                        lease: &lease,
+                        policy: &attestation_policy(),
+                    })
+                    .await,
+                Err(StoreError::AttestationChallengeUnavailable)
+            ),
+            "a refusal spends the challenge"
+        );
+
+        let MarketplaceStore::Memory(handle) = &store else {
+            unreachable!()
+        };
+        assert!(
+            handle.read().await.lease_gpu_cc_verdicts.is_empty(),
+            "a report that cannot verify stores no verdict"
+        );
+    }
+
+    /// The TDX submission the `/v1/leases/{id}/tdx-attestation` handler
+    /// delegates to is verify-gated the same way, against the guest challenge it
+    /// answers. The quote is the live capture the attestation crate's vectors
+    /// run, genuinely Intel-signed, but its REPORT_DATA is the CVM's own binding
+    /// rather than this lease's challenge, so it refuses at the nonce binding
+    /// and stores nothing.
+    #[tokio::test]
+    async fn the_tdx_submission_refuses_a_quote_bound_to_its_capture_nonce() {
+        let market = guest_lease_market(TrustClass::Confidential, LeaseState::Provisioning);
+        let lease = market.leases[&GUEST_LEASE_ID].1.clone();
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let challenge = store
+            .create_lease_attestation_challenge(GUEST_LEASE_ID)
+            .await
+            .unwrap();
+        let attestation = live_tdx_lease_attestation(GUEST_LEASE_ID, challenge.challenge_id);
+
+        assert!(matches!(
+            store
+                .record_lease_tdx_attestation(LeaseTdxAttestationSubmission {
+                    attestation: &attestation,
+                    lease: &lease,
+                    policy: &attestation_policy(),
+                })
+                .await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert!(
+            matches!(
+                store
+                    .record_lease_tdx_attestation(LeaseTdxAttestationSubmission {
+                        attestation: &attestation,
+                        lease: &lease,
+                        policy: &attestation_policy(),
+                    })
+                    .await,
+                Err(StoreError::AttestationChallengeUnavailable)
+            ),
+            "a refusal spends the challenge"
+        );
+
+        let MarketplaceStore::Memory(handle) = &store else {
+            unreachable!()
+        };
+        assert!(
+            handle.read().await.lease_tdx_guest_verdicts.is_empty(),
+            "a quote that cannot verify stores no verdict"
+        );
+    }
+
     #[tokio::test]
     async fn a_checksummed_linked_wallet_still_finds_its_nodes() {
         let checksummed = "0xAbC0000000000000000000000000000000000001";
