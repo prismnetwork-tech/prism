@@ -299,3 +299,18 @@ test("warming the pool ahead of the work is what makes a batch use all of it", a
   assert.equal(new Set(deps.calls.generations.map((g) => g.slot)).size, 3);
   assert.equal(new Set(out.body.receipt.lease_ids).size, 3);
 });
+
+test("a chain fault is logged with the reason, not just its code", async () => {
+  const deps = fakeDeps();
+  const lines = [];
+  deps.log = (line) => lines.push(line);
+  deps.agent.lease = async () => {
+    const err = new Error("prism 502: chain_error");
+    err.body = { cause: "Nonce provided for the transaction is lower than the current nonce of the account." };
+    throw err;
+  };
+  const gateway = build(deps, { poolMax: 2 });
+  const out = await gateway.handleBatch({ model: MODEL, prompts: prompts(2) }, pay());
+  assert.equal(out.status, 503);
+  assert.match(lines.join("\n"), /chain_error: Nonce provided/);
+});

@@ -69,6 +69,15 @@ const ROUTES = {
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/// An error worth acting on. The SDK carries the reason in `body.cause` and the
+/// message is only the status and the code, so a bare message reads as
+/// "chain_error" for faults that have nothing to do with each other.
+export function describe(err) {
+  const cause = err?.body?.cause ?? err?.cause;
+  const detail = typeof cause === "string" ? cause : cause?.message;
+  return detail ? `${err.message}: ${detail}` : String(err?.message ?? err);
+}
 /// Distinguishes "the wait elapsed" from "warming finished, with or without an
 /// error", which null and an Error already cover.
 const TIMED_OUT = Symbol("timed out");
@@ -215,7 +224,10 @@ export function createGateway({
       // network with fresh quote attempts helps nobody. Say why: every later
       // caller is told only that a cooldown is running, so a cause that is not
       // written down here cannot be recovered from outside at all.
-      log(`warmup failed while leasing: ${err.message}`);
+      // The SDK reports a chain fault as a status and a code, and puts what
+      // actually went wrong in the body. Logging only the message throws that
+      // away and leaves a cooldown with no stated cause.
+      log(`warmup failed while leasing: ${describe(err)}`);
       box.phase = "cold";
       coolUntil = now() + coolDownMs;
       throw err;
@@ -264,7 +276,7 @@ export function createGateway({
       coolUntil = now() + coolDownMs;
       // A lease was paid for and is being dropped, so this is the expensive
       // failure and the one worth naming precisely.
-      log(`warmup failed after lease ${lease.leaseId}: ${err.message}`);
+      log(`warmup failed after lease ${lease.leaseId}: ${describe(err)}`);
       throw err;
     }
   }

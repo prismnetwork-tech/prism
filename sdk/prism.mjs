@@ -175,12 +175,14 @@ export class PrismAgent {
 
   async transferUsdg(to, amountMicros) {
     try {
-      const hash = await this.walletClient.writeContract({
-        address: USDG,
-        abi: erc20Abi,
-        functionName: "transfer",
-        args: [to, BigInt(amountMicros)],
-      });
+      const hash = await this.#submit(() =>
+        this.walletClient.writeContract({
+          address: USDG,
+          abi: erc20Abi,
+          functionName: "transfer",
+          args: [to, BigInt(amountMicros)],
+        }),
+      );
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status !== "success") throw new PrismError(502, "transfer_reverted", { hash });
       return hash;
@@ -220,27 +222,36 @@ export class PrismAgent {
     const duration = parseDuration(quote.duration_seconds);
     const clientReference = keccak256(stringToBytes(quote.quote_id));
     try {
-      const allowance = await this.publicClient.readContract({
-        address: USDG,
-        abi: erc20Abi,
-        functionName: "allowance",
-        args: [this.address, this.escrow],
-      });
-      if (allowance < deposit) {
-        const approveHash = await this.walletClient.writeContract({
+      // Approving and spending are one indivisible step. The approval covers
+      // exactly this deposit, so a second lease that read the allowance before
+      // this one spent it would find it gone by the time the chain ran it.
+      const hash = await this.#submit(async () => {
+        const allowance = await this.publicClient.readContract({
           address: USDG,
           abi: erc20Abi,
-          functionName: "approve",
-          args: [this.escrow, deposit],
+          functionName: "allowance",
+          args: [this.address, this.escrow],
         });
-        const approved = await this.publicClient.waitForTransactionReceipt({ hash: approveHash });
-        if (approved.status !== "success") throw new PrismError(402, "approve_reverted", { hash: approveHash });
-      }
-      const hash = await this.walletClient.writeContract({
-        address: this.escrow,
-        abi: escrowAbi,
-        functionName: "createLease",
-        args: [quote.node_id, duration, clientReference],
+        if (allowance < deposit) {
+          const approveHash = await this.walletClient.writeContract({
+            address: USDG,
+            abi: erc20Abi,
+            functionName: "approve",
+            args: [this.escrow, deposit],
+          });
+          const approved = await this.publicClient.waitForTransactionReceipt({ hash: approveHash });
+          if (approved.status !== "success") throw new PrismError(402, "approve_reverted", { hash: approveHash });
+        }
+        const funding = await this.walletClient.writeContract({
+          address: this.escrow,
+          abi: escrowAbi,
+          functionName: "createLease",
+          args: [quote.node_id, duration, clientReference],
+        });
+        // One confirmation here, not for the control-plane's benefit but so the
+        // allowance and the nonce are settled before the next lease reads them.
+        await this.publicClient.waitForTransactionReceipt({ hash: funding });
+        return funding;
       });
       // 12 confirmations: the control-plane rejects funding until the tx is final.
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash, confirmations: CONFIRMATIONS });
@@ -494,6 +505,22 @@ export class PrismAgent {
         /* best effort */
       }
     }
+  }
+
+  // A wallet has one nonce, so two transactions prepared at the same moment are
+  // handed the same one and the chain refuses the second. Everything that
+  // submits from this wallet queues here, which is what lets one wallet fund
+  // several leases at once: they provision in parallel, they just do not sign
+  // at the same instant.
+  #submitting = Promise.resolve();
+
+  #submit(send) {
+    const done = this.#submitting.then(send, send);
+    this.#submitting = done.then(
+      () => {},
+      () => {},
+    );
+    return done;
   }
 
   #generateSshKey() {
