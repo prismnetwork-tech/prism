@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createGateway, priceFor } from "./gateway.mjs";
+import { createGateway, DEFAULT_PRICING, priceFor } from "./gateway.mjs";
+
+// What a lease costs and what it produces. The rate is the network's, read off
+// /v1/offers and confirmed by settled receipts (900s billed 199,800 micros).
+// The throughputs are end-to-end tokens per second measured under ollama on a
+// 273 GB/s workstation, which is slower than any card the network offers, so
+// they are the pessimistic case for cost.
+const LEASE_MICROS_PER_SECOND = 222;
+const WARM_WINDOW_SECONDS = 1800;
+const FLOOR_TOKENS_PER_SECOND = { "llama3.2:3b": 88.7, "llama3.1:8b": 43.4 };
+
+// What an uncapped request costs, which is what the tests below pay.
+const fullCap = (m) => String(DEFAULT_PRICING[m].base + DEFAULT_PRICING[m].perToken * 1024);
 
 const TX = `0x${"ab".repeat(32)}`;
 const payment = Buffer.from(JSON.stringify({ txHash: TX, signature: "0xsig" })).toString("base64");
@@ -133,6 +145,61 @@ test("prices scale with the model and the requested output cap", async () => {
   assert.equal(priceFor(pricing, "llama3.2:3b", 0).cap, 1024);
 });
 
+test("an unconfigured gateway quotes the shipped card, not a flat fee", () => {
+  const deps = fakeDeps();
+  const gateway = build(deps, { models: ["llama3.2:3b", "llama3.1:8b"] });
+  const listing = gateway.models();
+  assert.equal(listing.pricing["llama3.2:3b"].base_micros, 3000);
+  assert.equal(listing.pricing["llama3.2:3b"].per_token_micros, 3);
+  assert.equal(listing.pricing["llama3.2:3b"].full_cap_micros, String(3000 + 3 * 1024));
+  assert.equal(listing.pricing["llama3.1:8b"].full_cap_micros, String(6000 + 6 * 1024));
+  assert.equal(listing.price_micros, String(6000 + 6 * 1024));
+});
+
+test("a model with no measured card is priced as the largest one that was measured", () => {
+  const listing = build(fakeDeps(), { models: ["qwen2.5:32b"] }).models();
+  assert.deepEqual(
+    { base: listing.pricing["qwen2.5:32b"].base_micros, perToken: listing.pricing["qwen2.5:32b"].per_token_micros },
+    DEFAULT_PRICING["llama3.1:8b"],
+  );
+});
+
+test("a configured base moves the card without erasing its per-token rates", () => {
+  const listing = build(fakeDeps(), { models: ["llama3.2:3b"], priceMicros: 9_000n }).models();
+  assert.equal(listing.pricing["llama3.2:3b"].base_micros, 9000);
+  assert.equal(listing.pricing["llama3.2:3b"].per_token_micros, 3, "the measured rate survives a base override");
+
+  const explicit = build(fakeDeps(), {
+    models: ["llama3.2:3b"],
+    priceMicros: 9_000n,
+    pricing: { "llama3.2:3b": { base: 1, per_token: 2 } },
+  }).models();
+  assert.equal(explicit.pricing["llama3.2:3b"].base_micros, 1);
+  assert.equal(explicit.pricing["llama3.2:3b"].per_token_micros, 2);
+});
+
+// The two assertions that keep the card honest. Both are about money, not
+// shape, and both fail if someone trims a rate without redoing the arithmetic.
+test("every per-token rate is above the lease seconds a token burns", () => {
+  for (const [model, tokensPerSecond] of Object.entries(FLOOR_TOKENS_PER_SECOND)) {
+    const marginal = LEASE_MICROS_PER_SECOND / tokensPerSecond;
+    assert.ok(
+      DEFAULT_PRICING[model].perToken > marginal,
+      `${model} sells tokens at ${DEFAULT_PRICING[model].perToken} micros and burns ${marginal.toFixed(2)}`,
+    );
+  }
+});
+
+test("the base recovers a warm window inside the traffic one window can serve", () => {
+  const window = LEASE_MICROS_PER_SECOND * WARM_WINDOW_SECONDS;
+  for (const [model, { base, perToken }] of Object.entries(DEFAULT_PRICING)) {
+    const calls = window / (base + perToken * 256);
+    // A window holds far more than this, so break-even is a traffic level the
+    // GPU can actually serve rather than an arithmetic one.
+    assert.ok(calls < 150, `${model} needs ${Math.ceil(calls)} calls of 256 tokens to pay for its lease`);
+  }
+});
+
 test("stats count served generations and revenue", async () => {
   const deps = fakeDeps();
   const gateway = build(deps);
@@ -140,7 +207,7 @@ test("stats count served generations and revenue", async () => {
   const stats = gateway.stats();
   assert.equal(stats.generations, 1);
   assert.equal(stats.tokens_out, 7);
-  assert.equal(stats.revenue_micros, "10000");
+  assert.equal(stats.revenue_micros, fullCap("llama3.2:3b"));
   assert.equal(stats.leases_warmed, 1);
 });
 
@@ -272,7 +339,14 @@ function authorization(overrides = {}) {
     accepted: { scheme: "exact", network: "eip155:8453" },
     payload: {
       signature: "0xsig",
-      authorization: { from: PAYER, to: BASE_PAY_TO, value: "10000", validAfter: "1", validBefore: "2", nonce: NONCE },
+      authorization: {
+        from: PAYER,
+        to: BASE_PAY_TO,
+        value: fullCap("llama3.2:3b"),
+        validAfter: "1",
+        validBefore: "2",
+        nonce: NONCE,
+      },
       ...overrides,
     },
   })).toString("base64");
@@ -302,11 +376,11 @@ test("both rails are offered when Base is configured, Robinhood alone when it is
   // v1 names Base by its ecosystem name and v2 by CAIP-2; both mean chain 8453.
   const v1 = (await dual.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 1)).body.accepts;
   assert.deepEqual(v1.map((a) => a.network), ["base", "eip155:4663"]);
-  assert.equal(v1[0].maxAmountRequired, "10000");
+  assert.equal(v1[0].maxAmountRequired, fullCap("llama3.2:3b"));
 
   const offered = (await dual.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts;
   assert.deepEqual(offered.map((a) => a.network), ["eip155:8453", "eip155:4663"]);
-  assert.equal(offered[0].amount, "10000");
+  assert.equal(offered[0].amount, fullCap("llama3.2:3b"));
   assert.equal(offered[0].payTo, BASE_PAY_TO);
   assert.equal(offered[0].extra.assetTransferMethod, "eip3009");
   // The domain the signer must use has to travel with the requirement.

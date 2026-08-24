@@ -10,10 +10,10 @@ lease a machine or hold one open; Prism keeps a warm GPU and bills per call.
 Free, no payment. Returns the list currently served, and the rate card:
 
     {"models": ["llama3.2:3b", "llama3.1:8b"],
-     "pricing": {"llama3.2:3b": {"base_micros": 5000, "per_token_micros": 10,
-                                 "full_cap_micros": "15240"},
-                 "llama3.1:8b": {"base_micros": 10000, "per_token_micros": 25,
-                                 "full_cap_micros": "35600"}},
+     "pricing": {"llama3.2:3b": {"base_micros": 3000, "per_token_micros": 3,
+                                 "full_cap_micros": "6072"},
+                 "llama3.1:8b": {"base_micros": 6000, "per_token_micros": 6,
+                                 "full_cap_micros": "12144"}},
      "state": "warm"}
 
 This is the cheapest way to plan a call. The price of a generation is
@@ -64,9 +64,9 @@ refusal to serve, and it clears on its own.
 
 The 402 carries a `quote` alongside the payment options:
 
-    "quote": {"model": "llama3.2:3b", "output_cap": 1024, "price_micros": "15240"}
+    "quote": {"model": "llama3.2:3b", "output_cap": 1024, "price_micros": "6072"}
 
 `price_micros` is in millionths of a dollar, and both stablecoins carry six
 decimals, so the figure is the same number of atomic units on either rail. A
-24-token cap on `llama3.2:3b` quoted 5240 micros, which is 0.00524 of either
+24-token cap on `llama3.2:3b` quoted 3072 micros, which is 0.003072 of either
 stablecoin.

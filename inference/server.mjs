@@ -47,7 +47,9 @@ try {
   config = {
     port: Number(process.env.INFERENCE_PORT ?? 8500),
     models: (process.env.INFERENCE_MODELS ?? "llama3.2:3b").split(",").map((m) => m.trim()).filter(Boolean),
-    priceMicros: BigInt(process.env.INFERENCE_PRICE_MICROS ?? "10000"),
+    // Unset leaves the shipped rate card in place. Defaulting it here would
+    // overwrite every model's base with the same number and quietly undo it.
+    priceMicros: process.env.INFERENCE_PRICE_MICROS ? BigInt(process.env.INFERENCE_PRICE_MICROS) : null,
     pricing: process.env.INFERENCE_PRICING ? JSON.parse(process.env.INFERENCE_PRICING) : null,
     payTo: getAddress(requireEnv("INFERENCE_PAY_TO")),
     durationSeconds: Number(process.env.INFERENCE_WARM_SECONDS ?? 1800),
@@ -414,9 +416,11 @@ async function readJson(req, limit = MAX_BODY_BYTES) {
 server.requestTimeout = 600_000;
 server.headersTimeout = 620_000;
 
+// The resolved card, not the env var: what is quoted is what should be logged.
+const card = Object.entries(gateway.models().pricing)
+  .map(([m, p]) => `${m} ${p.base_micros}+${p.per_token_micros}/token`)
+  .join(", ");
+
 server.listen(config.port, () =>
-  console.error(
-    `prism inference gateway on :${config.port}, models ${config.models.join(", ")}, ` +
-      `${config.priceMicros} micros per generation to ${config.payTo}`,
-  ),
+  console.error(`prism inference gateway on :${config.port}, ${card} micros to ${config.payTo}`),
 );

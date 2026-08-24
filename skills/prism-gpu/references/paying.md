@@ -20,7 +20,7 @@ Each entry in `accepts` is one option:
 
     {"scheme": "exact",
      "network": "eip155:4663",
-     "amount": "5240",
+     "amount": "3072",
      "asset": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
      "payTo": "0xEcaaE714912C38fA7e0dAF78afa7C54DbeD11039",
      "maxTimeoutSeconds": 60,

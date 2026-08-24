@@ -42,6 +42,27 @@ per-token rate over the output cap you ask for (`options.num_predict`, up to
 `GET /v1/models` lists each model's rates next to `price_micros`, the highest
 full-cap price, which always clears verification when paid.
 
+## Rates
+
+Prices are in USDG micros; both stablecoins carry six decimals, so the same
+figure is the price on either rail.
+
+| Model | Base | Per output token | A 256-token answer | Full 1024-token answer |
+| --- | --- | --- | --- | --- |
+| `llama3.2:3b` | 3000 | 3 | $0.003768 | $0.006072 |
+| `llama3.1:8b` | 6000 | 6 | $0.007536 | $0.012144 |
+
+The base covers the warm window. Keeping a GPU leased costs 222 micros a
+second and the lease settles on the seconds the node ran, so an 1800-second
+window is 399,600 micros that are spent whether or not anyone calls. The
+per-token rate covers the lease time the tokens themselves burn, measured end
+to end under ollama: about 2.5 micros a token for `llama3.2:3b` and 5.1 for
+`llama3.1:8b` on hardware slower than anything the network offers.
+
+Set `options.num_predict` to what you actually want. The quote is priced on the
+cap, not on what the model happens to produce, so an uncapped request for a
+one-line answer pays for 1024 tokens.
+
 A payment is consumed only when a response is served. If the box is still
 warming or the generation fails, the answer is `503` and the same `X-PAYMENT`
 header works on the retry. `GET /v1/stats` reports generations served, tokens,
@@ -116,8 +137,8 @@ the chain runs batch root to item to lease to settlement.
 | `PRISM_AGENT_KEY` / `PRISM_ESCROW` | The wallet and escrow the gateway leases with. |
 | `INFERENCE_PAY_TO` | Address paid generations must reach. |
 | `INFERENCE_MODELS` | Comma list of ollama models to preload (default `llama3.2:3b`). |
-| `INFERENCE_PRICE_MICROS` | Default base price in USDG micros (default 10000 = 0.01 USDG). |
-| `INFERENCE_PRICING` | Per-model JSON, e.g. `{"llama3.2:3b":{"base":5000,"per_token":10}}`. |
+| `INFERENCE_PRICE_MICROS` | Base price in USDG micros for every model, overriding the table above. Per-token rates are unaffected. |
+| `INFERENCE_PRICING` | Per-model JSON overriding both, e.g. `{"llama3.2:3b":{"base":3000,"per_token":3}}`. |
 | `INFERENCE_WARM_SECONDS` | Lease length per warm window (default 1800). |
 | `INFERENCE_IDLE_SECONDS` | Idle time before a box is allowed to lapse (default 600). |
 | `INFERENCE_POOL_MAX` | How many GPUs the gateway may hold at once (default 1). |

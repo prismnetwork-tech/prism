@@ -10,7 +10,24 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "@prismnetwork/x402/codec";
 import { batchReceipt, digest } from "./receipt.mjs";
 
-export const DEFAULT_PRICE_MICROS = 10_000n;
+// The shipped rate card, in USDG micros, derived from what a generation costs
+// to serve.
+//
+// `base` recovers the warm window. A window is an 1800s lease at 222 micros/s,
+// the escrow settles on the seconds the node ran and there is no early exit, so
+// all 399,600 of those micros are spent whether anyone calls or not. Each base
+// is set so about an eighth of what a window can serve pays for the window.
+//
+// `perToken` covers the lease time the tokens themselves burn. Measured end to
+// end under ollama on a 273 GB/s workstation, llama3.2:3b runs at 89 tok/s and
+// llama3.1:8b at 43, which is 2.5 and 5.1 micros of lease per token. Every card
+// the network offers has more bandwidth than that, so treat those as the
+// ceiling on cost. The 1:2 ratio between the models is the ratio of their
+// measured throughput.
+export const DEFAULT_PRICING = {
+  "llama3.2:3b": { base: 3_000, perToken: 3 },
+  "llama3.1:8b": { base: 6_000, perToken: 6 },
+};
 export const MAX_PROMPT_BYTES = 32 * 1024;
 export const MAX_PREDICT_TOKENS = 1_024;
 export const MAX_BATCH_ITEMS = 64;
@@ -93,7 +110,9 @@ export function createGateway({
   // The batch takes a different body, and an indexer that reads the single
   // request's schema off a batch 402 publishes a call that cannot work.
   batchSchemas = null,
-  priceMicros = DEFAULT_PRICE_MICROS,
+  // Sets the base for every model when given, so an operator can move the
+  // whole card without listing it. Null leaves the shipped card alone.
+  priceMicros = null,
   pricing: pricingIn = null,
   image,
   durationSeconds = 1800,
@@ -126,7 +145,13 @@ export function createGateway({
   const pricing = {};
   for (const m of models) {
     const p = pricingIn?.[m] ?? {};
-    pricing[m] = { base: Number(p.base ?? priceMicros), perToken: Number(p.per_token ?? p.perToken ?? 0) };
+    // A model nobody costed is priced as the largest one that was measured.
+    // Guessing low there loses money on every call it serves.
+    const card = DEFAULT_PRICING[m] ?? DEFAULT_PRICING["llama3.1:8b"];
+    pricing[m] = {
+      base: Number(p.base ?? priceMicros ?? card.base),
+      perToken: Number(p.per_token ?? p.perToken ?? card.perToken),
+    };
     if (!Number.isFinite(pricing[m].base) || pricing[m].base < 0 || !Number.isFinite(pricing[m].perToken) || pricing[m].perToken < 0) {
       throw new Error(`pricing for ${m} must be non-negative numbers`);
     }

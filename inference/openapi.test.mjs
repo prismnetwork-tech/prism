@@ -5,8 +5,8 @@ import { openApiDocument } from "./openapi.mjs";
 const doc = () => openApiDocument({
   models: ["llama3.2:3b", "llama3.1:8b"],
   pricing: {
-    "llama3.2:3b": { base_micros: 5000, per_token_micros: 10, full_cap_micros: "15240" },
-    "llama3.1:8b": { base_micros: 10000, per_token_micros: 25, full_cap_micros: "35600" },
+    "llama3.2:3b": { base_micros: 3000, per_token_micros: 3, full_cap_micros: "6072" },
+    "llama3.1:8b": { base_micros: 6000, per_token_micros: 6, full_cap_micros: "12144" },
   },
   jobPriceMicros: 30000,
   contactEmail: "contact@prismnetwork.tech",
@@ -42,8 +42,8 @@ test("prices are decimal USD here, not the atomic units the 402 carries", () => 
   // is one of the listed registration failures.
   assert.equal(d.paths["/x402/run"].post["x-payment-info"].price.amount, "0.030000");
   const dyn = d.paths["/inference/v1/inference"].post["x-payment-info"].price;
-  assert.equal(dyn.min, "0.005000");
-  assert.equal(dyn.max, "0.035600");
+  assert.equal(dyn.min, "0.003000");
+  assert.equal(dyn.max, "0.012144");
 });
 
 test("every operation has an input and an output schema, or it is not invocable", () => {

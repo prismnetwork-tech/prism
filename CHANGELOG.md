@@ -8,6 +8,15 @@ The project follows semantic versioning after its first stable release.
 
 ### Changed
 
+- Managed inference is repriced against what a generation costs to serve.
+  `llama3.2:3b` is 3000 micros plus 3 a token and `llama3.1:8b` is 6000 plus 6,
+  which halves the price of a short answer and cuts a full 1024-token one by
+  about two thirds. The gateway now ships that rate card as its default instead
+  of a flat 10,000-micro fee, `INFERENCE_PRICE_MICROS` sets the base for every
+  model without erasing the per-token rates, and a model the card does not list
+  is priced as the largest one that was measured. `DEFAULT_PRICE_MICROS` is
+  replaced by `DEFAULT_PRICING`.
+
 - Repository links across the site, the packages and the docs now point at the
   new `prismnetworkdottech` organisation. Published artifact names are
   deliberately untouched: container images keep their `ghcr.io` path and the
