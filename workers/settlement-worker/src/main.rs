@@ -446,6 +446,16 @@ fn transaction_nonce(raw: &str) -> anyhow::Result<u64> {
         .context("settlement transaction nonce is invalid")
 }
 
+/// How far short of its paid window a lease has to end before the ending is
+/// treated as something going wrong rather than a lease closing on time.
+const EARLY_CLOSE_GRACE_SECONDS: u64 = 5;
+
+/// How stale the last sighting of a machine has to be, at the moment its lease
+/// closed, before the machine counts as having gone away. Below the window that
+/// triggers the close in the first place, and well above a normal poll gap, so
+/// a lease that finished between two polls is not mistaken for a fault.
+const STALE_OBSERVATION_SECONDS: u64 = 60;
+
 fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal> {
     if evidence.lease_id == 0
         || evidence.lease_nonce == 0
@@ -474,17 +484,43 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         .access_started_at
         .max(evidence.cuda_ready_at)
         .max(evidence.interactive_access_ready_at);
-    let end = evidence
+    // The paid window runs from the moment the chain started the lease, which
+    // is what the renter is charged against, not from the later moment the
+    // machine finished coming up.
+    let scheduled_end = evidence
+        .access_started_at
+        .saturating_add(u64::from(evidence.duration_seconds));
+    let closed_at = evidence
         .access_ended_at
         .min(evidence.gateway_closed_at)
-        .min(start.saturating_add(u64::from(evidence.duration_seconds)));
+        .min(scheduled_end);
     if start < evidence.access_started_at
-        || end > evidence.access_ended_at
-        || end < start
+        || closed_at > evidence.access_ended_at
+        || closed_at < start
         || evidence.access_ended_at <= evidence.access_started_at
     {
         anyhow::bail!("lease {} has an invalid metering window", evidence.lease_id);
     }
+    // Two things have to be true before a lease counts as cut short, and
+    // neither alone is enough. It has to have ended before the time it was paid
+    // for, and the machine has to have already stopped answering when it ended.
+    // Timing alone would blame the provider when a renter closed their own
+    // access early. A stale reading alone would blame a lease that simply
+    // finished between polls. Only the pair means the machine went away.
+    let ended_early = closed_at.saturating_add(EARLY_CLOSE_GRACE_SECONDS) < scheduled_end;
+    let interrupted = ended_early
+        && evidence.last_observed_at.is_some_and(|observed| {
+            closed_at.saturating_sub(observed) >= STALE_OBSERVATION_SECONDS
+        });
+    // Closing a lease means noticing it should be closed, and noticing takes a
+    // staleness window. Meter to the last moment the machine was known to be
+    // there so the renter never pays for the interval in which it was already
+    // gone and we had not caught up.
+    let end = match evidence.last_observed_at {
+        Some(observed) if interrupted => closed_at.min(observed.max(start)),
+        _ => closed_at,
+    };
+    let credited_seconds = interrupted.then(|| closed_at.saturating_sub(end));
     validate_execution_evidence(evidence, start, end)?;
     let trust_class = settled_trust_class(evidence)?;
     let maximum_by_deposit = evidence.deposit_base_units / evidence.rate_per_second;
@@ -514,10 +550,13 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         charged_base_units,
         refunded_base_units: evidence.deposit_base_units - charged_base_units,
         provider_paid_base_units: charged_base_units - charged_base_units * 1_000 / 10_000,
-        failure_class: None,
+        // Named so a cut-short lease is legible as one on the public feed
+        // instead of reading like a clean run that happened to be short.
+        failure_class: interrupted.then(|| "interrupted".to_owned()),
         outcome: ReceiptOutcome::Finalized,
         trust_class,
         attestation: None,
+        credited_seconds,
         receipt_hash: String::new(),
         transaction_hash: String::new(),
     };
@@ -1089,10 +1128,106 @@ mod tests {
             cuda_ready_at: 10,
             interactive_access_ready_at: 20,
             gateway_closed_at: 100,
+            last_observed_at: None,
             trust_class: None,
             execution: ExecutionEvidence::Physical,
             node_telemetry: telemetry,
         }
+    }
+
+    /// A lease whose machine went away 200s into a 900s window, noticed 150s
+    /// later, which is how long the cloud staleness window takes to fire.
+    fn interrupted_evidence() -> SettlementEvidence {
+        let mut evidence = evidence();
+        evidence.duration_seconds = 900;
+        evidence.deposit_base_units = 900_000;
+        evidence.access_started_at = 0;
+        evidence.cuda_ready_at = 0;
+        evidence.interactive_access_ready_at = 0;
+        evidence.access_ended_at = 350;
+        evidence.gateway_closed_at = 350;
+        evidence.last_observed_at = Some(200);
+        // The broker path, which is what every machine on the network runs on
+        // today, and which meters from the provider's own view of the instance
+        // rather than from telemetry a daemon signs.
+        evidence.execution = ExecutionEvidence::Vast {
+            instance_id: 42,
+            hourly_cost_micros: 600_000,
+        };
+        evidence.node_telemetry.clear();
+        evidence
+    }
+
+    #[test]
+    fn a_machine_that_goes_away_is_billed_to_its_last_sighting() {
+        let proposal = reconcile(&interrupted_evidence()).unwrap();
+        assert_eq!(
+            proposal.usage_seconds, 200,
+            "the 150s of noticing is not billable"
+        );
+        assert_eq!(proposal.receipt.credited_seconds, Some(150));
+        assert_eq!(
+            proposal.receipt.failure_class.as_deref(),
+            Some("interrupted")
+        );
+        assert_eq!(proposal.receipt.charged_base_units, 200_000);
+        assert_eq!(proposal.receipt.refunded_base_units, 700_000);
+    }
+
+    #[test]
+    fn a_lease_that_runs_its_full_window_is_never_called_interrupted() {
+        let mut evidence = interrupted_evidence();
+        evidence.access_ended_at = 900;
+        evidence.gateway_closed_at = 900;
+        evidence.last_observed_at = Some(840);
+        let proposal = reconcile(&evidence).unwrap();
+        assert_eq!(proposal.usage_seconds, 900);
+        assert_eq!(proposal.receipt.failure_class, None);
+        assert_eq!(proposal.receipt.credited_seconds, None);
+    }
+
+    #[test]
+    fn a_renter_closing_early_is_not_a_provider_fault() {
+        let mut evidence = interrupted_evidence();
+        // Closed well before the window ended, but the machine was answering
+        // right up to the moment it closed.
+        evidence.last_observed_at = Some(348);
+        let proposal = reconcile(&evidence).unwrap();
+        assert_eq!(
+            proposal.usage_seconds, 350,
+            "voluntary early close bills in full"
+        );
+        assert_eq!(proposal.receipt.failure_class, None);
+        assert_eq!(proposal.receipt.credited_seconds, None);
+    }
+
+    #[test]
+    fn a_lease_with_no_sighting_to_go_on_is_billed_as_it_always_was() {
+        let mut evidence = interrupted_evidence();
+        evidence.last_observed_at = None;
+        let proposal = reconcile(&evidence).unwrap();
+        assert_eq!(proposal.usage_seconds, 350);
+        assert_eq!(proposal.receipt.failure_class, None);
+    }
+
+    #[test]
+    fn a_sighting_from_before_the_lease_cannot_bill_negative_time() {
+        let mut evidence = interrupted_evidence();
+        evidence.cuda_ready_at = 120;
+        evidence.interactive_access_ready_at = 120;
+        evidence.last_observed_at = Some(5);
+        let proposal = reconcile(&evidence).unwrap();
+        assert_eq!(proposal.usage_seconds, 0);
+        assert_eq!(proposal.receipt.charged_base_units, 0);
+        assert_eq!(proposal.receipt.credited_seconds, Some(230));
+    }
+
+    #[test]
+    fn crediting_a_lease_changes_the_hash_it_settles_under() {
+        let plain = reconcile(&evidence()).unwrap();
+        let credited = reconcile(&interrupted_evidence()).unwrap();
+        assert_ne!(plain.receipt.receipt_hash, credited.receipt.receipt_hash);
+        assert!(prism_protocol::receipt_hash_matches(&credited.receipt).unwrap());
     }
 
     #[test]

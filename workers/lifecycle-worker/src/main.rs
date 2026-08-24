@@ -1652,6 +1652,9 @@ impl Worker {
             outcome: ReceiptOutcome::Refunded,
             trust_class: Some(context.lease.trust_class),
             attestation,
+            // A machine that never arrived was never billed, so there is
+            // nothing to credit back and nothing to say here.
+            credited_seconds: None,
             receipt_hash: String::new(),
             transaction_hash: transaction_hash.clone(),
         };
@@ -1926,8 +1929,8 @@ impl Worker {
 
     async fn settlement_evidence(&self, lease_id: u64) -> anyhow::Result<SettlementEvidence> {
         let context = self.lease_context(lease_id).await?;
-        let cloud = query_as::<_, (i64, i64, String)>(
-            "SELECT provider_instance_id, hourly_cost_micros, status \
+        let cloud = query_as::<_, (i64, i64, String, Option<DateTime<Utc>>)>(
+            "SELECT provider_instance_id, hourly_cost_micros, status, observed_at \
              FROM cloud_instances \
              WHERE lease_id = $1 \
                AND provider_instance_id IS NOT NULL \
@@ -1936,8 +1939,16 @@ impl Worker {
         .bind(lease_id as i64)
         .fetch_optional(&self.pool)
         .await?;
+        // The last time anything confirmed the machine was still there. For a
+        // cloud instance that is the provider poll; for a node of our own it is
+        // the newest telemetry it signed. Settlement meters up to this rather
+        // than to the close, so the renter does not pay for the gap between a
+        // machine going away and us noticing.
+        let mut last_observed_at = cloud
+            .as_ref()
+            .and_then(|(_, _, _, observed_at)| *observed_at);
         let execution = match cloud {
-            Some((instance_id, hourly_cost_micros, status)) => {
+            Some((instance_id, hourly_cost_micros, status, _)) => {
                 if status != "destroyed" {
                     anyhow::bail!("cloud instance was not destroyed before settlement");
                 }
@@ -1956,7 +1967,10 @@ impl Worker {
         .await?
         .into_iter()
         .map(|SqlJson(value)| value)
-        .collect();
+        .collect::<Vec<NodeTelemetry>>();
+        if last_observed_at.is_none() {
+            last_observed_at = telemetry.iter().map(|record| record.observed_at).max();
+        }
         let timestamp = |value: Option<DateTime<Utc>>, name: &str| {
             value
                 .with_context(|| format!("{name} is missing"))
@@ -1986,6 +2000,8 @@ impl Worker {
                 "interactive readiness",
             )?,
             gateway_closed_at: timestamp(context.gateway_closed_at, "gateway close")?,
+            last_observed_at: last_observed_at
+                .and_then(|value| u64::try_from(value.timestamp()).ok()),
             trust_class: Some(context.lease.trust_class),
             execution,
             node_telemetry: telemetry,

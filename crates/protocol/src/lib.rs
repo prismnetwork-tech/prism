@@ -1208,6 +1208,12 @@ pub struct PublicReceipt {
     pub trust_class: Option<TrustClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation: Option<ReceiptAttestation>,
+    /// Seconds the renter held but was not charged for, because the machine had
+    /// already stopped answering when the lease was cut short. Present only on
+    /// a lease that ended early, and zero is a real answer: it says the machine
+    /// was still responding at the moment access closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credited_seconds: Option<u64>,
     pub receipt_hash: String,
     pub transaction_hash: String,
 }
@@ -1243,6 +1249,11 @@ pub struct SettlementEvidence {
     pub cuda_ready_at: u64,
     pub interactive_access_ready_at: u64,
     pub gateway_closed_at: u64,
+    /// The last moment the machine was seen working. A lease is closed when the
+    /// machine stops being observed, which is necessarily after it went away,
+    /// so metering stops here rather than at the moment we noticed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_class: Option<TrustClass>,
     #[serde(default)]
@@ -1277,6 +1288,8 @@ struct ReceiptPayload {
     trust_class: Option<TrustClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attestation: Option<ReceiptAttestation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credited_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1605,6 +1618,7 @@ pub fn receipt_hash(receipt: &PublicReceipt) -> Result<String, ProtocolError> {
         outcome: receipt.outcome.clone(),
         trust_class: receipt.trust_class,
         attestation: receipt.attestation.clone(),
+        credited_seconds: receipt.credited_seconds,
     };
     Ok(hex::encode(Sha256::digest(canonical_json(&payload)?)))
 }
@@ -1855,6 +1869,7 @@ mod tests {
             refunded_base_units: 0,
             provider_paid_base_units: 900,
             failure_class: None,
+            credited_seconds: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,
@@ -1887,6 +1902,7 @@ mod tests {
             refunded_base_units: 0,
             provider_paid_base_units: 59_940,
             failure_class: None,
+            credited_seconds: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,
@@ -1915,6 +1931,7 @@ mod tests {
             refunded_base_units: 0,
             provider_paid_base_units: 59_940,
             failure_class: None,
+            credited_seconds: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: Some(TrustClass::Open),
             attestation: None,
@@ -1939,6 +1956,7 @@ mod tests {
             refunded_base_units: 0,
             provider_paid_base_units: 59_940,
             failure_class: None,
+            credited_seconds: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: Some(TrustClass::Isolated),
             attestation: None,
@@ -2804,6 +2822,35 @@ mod tests {
 
     // A discount that could ever raise a price would be a pricing bug pointed
     // at the customer, so pin the direction across the whole range.
+    #[test]
+    fn a_credited_receipt_hashes_the_credit_last() {
+        let receipt = PublicReceipt {
+            receipt_id: Uuid::parse_str("019f0000-0000-7000-8000-000000000001").unwrap(),
+            lease_id: "128".to_owned(),
+            node_id_hash: format!("0x{}", "a".repeat(64)),
+            gpu_model: "NVIDIA L40S".to_owned(),
+            runtime_seconds: 200,
+            charged_base_units: 44_400,
+            refunded_base_units: 155_400,
+            provider_paid_base_units: 39_960,
+            failure_class: Some("interrupted".to_owned()),
+            outcome: ReceiptOutcome::Finalized,
+            trust_class: Some(TrustClass::Open),
+            attestation: None,
+            credited_seconds: Some(150),
+            receipt_hash: String::new(),
+            transaction_hash: format!("0x{}", "c".repeat(64)),
+        };
+        // Pinned so the browser-side verifier in apps/web/lib/proof.ts can be
+        // checked against this, not against itself. The credit is the last
+        // field in the payload, which is what keeps every receipt settled
+        // before it hashing exactly as it did.
+        assert_eq!(
+            receipt_hash(&receipt).unwrap(),
+            "c63e4690f2e6be23ecf474e2f5e813b3eecce5b36a3d4a2b39b3c6e87e7de135"
+        );
+    }
+
     #[test]
     fn a_discount_only_ever_lowers_a_rate() {
         for rate in [1_u64, 2, 7, 222, 1_000, 999_999, u64::MAX / 10_000] {

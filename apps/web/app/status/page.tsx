@@ -149,10 +149,16 @@ export default async function StatusPage() {
             before recording began are marked unknown rather than counted as healthy.
           </p>
           <p>
-            Prism publishes no single uptime figure and offers no availability commitment. Capacity
-            is sourced as demand arrives, so an empty marketplace at a quiet hour is normal and is
-            not counted as an outage. Settled leases are listed on the{" "}
-            <Link href={new URL("/proof", siteUrl).href}>receipts page</Link>.
+            Prism publishes no single uptime figure. Capacity is sourced as demand arrives, so an
+            empty marketplace at a quiet hour is normal and is not counted as an outage.
+          </p>
+          <p>
+            What a lease does come with is a billing commitment. A machine that never becomes usable
+            costs nothing. A machine that goes away mid-lease is billed only up to the last moment it
+            was seen working, never through the minutes it takes to notice, and the unused remainder
+            of the deposit is returned. A lease cut short this way is marked as interrupted on its{" "}
+            <Link href={new URL("/proof", siteUrl).href}>receipt</Link>, alongside the seconds that
+            were held but not charged.
           </p>
         </section>
       </main>
