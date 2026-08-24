@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use p384::elliptic_curve::subtle::ConstantTimeEq;
 use prism_protocol::{
     AttestationKind, AttestationVerdict, AttestedGuest, GuestAttestation, LeaseAttestationVerdict,
-    NodeAttestation, TrustClass,
+    LeaseGpuCcVerdict, NodeAttestation, TrustClass,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -28,6 +28,7 @@ use thiserror::Error;
 mod amd;
 mod chain;
 mod nvidia;
+mod nvidia_cc;
 mod policy;
 mod snp;
 mod tdx;
@@ -50,6 +51,7 @@ pub use tdx::TdxLaunchIdentity;
 pub const VERIFIER_VERSION: &str = "nvidia-gpu/1";
 pub const SNP_VERIFIER_VERSION: &str = "sev-snp-guest/1";
 pub const TDX_VERIFIER_VERSION: &str = "intel-tdx-guest/1";
+pub const NVIDIA_CC_VERIFIER_VERSION: &str = "nvidia-cc/1";
 
 /// A device report proves which GPU signed it and what firmware that GPU runs.
 /// It says nothing about what host software booted, so GPU evidence stops at
@@ -67,6 +69,15 @@ pub const MAX_GRANTABLE_CLASS: TrustClass = TrustClass::Isolated;
 /// [`prism_protocol::class_for_lease`]. This constant says what the evidence
 /// earns; that one says what the network can substantiate.
 pub const SNP_GRANTABLE_CLASS: TrustClass = TrustClass::Attested;
+
+/// A verified NVIDIA CC report proves the GPU serving a lease holds VRAM in a
+/// single-GPU confidential mode: the confidential-mode flag is signed by the
+/// device and the signature chains to NVIDIA's Device Identity CA. That is the
+/// VRAM half of confidential, and it earns nothing on its own. Only beside a
+/// guest report that earns Attested does [`prism_protocol::class_for_lease`]
+/// fold the two into Confidential, which is why this grants the full rung: the
+/// clamp there is what holds it to what both halves substantiate.
+pub const NVIDIA_CC_GRANTABLE_CLASS: TrustClass = TrustClass::Confidential;
 
 /// A verified TDX quote proves the same kind of thing a SNP report does: what
 /// image the TD was launched from, on a genuine processor at the collateral's
@@ -180,6 +191,16 @@ pub enum VerificationError {
     TdxEventLogIncomplete,
     #[error("TDX event log binds a different compose file")]
     TdxComposeHashMismatch,
+    #[error("NVIDIA CC report signature does not verify under the device leaf key")]
+    NvCcReportSignatureInvalid,
+    #[error("NVIDIA CC report answers a different nonce")]
+    NvCcNonceMismatch,
+    #[error("NVIDIA CC report FWID does not match the device certificate")]
+    NvCcFwidMismatch,
+    #[error("NVIDIA CC report carries no confidential-mode flag, so the mode is unproven")]
+    NvCcModeUnproven,
+    #[error("NVIDIA CC report is not in a single-GPU confidential mode")]
+    NvCcNotSingleGpuConfidential,
 }
 
 /// Verifies one GPU attestation and, on success, returns the class it earns.
@@ -203,7 +224,7 @@ pub fn verify_nvidia_gpu_attestation(
         certificates.push(decode_base64(encoded)?);
     }
 
-    let chain = chain::verify_chain(&certificates, now, policy)?;
+    let chain = chain::verify_chain(&certificates, MAX_CHAIN_CERTIFICATES, now, policy)?;
     nvidia::verify_report_signature(&evidence, &chain.leaf_public_key)?;
 
     let report = nvidia::parse_report(&evidence)?;
@@ -457,6 +478,43 @@ pub fn verify_sev_snp_attestation(
         },
         granted_class: SNP_GRANTABLE_CLASS,
         verifier_version: SNP_VERIFIER_VERSION.to_string(),
+        verified_at: now,
+        expires_at: now + policy.lease_verdict_ttl,
+    })
+}
+
+/// Verifies one NVIDIA CC attestation for a lease and, on success, returns the
+/// GPU-CC verdict that lease earns.
+///
+/// The report and chain are the vendor-native evidence the GPU produced;
+/// `expected_nonce` is the lease challenge the control plane issued, which the
+/// GPU signs into the report so a capture taken for another lease is worth
+/// nothing here. The verdict is lease-scoped and grants the confidential rung
+/// on its own axis; the protocol combines it with the guest report.
+pub fn verify_nvidia_cc_lease_attestation(
+    lease_id: u64,
+    node_id: &str,
+    report_bytes: &[u8],
+    certificate_chain: &[Vec<u8>],
+    expected_nonce: &[u8; 32],
+    now: DateTime<Utc>,
+    policy: &Policy,
+) -> Result<LeaseGpuCcVerdict, VerificationError> {
+    let verdict = nvidia_cc::verify_nvidia_cc_attestation(
+        report_bytes,
+        certificate_chain,
+        expected_nonce,
+        now,
+        policy,
+    )?;
+    Ok(LeaseGpuCcVerdict {
+        lease_id,
+        node_id: node_id.to_string(),
+        kind: AttestationKind::NvidiaCc,
+        device_identity: verdict.device_identity,
+        measurement_digest: verdict.measurement_digest,
+        granted_class: NVIDIA_CC_GRANTABLE_CLASS,
+        verifier_version: NVIDIA_CC_VERIFIER_VERSION.to_string(),
         verified_at: now,
         expires_at: now + policy.lease_verdict_ttl,
     })

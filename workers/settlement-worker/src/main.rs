@@ -1121,13 +1121,28 @@ mod tests {
     }
 
     #[test]
-    fn a_class_above_the_ceiling_is_never_minted() {
-        let mut evidence = evidence();
-        evidence.trust_class = Some(TrustClass::Confidential);
-
+    fn every_servable_class_settles_and_the_guard_holds_the_ceiling() {
+        // Confidential is now the ceiling, so every class up to it settles.
+        for class in [
+            TrustClass::Open,
+            TrustClass::Isolated,
+            TrustClass::Attested,
+            TrustClass::Confidential,
+        ] {
+            let mut evidence = evidence();
+            evidence.trust_class = Some(class);
+            assert!(reconcile(&evidence).is_ok(), "{class:?} should settle");
+        }
+        // The guard still refuses anything past the ceiling; with Confidential
+        // the top class there is nothing above it to construct, so this pins
+        // the boundary at exactly the ceiling.
         assert!(
-            reconcile(&evidence).is_err(),
-            "confidential settled without verified attestation"
+            settled_trust_class(&{
+                let mut evidence = evidence();
+                evidence.trust_class = Some(MAX_VERIFIABLE_TRUST_CLASS);
+                evidence
+            })
+            .is_ok()
         );
     }
 

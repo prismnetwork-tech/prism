@@ -756,20 +756,28 @@ mod tests {
     }
 
     #[test]
-    fn nothing_above_the_ceiling_is_servable_however_good_the_verdict() {
+    fn confidential_is_served_only_with_a_confidential_verdict() {
         let n = now();
+        // The ceiling now reaches Confidential, so a Confidential request with
+        // a matching verdict is served.
         let strong = verdict_for(
             4711,
             "0xabc",
             TrustClass::Confidential,
             n + Duration::days(1),
         );
+        assert!(
+            check_trust_evidence(&request_at(TrustClass::Confidential, Some(strong)), n).is_ok()
+        );
+
+        // A verdict that only reached Attested cannot back a Confidential lease.
+        let weak = verdict_for(4711, "0xabc", TrustClass::Attested, n + Duration::days(1));
         assert_eq!(
             reason(check_trust_evidence(
-                &request_at(TrustClass::Confidential, Some(strong)),
+                &request_at(TrustClass::Confidential, Some(weak)),
                 n
             )),
-            "class_above_ceiling"
+            "attestation_too_weak"
         );
     }
 }

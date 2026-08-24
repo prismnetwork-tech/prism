@@ -10,8 +10,8 @@ use x509_parser::oid_registry::{
 };
 use x509_parser::prelude::*;
 
+use crate::VerificationError;
 use crate::policy::Policy;
-use crate::{MAX_CHAIN_CERTIFICATES, VerificationError};
 
 /// The vendor root every device certificate must chain to. It is pinned by
 /// content, not by name, so a certificate that merely calls itself NVIDIA gets
@@ -36,13 +36,14 @@ pub(crate) struct VerifiedChain {
 /// partial result a caller could mistake for a grant.
 pub(crate) fn verify_chain(
     chain: &[Vec<u8>],
+    max_certificates: usize,
     now: DateTime<Utc>,
     policy: &Policy,
 ) -> Result<VerifiedChain, VerificationError> {
     if chain.is_empty() {
         return Err(VerificationError::MalformedEvidence);
     }
-    if chain.len() > MAX_CHAIN_CERTIFICATES {
+    if chain.len() > max_certificates {
         return Err(VerificationError::ChainTooLong);
     }
 

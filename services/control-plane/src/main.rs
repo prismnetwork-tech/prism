@@ -7357,11 +7357,7 @@ async fn get_lease_access(
             relay_port: state.public_relay_port,
             ssh_user: "workspace".to_owned(),
             jupyter_path: "/lab".to_owned(),
-            gateway_ca: state
-                .certificate_authority
-                .certificate_pem
-                .as_ref()
-                .clone(),
+            gateway_ca: state.certificate_authority.certificate_pem.as_ref().clone(),
             jupyter_token: state
                 .credential_cipher
                 .decrypt(&jupyter_token)
@@ -9673,10 +9669,10 @@ mod tests {
             .await
     }
 
-    /// A report that passes every check earns `Attested`, and the lease settles
-    /// there because the reference material under the rung is now real. The
-    /// second assertion names the class rather than the constant on purpose: if
-    /// the ceiling moves again, this fails and whoever moved it has to say so.
+    /// A report that passes every check earns `Attested`, and a guest-only
+    /// lease settles there: the confidential rung needs a GPU CC verdict
+    /// beside the guest one, which this lease does not carry, so it stops at
+    /// the guest half however good the report is.
     #[tokio::test]
     async fn a_fully_verified_guest_settles_at_attested() {
         let market = guest_lease_market(TrustClass::Isolated, LeaseState::Provisioning);
@@ -9691,10 +9687,6 @@ mod tests {
             unreachable!()
         };
         let mut market = market.write().await;
-        assert_eq!(
-            market.leases[&GUEST_LEASE_ID].1.trust_class,
-            prism_protocol::MAX_VERIFIABLE_TRUST_CLASS
-        );
         assert_eq!(
             market.leases[&GUEST_LEASE_ID].1.trust_class,
             TrustClass::Attested

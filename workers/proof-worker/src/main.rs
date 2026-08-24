@@ -953,15 +953,23 @@ mod tests {
     /// evidence is what makes this worth asserting: the receipt fails on the
     /// class alone.
     #[test]
-    fn receipt_validation_rejects_a_class_the_network_cannot_verify() {
-        let mut receipt = valid_receipt("1", 'a');
-        receipt.trust_class = Some(TrustClass::Confidential);
-        receipt.attestation = Some(attestation());
-        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+    fn a_confidential_receipt_is_valid_with_its_backing_and_rejected_without() {
+        // The ceiling now reaches Confidential, so a receipt claiming it is
+        // accepted when it carries the attestation digest that backs the claim.
+        let mut backed = valid_receipt("1", 'a');
+        backed.trust_class = Some(TrustClass::Confidential);
+        backed.attestation = Some(attestation());
+        backed.receipt_hash = receipt_hash(&backed).unwrap();
+        assert!(validate_receipts(&[backed]).is_ok());
 
+        // The same claim without the digest is an unbacked claim and is refused.
+        let mut unbacked = valid_receipt("2", 'b');
+        unbacked.trust_class = Some(TrustClass::Confidential);
+        unbacked.attestation = None;
+        unbacked.receipt_hash = receipt_hash(&unbacked).unwrap();
         assert!(
-            validate_receipts(&[receipt]).is_err(),
-            "confidential published above the ceiling"
+            validate_receipts(&[unbacked]).is_err(),
+            "confidential claimed without a backing digest"
         );
     }
 

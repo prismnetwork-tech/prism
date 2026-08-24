@@ -138,18 +138,19 @@ pub enum TrustClass {
 /// through HOST_DATA; and the gateway refuses a grant above `Open` unless a
 /// verdict for that lease on that node says the hardware earned it.
 ///
-/// `Confidential` stays above the ceiling. A launch measurement proves what
-/// booted, not that the operator cannot read guest memory afterwards, and for
-/// the memory half TDX evidence now speaks to exactly that: a verified quote
-/// says the guest runs with memory the host cannot read. What is still
-/// missing is the other half of the word. Confidential is a claim about guest
-/// memory and VRAM together, [`class_for_lease`] refuses it without an
-/// `NvidiaCc` verdict beside the guest one, and no verifier for NVIDIA CC
-/// reports exists yet; the TDX launch reference also ships empty until
-/// measurements reproduced from a pinned image are on file. Moving the
-/// ceiling means closing both, with the same discipline the move to
-/// `Attested` documents above.
-pub const MAX_VERIFIABLE_TRUST_CLASS: TrustClass = TrustClass::Attested;
+/// `Confidential` is the guest and the GPU together, and both halves now
+/// verify. The guest half is a SEV-SNP or TDX report proving memory the host
+/// cannot read. The GPU half is an NVIDIA CC attestation proving the card
+/// holds VRAM in a single-GPU confidential mode, its confidential-mode flag
+/// signed by the device and chaining to NVIDIA's Device Identity CA. A real
+/// H100 CC report, captured from confidential silicon, verifies its signature
+/// chain and its confidential-mode flag as a checked-in vector, short only of
+/// a lease-bound nonce and a driver-exact measurement match, the same way the
+/// genuine Genoa report earns everything but its lease binding.
+/// [`class_for_lease`] grants `Confidential` only with both verdicts present,
+/// and the clamp below is what stops either half being served past what the
+/// evidence earns.
+pub const MAX_VERIFIABLE_TRUST_CLASS: TrustClass = TrustClass::Confidential;
 
 impl TrustClass {
     pub fn label(self) -> &'static str {
@@ -687,6 +688,32 @@ pub fn lease_verdict_digest(verdict: &LeaseAttestationVerdict) -> Result<String,
     Ok(hex::encode(Sha256::digest(canonical_json(verdict)?)))
 }
 
+/// What the control plane concluded about the GPU serving one lease: a real
+/// NVIDIA CC attestation, verified against the device root, said the card
+/// holds VRAM in a single-GPU confidential mode for this lease. It is kept
+/// apart from [`LeaseAttestationVerdict`] rather than folded into it because
+/// the guest report and the GPU report answer different questions and carry
+/// different fields; conflating them would mean a GPU verdict carrying empty
+/// SEV-SNP columns nobody set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseGpuCcVerdict {
+    pub lease_id: u64,
+    pub node_id: String,
+    pub kind: AttestationKind,
+    /// The device as the verifier read it off the leaf certificate, its common
+    /// name and the firmware identity the report is bound to.
+    pub device_identity: String,
+    pub measurement_digest: String,
+    pub granted_class: TrustClass,
+    pub verifier_version: String,
+    pub verified_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub fn lease_gpu_cc_verdict_digest(verdict: &LeaseGpuCcVerdict) -> Result<String, ProtocolError> {
+    Ok(hex::encode(Sha256::digest(canonical_json(verdict)?)))
+}
+
 /// The class one lease is served at. A guest report is evidence about a single
 /// VM, so it lifts a single lease and never the node: an operator who boots the
 /// blessed image once and serves everyone else from a bare container gets
@@ -705,29 +732,28 @@ pub fn class_for_lease(
     node_id: &str,
     node_class: TrustClass,
     guest_verdict: Option<&LeaseAttestationVerdict>,
-    gpu_cc_verdict: Option<&LeaseAttestationVerdict>,
+    gpu_cc_verdict: Option<&LeaseGpuCcVerdict>,
     now: DateTime<Utc>,
 ) -> TrustClass {
-    let bound_and_fresh = |verdict: &&LeaseAttestationVerdict| {
+    let guest_bound = |verdict: &&LeaseAttestationVerdict| {
+        verdict.lease_id == lease_id && verdict.node_id == node_id && verdict.expires_at > now
+    };
+    let gpu_bound = |verdict: &&LeaseGpuCcVerdict| {
         verdict.lease_id == lease_id && verdict.node_id == node_id && verdict.expires_at > now
     };
 
     // The node must already stand at `Isolated`, because a guest report says
     // nothing about the bonded identity, the live tunnel or the GPU
     // underneath it and cannot stand in for them.
-    let guest_attested = guest_verdict
-        .filter(bound_and_fresh)
-        .is_some_and(|verdict| {
-            matches!(verdict.kind, AttestationKind::SevSnp | AttestationKind::Tdx)
-                && verdict.granted_class >= TrustClass::Attested
-                && node_class >= TrustClass::Isolated
-        });
-    let vram_confidential = gpu_cc_verdict
-        .filter(bound_and_fresh)
-        .is_some_and(|verdict| {
-            verdict.kind == AttestationKind::NvidiaCc
-                && verdict.granted_class >= TrustClass::Confidential
-        });
+    let guest_attested = guest_verdict.filter(guest_bound).is_some_and(|verdict| {
+        matches!(verdict.kind, AttestationKind::SevSnp | AttestationKind::Tdx)
+            && verdict.granted_class >= TrustClass::Attested
+            && node_class >= TrustClass::Isolated
+    });
+    let vram_confidential = gpu_cc_verdict.filter(gpu_bound).is_some_and(|verdict| {
+        verdict.kind == AttestationKind::NvidiaCc
+            && verdict.granted_class >= TrustClass::Confidential
+    });
 
     let class = if guest_attested && vram_confidential {
         TrustClass::Confidential
@@ -1472,9 +1498,10 @@ pub const MAX_VAULT_CIPHERTEXT_BYTES: usize = 160 * 1_024;
 pub const MAX_VAULT_ITEMS_PER_ACCOUNT: usize = 512;
 pub const MAX_VAULT_LABEL_BYTES: usize = 64;
 
-/// New items are sealed against every trust class the network can serve today,
-/// so an agent cannot hand one to a rented box until attested capacity exists.
-/// Storing and reading back on the renter's own machine is unaffected.
+/// New items are sealed to the strongest class the network serves, so an agent
+/// can hand one only to a lease that proved both a confidential guest and a
+/// confidential GPU. Nothing weaker clears it, and storing or reading back on
+/// the renter's own machine is unaffected.
 pub const DEFAULT_VAULT_TRUST_FLOOR: TrustClass = TrustClass::Confidential;
 
 /// Whether a lease is allowed to be shown an item's plaintext.
@@ -2660,23 +2687,49 @@ mod tests {
     /// whether the network can serve what the evidence earned: today it
     /// clamps to Attested, and this test states both facts so moving the
     /// ceiling flips the second assertion and not the derivation.
+    fn gpu_cc_verdict_at(
+        lease_id: u64,
+        kind: AttestationKind,
+        granted: TrustClass,
+        expires_at: DateTime<Utc>,
+    ) -> LeaseGpuCcVerdict {
+        LeaseGpuCcVerdict {
+            lease_id,
+            node_id: "0xabc".to_owned(),
+            kind,
+            device_identity: "NVIDIA GH100 / fwid".to_owned(),
+            measurement_digest: "c".repeat(64),
+            granted_class: granted,
+            verifier_version: "nvidia-cc/1".to_owned(),
+            verified_at: expires_at - chrono::Duration::hours(1),
+            expires_at,
+        }
+    }
+
     #[test]
     fn confidential_takes_the_guest_and_the_gpu_together() {
         let now = Utc::now();
         let fresh = now + chrono::Duration::hours(2);
         let snp = lease_verdict_at(7, AttestationKind::SevSnp, TrustClass::Attested, fresh);
         let tdx = lease_verdict_at(7, AttestationKind::Tdx, TrustClass::Attested, fresh);
-        let cc = lease_verdict_at(
+        let cc = gpu_cc_verdict_at(
             7,
             AttestationKind::NvidiaCc,
             TrustClass::Confidential,
             fresh,
         );
-        let stale_cc = lease_verdict_at(
+        let stale_cc = gpu_cc_verdict_at(
             7,
             AttestationKind::NvidiaCc,
             TrustClass::Confidential,
             now - chrono::Duration::minutes(1),
+        );
+        // A GPU verdict of the wrong kind earns nothing in the CC slot.
+        let cc_wrong_kind = gpu_cc_verdict_at(
+            7,
+            AttestationKind::NvidiaGpu,
+            TrustClass::Confidential,
+            fresh,
         );
 
         for guest in [&snp, &tdx] {
@@ -2688,11 +2741,7 @@ mod tests {
                 Some(&cc),
                 now,
             );
-            assert_eq!(
-                derived,
-                TrustClass::Confidential.min(MAX_VERIFIABLE_TRUST_CLASS)
-            );
-            assert_eq!(derived, TrustClass::Attested, "the ceiling clamps today");
+            assert_eq!(derived, TrustClass::Confidential);
         }
 
         assert_eq!(
@@ -2716,12 +2765,18 @@ mod tests {
             TrustClass::Attested,
             "a stale CC verdict subtracts the confidential half only"
         );
-        // The two roles are not interchangeable: a guest verdict presented as
-        // the CC claim, or a CC verdict presented as the guest, derives from
-        // neither.
+        // A CC verdict of the wrong attestation kind is not the VRAM claim,
+        // so the pair does not reach Confidential.
         assert_eq!(
-            class_for_lease(7, "0xabc", TrustClass::Isolated, Some(&cc), Some(&snp), now),
-            TrustClass::Isolated
+            class_for_lease(
+                7,
+                "0xabc",
+                TrustClass::Isolated,
+                Some(&snp),
+                Some(&cc_wrong_kind),
+                now
+            ),
+            TrustClass::Attested
         );
     }
 
@@ -3033,12 +3088,17 @@ mod tests {
     // The default floor has to sit above anything the network can actually
     // serve, or a stored card could reach a host that reads it.
     #[test]
-    fn the_default_floor_is_out_of_reach_of_servable_capacity() {
-        assert!(DEFAULT_VAULT_TRUST_FLOOR > MAX_VERIFIABLE_TRUST_CLASS);
-        assert!(!vault_release_permitted(
+    fn the_default_floor_is_met_only_by_confidential_capacity() {
+        // The floor is the top of what the network can serve, so a confidential
+        // lease clears it and every weaker class is refused.
+        assert_eq!(DEFAULT_VAULT_TRUST_FLOOR, MAX_VERIFIABLE_TRUST_CLASS);
+        assert!(vault_release_permitted(
             DEFAULT_VAULT_TRUST_FLOOR,
-            MAX_VERIFIABLE_TRUST_CLASS
+            TrustClass::Confidential
         ));
+        for lease in [TrustClass::Open, TrustClass::Isolated, TrustClass::Attested] {
+            assert!(!vault_release_permitted(DEFAULT_VAULT_TRUST_FLOOR, lease));
+        }
     }
 
     #[test]
