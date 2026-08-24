@@ -1,5 +1,13 @@
 {
   "schema_version": 1,
-  "note": "Launch identities a TDX quote may present: MRTD plus the three boot-time runtime registers, taken together as one entry. The set ships empty, and an empty set refuses every quote. It is populated by measurements computed from a pinned meta-dstack release with dstack-mr and reproduced by someone who did not build the image, the same bar reference/snp-launch-measurements.json sets for SNP.",
-  "launch_measurements": []
+  "note": "Launch identities a TDX quote may present: MRTD plus the three boot-time runtime registers, taken together as one entry. Each entry records the image and machine shape it was computed from so someone who did not build it can reproduce it: dstack-mr against the published image, with the QEMU flags listed, must land on these exact values.",
+  "launch_measurements": [
+    {
+      "image_version": "dstack-0.5.9-dev, os-image-hash de9c74f0c85d0820ce075cb4a99f8e39f7b681be632907c5bf8bdc95ea72feb9, tarball sha256 1e11a1bc94e3069eef19f30457c2e92bfd70cb30fa9d134092de453f9ec6f205, 1 vCPU 2G, two-pass-add-pages, pic",
+      "mr_td": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+      "rtmr0": "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+      "rtmr1": "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+      "rtmr2": "a2a58c9a959a4fa44bd6da0c97a2270c051faf12084cfe91ae900e4fdff6cdd4f69a82005e04ee920f231497894d677f"
+    }
+  ]
 }

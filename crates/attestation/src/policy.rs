@@ -108,8 +108,8 @@ impl Policy {
     }
 
     /// Accepts these launch identities in place of the compiled TDX reference
-    /// set, which ships empty. Vectors verify a real vendored quote, so the
-    /// identity they inject is one a genuine platform actually produced.
+    /// set. Vectors verify a real vendored quote, so the identity they inject
+    /// is one a genuine platform actually produced.
     #[cfg(any(test, feature = "test-vectors"))]
     pub fn with_tdx_test_identities(mut self, identities: Vec<TdxLaunchIdentity>) -> Self {
         self.tdx_test_identities = Some(TdxMeasurementSet::new(identities));
@@ -386,11 +386,11 @@ struct TdxLaunchEntry {
     rtmr2: String,
 }
 
-/// Unlike the SNP loader this one accepts an empty file: the set ships empty
-/// until measurements reproduced from a pinned dstack release exist, and an
-/// empty set refuses every quote rather than trusting anything. The SNP
-/// assert protects a rung that is served today; nothing is served off this
-/// file yet, and refusing all is the correct meaning of having no reference.
+/// Unlike the SNP loader this one accepts an empty file: an empty set refuses
+/// every quote rather than trusting anything, which is the correct meaning of
+/// having no reference. The set is not empty today; the leeway stays because
+/// emptying it deliberately (pulling a compromised image's identity, say)
+/// must never turn into a build that trusts everything.
 pub(crate) fn tdx_launch_measurements() -> &'static TdxMeasurementSet {
     static MEASUREMENTS: OnceLock<TdxMeasurementSet> = OnceLock::new();
     MEASUREMENTS.get_or_init(|| {
@@ -432,12 +432,12 @@ mod tests {
         assert!(measurement_allowlist().len() > 0);
     }
 
-    /// The shipped TDX reference set is empty on purpose, and empty means
-    /// nothing verifies. Populating it is what flips this test, which is the
-    /// point: the change shows up here and in provenance.json together.
+    /// The reference set carries the identities recorded in provenance.json,
+    /// reproduced from published images. A set that parses to nothing means
+    /// the file and the provenance record have drifted apart.
     #[test]
-    fn the_tdx_reference_ships_empty_and_refuses_everything() {
-        assert!(tdx_launch_measurements().is_empty());
+    fn the_tdx_reference_parses_and_is_not_empty() {
+        assert!(!tdx_launch_measurements().is_empty());
     }
 
     #[test]

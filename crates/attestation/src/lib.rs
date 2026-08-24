@@ -1,9 +1,11 @@
 //! Verification of hardware attestation for the Prism control plane.
 //!
-//! Two verifiers live here. The NVIDIA one reads a device report and says which
-//! physical GPU answered and what firmware it runs. The SEV-SNP one reads a
-//! report a guest took of itself and says what image that VM was launched from,
-//! on which processor, at which patch level.
+//! Three verifiers live here. The NVIDIA one reads a device report and says
+//! which physical GPU answered and what firmware it runs. The SEV-SNP one
+//! reads a report a guest took of itself and says what image that VM was
+//! launched from, on which processor, at which patch level. The TDX one does
+//! the same for a TD, and additionally replays the runtime event log that
+//! binds the TD to the workload it is running.
 //!
 //! The crate is a pure function over bytes: no network, no clock, no I/O beyond
 //! the vendor roots and the reference values compiled into it. Either every
@@ -69,9 +71,9 @@ pub const SNP_GRANTABLE_CLASS: TrustClass = TrustClass::Attested;
 /// A verified TDX quote proves the same kind of thing a SNP report does: what
 /// image the TD was launched from, on a genuine processor at the collateral's
 /// patch level, with our challenge bound into `REPORT_DATA`. It stops at the
-/// same rung for the same reason. It says nothing about what has been extended
-/// into `RTMR3` at runtime and nothing about a GPU, and the confidential rung
-/// is exactly the claim those two missing checks would have to back.
+/// same rung for the same reason. The event log replay binds what the TD is
+/// running, but nothing here speaks for the GPU, and the confidential rung is
+/// exactly the claim GPU CC evidence would have to complete.
 pub const TDX_GRANTABLE_CLASS: TrustClass = TrustClass::Attested;
 
 /// Vendor chains are short. Anything longer is either a mistake or an attempt

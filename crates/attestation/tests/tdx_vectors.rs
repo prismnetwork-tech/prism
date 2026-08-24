@@ -143,20 +143,23 @@ fn report_data_binds_the_challenge() {
     assert_eq!(refused, Err(VerificationError::TdxReportDataMismatch));
 }
 
-/// The compiled reference set is empty, and empty refuses everything: a
-/// genuine, current, correctly bound quote still earns nothing until a
-/// reproduced launch identity is on file.
+/// The compiled reference set accepts this quote with nothing injected,
+/// because the identity it presents is the one reference/tdx-launch-
+/// measurements.json records: computed by dstack-mr from the published
+/// image, equal to what the live platform reported. The reference file and
+/// this vector hold each other in place.
 #[test]
-fn the_shipped_reference_set_refuses_a_genuine_quote() {
-    let refused = verify_tdx_attestation(
+fn the_compiled_reference_accepts_the_reproduced_identity() {
+    let verdict = verify_tdx_attestation(
         &attestation(),
         COLLATERAL,
         &events(),
         &expectation(),
         vector_time(),
         &Policy::for_tests(),
-    );
-    assert_eq!(refused, Err(VerificationError::TdxUnknownLaunchMeasurement));
+    )
+    .expect("the reproduced identity is on file");
+    assert_eq!(verdict.granted_class, TrustClass::Attested);
 }
 
 #[test]
