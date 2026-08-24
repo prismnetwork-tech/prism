@@ -5669,35 +5669,109 @@ impl MarketplaceStore {
         Ok(release)
     }
 
+    /// The class a lease can be served at right now, recomputed from the node's
+    /// live standing rather than read from the cached record. This gates vault
+    /// release and workspace restore, so a node whose tunnel has lapsed since
+    /// the class was recorded must drop below the floor here even though nothing
+    /// rewrote the cached class: the same live-standing rule `get_lease_access`
+    /// applies, on the gates that hand a renter their secrets.
     async fn active_lease_trust_class(
         &self,
         subject: &str,
         lease_id: u64,
     ) -> Result<Option<TrustClass>, StoreError> {
+        let now = Utc::now();
+        let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
         match self {
-            Self::Memory(market) => Ok(market
-                .read()
+            Self::Memory(market) => {
+                let market = market.read().await;
+                let Some((owner, lease)) = market.leases.get(&lease_id) else {
+                    return Ok(None);
+                };
+                if owner != subject || lease.state != LeaseState::Active {
+                    return Ok(None);
+                }
+                let node_class = class_for_verdict(
+                    &lease.node_id,
+                    market
+                        .tunnels
+                        .get(&lease.node_id)
+                        .is_some_and(|observed_at| *observed_at >= cutoff),
+                    fresh_posture(&market, &lease.node_id, cutoff),
+                    market.verdicts.get(&lease.node_id),
+                    now,
+                );
+                Ok(Some(class_for_lease(
+                    lease_id,
+                    &lease.node_id,
+                    node_class,
+                    market.lease_verdicts.get(&lease_id),
+                    market.lease_tdx_guest_verdicts.get(&lease_id),
+                    market.lease_gpu_cc_verdicts.get(&lease_id),
+                    now,
+                )))
+            }
+            Self::Postgres(pool) => {
+                let standing = query_as::<
+                    _,
+                    (
+                        String,
+                        Option<SqlJson<LeaseAttestationVerdict>>,
+                        Option<SqlJson<LeaseTdxGuestVerdict>>,
+                        Option<SqlJson<LeaseGpuCcVerdict>>,
+                        bool,
+                        Option<SqlJson<NodePosture>>,
+                        Option<SqlJson<AttestationVerdict>>,
+                    ),
+                >(
+                    "SELECT l.document->>'node_id', \
+                            (SELECT v.document FROM lease_attestation_verdicts v \
+                             WHERE v.lease_id = l.lease_id), \
+                            (SELECT tv.document FROM lease_tdx_guest_verdicts tv \
+                             WHERE tv.lease_id = l.lease_id), \
+                            (SELECT gv.document FROM lease_gpu_cc_verdicts gv \
+                             WHERE gv.lease_id = l.lease_id), \
+                            EXISTS ( \
+                                SELECT 1 FROM node_tunnels t \
+                                WHERE t.node_id = l.document->>'node_id' \
+                                  AND t.observed_at >= $3 \
+                            ), \
+                            (SELECT nt.document->'posture' FROM node_telemetry nt \
+                             WHERE nt.node_id = l.document->>'node_id' \
+                               AND nt.observed_at >= $3), \
+                            (SELECT nv.document FROM node_attestation_verdicts nv \
+                             WHERE nv.node_id = l.document->>'node_id' \
+                               AND nv.expires_at > now()) \
+                     FROM leases l \
+                     WHERE l.lease_id = $1 AND l.subject = $2 AND l.state = 'active'",
+                )
+                .bind(lease_id as i64)
+                .bind(subject)
+                .bind(cutoff)
+                .fetch_optional(pool)
                 .await
-                .leases
-                .get(&lease_id)
-                .filter(|(owner, lease)| owner == subject && lease.state == LeaseState::Active)
-                .map(|(_, lease)| lease.trust_class)),
-            // Read the one field rather than the whole record: this gate must
-            // not start returning 500s because some unrelated part of a lease
-            // document changed shape.
-            Self::Postgres(pool) => query_scalar::<_, Option<String>>(
-                "SELECT document->>'trust_class' FROM leases \
-                 WHERE lease_id = $1 AND subject = $2 AND state = 'active'",
-            )
-            .bind(lease_id as i64)
-            .bind(subject)
-            .fetch_optional(pool)
-            .await
-            .map_err(StoreError::Storage)?
-            // A lease predating trust classes is `open`, matching the serde
-            // default, which is the weakest class and so fails closed.
-            .map(|class| class.map_or(Ok(TrustClass::Open), |class| parse_trust_class(&class)))
-            .transpose(),
+                .map_err(StoreError::Storage)?;
+                let Some((node_id, snp, tdx, gpu, tunneled, posture, node_verdict)) = standing
+                else {
+                    return Ok(None);
+                };
+                let node_class = class_for_verdict(
+                    &node_id,
+                    tunneled,
+                    posture.as_ref().map(|SqlJson(posture)| posture),
+                    node_verdict.as_ref().map(|SqlJson(verdict)| verdict),
+                    now,
+                );
+                Ok(Some(class_for_lease(
+                    lease_id,
+                    &node_id,
+                    node_class,
+                    snp.as_ref().map(|SqlJson(verdict)| verdict),
+                    tdx.as_ref().map(|SqlJson(verdict)| verdict),
+                    gpu.as_ref().map(|SqlJson(verdict)| verdict),
+                    now,
+                )))
+            }
         }
     }
 
@@ -12271,6 +12345,40 @@ mod tests {
                 },
             ),
         );
+        // The vault and workspace gates recompute the lease class from the
+        // node's live standing, so a lease that is meant to be servable at
+        // `trust_class` needs the standing that earns it: a fresh tunnel and a
+        // node verdict for Isolated, a lease guest verdict for Attested, and a
+        // GPU-CC verdict for Confidential.
+        let now = Utc::now();
+        let expires_at = now + Duration::hours(1);
+        if trust_class >= TrustClass::Isolated {
+            market.tunnels.insert("node".to_owned(), now);
+            market.verdicts.insert(
+                "node".to_owned(),
+                AttestationVerdict {
+                    node_id: "node".to_owned(),
+                    kind: AttestationKind::Tdx,
+                    device_identity: "tdx/node".to_owned(),
+                    measurement_digest: "0".repeat(64),
+                    claimed_capability: prism_protocol::HostTeeCapability::default(),
+                    granted_class: TrustClass::Isolated,
+                    verifier_version: "test".to_owned(),
+                    verified_at: now,
+                    expires_at,
+                },
+            );
+        }
+        if trust_class >= TrustClass::Attested {
+            market
+                .lease_tdx_guest_verdicts
+                .insert(9, tdx_guest_verdict(9, "node", expires_at));
+        }
+        if trust_class >= TrustClass::Confidential {
+            market
+                .lease_gpu_cc_verdicts
+                .insert(9, gpu_cc_verdict(9, "node", expires_at));
+        }
         MarketplaceStore::Memory(Arc::new(RwLock::new(market)))
     }
 
@@ -12437,6 +12545,33 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_node_cannot_release_a_confidential_secret() {
+        let store = store_with_active_lease("owner", TrustClass::Confidential).await;
+        let item_id = Uuid::now_v7();
+        store
+            .write_vault_item(
+                "owner",
+                item_id,
+                vault_write("dG9rZW4", TrustClass::Confidential),
+            )
+            .await
+            .unwrap();
+        // With the node's tunnel fresh, the lease clears the confidential floor.
+        store.release_vault_item("owner", item_id, 9).await.unwrap();
+
+        // The node's tunnel lapses and nothing rewrites the cached class, but
+        // the gate recomputes the class live, so the node is now Open and the
+        // confidential secret is withheld.
+        if let MarketplaceStore::Memory(market) = &store {
+            market.write().await.tunnels.remove("node");
+        }
+        assert!(matches!(
+            store.release_vault_item("owner", item_id, 9).await,
+            Err(StoreError::VaultTrustFloorUnmet { .. })
+        ));
     }
 
     #[tokio::test]
