@@ -284,3 +284,18 @@ test("the whole batch survives the wire, and the receipt still verifies on the o
     assert.ok(verifyItem(item.commitment, item.merkle_proof, wire.receipt.merkle_root));
   }
 });
+
+test("warming the pool ahead of the work is what makes a batch use all of it", async () => {
+  const deps = fakeDeps();
+  const gateway = build(deps, { poolMax: 3, itemsPerBox: 25 });
+  await gateway.ensureWarm(3);
+  assert.equal(deps.calls.leases, 3);
+  assert.equal(gateway.stats().pool.warm, 3);
+
+  // Small enough that the growth gate would never have leased a second box.
+  const out = await gateway.handleBatch({ model: MODEL, prompts: prompts(6) }, pay());
+  assert.equal(out.status, 200);
+  assert.equal(deps.calls.leases, 3, "an already-warm pool is used, not grown");
+  assert.equal(new Set(deps.calls.generations.map((g) => g.slot)).size, 3);
+  assert.equal(new Set(out.body.receipt.lease_ids).size, 3);
+});

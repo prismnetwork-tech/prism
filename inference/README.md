@@ -70,8 +70,10 @@ revenue, and leases warmed since boot.
 
 The first paid request on a cold gateway waits through provisioning, usually
 one to four minutes. `POST /v1/warm` (free) starts the warmup early, and
-`GET /v1/models` reports the models, price, current state, and how many GPUs
-are warm behind the endpoint.
+`POST /v1/warm?slots=N` brings N boxes up at once, which is what a batch
+needs: a box leased after the prompts are already moving arrives too late to
+take any of them. `GET /v1/models` reports the models, price, current state,
+and how many GPUs are warm behind the endpoint.
 
 ## Batches
 

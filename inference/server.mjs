@@ -337,8 +337,13 @@ const server = createServer(async (req, res) => {
       ],
     });
   }
+  // `slots` brings the whole pool up before the work arrives. A batch that
+  // finds one box warm runs on one box, because a box leased after the prompts
+  // are already moving arrives too late to take any of them.
   if (req.method === "POST" && url.pathname === "/v1/warm") {
-    gateway.ensureWarm().catch((err) => console.error(`warmup failed: ${err.message}`));
+    const asked = Number(url.searchParams.get("slots") ?? 1);
+    const slots = Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : 1;
+    gateway.ensureWarm(slots).catch((err) => console.error(`warmup failed: ${err.message}`));
     return json(res, 202, gateway.state());
   }
   // Discovery probes come in on GET, and an endpoint that answers 404 to one
