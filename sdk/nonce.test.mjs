@@ -73,3 +73,58 @@ test("one failed submission does not wedge the queue behind it", async () => {
   assert.equal(good.status, "fulfilled");
   assert.equal(seen.peak, 1);
 });
+
+function leasingAgent() {
+  const prism = new PrismAgent({ privateKey: KEY, escrow: ESCROW, rpcUrl: "http://127.0.0.1:1" });
+  const seen = { claims: [], open: 0, peak: 0 };
+  let nth = 0;
+  let leaseId = 0;
+  prism.publicClient = {
+    readContract: async () => 10_000n,
+    waitForTransactionReceipt: async () => ({ status: "success" }),
+  };
+  prism.walletClient = {
+    writeContract: async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      nth += 1;
+      return `0x${nth.toString(16).padStart(64, "0")}`;
+    },
+  };
+  prism.session = { token: "t" };
+  prism.balances = async () => ({ usdg: "1000000", eth: "1000000" });
+  prism.quote = async () => {
+    seen.open += 1;
+    seen.peak = Math.max(seen.peak, seen.open);
+    seen.claims.push("quote");
+    await new Promise((r) => setTimeout(r, 5));
+    return { quote_id: `q${nth}`, node_id: NODE, maximum_escrow: "1000", duration_seconds: 900 };
+  };
+  prism.confirm = async () => {
+    seen.claims.push("confirm");
+    seen.open -= 1;
+    leaseId += 1;
+    return { lease_id: leaseId };
+  };
+  prism.waitForAccess = async () => {
+    await new Promise((r) => setTimeout(r, 20));
+    return { mode: "direct_ssh", ssh_host: "h", ssh_port: 22, expires_at: new Date().toISOString() };
+  };
+  return { prism, seen };
+}
+
+test("a second lease does not quote until the first machine is claimed", async () => {
+  const { prism, seen } = leasingAgent();
+  const opts = { image: `img@sha256:${"0".repeat(64)}`, durationSeconds: 900, minVramMib: 16000 };
+  await Promise.all([prism.lease(opts), prism.lease(opts), prism.lease(opts)]);
+  assert.equal(seen.peak, 1, "two quotes were held at once, which releases the first reservation");
+  assert.deepEqual(seen.claims, ["quote", "confirm", "quote", "confirm", "quote", "confirm"]);
+});
+
+test("provisioning still overlaps, because only the claim is serialised", async () => {
+  const { prism } = leasingAgent();
+  const opts = { image: `img@sha256:${"0".repeat(64)}`, durationSeconds: 900, minVramMib: 16000 };
+  const started = Date.now();
+  await Promise.all([prism.lease(opts), prism.lease(opts), prism.lease(opts)]);
+  // Three 20ms waits back to back would be 60ms; overlapped they cost about one.
+  assert.ok(Date.now() - started < 90, `serialised provisioning would be far slower (${Date.now() - started}ms)`);
+});

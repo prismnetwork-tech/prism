@@ -215,6 +215,10 @@ export class PrismAgent {
   // Approve USDG and create the on-chain lease bound to the quote. The escrow
   // binds funding to keccak256(quote_id), so reproduce it exactly or confirm rejects.
   async fund(quote) {
+    return this.#submit(() => this.#fundNow(quote));
+  }
+
+  async #fundNow(quote) {
     if (typeof quote?.quote_id !== "string" || typeof quote?.node_id !== "string") {
       throw new PrismError(400, "invalid_quote");
     }
@@ -225,7 +229,7 @@ export class PrismAgent {
       // Approving and spending are one indivisible step. The approval covers
       // exactly this deposit, so a second lease that read the allowance before
       // this one spent it would find it gone by the time the chain ran it.
-      const hash = await this.#submit(async () => {
+      const hash = await (async () => {
         const allowance = await this.publicClient.readContract({
           address: USDG,
           abi: erc20Abi,
@@ -252,7 +256,7 @@ export class PrismAgent {
         // allowance and the nonce are settled before the next lease reads them.
         await this.publicClient.waitForTransactionReceipt({ hash: funding });
         return funding;
-      });
+      })();
       // 12 confirmations: the control-plane rejects funding until the tx is final.
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash, confirmations: CONFIRMATIONS });
       if (receipt.status !== "success") throw new PrismError(402, "lease_funding_reverted", { hash });
@@ -369,26 +373,35 @@ export class PrismAgent {
         hint: "the wallet needs USDG for the deposit and native ETH for gas on Robinhood Chain (id 4663) before it can lease",
       });
     }
-    const quote = await this.quote({
-      image,
-      durationSeconds,
-      minVramMib,
-      preferredNodeId,
-      minTrustClass,
-      command,
-    });
-    if (maxDeposit != null && parseBaseUnits(quote.maximum_escrow, "maximum_escrow") > BigInt(maxDeposit)) {
-      throw new PrismError(402, "cost_exceeds_max", { required: quote.maximum_escrow, max: String(maxDeposit) });
-    }
     const key = this.#generateSshKey();
+    let quote = null;
     let funded = null;
     let leaseId = null;
     try {
-      funded = await this.fund(quote);
-      const record = await this.confirm({
-        quoteId: quote.quote_id,
-        transactionHash: funded.hash,
-        sshAuthorizedKey: key.publicKey,
+      // One renter takes one machine at a time, up to the point the chain knows
+      // it is taken. Asking for a quote releases this renter's other open
+      // quotes, so two quotes held at once can name the same machine and the
+      // second lease reverts against a node that is no longer free. Only the
+      // claim is serialised: provisioning, which is the part that takes
+      // minutes, still runs in parallel.
+      const record = await this.#submit(async () => {
+        quote = await this.quote({
+          image,
+          durationSeconds,
+          minVramMib,
+          preferredNodeId,
+          minTrustClass,
+          command,
+        });
+        if (maxDeposit != null && parseBaseUnits(quote.maximum_escrow, "maximum_escrow") > BigInt(maxDeposit)) {
+          throw new PrismError(402, "cost_exceeds_max", { required: quote.maximum_escrow, max: String(maxDeposit) });
+        }
+        funded = await this.#fundNow(quote);
+        return this.confirm({
+          quoteId: quote.quote_id,
+          transactionHash: funded.hash,
+          sshAuthorizedKey: key.publicKey,
+        });
       });
       if (!Number.isInteger(record?.lease_id)) {
         throw new PrismError(502, "malformed_lease_record", { funding_hash: funded.hash });
