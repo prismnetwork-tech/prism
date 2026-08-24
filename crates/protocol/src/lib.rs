@@ -267,6 +267,9 @@ pub struct TdxEventEntry {
 /// extensions without letting a log become the expensive part of a request.
 pub const MAX_TDX_EVENT_LOG_ENTRIES: usize = 256;
 pub const MAX_TDX_EVENT_PAYLOAD_BYTES: usize = 4 * 1_024;
+/// A full Intel collateral bundle runs around 25 KiB; the cap bounds a body
+/// well before the request limit without ever pinching a real one.
+pub const MAX_TDX_COLLATERAL_BYTES: usize = 128 * 1_024;
 
 pub const TDX_REPORT_DATA_DOMAIN: &[u8] = b"prism.tdx.report-data.v1\0";
 
@@ -319,6 +322,14 @@ pub struct NodeAttestation {
     /// existed still verify.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tdx_event_log: Vec<TdxEventEntry>,
+    /// TDX evidence only: the Intel collateral (TCB info, QE identity, CRLs)
+    /// the quote verifies against, fetched by the node from a PCCS. Nothing
+    /// in it is taken on the node's word: every piece is Intel-signed and the
+    /// verifier enforces its validity windows, so the most a node choosing
+    /// its own collateral can do is present the newest material Intel had
+    /// already published, which is the same exposure a caching fetcher has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdx_collateral_json: Option<String>,
     pub capability: HostTeeCapability,
     pub pci_address: String,
     pub collected_at: DateTime<Utc>,
@@ -334,6 +345,8 @@ pub struct UnsignedNodeAttestation {
     pub certificate_chain_base64: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tdx_event_log: Vec<TdxEventEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdx_collateral_json: Option<String>,
     pub capability: HostTeeCapability,
     pub pci_address: String,
     pub collected_at: DateTime<Utc>,
@@ -353,6 +366,7 @@ impl NodeAttestation {
             evidence_base64: unsigned.evidence_base64,
             certificate_chain_base64: unsigned.certificate_chain_base64,
             tdx_event_log: unsigned.tdx_event_log,
+            tdx_collateral_json: unsigned.tdx_collateral_json,
             capability: unsigned.capability,
             pci_address: unsigned.pci_address,
             collected_at: unsigned.collected_at,
@@ -371,6 +385,7 @@ impl NodeAttestation {
                 evidence_base64: self.evidence_base64.clone(),
                 certificate_chain_base64: self.certificate_chain_base64.clone(),
                 tdx_event_log: self.tdx_event_log.clone(),
+                tdx_collateral_json: self.tdx_collateral_json.clone(),
                 capability: self.capability,
                 pci_address: self.pci_address.clone(),
                 collected_at: self.collected_at,
@@ -404,6 +419,13 @@ impl NodeAttestation {
             return Err(ProtocolError::AttestationTooLarge);
         }
         if self.tdx_event_log.len() > MAX_TDX_EVENT_LOG_ENTRIES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self
+            .tdx_collateral_json
+            .as_ref()
+            .is_some_and(|collateral| collateral.len() > MAX_TDX_COLLATERAL_BYTES)
+        {
             return Err(ProtocolError::AttestationTooLarge);
         }
         if self
@@ -2082,6 +2104,7 @@ mod tests {
         let unsigned = unsigned_attestation("0xabc");
         let serialized = serde_json::to_string(&unsigned).expect("canonical form");
         assert!(!serialized.contains("tdx_event_log"));
+        assert!(!serialized.contains("tdx_collateral_json"));
 
         let mut with_log = unsigned_attestation("0xabc");
         with_log.tdx_event_log.push(TdxEventEntry {
@@ -2098,6 +2121,7 @@ mod tests {
     fn unsigned_attestation(node_id: &str) -> UnsignedNodeAttestation {
         UnsignedNodeAttestation {
             tdx_event_log: Vec::new(),
+            tdx_collateral_json: None,
             node_id: node_id.to_owned(),
             challenge_id: Uuid::now_v7(),
             kind: AttestationKind::NvidiaGpu,

@@ -12,7 +12,6 @@ mod amd_kds;
 mod workspaces;
 
 use anyhow::Context;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -20,7 +19,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
 };
-use chrono::{Duration, Utc};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use prism_protocol::{
@@ -32,10 +32,10 @@ use prism_protocol::{
     MAX_WORKSPACE_NAME_BYTES, MAX_WORKSPACES_PER_ACCOUNT, NodeAttestation, NodeCertificateBundle,
     NodeCertificateRequest, NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll,
     NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture, NodeTelemetry,
-    STANDARD_RATE_PER_SECOND, SettlementEvidence, TrustClass, VaultEnvelope, VaultItem,
-    VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot, attestation_report_nonce,
+    STANDARD_RATE_PER_SECOND, SettlementEvidence, TdxEventEntry, TrustClass, VaultEnvelope,
+    VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot, attestation_report_nonce,
     class_for_lease, class_for_verdict, discounted_rate, node_id, snp_report_data,
-    stake_discount_bps, vault_release_permitted, verifying_key,
+    stake_discount_bps, tdx_report_data, vault_release_permitted, verifying_key,
 };
 use rand::RngCore;
 use rcgen::{
@@ -126,6 +126,9 @@ struct AppState {
     stake: StakeReader,
     workspaces: Option<Arc<workspaces::WorkspaceStorage>>,
     attestation_policy: Arc<prism_attestation::Policy>,
+    /// Compose hashes a TDX node may prove it launched from, from
+    /// PRISM_TDX_COMPOSE_HASHES. Empty refuses all TDX evidence.
+    tdx_compose_allowlist: Arc<Vec<[u8; 32]>>,
     /// Absent only where the deployment has no route to AMD, in which case a
     /// guest that sends no chain is refused rather than quietly downgraded.
     amd_kds: Option<amd_kds::AmdKds>,
@@ -229,6 +232,10 @@ struct AttestationSubmission<'a> {
     /// other key hashes to a nonce that does not match.
     device_public_key: &'a str,
     policy: &'a prism_attestation::Policy,
+    /// Compose hashes a TDX node may prove it launched from. Empty means no
+    /// TDX evidence can verify, which is the shipped state until an operator
+    /// deliberately lists the images this deployment accepts.
+    tdx_compose_allowlist: &'a [[u8; 32]],
 }
 
 struct LeaseAttestationSubmission<'a> {
@@ -322,6 +329,133 @@ fn expected_report_nonce(
     let nonce = hex::decode(nonce)
         .map_err(|_| StoreError::InvalidStoredState("attestation nonce is not hex".to_owned()))?;
     Ok(attestation_report_nonce(&nonce, node_id, device_public_key))
+}
+
+/// The wire event log, hex fields decoded into what the verifier judges. A
+/// field that does not decode refuses the submission; the verifier never sees
+/// a partially decoded log.
+fn decode_tdx_events(
+    entries: &[TdxEventEntry],
+) -> Result<Vec<prism_attestation::TdxEvent>, &'static str> {
+    entries
+        .iter()
+        .map(|entry| {
+            Ok(prism_attestation::TdxEvent {
+                imr: entry.imr,
+                event_type: entry.event_type,
+                name: entry.event.clone(),
+                digest: hex::decode(&entry.digest)
+                    .ok()
+                    .and_then(|raw| raw.try_into().ok())
+                    .ok_or("an event digest is not a 48 byte hex digest")?,
+                payload: hex::decode(&entry.event_payload)
+                    .map_err(|_| "an event payload is not hex")?,
+            })
+        })
+        .collect()
+}
+
+/// PRISM_TDX_COMPOSE_HASHES is a comma-separated list of sha256 hex digests
+/// of the compose files this deployment accepts from TDX nodes. Absent or
+/// empty means TDX evidence is refused, which is the safe default; an entry
+/// that does not parse is a configuration mistake and refuses startup rather
+/// than silently disabling the rung it was meant to open.
+fn tdx_compose_allowlist_from_environment() -> anyhow::Result<Vec<[u8; 32]>> {
+    let Ok(raw) = std::env::var("PRISM_TDX_COMPOSE_HASHES") else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            hex::decode(entry)
+                .ok()
+                .and_then(|digest| digest.try_into().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "PRISM_TDX_COMPOSE_HASHES entry {entry:?} is not a 32 byte hex digest"
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Turns one submission's evidence into a verdict, whatever kind it carries.
+/// Refusals are judged and logged here so both store backends refuse the same
+/// way, and the challenge stays spent whichever way this goes.
+fn verify_node_evidence(
+    attestation: &NodeAttestation,
+    nonce: &str,
+    device_public_key: &str,
+    policy: &prism_attestation::Policy,
+    tdx_compose_allowlist: &[[u8; 32]],
+    now: DateTime<Utc>,
+) -> Result<AttestationVerdict, StoreError> {
+    let node_id = attestation.node_id.as_str();
+    match attestation.kind {
+        AttestationKind::NvidiaGpu => {
+            let expected = expected_report_nonce(nonce, node_id, device_public_key)?;
+            prism_attestation::verify_nvidia_gpu_attestation(attestation, &expected, now, policy)
+                .map_err(|error| {
+                    tracing::warn!(node_id, %error, "attestation evidence rejected");
+                    StoreError::AttestationUnverified
+                })
+        }
+        AttestationKind::Tdx => {
+            let Some(collateral) = attestation.tdx_collateral_json.as_deref() else {
+                tracing::warn!(node_id, "TDX attestation carries no collateral");
+                return Err(StoreError::AttestationUnverified);
+            };
+            if tdx_compose_allowlist.is_empty() {
+                tracing::warn!(
+                    node_id,
+                    "no TDX compose hashes are configured, so no TDX evidence can verify"
+                );
+                return Err(StoreError::AttestationUnverified);
+            }
+            let events = decode_tdx_events(&attestation.tdx_event_log).map_err(|reason| {
+                tracing::warn!(node_id, reason, "TDX event log rejected");
+                StoreError::AttestationUnverified
+            })?;
+            let raw_nonce = hex::decode(nonce).map_err(|_| {
+                StoreError::InvalidStoredState("attestation nonce is not hex".to_owned())
+            })?;
+            let report_data = tdx_report_data(&raw_nonce, node_id, device_public_key);
+            // The allowlist is small and the quote is bound to one compose,
+            // so trying each accepted compose against a full verification is
+            // simpler than teaching the verifier about alternatives, and a
+            // mismatch costs one DCAP walk.
+            let mut refusal = None;
+            for compose_hash in tdx_compose_allowlist {
+                match prism_attestation::verify_tdx_attestation(
+                    attestation,
+                    collateral,
+                    &events,
+                    &prism_attestation::TdxExpectation {
+                        report_data,
+                        compose_hash: *compose_hash,
+                    },
+                    now,
+                    policy,
+                ) {
+                    Ok(verdict) => return Ok(verdict),
+                    Err(error) => refusal = Some(error),
+                }
+            }
+            if let Some(error) = refusal {
+                tracing::warn!(node_id, %error, "attestation evidence rejected");
+            }
+            Err(StoreError::AttestationUnverified)
+        }
+        kind => {
+            tracing::warn!(
+                node_id,
+                ?kind,
+                "attestation kind has no node-level verifier"
+            );
+            Err(StoreError::AttestationUnverified)
+        }
+    }
 }
 
 /// As above, for the 64 bytes a guest commits to in `REPORT_DATA`. The lease id
@@ -1040,6 +1174,17 @@ async fn main() -> anyhow::Result<()> {
             prism_attestation::Policy::default()
                 .with_verdict_ttl(Duration::hours(ATTESTATION_VERDICT_TTL_HOURS)),
         ),
+        tdx_compose_allowlist: {
+            let allowlist = tdx_compose_allowlist_from_environment()?;
+            if allowlist.is_empty() {
+                tracing::info!(
+                    "no TDX compose hashes configured; TDX attestations will be refused"
+                );
+            } else {
+                tracing::info!(accepted = allowlist.len(), "TDX compose allowlist loaded");
+            }
+            Arc::new(allowlist)
+        },
         // A guest whose firmware carries no certificates sends a report alone,
         // and this is what turns it into something that can be walked to the
         // AMD root.
@@ -3388,6 +3533,7 @@ impl MarketplaceStore {
             attestation,
             device_public_key,
             policy,
+            tdx_compose_allowlist,
         } = submission;
         let node_id = attestation.node_id.as_str();
         let now = Utc::now();
@@ -3415,17 +3561,14 @@ impl MarketplaceStore {
                     stored.consumed_at = Some(now);
                     stored.challenge.nonce.clone()
                 };
-                let expected = expected_report_nonce(&nonce, node_id, device_public_key)?;
-                let verdict = prism_attestation::verify_nvidia_gpu_attestation(
+                let verdict = verify_node_evidence(
                     attestation,
-                    &expected,
-                    now,
+                    &nonce,
+                    device_public_key,
                     policy,
-                )
-                .map_err(|error| {
-                    tracing::warn!(node_id, %error, "attestation evidence rejected");
-                    StoreError::AttestationUnverified
-                })?;
+                    tdx_compose_allowlist,
+                    now,
+                )?;
                 if market.verdicts.values().any(|current| {
                     current.device_identity == verdict.device_identity
                         && current.node_id != verdict.node_id
@@ -3478,18 +3621,18 @@ impl MarketplaceStore {
                 else {
                     return Err(StoreError::AttestationChallengeUnavailable);
                 };
-                let expected = expected_report_nonce(&nonce, node_id, device_public_key)?;
-                let verdict = match prism_attestation::verify_nvidia_gpu_attestation(
+                let verdict = match verify_node_evidence(
                     attestation,
-                    &expected,
-                    now,
+                    &nonce,
+                    device_public_key,
                     policy,
+                    tdx_compose_allowlist,
+                    now,
                 ) {
                     Ok(verdict) => verdict,
                     Err(error) => {
-                        tracing::warn!(node_id, %error, "attestation evidence rejected");
                         transaction.commit().await.map_err(StoreError::Storage)?;
-                        return Err(StoreError::AttestationUnverified);
+                        return Err(error);
                     }
                 };
                 let taken = query_scalar::<_, bool>(
@@ -4316,8 +4459,14 @@ impl MarketplaceStore {
                 // function that will read one later is what keeps the record
                 // inside what the network can substantiate without anybody
                 // having to remember the ceiling.
-                lease.trust_class =
-                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, None, now);
+                lease.trust_class = class_for_lease(
+                    lease.lease_id,
+                    &lease.node_id,
+                    quote.trust_class,
+                    None,
+                    None,
+                    now,
+                );
                 if market
                     .leases
                     .values()
@@ -4447,8 +4596,14 @@ impl MarketplaceStore {
                 // function that will read one later is what keeps the record
                 // inside what the network can substantiate without anybody
                 // having to remember the ceiling.
-                lease.trust_class =
-                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, None, now);
+                lease.trust_class = class_for_lease(
+                    lease.lease_id,
+                    &lease.node_id,
+                    quote.trust_class,
+                    None,
+                    None,
+                    now,
+                );
                 let node_busy = query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
@@ -5433,18 +5588,18 @@ impl MarketplaceStore {
                 Ok((owner == subject).then_some(lease.state.clone()))
             }
             Self::Postgres(pool) => {
-                let stored: Option<String> = query_scalar(
-                    "SELECT state FROM leases WHERE lease_id = $1 AND subject = $2",
-                )
-                .bind(lease_id as i64)
-                .bind(subject)
-                .fetch_optional(pool)
-                .await
-                .map_err(StoreError::Storage)?;
+                let stored: Option<String> =
+                    query_scalar("SELECT state FROM leases WHERE lease_id = $1 AND subject = $2")
+                        .bind(lease_id as i64)
+                        .bind(subject)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(StoreError::Storage)?;
                 stored
                     .map(|state| {
-                        serde_json::from_value(serde_json::Value::String(state))
-                            .map_err(|_| StoreError::InvalidStoredState("unknown lease state".to_owned()))
+                        serde_json::from_value(serde_json::Value::String(state)).map_err(|_| {
+                            StoreError::InvalidStoredState("unknown lease state".to_owned())
+                        })
                     })
                     .transpose()
             }
@@ -5493,7 +5648,8 @@ impl MarketplaceStore {
                     market.verdicts.get(&lease.node_id),
                     now,
                 );
-                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, None, now) < quoted_class
+                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, None, now)
+                    < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
                 }
@@ -6817,6 +6973,7 @@ async fn record_attestation(
             attestation: &attestation,
             device_public_key: &offer.device_public_key,
             policy: &state.attestation_policy,
+            tdx_compose_allowlist: &state.tdx_compose_allowlist,
         })
         .await
         .map_err(store_error)?;
@@ -6836,14 +6993,26 @@ fn check_attestation_envelope(
             "attestation evidence is malformed or larger than this service accepts",
         ));
     }
-    // A GPU device report is the only evidence this network can check. A host
-    // launch measurement needs SEV-SNP, which needs a kernel this hardware is
-    // not running, so accepting one here would mean storing it unverified.
-    if attestation.kind != AttestationKind::NvidiaGpu {
-        return Err(bad_request(
-            "unsupported_attestation_kind",
-            "this endpoint verifies NVIDIA GPU device reports",
-        ));
+    // Only kinds this service can actually check are let past the envelope:
+    // a GPU device report, or a TDX quote carrying the event log and Intel
+    // collateral its verification consumes. Anything else would be stored
+    // unverified.
+    match attestation.kind {
+        AttestationKind::NvidiaGpu => {}
+        AttestationKind::Tdx => {
+            if attestation.tdx_collateral_json.is_none() || attestation.tdx_event_log.is_empty() {
+                return Err(bad_request(
+                    "incomplete_tdx_evidence",
+                    "TDX attestations carry a quote, an event log and collateral",
+                ));
+            }
+        }
+        _ => {
+            return Err(bad_request(
+                "unsupported_attestation_kind",
+                "this endpoint verifies NVIDIA GPU device reports and TDX quotes",
+            ));
+        }
     }
     let device_key = verifying_key(&offer.device_public_key)
         .map_err(|_| bad_request("invalid_device_key", "node device key is invalid"))?;
@@ -8329,6 +8498,7 @@ mod tests {
         NodeAttestation::sign(
             prism_protocol::UnsignedNodeAttestation {
                 tdx_event_log: Vec::new(),
+                tdx_collateral_json: None,
                 node_id: challenge.node_id.clone(),
                 challenge_id: challenge.challenge_id,
                 kind: AttestationKind::NvidiaGpu,
@@ -8355,6 +8525,7 @@ mod tests {
         NodeAttestation::sign(
             prism_protocol::UnsignedNodeAttestation {
                 tdx_event_log: Vec::new(),
+                tdx_collateral_json: None,
                 node_id: attested_node_id(),
                 challenge_id,
                 kind: AttestationKind::NvidiaGpu,
@@ -8706,6 +8877,7 @@ mod tests {
                 attestation: &attestation,
                 device_public_key: &attestation_device_key(),
                 policy: &attestation_policy(),
+                tdx_compose_allowlist: &[],
             })
             .await
             .unwrap();
@@ -8746,6 +8918,7 @@ mod tests {
                     attestation: &attestation,
                     device_public_key: &attestation_device_key(),
                     policy: &attestation_policy(),
+                    tdx_compose_allowlist: &[],
                 })
                 .await,
             Err(StoreError::AttestationUnverified)
@@ -8754,6 +8927,83 @@ mod tests {
             store.list_offers().await.unwrap()[0].trust_class,
             TrustClass::Open,
             "a failed verification stores nothing"
+        );
+    }
+
+    /// The TDX path is routed and fails closed on real evidence. The quote,
+    /// log and collateral are the live capture the attestation crate's
+    /// vectors run, and it is genuinely Intel-signed, but its REPORT_DATA
+    /// answers the CVM's own TLS binding rather than a challenge this store
+    /// issued, so the submission refuses at the nonce binding, and the spent
+    /// challenge stays spent. With no accepted compose hashes it refuses
+    /// before any of that.
+    #[tokio::test]
+    async fn a_tdx_submission_is_bound_to_the_challenge_it_answers() {
+        let quote: &[u8] =
+            include_bytes!("../../../crates/attestation/tests/fixtures/tdx/live-quote.bin");
+        let collateral =
+            include_str!("../../../crates/attestation/tests/fixtures/tdx/live-collateral.json");
+        let events: Vec<TdxEventEntry> = serde_json::from_str(include_str!(
+            "../../../crates/attestation/tests/fixtures/tdx/live-events.json"
+        ))
+        .expect("live event log fixture");
+        let compose_hash: [u8; 32] =
+            hex::decode("c0fbe230ec1ce7ad7a092b8b698181a980df8555ab47e671f5464623c567b54f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        let node_id = attested_node_id();
+        let store = attested_market(IsolationMode::Shared, true, Utc::now(), None);
+        let submit = |challenge: &AttestationChallenge, allowlist: Vec<[u8; 32]>| {
+            let attestation = NodeAttestation {
+                node_id: challenge.node_id.clone(),
+                challenge_id: challenge.challenge_id,
+                kind: AttestationKind::Tdx,
+                evidence_base64: URL_SAFE_NO_PAD.encode(quote),
+                certificate_chain_base64: Vec::new(),
+                tdx_event_log: events.clone(),
+                tdx_collateral_json: Some(collateral.to_owned()),
+                capability: prism_protocol::HostTeeCapability::default(),
+                pci_address: String::new(),
+                collected_at: Utc::now(),
+                signature: String::new(),
+            };
+            let store = store.clone();
+            async move {
+                store
+                    .record_attestation(AttestationSubmission {
+                        attestation: &attestation,
+                        device_public_key: &attestation_device_key(),
+                        policy: &attestation_policy(),
+                        tdx_compose_allowlist: &allowlist,
+                    })
+                    .await
+            }
+        };
+
+        let challenge = store.create_attestation_challenge(&node_id).await.unwrap();
+        assert!(matches!(
+            submit(&challenge, vec![compose_hash]).await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert!(
+            matches!(
+                submit(&challenge, vec![compose_hash]).await,
+                Err(StoreError::AttestationChallengeUnavailable)
+            ),
+            "a refusal spends the challenge"
+        );
+
+        let challenge = store.create_attestation_challenge(&node_id).await.unwrap();
+        assert!(matches!(
+            submit(&challenge, Vec::new()).await,
+            Err(StoreError::AttestationUnverified)
+        ));
+        assert_eq!(
+            store.list_offers().await.unwrap()[0].trust_class,
+            TrustClass::Open,
+            "nothing was stored"
         );
     }
 
@@ -8785,6 +9035,7 @@ mod tests {
                 attestation: &attested_submission(&mine, &first, &first, "1650223000001"),
                 device_public_key: &attestation_device_key(),
                 policy: &attestation_policy(),
+                tdx_compose_allowlist: &[],
             })
             .await
             .unwrap();
@@ -8800,6 +9051,7 @@ mod tests {
                     attestation: &relayed,
                     device_public_key: &URL_SAFE_NO_PAD.encode(second.verifying_key().as_bytes()),
                     policy: &attestation_policy(),
+                    tdx_compose_allowlist: &[],
                 })
                 .await,
             Err(StoreError::AttestedDeviceConflict)
@@ -8871,6 +9123,7 @@ mod tests {
                     attestation: &attestation,
                     device_public_key: &attestation_device_key(),
                     policy: &policy,
+                    tdx_compose_allowlist: &[],
                 })
                 .await
         };
@@ -8945,6 +9198,7 @@ mod tests {
                     attestation: &attestation,
                     device_public_key: &attestation_device_key(),
                     policy: &attestation_policy(),
+                    tdx_compose_allowlist: &[],
                 })
                 .await,
             Err(StoreError::AttestationChallengeUnavailable)

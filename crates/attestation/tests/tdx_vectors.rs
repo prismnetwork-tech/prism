@@ -75,6 +75,7 @@ fn attestation() -> NodeAttestation {
     use base64::Engine as _;
     NodeAttestation {
         tdx_event_log: Vec::new(),
+        tdx_collateral_json: None,
         node_id: "0xtdxnode".into(),
         challenge_id: uuid::Uuid::nil(),
         kind: AttestationKind::Tdx,

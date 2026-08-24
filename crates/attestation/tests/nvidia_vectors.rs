@@ -72,6 +72,7 @@ fn chain() -> Vec<String> {
 fn attestation(evidence: Vec<u8>, chain: Vec<String>) -> NodeAttestation {
     NodeAttestation {
         tdx_event_log: Vec::new(),
+        tdx_collateral_json: None,
         node_id: NODE_ID.to_string(),
         challenge_id: Uuid::nil(),
         kind: AttestationKind::NvidiaGpu,
