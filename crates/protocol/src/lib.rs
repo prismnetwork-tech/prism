@@ -67,6 +67,8 @@ const COMMAND_POLL_SIGNATURE_DOMAIN: &[u8] = b"prism.node-command-poll.v1\0";
 const COMMAND_REPORT_SIGNATURE_DOMAIN: &[u8] = b"prism.node-command-report.v1\0";
 const ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.node-attestation.v1\0";
 const GUEST_ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.guest-attestation.v1\0";
+const TDX_LEASE_ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.tdx-lease-attestation.v1\0";
+const GPU_CC_ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.gpu-cc-attestation.v1\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -639,6 +641,203 @@ impl GuestAttestation {
         if self.report_base64.len() > MAX_SNP_REPORT_BYTES {
             return Err(ProtocolError::AttestationTooLarge);
         }
+        if self.certificate_chain_base64.len() > MAX_ATTESTATION_CERTIFICATES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self
+            .certificate_chain_base64
+            .iter()
+            .any(|certificate| certificate.len() > MAX_ATTESTATION_CERTIFICATE_BYTES)
+        {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        Ok(())
+    }
+}
+
+/// A TDX quote a leased CVM took of itself, carried to the control plane by the
+/// host beside the runtime event log and Intel collateral the verifier needs to
+/// judge it. Like `GuestAttestation`, the host signs only as the courier that
+/// says which node is presenting this; it cannot forge a quote the TD sealed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TdxLeaseAttestation {
+    pub node_id: String,
+    pub lease_id: u64,
+    pub challenge_id: Uuid,
+    pub quote_base64: String,
+    pub tdx_event_log: Vec<TdxEventEntry>,
+    /// Intel PCS collateral bundle as JSON, so the verifier need not fetch it.
+    pub tdx_collateral_json: String,
+    pub collected_at: DateTime<Utc>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsignedTdxLeaseAttestation {
+    pub node_id: String,
+    pub lease_id: u64,
+    pub challenge_id: Uuid,
+    pub quote_base64: String,
+    pub tdx_event_log: Vec<TdxEventEntry>,
+    pub tdx_collateral_json: String,
+    pub collected_at: DateTime<Utc>,
+}
+
+impl TdxLeaseAttestation {
+    pub fn sign(
+        unsigned: UnsignedTdxLeaseAttestation,
+        key: &SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        let payload = signature_payload(TDX_LEASE_ATTESTATION_SIGNATURE_DOMAIN, &unsigned)?;
+        let signature = key.sign(&payload);
+        let attestation = Self {
+            node_id: unsigned.node_id,
+            lease_id: unsigned.lease_id,
+            challenge_id: unsigned.challenge_id,
+            quote_base64: unsigned.quote_base64,
+            tdx_event_log: unsigned.tdx_event_log,
+            tdx_collateral_json: unsigned.tdx_collateral_json,
+            collected_at: unsigned.collected_at,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        };
+        attestation.validate()?;
+        Ok(attestation)
+    }
+
+    pub fn verify(&self, key: &VerifyingKey) -> Result<(), ProtocolError> {
+        verify_signature(
+            &UnsignedTdxLeaseAttestation {
+                node_id: self.node_id.clone(),
+                lease_id: self.lease_id,
+                challenge_id: self.challenge_id,
+                quote_base64: self.quote_base64.clone(),
+                tdx_event_log: self.tdx_event_log.clone(),
+                tdx_collateral_json: self.tdx_collateral_json.clone(),
+                collected_at: self.collected_at,
+            },
+            &self.signature,
+            key,
+            TDX_LEASE_ATTESTATION_SIGNATURE_DOMAIN,
+        )
+    }
+
+    /// Checked before a signature is even looked at, so a body that would cost
+    /// more to parse than to reject never gets that far.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.node_id.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        // A quote that names no lease binds to no session, which is the whole
+        // point of taking it inside the guest.
+        if self.lease_id == 0 {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.quote_base64.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.quote_base64.len() > MAX_ATTESTATION_EVIDENCE_BYTES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self.tdx_event_log.len() > MAX_TDX_EVENT_LOG_ENTRIES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self
+            .tdx_event_log
+            .iter()
+            .any(|entry| entry.event_payload.len() > MAX_TDX_EVENT_PAYLOAD_BYTES)
+        {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self.tdx_collateral_json.len() > MAX_TDX_COLLATERAL_BYTES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        Ok(())
+    }
+}
+
+/// An NVIDIA confidential-computing report is a GPU attestation report plus its
+/// device certificate chain, so the ceiling has to clear a real one without
+/// letting a body run away. A CC report runs a few kilobytes.
+pub const MAX_GPU_CC_REPORT_BYTES: usize = 32 * 1_024;
+
+/// A GPU confidential-computing report a leased node took of its accelerators,
+/// carried to the control plane by the host. Same courier model as the other
+/// lease attestations: the host says which node is presenting the report, the
+/// device signs the report itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuCcAttestation {
+    pub node_id: String,
+    pub lease_id: u64,
+    pub challenge_id: Uuid,
+    pub report_base64: String,
+    pub certificate_chain_base64: Vec<String>,
+    pub collected_at: DateTime<Utc>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsignedGpuCcAttestation {
+    pub node_id: String,
+    pub lease_id: u64,
+    pub challenge_id: Uuid,
+    pub report_base64: String,
+    pub certificate_chain_base64: Vec<String>,
+    pub collected_at: DateTime<Utc>,
+}
+
+impl GpuCcAttestation {
+    pub fn sign(
+        unsigned: UnsignedGpuCcAttestation,
+        key: &SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        let payload = signature_payload(GPU_CC_ATTESTATION_SIGNATURE_DOMAIN, &unsigned)?;
+        let signature = key.sign(&payload);
+        let attestation = Self {
+            node_id: unsigned.node_id,
+            lease_id: unsigned.lease_id,
+            challenge_id: unsigned.challenge_id,
+            report_base64: unsigned.report_base64,
+            certificate_chain_base64: unsigned.certificate_chain_base64,
+            collected_at: unsigned.collected_at,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        };
+        attestation.validate()?;
+        Ok(attestation)
+    }
+
+    pub fn verify(&self, key: &VerifyingKey) -> Result<(), ProtocolError> {
+        verify_signature(
+            &UnsignedGpuCcAttestation {
+                node_id: self.node_id.clone(),
+                lease_id: self.lease_id,
+                challenge_id: self.challenge_id,
+                report_base64: self.report_base64.clone(),
+                certificate_chain_base64: self.certificate_chain_base64.clone(),
+                collected_at: self.collected_at,
+            },
+            &self.signature,
+            key,
+            GPU_CC_ATTESTATION_SIGNATURE_DOMAIN,
+        )
+    }
+
+    /// Checked before a signature is even looked at, so a body that would cost
+    /// more to parse than to reject never gets that far.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.node_id.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.lease_id == 0 {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.report_base64.is_empty() {
+            return Err(ProtocolError::InvalidAttestation);
+        }
+        if self.report_base64.len() > MAX_GPU_CC_REPORT_BYTES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        // NVIDIA's device chain is five hops; the shared ceiling leaves headroom
+        // without letting a chain become the expensive part of a request.
         if self.certificate_chain_base64.len() > MAX_ATTESTATION_CERTIFICATES {
             return Err(ProtocolError::AttestationTooLarge);
         }
@@ -2577,6 +2776,140 @@ mod tests {
         unsigned.certificate_chain_base64 = vec!["A".repeat(MAX_ATTESTATION_CERTIFICATE_BYTES + 1)];
         assert!(matches!(
             GuestAttestation::sign(unsigned, &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+    }
+
+    // Flips one byte of a decoded signature so it still parses as 64 bytes but
+    // no longer matches the payload, which is what a mangled signature looks
+    // like on the wire.
+    fn tamper_signature(encoded: &str) -> String {
+        let mut bytes = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        bytes[0] ^= 0x01;
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn unsigned_tdx_lease_attestation(node_id: &str, lease_id: u64) -> UnsignedTdxLeaseAttestation {
+        UnsignedTdxLeaseAttestation {
+            node_id: node_id.to_owned(),
+            lease_id,
+            challenge_id: Uuid::now_v7(),
+            quote_base64: URL_SAFE_NO_PAD.encode("tdx quote"),
+            tdx_event_log: vec![TdxEventEntry {
+                imr: 1,
+                event_type: 0x0000_0007,
+                event: "boot".to_owned(),
+                digest: "00".repeat(48),
+                event_payload: String::new(),
+            }],
+            tdx_collateral_json: "{\"pck\":\"...\"}".to_owned(),
+            collected_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn tdx_lease_attestation_round_trip_verifies() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut attestation = TdxLeaseAttestation::sign(
+            unsigned_tdx_lease_attestation(&node_id(&key.verifying_key()), 7),
+            &key,
+        )
+        .unwrap();
+
+        assert!(attestation.verify(&key.verifying_key()).is_ok());
+
+        let good = attestation.signature.clone();
+        attestation.signature = tamper_signature(&good);
+        assert!(attestation.verify(&key.verifying_key()).is_err());
+
+        attestation.signature = good;
+        attestation.lease_id = 8;
+        assert!(attestation.verify(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn tdx_lease_attestation_rejects_an_unbound_or_oversized_body() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut unsigned = unsigned_tdx_lease_attestation("0xabc", 0);
+        assert!(matches!(
+            TdxLeaseAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::InvalidAttestation)
+        ));
+
+        unsigned.lease_id = 7;
+        unsigned.quote_base64 = "A".repeat(MAX_ATTESTATION_EVIDENCE_BYTES + 1);
+        assert!(matches!(
+            TdxLeaseAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+
+        unsigned.quote_base64 = URL_SAFE_NO_PAD.encode("quote");
+        unsigned.tdx_collateral_json = "A".repeat(MAX_TDX_COLLATERAL_BYTES + 1);
+        assert!(matches!(
+            TdxLeaseAttestation::sign(unsigned, &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+    }
+
+    fn unsigned_gpu_cc_attestation(node_id: &str, lease_id: u64) -> UnsignedGpuCcAttestation {
+        UnsignedGpuCcAttestation {
+            node_id: node_id.to_owned(),
+            lease_id,
+            challenge_id: Uuid::now_v7(),
+            report_base64: URL_SAFE_NO_PAD.encode("gpu cc report"),
+            // The NVIDIA device chain is five hops; sign one shaped like the real thing.
+            certificate_chain_base64: vec![URL_SAFE_NO_PAD.encode("device cert"); 5],
+            collected_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn gpu_cc_attestation_round_trip_verifies() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut attestation = GpuCcAttestation::sign(
+            unsigned_gpu_cc_attestation(&node_id(&key.verifying_key()), 7),
+            &key,
+        )
+        .unwrap();
+
+        assert!(attestation.verify(&key.verifying_key()).is_ok());
+
+        let good = attestation.signature.clone();
+        attestation.signature = tamper_signature(&good);
+        assert!(attestation.verify(&key.verifying_key()).is_err());
+
+        attestation.signature = good;
+        attestation.node_id = "0xdifferent".to_owned();
+        assert!(attestation.verify(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn gpu_cc_attestation_rejects_an_unbound_or_oversized_body() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut unsigned = unsigned_gpu_cc_attestation("0xabc", 0);
+        assert!(matches!(
+            GpuCcAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::InvalidAttestation)
+        ));
+
+        unsigned.lease_id = 7;
+        unsigned.report_base64 = "A".repeat(MAX_GPU_CC_REPORT_BYTES + 1);
+        assert!(matches!(
+            GpuCcAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+
+        unsigned.report_base64 = URL_SAFE_NO_PAD.encode("report");
+        unsigned.certificate_chain_base64 =
+            vec![URL_SAFE_NO_PAD.encode("der"); MAX_ATTESTATION_CERTIFICATES + 1];
+        assert!(matches!(
+            GpuCcAttestation::sign(unsigned.clone(), &key),
+            Err(ProtocolError::AttestationTooLarge)
+        ));
+
+        unsigned.certificate_chain_base64 = vec!["A".repeat(MAX_ATTESTATION_CERTIFICATE_BYTES + 1)];
+        assert!(matches!(
+            GpuCcAttestation::sign(unsigned, &key),
             Err(ProtocolError::AttestationTooLarge)
         ));
     }
