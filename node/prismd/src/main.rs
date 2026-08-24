@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     io::Write,
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -27,6 +28,8 @@ use sha3::{Digest as _, Keccak256};
 use tracing_subscriber::EnvFilter;
 
 mod attestation;
+mod gpu;
+mod idle;
 mod probe;
 mod runtime;
 mod snp;
@@ -76,9 +79,22 @@ struct Cli {
     command: CommandName,
 }
 
+/// How this node serves leases. Declared by the operator and never inferred: a
+/// machine that happens to have a bound VFIO group and a kata shim can still be
+/// the wrong place to run one, and guessing would change what the node claims
+/// about itself without anyone deciding to.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum IsolationArg {
+    KataVfio,
+    Shared,
+}
+
 #[derive(Subcommand)]
 enum CommandName {
-    Preflight,
+    Preflight {
+        #[arg(long, value_enum, env = "PRISM_ISOLATION", default_value = "kata-vfio")]
+        isolation: IsolationArg,
+    },
     CreateIdentity {
         #[arg(long, default_value = "/var/lib/prismd/device.json")]
         path: PathBuf,
@@ -180,6 +196,41 @@ enum CommandName {
         /// lease runs on the ordinary runtime and takes no report.
         #[arg(long, env = "PRISM_AGENT_POLICY_DIGEST")]
         agent_policy_digest: Option<String>,
+        #[arg(long, value_enum, env = "PRISM_ISOLATION", default_value = "kata-vfio")]
+        isolation: IsolationArg,
+        /// Which card to serve, by UUID. Needed under shared isolation when
+        /// the host has more than one.
+        #[arg(long, env = "PRISM_GPU_UUID")]
+        gpu_uuid: Option<String>,
+        /// Memory a shared lease may use. Defaults to three quarters of the
+        /// host's.
+        #[arg(long, env = "PRISM_LEASE_MEMORY_MIB")]
+        lease_memory_mib: Option<u32>,
+        /// CPUs a shared lease may use. Defaults to one short of all of them.
+        #[arg(long, env = "PRISM_LEASE_CPUS")]
+        lease_cpus: Option<u32>,
+        /// The workload to run between leases, described by a JSON file.
+        /// Without it the node does nothing while it waits.
+        #[arg(long, env = "PRISM_IDLE_CONFIG")]
+        idle_config: Option<PathBuf>,
+    },
+    /// Start the configured idle workload, wait for it to take the GPU, then
+    /// stop it the way a lease does and report what that cost. Run it before
+    /// bonding a node that has one.
+    IdleCheck {
+        #[arg(long, env = "PRISM_IDLE_CONFIG")]
+        idle_config: PathBuf,
+        #[arg(long, env = "PRISM_GPU_UUID")]
+        gpu_uuid: Option<String>,
+        /// The workload's own directory, which it runs in and owns.
+        #[arg(long, default_value = "/var/lib/prismd/idle")]
+        idle_root: PathBuf,
+        /// Where the daemon keeps its own state file and the workload's log.
+        /// Root owns this one.
+        #[arg(long, default_value = "/var/lib/prismd/idle-state")]
+        idle_state_root: PathBuf,
+        #[arg(long, default_value = "/var/lib/prismd/leases")]
+        state_root: PathBuf,
     },
     /// Runs inside the guest, not on the host: it asks the processor for a
     /// report over the challenge, the lease and the SSH host key this guest
@@ -240,7 +291,7 @@ enum CommandName {
         #[arg(long)]
         lease_id: String,
         #[arg(long)]
-        vfio_group: u32,
+        vfio_group: Option<u32>,
         #[arg(long, default_value = "/var/lib/prismd/workspaces")]
         workspace_root: PathBuf,
         #[arg(long, default_value = "/var/lib/prismd/leases")]
@@ -255,6 +306,14 @@ enum CommandName {
         ssh_port: u16,
         #[arg(long, default_value_t = 8_888)]
         jupyter_port: u16,
+        #[arg(long, value_enum, env = "PRISM_ISOLATION", default_value = "kata-vfio")]
+        isolation: IsolationArg,
+        #[arg(long, env = "PRISM_GPU_UUID")]
+        gpu_uuid: Option<String>,
+        #[arg(long, env = "PRISM_LEASE_MEMORY_MIB")]
+        lease_memory_mib: Option<u32>,
+        #[arg(long, env = "PRISM_LEASE_CPUS")]
+        lease_cpus: Option<u32>,
         #[arg(long)]
         execute: bool,
     },
@@ -266,12 +325,160 @@ enum RelayServiceArg {
     Jupyter,
 }
 
+/// What the flags asked for, before the host is consulted. Kept pure so the
+/// combinations this refuses can be proved without a GPU under the test.
+#[derive(Debug, PartialEq, Eq)]
+enum IsolationRequest {
+    KataVfio {
+        group: Option<u32>,
+    },
+    Shared {
+        gpu_uuid: Option<String>,
+        memory_mib: Option<u32>,
+        cpus: Option<u32>,
+    },
+}
+
+/// clap cannot express these: the conflict is with the value of `--isolation`
+/// rather than with the presence of a flag, so the check is written out and
+/// the message names the mode the flag belongs to.
+fn isolation_request(
+    mode: IsolationArg,
+    vfio_group: Option<u32>,
+    gpu_uuid: Option<String>,
+    memory_mib: Option<u32>,
+    cpus: Option<u32>,
+) -> anyhow::Result<IsolationRequest> {
+    match mode {
+        IsolationArg::KataVfio => {
+            if gpu_uuid.is_some() {
+                anyhow::bail!(
+                    "--gpu-uuid belongs to --isolation shared; under kata-vfio the card is named by its VFIO group"
+                );
+            }
+            if memory_mib.is_some() || cpus.is_some() {
+                anyhow::bail!(
+                    "--lease-memory-mib and --lease-cpus belong to --isolation shared; a Kata lease gets the guest the hypervisor gave it"
+                );
+            }
+            Ok(IsolationRequest::KataVfio { group: vfio_group })
+        }
+        IsolationArg::Shared => {
+            if vfio_group.is_some() {
+                anyhow::bail!(
+                    "--vfio-group belongs to --isolation kata-vfio; under shared the card is named by --gpu-uuid"
+                );
+            }
+            Ok(IsolationRequest::Shared {
+                gpu_uuid,
+                memory_mib,
+                cpus,
+            })
+        }
+    }
+}
+
+/// A lease started by hand under Kata names the card it takes. The daemon
+/// discovers it instead, which is why this is not part of the request.
+fn launch_vfio_group(request: &IsolationRequest) -> anyhow::Result<Option<u32>> {
+    let IsolationRequest::KataVfio { group } = request else {
+        return Ok(None);
+    };
+    let group = group.context(
+        "--isolation kata-vfio needs --vfio-group to name the card that was passed through",
+    )?;
+    Ok(Some(group))
+}
+
+/// The mode this daemon runs in, resolved once against the host so no lease has
+/// to go looking for the card it runs on.
+enum IsolationSetting {
+    KataVfio,
+    Shared {
+        gpu: gpu::HostGpu,
+        limits: runtime::LeaseLimits,
+    },
+}
+
+impl IsolationSetting {
+    fn resolve(request: IsolationRequest) -> anyhow::Result<Self> {
+        match request {
+            IsolationRequest::KataVfio { .. } => Ok(Self::KataVfio),
+            IsolationRequest::Shared {
+                gpu_uuid,
+                memory_mib,
+                cpus,
+            } => {
+                let gpu = gpu::select(gpu::discover()?, gpu_uuid.as_deref())?;
+                let host = match (memory_mib, cpus) {
+                    (Some(_), Some(_)) => runtime::LeaseLimits::UNUSED,
+                    _ => runtime::LeaseLimits::for_host()?,
+                };
+                let limits = runtime::LeaseLimits {
+                    memory_mib: memory_mib.unwrap_or(host.memory_mib),
+                    cpus: cpus.unwrap_or(host.cpus),
+                };
+                tracing::info!(
+                    gpu = %gpu.uuid,
+                    model = %gpu.model,
+                    memory_mib = limits.memory_mib,
+                    cpus = limits.cpus,
+                    "serving open leases on a host-visible GPU"
+                );
+                Ok(Self::Shared { gpu, limits })
+            }
+        }
+    }
+
+    /// The card the next lease runs on. Under Kata the group is discovered per
+    /// command, exactly as it always has been, and a host with none reports the
+    /// command failed rather than taking the daemon down.
+    fn isolation(&self) -> anyhow::Result<Option<runtime::Isolation>> {
+        Ok(match self {
+            Self::KataVfio => runtime::discover_vfio_gpu_groups()?
+                .into_iter()
+                .next()
+                .map(|group| runtime::Isolation::KataVfio { group }),
+            Self::Shared { gpu, .. } => Some(runtime::Isolation::Shared { gpu: gpu.clone() }),
+        })
+    }
+
+    fn limits(&self) -> runtime::LeaseLimits {
+        match self {
+            Self::KataVfio => runtime::LeaseLimits::UNUSED,
+            Self::Shared { limits, .. } => *limits,
+        }
+    }
+
+    fn shared_gpu(&self) -> Option<&gpu::HostGpu> {
+        match self {
+            Self::KataVfio => None,
+            Self::Shared { gpu, .. } => Some(gpu),
+        }
+    }
+
+    /// A node configured shared reports shared, on any host. Inferring it from
+    /// what happens to be installed would let a machine that still has a bound
+    /// group and a kata shim claim a class it is not serving.
+    fn posture(&self, capability: &HostTeeCapability) -> NodePosture {
+        match self {
+            Self::KataVfio => local_posture(capability),
+            Self::Shared { .. } => NodePosture {
+                isolation: IsolationMode::Shared,
+                attestation: None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PreflightReport {
     supported: bool,
+    isolation: &'static str,
     architecture: String,
     linux: bool,
     nvidia_smi: bool,
+    driver_version: Option<String>,
     containerd: bool,
     nerdctl: bool,
     kata_runtime: bool,
@@ -280,13 +487,69 @@ struct PreflightReport {
     nftables: bool,
     swap_disabled: bool,
     nvidia_container_toolkit: bool,
+    nvidia_container_cli: bool,
+    workspace_ports_free: bool,
+    forward_chain_open: bool,
     sev: bool,
     sev_es: bool,
     sev_snp: bool,
     sev_guest_device: bool,
     kata_confidential_runtime: bool,
     vfio_gpu_groups: Vec<runtime::VfioGroup>,
+    host_gpus: Vec<gpu::HostGpu>,
     gpu_devices: Vec<PciIdentity>,
+}
+
+/// The facts the baseline is decided from, kept apart from the report so the
+/// decision is a function of them and of the mode, and nothing else.
+struct PreflightChecks {
+    linux: bool,
+    x86_64: bool,
+    containerd: bool,
+    nerdctl: bool,
+    kata_runtime: bool,
+    iommu: bool,
+    vfio: bool,
+    nftables: bool,
+    swap_disabled: bool,
+    nvidia_smi: bool,
+    nvidia_container_cli: bool,
+    workspace_ports_free: bool,
+    forward_chain_open: bool,
+    vfio_gpu_groups: usize,
+    host_gpus: usize,
+}
+
+fn preflight_supported(isolation: IsolationArg, checks: &PreflightChecks) -> bool {
+    match isolation {
+        IsolationArg::KataVfio => {
+            checks.linux
+                && checks.x86_64
+                && checks.containerd
+                && checks.nerdctl
+                && checks.kata_runtime
+                && checks.iommu
+                && checks.vfio
+                && checks.nftables
+                && checks.swap_disabled
+                && checks.vfio_gpu_groups > 0
+        }
+        // No kata, no IOMMU, no VFIO and no requirement to have disabled swap:
+        // this is a stock host with a driver, and asking for the passthrough
+        // baseline here would only turn away the machines the mode is for.
+        IsolationArg::Shared => {
+            checks.linux
+                && checks.x86_64
+                && checks.containerd
+                && checks.nerdctl
+                && checks.nftables
+                && checks.nvidia_smi
+                && checks.nvidia_container_cli
+                && checks.host_gpus > 0
+                && checks.workspace_ports_free
+                && checks.forward_chain_open
+        }
+    }
 }
 
 /// Which card, not what class of card. An operator reading this should see
@@ -313,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
     match Cli::parse().command {
-        CommandName::Preflight => preflight(),
+        CommandName::Preflight { isolation } => preflight(isolation),
         CommandName::CreateIdentity { path } => create_identity(path),
         CommandName::Register {
             identity,
@@ -380,6 +643,7 @@ async fn main() -> anyhow::Result<()> {
                 tunnel_connected,
                 active_lease,
                 image_digest,
+                local_posture(host_capability()),
             )
             .await
         }
@@ -416,7 +680,14 @@ async fn main() -> anyhow::Result<()> {
             jupyter_port,
             poll_seconds,
             agent_policy_digest,
+            isolation,
+            gpu_uuid,
+            lease_memory_mib,
+            lease_cpus,
+            idle_config,
         } => {
+            let request =
+                isolation_request(isolation, None, gpu_uuid, lease_memory_mib, lease_cpus)?;
             command_loop(CommandLoopConfig {
                 identity,
                 control_plane,
@@ -426,8 +697,26 @@ async fn main() -> anyhow::Result<()> {
                 jupyter_port,
                 poll_seconds,
                 agent_policy_digest,
+                isolation: IsolationSetting::resolve(request)?,
+                idle_config,
             })
             .await
+        }
+        CommandName::IdleCheck {
+            idle_config,
+            gpu_uuid,
+            idle_root,
+            idle_state_root,
+            state_root,
+        } => {
+            let gpu = gpu::select(gpu::discover()?, gpu_uuid.as_deref())?;
+            idle::check(
+                idle::load(&idle_config)?,
+                idle_root,
+                idle_state_root,
+                state_root,
+                gpu.uuid,
+            )
         }
         CommandName::SnpReport {
             challenge_file,
@@ -507,14 +796,36 @@ async fn main() -> anyhow::Result<()> {
             jupyter_token,
             ssh_port,
             jupyter_port,
+            isolation,
+            gpu_uuid,
+            lease_memory_mib,
+            lease_cpus,
             execute,
         } => {
+            let request = isolation_request(
+                isolation,
+                vfio_group,
+                gpu_uuid,
+                lease_memory_mib,
+                lease_cpus,
+            )?;
+            let group = launch_vfio_group(&request)?;
+            let setting = IsolationSetting::resolve(request)?;
+            let isolation = match group {
+                Some(group) => runtime::Isolation::KataVfio {
+                    group: runtime::VfioGroup::from_system(group)?,
+                },
+                None => setting
+                    .isolation()?
+                    .context("no GPU on this host can serve a lease")?,
+            };
             let config = runtime::LaunchConfig {
                 image: &image,
                 lease_id: &lease_id,
                 workspace_root: &workspace_root,
                 state_root: &state_root,
-                vfio_group,
+                isolation: &isolation,
+                limits: setting.limits(),
                 duration_seconds,
                 ssh_authorized_key: &ssh_authorized_key,
                 jupyter_token: &jupyter_token,
@@ -523,7 +834,15 @@ async fn main() -> anyhow::Result<()> {
                 attestation_challenge: None,
                 agent_policy_digest: None,
             };
-            let command = runtime::kata_command(&config, &workspace_root.join(&lease_id))?;
+            let control_directory = workspace_root.join(&lease_id);
+            let command = match &isolation {
+                runtime::Isolation::KataVfio { .. } => {
+                    runtime::kata_command(&config, &control_directory)?
+                }
+                runtime::Isolation::Shared { .. } => {
+                    runtime::shared_command(&config, &control_directory)?
+                }
+            };
             if execute {
                 runtime::launch(config)
             } else {
@@ -534,7 +853,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn preflight() -> anyhow::Result<()> {
+fn preflight(isolation: IsolationArg) -> anyhow::Result<()> {
     let linux = cfg!(target_os = "linux");
     let architecture = env::consts::ARCH.to_owned();
     let nvidia_smi = command_success("nvidia-smi", &["-L"]);
@@ -547,7 +866,16 @@ fn preflight() -> anyhow::Result<()> {
     let nftables = command_success("nft", &["--version"]);
     let swap_disabled = swap_disabled();
     let nvidia_container_toolkit = command_success("nvidia-ctk", &["--version"]);
+    let nvidia_container_cli = gpu::nvidia_container_cli_available();
+    let workspace_ports_free = port_bindable(2_222) && port_bindable(8_888);
+    let forward_chain_open = forward_chain_open();
     let vfio_gpu_groups = runtime::discover_vfio_gpu_groups()?;
+    // A driver that answers with an error is reported as one. Reading it as a
+    // machine with no cards would enrol a node that cannot serve anything.
+    let (host_gpus, driver_error) = match gpu::discover() {
+        Ok(gpus) => (gpus, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let gpu_devices = vfio_gpu_groups
         .iter()
         .flat_map(|group| &group.pci_devices)
@@ -561,20 +889,33 @@ fn preflight() -> anyhow::Result<()> {
                 })
         })
         .collect();
+    let checks = PreflightChecks {
+        linux,
+        x86_64: architecture == "x86_64",
+        containerd,
+        nerdctl,
+        kata_runtime,
+        iommu,
+        vfio,
+        nftables,
+        swap_disabled,
+        nvidia_smi,
+        nvidia_container_cli,
+        workspace_ports_free,
+        forward_chain_open,
+        vfio_gpu_groups: vfio_gpu_groups.len(),
+        host_gpus: host_gpus.len(),
+    };
     let report = PreflightReport {
-        supported: linux
-            && architecture == "x86_64"
-            && containerd
-            && nerdctl
-            && kata_runtime
-            && iommu
-            && vfio
-            && nftables
-            && swap_disabled
-            && !vfio_gpu_groups.is_empty(),
+        supported: preflight_supported(isolation, &checks),
+        isolation: match isolation {
+            IsolationArg::KataVfio => "kata-vfio",
+            IsolationArg::Shared => "shared",
+        },
         architecture,
         linux,
         nvidia_smi,
+        driver_version: gpu::driver_version(),
         containerd,
         nerdctl,
         kata_runtime,
@@ -583,15 +924,30 @@ fn preflight() -> anyhow::Result<()> {
         nftables,
         swap_disabled,
         nvidia_container_toolkit,
+        nvidia_container_cli,
+        workspace_ports_free,
+        forward_chain_open,
         sev: capability.sev,
         sev_es: capability.sev_es,
         sev_snp: capability.sev_snp,
         sev_guest_device: capability.sev_guest_device,
         kata_confidential_runtime: capability.kata_confidential_runtime,
         vfio_gpu_groups,
+        host_gpus,
         gpu_devices,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
+    match isolation {
+        IsolationArg::KataVfio => report_passthrough_findings(&capability),
+        IsolationArg::Shared => report_shared_findings(&report, driver_error.as_ref()),
+    }
+    if !report.supported {
+        anyhow::bail!("host does not satisfy the GPU node baseline");
+    }
+    Ok(())
+}
+
+fn report_passthrough_findings(capability: &HostTeeCapability) {
     if capability.sev && !capability.sev_snp {
         eprintln!(
             "SEV is on but SEV-SNP is not exposed by this kernel; host SEV-SNP needs Linux 6.11 or newer, so this node can serve isolated but not attested"
@@ -603,10 +959,70 @@ fn preflight() -> anyhow::Result<()> {
             probe::CONFIDENTIAL_RUNTIME
         );
     }
-    if !report.supported {
-        anyhow::bail!("host does not satisfy the GPU node baseline");
+}
+
+fn report_shared_findings(report: &PreflightReport, driver_error: Option<&anyhow::Error>) {
+    if let Some(error) = driver_error {
+        eprintln!("the NVIDIA driver did not answer: {error:#}");
     }
-    Ok(())
+    if !report.nvidia_container_cli {
+        eprintln!(
+            "nvidia-container-cli is missing; install nvidia-container-toolkit, because that binary is what hands the card to a container"
+        );
+    }
+    if report.host_gpus.is_empty() && !report.vfio_gpu_groups.is_empty() {
+        eprintln!(
+            "every GPU on this host is bound to vfio-pci, so the driver on this side has nothing to serve; unbind one or run with --isolation kata-vfio"
+        );
+    } else if !report.vfio_gpu_groups.is_empty() {
+        eprintln!(
+            "a GPU on this host is bound to vfio-pci and stays with whatever is using it; leases run on the cards the driver reports"
+        );
+    }
+    if !report.workspace_ports_free {
+        eprintln!(
+            "127.0.0.1:2222 or 127.0.0.1:8888 is already in use; free both, because every lease publishes SSH and Jupyter on them"
+        );
+    }
+    if !report.forward_chain_open {
+        eprintln!(
+            "the iptables FORWARD policy is DROP and nothing lets the container bridge through, so a lease would come up with no network; run `iptables -I FORWARD -i nerdctl0 -j ACCEPT` and `iptables -I FORWARD -o nerdctl0 -j ACCEPT`, and make them persist"
+        );
+    }
+    if !report.swap_disabled {
+        eprintln!(
+            "swap is on; a lease that fills memory will page instead of failing, and the renter sees it as a slow card"
+        );
+    }
+}
+
+/// Every lease publishes SSH and Jupyter on these two loopback ports, so one
+/// taken by something else is a permanent outage rather than a slow start.
+fn port_bindable(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Docker sets the FORWARD policy to DROP and adds rules for its own bridge
+/// only. Everything behind another bridge is then dropped, and a lease comes
+/// up, reports itself ready and reaches nothing.
+///
+/// A host with no readable ruleset is left alone. Failing enrollment on a
+/// question nobody could answer is worse than the outage this warns about.
+fn forward_chain_open() -> bool {
+    let Ok(output) = Command::new("iptables").args(["-S", "FORWARD"]).output() else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let rules = String::from_utf8_lossy(&output.stdout);
+    if !rules.lines().any(|line| line.trim() == "-P FORWARD DROP") {
+        return true;
+    }
+    rules.lines().map(str::trim).any(|line| {
+        line.starts_with("-A FORWARD")
+            && (line == "-A FORWARD -j ACCEPT" || line.contains("nerdctl"))
+    })
 }
 
 fn create_identity(path: PathBuf) -> anyhow::Result<()> {
@@ -985,6 +1401,7 @@ async fn publish_telemetry(
     tunnel_connected: bool,
     active_lease: Option<String>,
     image_digest: Option<String>,
+    posture: NodePosture,
 ) -> anyhow::Result<()> {
     let mut identity = load_identity(identity_path)?;
     let signing_key = signing_key(&identity)?;
@@ -1004,7 +1421,7 @@ async fn publish_telemetry(
             active_lease,
             tunnel_connected,
             image_digest,
-            posture: Some(local_posture(host_capability())),
+            posture: Some(posture),
         },
         &signing_key,
     )?;
@@ -1027,6 +1444,8 @@ struct CommandLoopConfig {
     jupyter_port: u16,
     poll_seconds: u64,
     agent_policy_digest: Option<String>,
+    isolation: IsolationSetting,
+    idle_config: Option<PathBuf>,
 }
 
 async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
@@ -1036,6 +1455,12 @@ async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
     if config.ssh_port == 0 || config.jupyter_port == 0 || config.ssh_port == config.jupyter_port {
         anyhow::bail!("workspace access ports are invalid");
     }
+    if config.isolation.shared_gpu().is_some() && config.agent_policy_digest.is_some() {
+        anyhow::bail!(
+            "--agent-policy-digest describes a confidential guest, which --isolation shared cannot start"
+        );
+    }
+    let idle = start_idle_supervisor(&config)?;
     fs::create_dir_all(&config.workspace_root)?;
     fs::create_dir_all(&config.state_root)?;
     let identity = load_identity(&config.identity)?;
@@ -1052,12 +1477,21 @@ async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
         sev_snp = capability.sev_snp,
         "host TEE capability"
     );
-    tokio::spawn(attestation_loop(
-        config.identity.clone(),
-        config.control_plane.clone(),
-    ));
+    // A shared lease runs on the host's own kernel, so there is nothing here
+    // that could take a report and no reason to keep asking for a verdict.
+    if config.isolation.shared_gpu().is_none() {
+        tokio::spawn(attestation_loop(
+            config.identity.clone(),
+            config.control_plane.clone(),
+        ));
+    }
 
     loop {
+        // Ahead of the poll, because the workload the operator configured has
+        // to keep running through a control plane this node cannot reach.
+        if let Some(idle) = &idle {
+            idle.tick().await;
+        }
         let command =
             match poll_command(&client, &config.control_plane, &node, &public_key, &key).await {
                 Ok(command) => command,
@@ -1068,25 +1502,41 @@ async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
                 }
             };
         if let Some(command) = command {
-            if let Err(error) =
-                execute_node_command(&client, &config, &node, &public_key, &key, command).await
+            if let Err(error) = execute_node_command(
+                &client,
+                &config,
+                idle.as_ref(),
+                &node,
+                &public_key,
+                &key,
+                command,
+            )
+            .await
             {
                 tracing::error!(%error, "node command execution failed");
                 tokio::time::sleep(Duration::from_secs(config.poll_seconds)).await;
             }
             continue;
         }
-        if last_heartbeat.is_none_or(|last: chrono::DateTime<Utc>| {
-            Utc::now().signed_duration_since(last) >= chrono::Duration::seconds(30)
-        }) {
+        // A quarantined node stops publishing so the offer ages out of
+        // matching. Failing a fresh lease every few seconds until someone
+        // notices is worse than dropping off the list.
+        let publishing = idle.as_ref().is_none_or(|idle| !idle.quarantined());
+        if publishing
+            && last_heartbeat.is_none_or(|last: chrono::DateTime<Utc>| {
+                Utc::now().signed_duration_since(last) >= chrono::Duration::seconds(30)
+            })
+        {
+            let usage = idle_gpu_usage(&config.isolation);
             if let Err(error) = publish_telemetry(
                 &config.identity,
                 &config.control_plane,
-                0,
-                0,
+                usage.utilization_bps,
+                usage.memory_used_mib,
                 true,
                 None,
                 None,
+                config.isolation.posture(capability),
             )
             .await
             {
@@ -1096,6 +1546,67 @@ async fn command_loop(config: CommandLoopConfig) -> anyhow::Result<()> {
             }
         }
         tokio::time::sleep(Duration::from_secs(config.poll_seconds)).await;
+    }
+}
+
+/// What the card is doing while nobody is renting it. During a lease this stays
+/// at zero: the workload belongs to the renter and its shape is not ours to
+/// report.
+fn idle_gpu_usage(isolation: &IsolationSetting) -> gpu::Usage {
+    let idle = gpu::Usage {
+        utilization_bps: 0,
+        memory_used_mib: 0,
+    };
+    let Some(host_gpu) = isolation.shared_gpu() else {
+        return idle;
+    };
+    gpu::usage(&host_gpu.uuid).unwrap_or_else(|error| {
+        tracing::debug!(%error, "could not read GPU utilization");
+        idle
+    })
+}
+
+fn start_idle_supervisor(config: &CommandLoopConfig) -> anyhow::Result<Option<idle::Idle>> {
+    let Some(path) = &config.idle_config else {
+        return Ok(None);
+    };
+    let Some(gpu) = config.isolation.shared_gpu() else {
+        anyhow::bail!(
+            "an idle workload needs a GPU the host can use, and under --isolation kata-vfio the card is bound to vfio-pci"
+        );
+    };
+    let workload = idle::load(path)?;
+    let root = config
+        .state_root
+        .parent()
+        .unwrap_or(Path::new("/var/lib/prismd"));
+    Ok(Some(idle::Idle::new(
+        workload,
+        root.join("idle"),
+        root.join("idle-state"),
+        config.state_root.clone(),
+        gpu.uuid.clone(),
+    )?))
+}
+
+/// Take the card back before the lease starts.
+///
+/// Returns the message to fail the command with when the machine could not
+/// hand it over. Launching anyway would sell a renter a card somebody else is
+/// still computing on.
+async fn release_gpu_for_lease(idle: Option<&idle::Idle>) -> Option<String> {
+    let idle = idle?;
+    match idle.stop_for_lease().await {
+        Ok(release) => {
+            tracing::info!(
+                exit_ms = release.exit_ms,
+                free_ms = release.free_ms,
+                forced = release.forced,
+                "handed the GPU to the lease"
+            );
+            None
+        }
+        Err(error) => Some(format!("{error:#}")),
     }
 }
 
@@ -1126,9 +1637,11 @@ async fn poll_command(
         .context("decode node command")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_node_command(
     client: &reqwest::Client,
     config: &CommandLoopConfig,
+    idle: Option<&idle::Idle>,
     node: &str,
     public_key: &str,
     key: &SigningKey,
@@ -1158,6 +1671,7 @@ async fn execute_node_command(
         return run_batch_command(
             client,
             config,
+            idle,
             node,
             public_key,
             key,
@@ -1193,8 +1707,7 @@ async fn execute_node_command(
         .rsplit_once('@')
         .map(|(_, digest)| digest.to_owned())
         .context("launch image has no immutable digest")?;
-    let groups = runtime::discover_vfio_gpu_groups()?;
-    let Some(group) = groups.first() else {
+    let Some(isolation) = config.isolation.isolation()? else {
         report_command(
             client,
             &config.control_plane,
@@ -1270,11 +1783,27 @@ async fn execute_node_command(
     )?);
 
     let lease_id = command.lease_id.to_string();
+    if let Some(reason) = release_gpu_for_lease(idle).await {
+        report_command(
+            client,
+            &config.control_plane,
+            node,
+            public_key,
+            key,
+            command.command_id,
+            NodeCommandOutcome::Failed,
+            Some(reason.chars().take(512).collect()),
+            None,
+        )
+        .await?;
+        let _ = fs::remove_dir_all(&credential_root);
+        return Ok(());
+    }
     let workspace_root = config.workspace_root.clone();
     let state_root = config.state_root.clone();
     let ssh_port = config.ssh_port;
     let jupyter_port = config.jupyter_port;
-    let vfio_group = group.id;
+    let limits = config.isolation.limits();
     let launch_lease_id = lease_id.clone();
     let launch_ssh_key = ssh_key_path.clone();
     let launch_jupyter_token = jupyter_token_path.clone();
@@ -1286,7 +1815,8 @@ async fn execute_node_command(
             lease_id: &launch_lease_id,
             workspace_root: &workspace_root,
             state_root: &state_root,
-            vfio_group,
+            isolation: &isolation,
+            limits,
             duration_seconds,
             ssh_authorized_key: &launch_ssh_key,
             jupyter_token: &launch_jupyter_token,
@@ -1337,6 +1867,7 @@ async fn execute_node_command(
                 true,
                 Some(lease_id.clone()),
                 Some(image_digest.clone()),
+                config.isolation.posture(host_capability()),
             )
             .await?;
             telemetry_reported_at = Some(Utc::now());
@@ -1372,6 +1903,7 @@ async fn execute_node_command(
             true,
             Some(lease_id.clone()),
             Some(image_digest),
+            config.isolation.posture(host_capability()),
         )
         .await?;
     }
@@ -1398,12 +1930,13 @@ async fn execute_node_command(
 }
 
 /// A batch command occupies the GPU exactly like a lease does, so it takes the
-/// same VFIO group and reports through the same signed channel. The difference
-/// is what comes back: what the command printed, rather than a way in.
+/// same card and reports through the same signed channel. The difference is
+/// what comes back: what the command printed, rather than a way in.
 #[allow(clippy::too_many_arguments)]
 async fn run_batch_command(
     client: &reqwest::Client,
     config: &CommandLoopConfig,
+    idle: Option<&idle::Idle>,
     node: &str,
     public_key: &str,
     key: &SigningKey,
@@ -1412,8 +1945,7 @@ async fn run_batch_command(
     program: &str,
     duration_seconds: u32,
 ) -> anyhow::Result<()> {
-    let groups = runtime::discover_vfio_gpu_groups()?;
-    let Some(group) = groups.first() else {
+    let Some(isolation) = config.isolation.isolation()? else {
         return report_command(
             client,
             &config.control_plane,
@@ -1427,11 +1959,25 @@ async fn run_batch_command(
         )
         .await;
     };
+    if let Some(reason) = release_gpu_for_lease(idle).await {
+        return report_command(
+            client,
+            &config.control_plane,
+            node,
+            public_key,
+            key,
+            command.command_id,
+            NodeCommandOutcome::Failed,
+            Some(reason.chars().take(512).collect()),
+            None,
+        )
+        .await;
+    }
 
     let lease_id = command.lease_id.to_string();
     let workspace_root = config.workspace_root.clone();
     let state_root = config.state_root.clone();
-    let vfio_group = group.id;
+    let limits = config.isolation.limits();
     let image = image.to_owned();
     let program = program.to_owned();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1441,7 +1987,8 @@ async fn run_batch_command(
             command: &program,
             workspace_root: &workspace_root,
             state_root: &state_root,
-            vfio_group,
+            isolation: &isolation,
+            limits,
             duration_seconds,
         })
     })
@@ -1911,6 +2458,224 @@ mod tests {
         let isolated = posture_for(true, &with_kata);
         assert_eq!(isolated.isolation, IsolationMode::KataVfio);
         assert!(isolated.attestation.is_none());
+    }
+
+    fn every_check_passing() -> PreflightChecks {
+        PreflightChecks {
+            linux: true,
+            x86_64: true,
+            containerd: true,
+            nerdctl: true,
+            kata_runtime: true,
+            iommu: true,
+            vfio: true,
+            nftables: true,
+            swap_disabled: true,
+            nvidia_smi: true,
+            nvidia_container_cli: true,
+            workspace_ports_free: true,
+            forward_chain_open: true,
+            vfio_gpu_groups: 1,
+            host_gpus: 1,
+        }
+    }
+
+    /// The passthrough baseline is what it was. The shared one asks for a
+    /// driver, the binary that hands a card to a container, and two loopback
+    /// ports nothing else has taken, and it asks for none of the passthrough
+    /// machinery.
+    #[test]
+    fn each_mode_asks_the_host_for_what_that_mode_needs() {
+        assert!(preflight_supported(
+            IsolationArg::KataVfio,
+            &every_check_passing()
+        ));
+        assert!(preflight_supported(
+            IsolationArg::Shared,
+            &every_check_passing()
+        ));
+
+        for missing in [
+            PreflightChecks {
+                kata_runtime: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                iommu: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                vfio: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                swap_disabled: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                vfio_gpu_groups: 0,
+                ..every_check_passing()
+            },
+        ] {
+            assert!(!preflight_supported(IsolationArg::KataVfio, &missing));
+            assert!(
+                preflight_supported(IsolationArg::Shared, &missing),
+                "a stock host has none of the passthrough machinery and still serves open leases"
+            );
+        }
+
+        for missing in [
+            PreflightChecks {
+                nvidia_smi: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                nvidia_container_cli: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                host_gpus: 0,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                workspace_ports_free: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                forward_chain_open: false,
+                ..every_check_passing()
+            },
+        ] {
+            assert!(!preflight_supported(IsolationArg::Shared, &missing));
+            assert!(preflight_supported(IsolationArg::KataVfio, &missing));
+        }
+
+        for missing in [
+            PreflightChecks {
+                linux: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                x86_64: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                containerd: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                nerdctl: false,
+                ..every_check_passing()
+            },
+            PreflightChecks {
+                nftables: false,
+                ..every_check_passing()
+            },
+        ] {
+            assert!(!preflight_supported(IsolationArg::KataVfio, &missing));
+            assert!(!preflight_supported(IsolationArg::Shared, &missing));
+        }
+    }
+
+    /// A machine that still has a bound group and a kata shim, configured to
+    /// serve open leases, reports open. Reading the posture off the host would
+    /// let it claim a class it is not serving.
+    #[test]
+    fn a_node_configured_shared_reports_shared_whatever_the_host_has_installed() {
+        let with_kata = HostTeeCapability {
+            kata_runtime: true,
+            ..HostTeeCapability::default()
+        };
+        let setting = IsolationSetting::Shared {
+            gpu: gpu::HostGpu {
+                index: 0,
+                uuid: "GPU-1a2b3c4d-0000-0000-0000-000000000001".to_owned(),
+                model: "NVIDIA GeForce RTX 4090".to_owned(),
+                vram_mib: 24_564,
+            },
+            limits: runtime::LeaseLimits {
+                memory_mib: 24_576,
+                cpus: 7,
+            },
+        };
+        let posture = setting.posture(&with_kata);
+        assert_eq!(posture.isolation, IsolationMode::Shared);
+        assert!(posture.attestation.is_none());
+    }
+
+    #[test]
+    fn a_flag_that_names_one_mode_is_refused_under_the_other() {
+        assert!(
+            isolation_request(IsolationArg::Shared, Some(5), None, None, None).is_err(),
+            "a shared lease takes the card by UUID and there is no group to name"
+        );
+        assert!(
+            isolation_request(
+                IsolationArg::KataVfio,
+                Some(5),
+                Some("GPU-1a2b3c4d".to_owned()),
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            isolation_request(IsolationArg::KataVfio, Some(5), None, Some(4_096), None).is_err()
+        );
+        assert!(isolation_request(IsolationArg::KataVfio, Some(5), None, None, Some(4)).is_err());
+
+        assert_eq!(
+            isolation_request(IsolationArg::KataVfio, Some(5), None, None, None).unwrap(),
+            IsolationRequest::KataVfio { group: Some(5) }
+        );
+        assert_eq!(
+            isolation_request(IsolationArg::Shared, None, None, Some(4_096), Some(4)).unwrap(),
+            IsolationRequest::Shared {
+                gpu_uuid: None,
+                memory_mib: Some(4_096),
+                cpus: Some(4),
+            }
+        );
+    }
+
+    /// The daemon discovers the group. A lease started by hand says which card
+    /// it takes, so a missing group is a refusal rather than a guess.
+    #[test]
+    fn a_hand_run_passthrough_launch_has_to_name_its_group() {
+        assert!(launch_vfio_group(&IsolationRequest::KataVfio { group: None }).is_err());
+        assert_eq!(
+            launch_vfio_group(&IsolationRequest::KataVfio { group: Some(42) }).unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            launch_vfio_group(&IsolationRequest::Shared {
+                gpu_uuid: None,
+                memory_mib: None,
+                cpus: None,
+            })
+            .unwrap(),
+            None
+        );
+    }
+
+    /// A node that says nothing about isolation is the passthrough node this
+    /// daemon has always been.
+    #[test]
+    fn the_isolation_default_is_the_passthrough_node() {
+        let cli = Cli::try_parse_from(["prismd", "preflight"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Preflight {
+                isolation: IsolationArg::KataVfio
+            }
+        ));
+        let cli = Cli::try_parse_from(["prismd", "preflight", "--isolation", "shared"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Preflight {
+                isolation: IsolationArg::Shared
+            }
+        ));
     }
 
     #[test]

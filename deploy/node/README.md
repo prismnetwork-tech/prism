@@ -1,9 +1,8 @@
 # Independent node installation
 
-The physical-node runtime targets Ubuntu 24.04 x86-64 with an NVIDIA GPU bound
-as a complete IOMMU group to `vfio-pci`. It launches public OCI images through
-containerd and Kata, applies host egress policy, and connects outbound to the
-Prism gateway over mTLS.
+The physical-node runtime targets Ubuntu 24.04 x86-64 with an NVIDIA GPU. It
+launches public OCI images through containerd, applies host egress policy, and
+connects outbound to the Prism gateway over mTLS.
 
 The daemon, systemd units, certificate flow, tunnel and simulated workspace
 lifecycle pass repository integration tests. They have not yet completed an
@@ -12,7 +11,31 @@ end-to-end run on physical NVIDIA/Kata/VFIO hardware.
 Order of operations: preflight the host, create the device identity, bond it in
 the registry, enroll with the control plane, then install the services.
 
+## Isolation mode
+
+The node serves one isolation mode, chosen with `--isolation` or
+`PRISM_ISOLATION` and fixed for the life of the daemon. Nothing is detected
+automatically.
+
+`kata-vfio` is the default. The GPU is bound as a complete IOMMU group to
+`vfio-pci` and the workload runs in a Kata guest that holds the card
+exclusively, which is what lets the node publish above `open`. The host work is
+the larger part of the job and [GPU_PASSTHROUGH.md](GPU_PASSTHROUGH.md) covers
+it.
+
+`shared` leaves the card with the host driver and runs the workload in a
+container with the card attached. Stock Ubuntu, an NVIDIA driver and containerd
+are enough, and the daemon can run a workload of the operator's choosing between
+leases. Such a node publishes `open`. [OPEN_MODE.md](OPEN_MODE.md) is the
+runbook and `install.sh` in this directory prepares the host.
+
+The rest of this document assumes `kata-vfio`. OPEN_MODE.md names every place
+`shared` differs.
+
 ## Host baseline
+
+This is the `kata-vfio` baseline. `shared` has a smaller one that `install.sh`
+puts in place, and OPEN_MODE.md lists it.
 
 Install and configure:
 
@@ -31,16 +54,19 @@ install -o root -g root -m 0755 \
   target/release/prismd /usr/local/sbin/prismd
 ```
 
-Run preflight before enrollment:
+Run preflight before enrollment, naming the mode the node will serve:
 
 ```sh
-prismd preflight
+prismd preflight --isolation kata-vfio
+prismd preflight --isolation shared
 ```
 
-Review the full JSON report. Treat a failed `nvidia_smi` or
-`nvidia_container_toolkit` check as a blocker even if the current aggregate
-`supported` field is true; the aggregate currently validates the host
-isolation baseline, not CUDA workspace readiness.
+Review the full JSON report. Under `kata-vfio`, treat a failed `nvidia_smi` or
+`nvidia_container_toolkit` check as a blocker even if the aggregate `supported`
+field is true; that aggregate validates the host isolation baseline and says
+nothing about CUDA workspace readiness. Under `shared` the aggregate covers the
+container path itself, including `nvidia_container_cli`, the binary that hands
+the card to a container.
 
 ## Identity and enrollment
 
@@ -138,6 +164,9 @@ will not put on a host that can read guest memory. Capacity brokered from a
 public cloud cannot reach that tier, so this is where self-hosted hardware is
 worth more than resold hardware.
 
+A node configured for `shared` reports `open` whatever the host is capable of,
+including a host that still has a bound VFIO group and a Kata shim installed.
+
 ## Install services
 
 Copy `node.env.example` to `/etc/prismd/node.env`, replace every placeholder,
@@ -162,7 +191,7 @@ the next timer activation.
 The command supervisor runs as root because VFIO assignment, nftables policy
 and containerd require host privileges. The tunnel runs as the unprivileged
 `prismd` account. Only one command supervisor may run per host; the exclusive
-VFIO reservation rejects a duplicate.
+device reservation rejects a duplicate.
 
 ## Security boundary
 
@@ -174,5 +203,7 @@ VFIO reservation rejects a duplicate.
   telemetry model.
 - Kata reduces exposure to hostile workloads but does not make a permissionless
   supplier trustworthy.
+- Under `shared` there is no guest boundary. The workload runs in a container
+  the host can read, which is what the `open` class states.
 - Do not run confidential or sensitive workloads until independently
   attestable confidential-GPU nodes are available.

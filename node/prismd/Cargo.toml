@@ -11,6 +11,7 @@ chrono.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+libc.workspace = true
 prism-chain = { path = "../../crates/chain" }
 prism-protocol = { path = "../../crates/protocol" }
 rand.workspace = true

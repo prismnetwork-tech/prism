@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "/usr/local/bin/miner",
+    "--algo", "kawpow",
+    "--pool", "stratum+tcp://pool.example.invalid:3333",
+    "--worker", "replace-with-worker-name"
+  ],
+  "user": "prismd-idle",
+  "working_directory": "/var/lib/prismd/idle",
+  "environment": {
+    "MINER_PASSWORD": "replace-with-pool-password"
+  },
+  "stop_grace_seconds": 30,
+  "gpu_release_seconds": 20
+}

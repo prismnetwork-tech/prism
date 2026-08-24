@@ -38,6 +38,7 @@ futures = "0.3.31"
 hex = "0.4.3"
 hmac = "0.12.1"
 k256 = { version = "0.13.4", features = ["ecdsa", "pkcs8"] }
+libc = "0.2.186"
 p384 = { version = "0.13.1", features = ["ecdsa", "pkcs8"] }
 rand = "0.8.5"
 rcgen = { version = "0.14.8", features = ["pem", "x509-parser"] }

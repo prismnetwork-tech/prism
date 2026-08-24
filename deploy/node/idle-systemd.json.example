@@ -1,0 +1,5 @@
+{
+  "systemd_unit": "miner.service",
+  "stop_grace_seconds": 30,
+  "gpu_release_seconds": 20
+}

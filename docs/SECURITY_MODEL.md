@@ -29,6 +29,12 @@ or Jupyter bytes over a revocable mTLS tunnel. These paths pass software and
 container integration tests, but cannot become hardware guarantees until the
 physical Ubuntu/NVIDIA/Kata test matrix passes.
 
+That description covers a node configured for VFIO passthrough. A node
+configured for shared isolation keeps the GPU on the host driver, runs the
+workload in a container with one card attached by UUID, and applies the same
+egress policy and lease lifecycle. It claims no guest boundary and publishes
+`open`.
+
 The control plane verifies that a finalized `LeaseFunded` event contains the exact
 quote-derived client reference before associating it with an account. Node
 command polls and reports are device-signed, freshness-bounded, single-claim, and
@@ -112,7 +118,22 @@ the hardware arrives, which is the same principle as before and now cuts the
 other way. [ATTESTATION.md](ATTESTATION.md) has the checks, the failure modes,
 and what each class does and does not cover.
 
-All capacity live today is `open`.
+All capacity live today is `open`, and it arrives two ways. Brokered capacity is
+rented from a public cloud and resold. A self-hosted open node runs `prismd` on
+hardware its operator owns and bonded, with the GPU left on the host driver and
+the workload in a container. Both sit at `open` for the same reason: the
+operator can read what the workload touches. A renter who needs more than that
+sets `min_trust_class` and pays for a node that clears it.
+
+Batch commands run on nodes that poll the signed command channel, which
+self-hosted open nodes do and brokered capacity does not. The output of such a
+command is what the node reported, signed by its device key and backed by its
+bond. Nothing in the `open` class establishes that the command ran as written,
+so a renter who needs that guarantee raises the trust floor. Selection among
+matching offers takes the lowest price first, then the node's reliability
+record, then its benchmark score. The bond is a floor a node clears to be
+offered at all rather than a place in that order. A rate floor for command
+leases is future work.
 
 ## Private data
 

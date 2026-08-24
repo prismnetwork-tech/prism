@@ -642,6 +642,11 @@ pub struct NodeOffer {
     /// operator who simply prices low is never hidden from ordinary renters.
     #[serde(default)]
     pub staker_only: bool,
+    /// Whether the node is polling the signed command channel. Derived on every
+    /// read from the polls the node itself made, never from what it enrolled
+    /// with, so a node that goes quiet stops taking batch work on its own.
+    #[serde(default)]
+    pub command_channel: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1751,6 +1756,29 @@ mod tests {
         let offer: NodeOffer = serde_json::from_value(document).unwrap();
 
         assert_eq!(offer.trust_class, TrustClass::Open);
+    }
+
+    /// The flag is derived by the control plane on every read, so an offer that
+    /// arrives without it is a node nobody has heard poll yet.
+    #[test]
+    fn an_offer_without_a_command_channel_flag_reads_false() {
+        let document = serde_json::json!({
+            "node_id": "0xabc",
+            "operator_wallet": "0x1111111111111111111111111111111111111111",
+            "payout_wallet": "0x2222222222222222222222222222222222222222",
+            "device_public_key": "key",
+            "gpu": {"model": "NVIDIA L40S", "vram_mib": 46_068, "cuda_major": 12},
+            "rate_per_second": 222,
+            "reliability_bps": 10_000,
+            "benchmark_score": 10_000,
+            "bonded": true,
+            "online": true,
+            "public_image_only": true,
+            "updated_at": "2026-07-24T00:00:00Z",
+        });
+        let offer: NodeOffer = serde_json::from_value(document).unwrap();
+
+        assert!(!offer.command_channel);
     }
 
     #[test]

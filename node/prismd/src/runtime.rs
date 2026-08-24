@@ -17,15 +17,153 @@ const SYSTEM_SYSFS_ROOT: &str = "/sys";
 const SYSTEM_DEVICE_ROOT: &str = "/dev";
 const SYSTEM_LOCK_ROOT: &str = "/run/lock/prismd";
 const WORKSPACE_BOOTSTRAP: &str = include_str!("../assets/workspace-bootstrap.sh");
+const WORKSPACE_BOOTSTRAP_SHARED: &str = include_str!("../assets/workspace-bootstrap-shared.sh");
 const MAX_LEASE_SECONDS: u32 = 21_600;
 const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
+/// A workspace image is several gigabytes and a consumer uplink is not a data
+/// centre one. The pull gets its own clock so it cannot eat the readiness
+/// budget and fail a lease that was only ever downloading.
+const IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(3_600);
+/// The bridge nerdctl builds for its default network, which is where a shared
+/// lease lands.
+const LEASE_BRIDGE: &str = "nerdctl0";
+/// Everything a lease has no business reaching: the host's own networks, the
+/// link-local metadata address, and the ranges a scan would walk.
+const PRIVATE_DESTINATIONS: &str = "{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }";
+const MAIL_PORTS: &str = "{ 25, 465, 587 }";
+
+/// How the card reaches the workload.
+///
+/// The two modes are not variations on one launch. Under Kata the GPU is bound
+/// to vfio-pci and handed to a virtual machine that the host cannot read;
+/// shared leaves the card on the host under the ordinary driver and hands it to
+/// a container. Everything that differs between them differs here, so neither
+/// path can drift into the other by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Isolation {
+    KataVfio { group: VfioGroup },
+    Shared { gpu: crate::gpu::HostGpu },
+}
+
+impl Isolation {
+    fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared { .. })
+    }
+
+    /// The slot the reservation lock is taken under. Kata keeps the VFIO group
+    /// it has always used, so a node upgrading in place finds its own locks.
+    fn reservation_slot(&self) -> DeviceSlot {
+        match self {
+            Self::KataVfio { group } => DeviceSlot::vfio(group.id),
+            Self::Shared { gpu } => DeviceSlot::shared_gpu(&gpu.uuid),
+        }
+    }
+
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::KataVfio { .. } => "kata-vfio",
+            Self::Shared { .. } => "shared",
+        }
+    }
+
+    /// What the operator sees this called in a failure. A shared lease is not
+    /// a Kata workspace and saying so sends them looking for a shim that was
+    /// never meant to be there.
+    fn workload_noun(&self) -> &'static str {
+        match self {
+            Self::KataVfio { .. } => "Kata workspace",
+            Self::Shared { .. } => "workspace",
+        }
+    }
+}
+
+/// The device a reservation is taken for: the name its lock file carries, and
+/// the name an operator reads when something else already holds it.
+pub struct DeviceSlot {
+    lock: String,
+    description: String,
+}
+
+impl DeviceSlot {
+    fn vfio(group: u32) -> Self {
+        Self {
+            lock: format!("vfio-{group}"),
+            description: format!("VFIO group {group}"),
+        }
+    }
+
+    fn shared_gpu(uuid: &str) -> Self {
+        Self {
+            lock: format!("gpu-{uuid}"),
+            description: format!("GPU {uuid}"),
+        }
+    }
+}
+
+/// What a shared lease is allowed to take from the host. Kata leases ignore
+/// this: the guest gets the machine the hypervisor gave it and nothing on this
+/// side can be spent twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseLimits {
+    pub memory_mib: u32,
+    pub cpus: u32,
+}
+
+impl LeaseLimits {
+    /// Carried by a Kata lease and never read by one.
+    pub const UNUSED: Self = Self {
+        memory_mib: 0,
+        cpus: 0,
+    };
+
+    /// Three quarters of memory and one core short of all of them. The host
+    /// still has containerd, the daemon and the operator's own session to run,
+    /// and a lease that takes the last core makes the node unreachable rather
+    /// than merely busy.
+    pub fn for_host() -> anyhow::Result<Self> {
+        Ok(Self {
+            memory_mib: host_memory_mib()? / 4 * 3,
+            cpus: host_cores().saturating_sub(1).max(1),
+        })
+    }
+
+    fn validate(self) -> anyhow::Result<()> {
+        if self.memory_mib < 1_024 {
+            anyhow::bail!("a lease needs at least 1024 MiB of memory");
+        }
+        if self.cpus == 0 {
+            anyhow::bail!("a lease needs at least one CPU");
+        }
+        Ok(())
+    }
+}
+
+fn host_memory_mib() -> anyhow::Result<u32> {
+    let meminfo = fs::read_to_string("/proc/meminfo").context("read host memory from /proc")?;
+    let kilobytes: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|value| value.split_whitespace().next())
+        .context("/proc/meminfo has no MemTotal")?
+        .parse()
+        .context("MemTotal is not a number")?;
+    u32::try_from(kilobytes / 1_024).context("host memory does not fit in a lease limit")
+}
+
+fn host_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|cores| u32::try_from(cores.get()).unwrap_or(u32::MAX))
+        .unwrap_or(1)
+}
 
 pub struct LaunchConfig<'a> {
     pub image: &'a str,
     pub lease_id: &'a str,
     pub workspace_root: &'a Path,
     pub state_root: &'a Path,
-    pub vfio_group: u32,
+    pub isolation: &'a Isolation,
+    /// Only read in shared mode.
+    pub limits: LeaseLimits,
     pub duration_seconds: u32,
     pub ssh_authorized_key: &'a Path,
     pub jupyter_token: &'a Path,
@@ -205,6 +343,25 @@ pub fn kata_command(
     config: &LaunchConfig<'_>,
     control_directory: &Path,
 ) -> anyhow::Result<Command> {
+    if config.isolation.is_shared() {
+        anyhow::bail!(
+            "this lease runs on a host-visible GPU and cannot be started as a Kata guest"
+        );
+    }
+    workspace_command(config, control_directory, None)
+}
+
+/// The same workspace on a host that kept its GPU. The card is injected by the
+/// container toolkit rather than passed through to a virtual machine, so the
+/// operator can read everything the workload touches, and the node says so by
+/// serving this at the Open trust class.
+pub fn shared_command(
+    config: &LaunchConfig<'_>,
+    control_directory: &Path,
+) -> anyhow::Result<Command> {
+    if !config.isolation.is_shared() {
+        anyhow::bail!("this lease runs on a passed-through GPU and needs the Kata runtime");
+    }
     workspace_command(config, control_directory, None)
 }
 
@@ -262,13 +419,78 @@ fn kata_snp_command_in(
     workspace_command(config, control_directory, Some(policy_digest))
 }
 
+/// The device flags, spliced where Kata's pair of VFIO nodes sits.
+///
+/// `--gpus` is what nerdctl hands to containerd's NVIDIA support, and that
+/// execs `nvidia-container-cli` to inject the driver and the device nodes. The
+/// selector always names one card by its UUID: the node advertises one card and
+/// hands over one card, and `all` on a two-card machine would quietly give a
+/// renter both.
+fn device_arguments(isolation: &Isolation, limits: LeaseLimits) -> anyhow::Result<Vec<String>> {
+    Ok(match isolation {
+        Isolation::KataVfio { group } => vec![
+            "--device".to_owned(),
+            "/dev/vfio/vfio".to_owned(),
+            "--device".to_owned(),
+            format!("/dev/vfio/{}", group.id),
+        ],
+        Isolation::Shared { gpu } => {
+            limits.validate()?;
+            let memory = format!("{}m", limits.memory_mib);
+            vec![
+                "--gpus".to_owned(),
+                format!("device={}", gpu.uuid),
+                "--memory".to_owned(),
+                memory.clone(),
+                // Equal to the memory limit, which is how runc is told the
+                // lease gets no swap of its own. Without it a lease reaches
+                // past its limit and the host pays for it in latency.
+                "--memory-swap".to_owned(),
+                memory,
+                "--cpus".to_owned(),
+                limits.cpus.to_string(),
+                "--ulimit".to_owned(),
+                "nofile=8192:8192".to_owned(),
+            ]
+        }
+    })
+}
+
+struct TmpfsMounts {
+    run: String,
+    temporary: String,
+    workspace: String,
+}
+
+impl TmpfsMounts {
+    /// Under Kata these live in the guest's own memory and the hypervisor
+    /// bounds them. Under runc they come out of host RAM, so they are sized to
+    /// fit inside the lease's memory limit rather than the machine's.
+    fn new(isolation: &Isolation, limits: LeaseLimits) -> Self {
+        let sized = |options: &str, mib: u32| match isolation {
+            Isolation::KataVfio { .. } => options.to_owned(),
+            Isolation::Shared { .. } => format!("{options},size={mib}m"),
+        };
+        Self {
+            run: sized("/run:rw,nosuid,nodev,mode=0755", 64),
+            temporary: sized(
+                "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+                limits.memory_mib / 4,
+            ),
+            workspace: sized(
+                "/workspace:rw,nosuid,nodev,mode=0700",
+                limits.memory_mib / 2,
+            ),
+        }
+    }
+}
+
 fn workspace_command(
     config: &LaunchConfig<'_>,
     control_directory: &Path,
     policy_digest: Option<&str>,
 ) -> anyhow::Result<Command> {
     validate_launch_config(config)?;
-    let vfio_device = format!("/dev/vfio/{}", config.vfio_group);
     let control_mount = format!(
         "type=bind,src={},dst=/run/prism/control,ro",
         control_directory.display()
@@ -285,6 +507,8 @@ fn workspace_command(
             crate::snp::initdata_annotation(config.lease_id, config.image, digest)
         )
     });
+    let device = device_arguments(config.isolation, config.limits)?;
+    let tmpfs = TmpfsMounts::new(config.isolation, config.limits);
     let mut command = Command::new("nerdctl");
     command.args([
         "--namespace",
@@ -294,9 +518,12 @@ fn workspace_command(
         "--pull",
         "always",
         "--runtime",
-        match policy_digest {
-            Some(_) => crate::probe::CONFIDENTIAL_RUNTIME,
-            None => "io.containerd.kata.v2",
+        match (policy_digest, config.isolation) {
+            (Some(_), _) => crate::probe::CONFIDENTIAL_RUNTIME,
+            (None, Isolation::KataVfio { .. }) => "io.containerd.kata.v2",
+            // Named rather than left to the containerd default, so the log
+            // line an operator reads says which runtime actually ran.
+            (None, Isolation::Shared { .. }) => "io.containerd.runc.v2",
         },
         "--read-only",
         "--security-opt",
@@ -321,16 +548,15 @@ fn workspace_command(
         "0:0",
         "--sysctl",
         "net.ipv6.conf.all.disable_ipv6=1",
-        "--device",
-        "/dev/vfio/vfio",
-        "--device",
-        &vfio_device,
+    ]);
+    command.args(&device);
+    command.args([
         "--tmpfs",
-        "/run:rw,nosuid,nodev,mode=0755",
+        &tmpfs.run,
         "--tmpfs",
-        "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+        &tmpfs.temporary,
         "--tmpfs",
-        "/workspace:rw,nosuid,nodev,mode=0700",
+        &tmpfs.workspace,
         "--mount",
         &control_mount,
         "--publish",
@@ -455,10 +681,17 @@ pub fn attestation_command(
 
 pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
     validate_launch_config(&config)?;
-    let group = VfioGroup::from_system(config.vfio_group)?;
-    let _reservation = DeviceReservation::acquire(
+    // Kata resolves the group against sysfs here rather than trusting the
+    // caller, which is what has always guarded a stale group number.
+    let isolation = match config.isolation {
+        Isolation::KataVfio { group } => Isolation::KataVfio {
+            group: VfioGroup::from_system(group.id)?,
+        },
+        Isolation::Shared { .. } => config.isolation.clone(),
+    };
+    let _reservation = DeviceReservation::acquire_slot(
         Path::new(SYSTEM_LOCK_ROOT),
-        config.vfio_group,
+        &isolation.reservation_slot(),
         config.lease_id,
     )?;
     release_stale_host_ports(config.ssh_port, config.jupyter_port);
@@ -469,6 +702,11 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
     if state_path.exists() {
         recover_interrupted_lease(config.lease_id, &workspace, &state_path)?;
     }
+    // Before anything is written for this lease, so a pull that fails leaves no
+    // state behind claiming a lease is coming up.
+    if config.isolation.is_shared() {
+        pull_image(config.image)?;
+    }
     let mut command = match config.attestation_challenge {
         Some(_) => {
             let policy_digest = config.agent_policy_digest.context(
@@ -476,29 +714,33 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
             )?;
             kata_snp_command(&config, &workspace, policy_digest)?
         }
-        None => kata_command(&config, &workspace)?,
+        None => workspace_command(&config, &workspace, None)?,
     };
     fs::create_dir_all(&workspace)?;
     prepare_control_directory(&config, &workspace)?;
     persist_state(
         &state_path,
-        &LeaseState::new(&config, &group, LeasePhase::Provisioning, None, None),
+        &LeaseState::new(&config, &isolation, LeasePhase::Provisioning, None, None),
     )?;
     let mut ready_at = None;
-    let result = match command
-        .spawn()
-        .context("failed to start the Kata workspace through nerdctl")
-    {
+    // Policy first, container second: the container's first process comes out
+    // of the renter's image and runs the moment it exists.
+    let started = install_startup_policy(&isolation).and_then(|()| {
+        command.spawn().context(match config.isolation {
+            Isolation::KataVfio { .. } => "failed to start the Kata workspace through nerdctl",
+            Isolation::Shared { .. } => "failed to start the workspace through nerdctl",
+        })
+    });
+    let result = match started {
         Ok(mut child) => {
-            let printed = child
-                .stdout
-                .take()
-                .map(|stdout| collect_printed_evidence(stdout, crate::snp::evidence_directory(&workspace)));
+            let printed = child.stdout.take().map(|stdout| {
+                collect_printed_evidence(stdout, crate::snp::evidence_directory(&workspace))
+            });
             let result = run_workspace(
                 &config,
                 &workspace,
                 &state_path,
-                &group,
+                &isolation,
                 &mut child,
                 &mut ready_at,
             );
@@ -507,12 +749,15 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
             }
             let _ = remove_egress_policy();
             if child.try_wait().ok().flatten().is_none() {
-                let _ = stop_container(config.lease_id);
+                let _ = stop_container(config.lease_id, isolation.workload_noun());
                 let _ = child.wait();
             }
             result
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            remove_shared_policy(&isolation);
+            Err(error)
+        }
     };
     let cleanup = fs::remove_dir_all(&workspace).context("remove lease workspace");
     let outcome = result.and(cleanup);
@@ -522,9 +767,39 @@ pub fn launch(config: LaunchConfig<'_>) -> anyhow::Result<()> {
     };
     persist_state(
         &state_path,
-        &LeaseState::new(&config, &group, phase, error, ready_at),
+        &LeaseState::new(&config, &isolation, phase, error, ready_at),
     )?;
     outcome
+}
+
+/// Bring the image down before the container is asked to start.
+///
+/// `nerdctl run --pull always` does the same thing, but it does it inside the
+/// window the readiness check is timing, so a workspace image arriving over a
+/// consumer uplink reads as a lease that never came up. Pulling first costs a
+/// digest check on the second pass and nothing else.
+fn pull_image(image: &str) -> anyhow::Result<()> {
+    validate_image_reference(image)?;
+    let mut child = Command::new("nerdctl")
+        .args(["--namespace", "prism", "pull", "--quiet", image])
+        .stdin(Stdio::null())
+        .spawn()
+        .context("failed to start the image pull through nerdctl")?;
+    let deadline = Instant::now() + IMAGE_PULL_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                anyhow::bail!("nerdctl could not pull the workspace image");
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("the workspace image did not finish downloading within an hour");
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Drop any port forward left over from a previous workspace.
@@ -599,6 +874,17 @@ fn validate_launch_config(config: &LaunchConfig<'_>) -> anyhow::Result<()> {
     if config.ssh_port == 0 || config.jupyter_port == 0 || config.ssh_port == config.jupyter_port {
         anyhow::bail!("workspace access ports are invalid");
     }
+    // A shared lease runs on the host's own kernel, so there is no guest to
+    // take a report and nothing an attestation could measure. Refusing here
+    // means no configuration mistake can produce a lease that looks attested.
+    if config.isolation.is_shared() {
+        config.limits.validate()?;
+        if config.attestation_challenge.is_some() || config.agent_policy_digest.is_some() {
+            anyhow::bail!(
+                "a shared lease cannot produce a guest report; serve attested leases with --isolation kata-vfio"
+            );
+        }
+    }
     if let Some(challenge) = config.attestation_challenge
         && (challenge.len() != 64
             || !challenge
@@ -635,7 +921,11 @@ fn prepare_control_directory(config: &LaunchConfig<'_>, workspace: &Path) -> any
     }
     write_secret(
         &workspace.join("bootstrap.sh"),
-        WORKSPACE_BOOTSTRAP.as_bytes(),
+        match config.isolation {
+            Isolation::KataVfio { .. } => WORKSPACE_BOOTSTRAP,
+            Isolation::Shared { .. } => WORKSPACE_BOOTSTRAP_SHARED,
+        }
+        .as_bytes(),
     )
 }
 
@@ -683,7 +973,10 @@ fn collect_printed_evidence(
             };
             // The name decides a path, so it is matched against what the guest
             // is allowed to send rather than joined onto a directory.
-            let Some(name) = EVIDENCE_ARTIFACTS.iter().find(|artifact| **artifact == name) else {
+            let Some(name) = EVIDENCE_ARTIFACTS
+                .iter()
+                .find(|artifact| **artifact == name)
+            else {
                 tracing::warn!(%name, "ignoring an evidence artifact this node does not expect");
                 continue;
             };
@@ -718,27 +1011,30 @@ fn run_workspace(
     config: &LaunchConfig<'_>,
     workspace: &Path,
     state_path: &Path,
-    group: &VfioGroup,
+    isolation: &Isolation,
     child: &mut Child,
     ready_at: &mut Option<DateTime<Utc>>,
 ) -> anyhow::Result<()> {
-    let ip = wait_for_container_ip(config.lease_id, child, READINESS_TIMEOUT)?;
-    install_egress_policy(ip)?;
+    let ip = wait_for_container_ip(config.lease_id, child, READINESS_TIMEOUT, isolation)?;
+    install_egress_policy(ip, isolation)?;
     write_secret(&workspace.join("network-ready"), b"ready\n")?;
-    wait_for_access(config, child, READINESS_TIMEOUT)?;
+    wait_for_access(config, child, READINESS_TIMEOUT, isolation)?;
     *ready_at = Some(Utc::now());
     persist_state(
         state_path,
-        &LeaseState::new(config, group, LeasePhase::Ready, None, *ready_at),
+        &LeaseState::new(config, isolation, LeasePhase::Ready, None, *ready_at),
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(u64::from(config.duration_seconds));
     loop {
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("Kata workspace exited before the lease deadline: {status}");
+            anyhow::bail!(
+                "{} exited before the lease deadline: {status}",
+                isolation.workload_noun()
+            );
         }
         if Instant::now() >= deadline {
-            stop_container(config.lease_id)?;
+            stop_container(config.lease_id, isolation.workload_noun())?;
             let _ = child.wait();
             return Ok(());
         }
@@ -750,11 +1046,15 @@ fn wait_for_container_ip(
     lease_id: &str,
     child: &mut Child,
     timeout: Duration,
+    isolation: &Isolation,
 ) -> anyhow::Result<IpAddr> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("Kata workspace exited before network policy installation: {status}");
+            anyhow::bail!(
+                "{} exited before network policy installation: {status}",
+                isolation.workload_noun()
+            );
         }
         let output = Command::new("nerdctl")
             .args([
@@ -775,13 +1075,17 @@ fn wait_for_container_ip(
         }
         thread::sleep(Duration::from_millis(500));
     }
-    anyhow::bail!("Kata workspace did not receive a network address")
+    anyhow::bail!(
+        "{} did not receive a network address",
+        isolation.workload_noun()
+    )
 }
 
 fn wait_for_access(
     config: &LaunchConfig<'_>,
     child: &mut Child,
     timeout: Duration,
+    isolation: &Isolation,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let ssh = SocketAddr::from(([127, 0, 0, 1], config.ssh_port));
@@ -790,7 +1094,10 @@ fn wait_for_access(
     let mut jupyter_ready = false;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("Kata workspace exited before access readiness: {status}");
+            anyhow::bail!(
+                "{} exited before access readiness: {status}",
+                isolation.workload_noun()
+            );
         }
         ssh_ready |= TcpStream::connect_timeout(&ssh, Duration::from_millis(500)).is_ok();
         jupyter_ready |= TcpStream::connect_timeout(&jupyter, Duration::from_millis(500)).is_ok();
@@ -799,22 +1106,78 @@ fn wait_for_access(
         }
         thread::sleep(Duration::from_millis(500));
     }
-    anyhow::bail!("Kata workspace did not make SSH and Jupyter ready")
+    anyhow::bail!(
+        "{} did not make SSH and Jupyter ready",
+        isolation.workload_noun()
+    )
 }
 
-fn stop_container(lease_id: &str) -> anyhow::Result<()> {
+fn stop_container(lease_id: &str, noun: &str) -> anyhow::Result<()> {
     let status = Command::new("nerdctl")
         .args(["--namespace", "prism", "stop", "--time", "10", lease_id])
         .status()
-        .context("stop Kata workspace")?;
+        .with_context(|| format!("stop {noun}"))?;
     if !status.success() {
-        anyhow::bail!("nerdctl could not stop the Kata workspace");
+        anyhow::bail!("nerdctl could not stop the {noun}");
     }
     Ok(())
 }
 
-fn install_egress_policy(source: IpAddr) -> anyhow::Result<()> {
-    let script = egress_policy(source)?;
+fn install_egress_policy(source: IpAddr, isolation: &Isolation) -> anyhow::Result<()> {
+    install_policy(&egress_policy(source, isolation)?)
+}
+
+/// Close the bridge before the container starts.
+///
+/// The container's first process comes from the renter's own image, so the wait
+/// on `network-ready` in the bootstrap is the renter's code and cannot be
+/// relied on. Until the address is known the same rules are keyed on the
+/// interface the lease arrives over, which is the same scope while one lease
+/// runs per host. `nerdctl0` is the bridge nerdctl builds for its default
+/// network; a host that renames it is left with the per-address policy alone.
+fn install_startup_policy(isolation: &Isolation) -> anyhow::Result<()> {
+    if !isolation.is_shared() {
+        return Ok(());
+    }
+    install_policy(&startup_policy())
+}
+
+fn startup_policy() -> String {
+    format!(
+        "table inet prism {{\n\
+         chain forward {{\n\
+         type filter hook forward priority -10; policy accept;\n\
+         iifname \"{LEASE_BRIDGE}\" ip daddr {PRIVATE_DESTINATIONS} reject\n\
+         iifname \"{LEASE_BRIDGE}\" tcp dport {MAIL_PORTS} reject\n\
+         }}\n\
+         chain input {{\n\
+         type filter hook input priority -10; policy accept;\n\
+         ct state established,related accept\n\
+         iifname \"{LEASE_BRIDGE}\" udp dport 53 accept\n\
+         iifname \"{LEASE_BRIDGE}\" tcp dport 53 accept\n\
+         iifname \"{LEASE_BRIDGE}\" reject\n\
+         }}\n\
+         }}\n"
+    )
+}
+
+fn remove_shared_policy(isolation: &Isolation) {
+    if isolation.is_shared() {
+        let _ = remove_egress_policy();
+    }
+}
+
+/// A container the daemon has stopped following is taken down rather than left
+/// running: nothing holds it to its paid deadline any more, and on a shared
+/// node it sits on the host's own bridge.
+fn abandon_batch(child: &mut Child, lease_id: &str, isolation: &Isolation) {
+    let _ = child.kill();
+    let _ = stop_container(lease_id, isolation.workload_noun());
+    let _ = child.wait();
+    remove_shared_policy(isolation);
+}
+
+fn install_policy(script: &str) -> anyhow::Result<()> {
     let _ = remove_egress_policy();
     let mut child = Command::new("nft")
         .args(["-f", "-"])
@@ -833,19 +1196,39 @@ fn install_egress_policy(source: IpAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn egress_policy(source: IpAddr) -> anyhow::Result<String> {
+fn egress_policy(source: IpAddr, isolation: &Isolation) -> anyhow::Result<String> {
     let IpAddr::V4(source) = source else {
         anyhow::bail!("workspace network must use IPv4 with IPv6 disabled");
     };
-    Ok(format!(
-        "table inet prism {{\n\
-         chain forward {{\n\
+    let forward = format!(
+        "chain forward {{\n\
          type filter hook forward priority -10; policy accept;\n\
-         ip saddr {source} ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }} reject\n\
-         ip saddr {source} tcp dport {{ 25, 465, 587 }} reject\n\
-         }}\n\
+         ip saddr {source} ip daddr {PRIVATE_DESTINATIONS} reject\n\
+         ip saddr {source} tcp dport {MAIL_PORTS} reject\n\
          }}\n"
-    ))
+    );
+    // A Kata lease reaches the host across a hypervisor boundary. A shared one
+    // sits on the host's own bridge, so the host is one hop away and the input
+    // hook is the only thing between the workload and every service listening
+    // on this machine.
+    //
+    // The established rule has to come first. SSH and Jupyter are published on
+    // loopback and reach the container through DNAT, and the replies arrive
+    // back at the input hook with the container as their source. Rejecting
+    // those kills every lease on the node.
+    let input = match isolation {
+        Isolation::KataVfio { .. } => String::new(),
+        Isolation::Shared { .. } => format!(
+            "chain input {{\n\
+             type filter hook input priority -10; policy accept;\n\
+             ct state established,related accept\n\
+             ip saddr {source} udp dport 53 accept\n\
+             ip saddr {source} tcp dport 53 accept\n\
+             ip saddr {source} reject\n\
+             }}\n"
+        ),
+    };
+    Ok(format!("table inet prism {{\n{forward}{input}}}\n"))
 }
 
 fn remove_egress_policy() -> anyhow::Result<()> {
@@ -926,7 +1309,11 @@ pub fn lease_phase(root: &Path, lease_id: &str) -> anyhow::Result<Option<LeasePh
 struct LeaseState {
     lease_id: String,
     image: String,
-    vfio_group: u32,
+    /// Absent from state files written before this node served shared leases,
+    /// and a daemon that restarts mid-upgrade has to be able to read those.
+    #[serde(default = "kata_vfio_mode")]
+    isolation: String,
+    vfio_group: Option<u32>,
     pci_devices: Vec<String>,
     phase: LeasePhase,
     ssh_port: u16,
@@ -936,19 +1323,28 @@ struct LeaseState {
     updated_at: DateTime<Utc>,
 }
 
+fn kata_vfio_mode() -> String {
+    "kata-vfio".to_owned()
+}
+
 impl LeaseState {
     fn new(
         config: &LaunchConfig<'_>,
-        group: &VfioGroup,
+        isolation: &Isolation,
         phase: LeasePhase,
         error: Option<String>,
         ready_at: Option<DateTime<Utc>>,
     ) -> Self {
+        let (vfio_group, pci_devices) = match isolation {
+            Isolation::KataVfio { group } => (Some(group.id), group.pci_devices.clone()),
+            Isolation::Shared { .. } => (None, Vec::new()),
+        };
         Self {
             lease_id: config.lease_id.to_owned(),
             image: config.image.to_owned(),
-            vfio_group: group.id,
-            pci_devices: group.pci_devices.clone(),
+            isolation: isolation.mode().to_owned(),
+            vfio_group,
+            pci_devices,
             phase,
             ssh_port: config.ssh_port,
             jupyter_port: config.jupyter_port,
@@ -957,6 +1353,35 @@ impl LeaseState {
             updated_at: Utc::now(),
         }
     }
+}
+
+/// Whether any lease on this node was still running when its state was last
+/// written. A daemon that restarted mid-lease finds one of these, and the idle
+/// workload must not start on top of it.
+///
+/// The file is written when the lease starts and again when it ends, so one
+/// that still says the lease is running is only believable for as long as a
+/// lease can run. Past that it is a leftover from a node that went down mid
+/// lease, and believing it would keep the idle workload off the card for as
+/// long as the machine stays up.
+pub fn lease_in_flight(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    let horizon = Utc::now() - chrono::Duration::seconds(i64::from(MAX_LEASE_SECONDS));
+    entries.filter_map(Result::ok).any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|suffix| suffix == "json")
+            && fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<LeaseState>(&bytes).ok())
+                .is_some_and(|state| {
+                    matches!(state.phase, LeasePhase::Provisioning | LeasePhase::Ready)
+                        && state.updated_at > horizon
+                })
+    })
 }
 
 fn persist_state(path: &Path, state: &LeaseState) -> anyhow::Result<()> {
@@ -975,8 +1400,27 @@ fn persist_state(path: &Path, state: &LeaseState) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct DeviceReservation {
+/// One lease at a time per card, held for as long as the lease runs.
+///
+/// The idle workload takes the same lock, so a workspace started by hand cannot
+/// come up underneath a miner that is still on the GPU.
+pub struct DeviceReservation {
     path: PathBuf,
+}
+
+/// Take the shared card's slot for something that is not a lease. The name has
+/// to match what a shared launch would take, or the two would not exclude each
+/// other.
+pub fn reserve_shared_gpu(
+    lock_root: &Path,
+    gpu_uuid: &str,
+    holder: &str,
+) -> anyhow::Result<DeviceReservation> {
+    DeviceReservation::acquire_slot(lock_root, &DeviceSlot::shared_gpu(gpu_uuid), holder)
+}
+
+pub fn system_lock_root() -> &'static Path {
+    Path::new(SYSTEM_LOCK_ROOT)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -987,10 +1431,15 @@ struct ReservationRecord {
 }
 
 impl DeviceReservation {
-    fn acquire(root: &Path, vfio_group: u32, lease_id: &str) -> anyhow::Result<Self> {
+    fn acquire_slot(root: &Path, slot: &DeviceSlot, lease_id: &str) -> anyhow::Result<Self> {
         validate_lease_id(lease_id)?;
-        fs::create_dir_all(root)?;
-        let path = root.join(format!("vfio-{vfio_group}.lock"));
+        fs::create_dir_all(root).with_context(|| {
+            format!(
+                "create the device reservation directory at {}",
+                root.display()
+            )
+        })?;
+        let path = root.join(format!("{}.lock", slot.lock));
         let record = ReservationRecord {
             pid: process::id(),
             process_start_ticks: process_start_ticks(process::id()),
@@ -1015,7 +1464,7 @@ impl DeviceReservation {
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<ReservationRecord>(&bytes).ok());
                     if existing.as_ref().is_some_and(reservation_is_live) {
-                        anyhow::bail!("VFIO group {vfio_group} is already reserved");
+                        anyhow::bail!("{} is already reserved", slot.description);
                     }
                     match fs::remove_file(&path) {
                         Ok(()) => continue,
@@ -1026,7 +1475,7 @@ impl DeviceReservation {
                 Err(error) => return Err(error.into()),
             }
         }
-        anyhow::bail!("VFIO group {vfio_group} reservation changed concurrently")
+        anyhow::bail!("{} reservation changed concurrently", slot.description)
     }
 }
 
@@ -1061,13 +1510,16 @@ pub struct BatchConfig<'a> {
     pub command: &'a str,
     pub workspace_root: &'a Path,
     pub state_root: &'a Path,
-    pub vfio_group: u32,
+    pub isolation: &'a Isolation,
+    /// Only read in shared mode.
+    pub limits: LeaseLimits,
     pub duration_seconds: u32,
 }
 
 pub fn batch_command(config: &BatchConfig<'_>) -> anyhow::Result<Command> {
     validate_batch_config(config)?;
-    let vfio_device = format!("/dev/vfio/{}", config.vfio_group);
+    let device = device_arguments(config.isolation, config.limits)?;
+    let tmpfs = TmpfsMounts::new(config.isolation, config.limits);
     let mut command = Command::new("nerdctl");
     command.args([
         "--namespace",
@@ -1077,7 +1529,10 @@ pub fn batch_command(config: &BatchConfig<'_>) -> anyhow::Result<Command> {
         "--pull",
         "always",
         "--runtime",
-        "io.containerd.kata.v2",
+        match config.isolation {
+            Isolation::KataVfio { .. } => "io.containerd.kata.v2",
+            Isolation::Shared { .. } => "io.containerd.runc.v2",
+        },
         "--read-only",
         "--security-opt",
         "no-new-privileges:true",
@@ -1089,16 +1544,15 @@ pub fn batch_command(config: &BatchConfig<'_>) -> anyhow::Result<Command> {
         "0:0",
         "--sysctl",
         "net.ipv6.conf.all.disable_ipv6=1",
-        "--device",
-        "/dev/vfio/vfio",
-        "--device",
-        &vfio_device,
+    ]);
+    command.args(&device);
+    command.args([
         "--tmpfs",
-        "/run:rw,nosuid,nodev,mode=0755",
+        &tmpfs.run,
         "--tmpfs",
-        "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+        &tmpfs.temporary,
         "--tmpfs",
-        "/workspace:rw,nosuid,nodev,mode=0700",
+        &tmpfs.workspace,
         "--hostname",
         config.lease_id,
         "--entrypoint",
@@ -1120,37 +1574,92 @@ pub fn batch_command(config: &BatchConfig<'_>) -> anyhow::Result<Command> {
 /// a result, not an error, because the renter still paid for the attempt.
 pub fn run_batch(config: BatchConfig<'_>) -> anyhow::Result<prism_protocol::CommandResult> {
     validate_batch_config(&config)?;
-    let group = VfioGroup::from_system(config.vfio_group)?;
-    let _reservation = DeviceReservation::acquire(
+    let isolation = match config.isolation {
+        Isolation::KataVfio { group } => Isolation::KataVfio {
+            group: VfioGroup::from_system(group.id)?,
+        },
+        Isolation::Shared { .. } => config.isolation.clone(),
+    };
+    let _reservation = DeviceReservation::acquire_slot(
         Path::new(SYSTEM_LOCK_ROOT),
-        config.vfio_group,
+        &isolation.reservation_slot(),
         config.lease_id,
     )?;
     fs::create_dir_all(config.workspace_root)?;
     fs::create_dir_all(config.state_root)?;
+    if config.isolation.is_shared() {
+        pull_image(config.image)?;
+    }
 
-    let mut child = batch_command(&config)?
-        .spawn()
-        .context("failed to start the batch workload through nerdctl")?;
-
-    let deadline = Instant::now() + Duration::from_secs(u64::from(config.duration_seconds));
-    let timed_out = loop {
-        match child.try_wait()? {
-            Some(_) => break false,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = stop_container(config.lease_id);
-                break true;
-            }
-            None => thread::sleep(Duration::from_millis(250)),
+    let mut command = batch_command(&config)?;
+    install_startup_policy(&isolation)?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            remove_shared_policy(&isolation);
+            return Err(error).context("failed to start the batch workload through nerdctl");
         }
     };
 
-    let output = child
-        .wait_with_output()
-        .context("failed to collect batch output")?;
+    // A shared batch shares the host's bridge with everything else on the
+    // machine, so it gets the same policy an interactive lease gets. A Kata
+    // batch still runs without one: it is unreachable and it has no
+    // credentials, but its outbound traffic is unfiltered, and closing that is
+    // a change to the passthrough path rather than to this one.
+    if config.isolation.is_shared() {
+        let policed = match wait_for_container_ip(
+            config.lease_id,
+            &mut child,
+            READINESS_TIMEOUT,
+            &isolation,
+        ) {
+            Ok(ip) => install_egress_policy(ip, &isolation),
+            // A command short enough to finish before the address is readable
+            // has nothing left to police, and failing the lease over it would
+            // punish work the renter already paid for and received.
+            Err(error) => match child.try_wait() {
+                Ok(Some(_)) => {
+                    tracing::debug!(%error, "the batch workload finished before its network policy");
+                    Ok(())
+                }
+                _ => Err(error),
+            },
+        };
+        if let Err(error) = policed {
+            abandon_batch(&mut child, config.lease_id, &isolation);
+            return Err(error);
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(u64::from(config.duration_seconds));
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = stop_container(config.lease_id, isolation.workload_noun());
+                break true;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(250)),
+            Err(error) => {
+                abandon_batch(&mut child, config.lease_id, &isolation);
+                return Err(error).context("failed to watch the batch workload");
+            }
+        }
+    };
+
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            // The handle is gone with the call, so the container is all there is
+            // left to take down.
+            let _ = stop_container(config.lease_id, isolation.workload_noun());
+            remove_shared_policy(&isolation);
+            return Err(error).context("failed to collect batch output");
+        }
+    };
     let _ = remove_egress_policy();
-    drop(group);
+    drop(isolation);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -1180,6 +1689,9 @@ fn validate_batch_config(config: &BatchConfig<'_>) -> anyhow::Result<()> {
     if config.command.len() > 8 * 1024 {
         anyhow::bail!("batch command is too long");
     }
+    if config.isolation.is_shared() {
+        config.limits.validate()?;
+    }
     Ok(())
 }
 
@@ -1198,17 +1710,47 @@ mod tests {
         path
     }
 
+    const TEST_IMAGE: &str = "registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_GPU_UUID: &str = "GPU-1a2b3c4d-0000-0000-0000-000000000001";
+    const TEST_LIMITS: LeaseLimits = LeaseLimits {
+        memory_mib: 24_576,
+        cpus: 7,
+    };
+
+    fn kata_isolation(group: u32) -> Isolation {
+        Isolation::KataVfio {
+            group: VfioGroup {
+                id: group,
+                device: PathBuf::from(format!("/dev/vfio/{group}")),
+                pci_devices: vec!["0000:01:00.0".to_owned()],
+            },
+        }
+    }
+
+    fn shared_isolation() -> Isolation {
+        Isolation::Shared {
+            gpu: crate::gpu::HostGpu {
+                index: 0,
+                uuid: TEST_GPU_UUID.to_owned(),
+                model: "NVIDIA GeForce RTX 4090".to_owned(),
+                vram_mib: 24_564,
+            },
+        }
+    }
+
     fn launch_config<'a>(
         root: &'a Path,
         authorized_key: &'a Path,
         jupyter_token: &'a Path,
+        isolation: &'a Isolation,
     ) -> LaunchConfig<'a> {
         LaunchConfig {
-            image: "registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            image: TEST_IMAGE,
             lease_id: "lease-1",
             workspace_root: root,
             state_root: root,
-            vfio_group: 42,
+            isolation,
+            limits: TEST_LIMITS,
             duration_seconds: 3_600,
             ssh_authorized_key: authorized_key,
             jupyter_token,
@@ -1217,6 +1759,685 @@ mod tests {
             attestation_challenge: None,
             agent_policy_digest: None,
         }
+    }
+
+    fn workspace_credentials(root: &Path) -> (PathBuf, PathBuf) {
+        let authorized_key = root.join("authorized-key");
+        let jupyter_token = root.join("jupyter-token");
+        fs::write(
+            &authorized_key,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest workspace\n",
+        )
+        .unwrap();
+        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
+        (authorized_key, jupyter_token)
+    }
+
+    fn argv(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A passthrough node upgrades by replacing the binary, so its argv is a
+    /// compatibility surface rather than an implementation detail. Every
+    /// argument below is pinned: the shared path may not reach any of them.
+    #[test]
+    fn the_kata_workspace_argv_is_what_it_has_always_been() {
+        let root = temporary_directory("golden-kata");
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let kata = kata_isolation(42);
+        let config = launch_config(&root, &authorized_key, &jupyter_token, &kata);
+        let command = kata_command(&config, &root).unwrap();
+
+        assert_eq!(command.get_program(), "nerdctl");
+        assert_eq!(
+            argv(&command),
+            vec![
+                "--namespace",
+                "prism",
+                "run",
+                "--rm",
+                "--pull",
+                "always",
+                "--runtime",
+                "io.containerd.kata.v2",
+                "--read-only",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "CHOWN",
+                "--cap-add",
+                "DAC_OVERRIDE",
+                "--cap-add",
+                "KILL",
+                "--cap-add",
+                "SETGID",
+                "--cap-add",
+                "SETUID",
+                "--cap-add",
+                "SYS_CHROOT",
+                "--pids-limit",
+                "2048",
+                "--user",
+                "0:0",
+                "--sysctl",
+                "net.ipv6.conf.all.disable_ipv6=1",
+                "--device",
+                "/dev/vfio/vfio",
+                "--device",
+                "/dev/vfio/42",
+                "--tmpfs",
+                "/run:rw,nosuid,nodev,mode=0755",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+                "--tmpfs",
+                "/workspace:rw,nosuid,nodev,mode=0700",
+                "--mount",
+                &format!("type=bind,src={},dst=/run/prism/control,ro", root.display()),
+                "--publish",
+                "127.0.0.1:2222:2222",
+                "--publish",
+                "127.0.0.1:8888:8888",
+                "--hostname",
+                "lease-1",
+                "--entrypoint",
+                "/bin/sh",
+                "--name",
+                "lease-1",
+                TEST_IMAGE,
+                "/run/prism/control/bootstrap.sh",
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_confidential_workspace_argv_is_what_it_has_always_been() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory("golden-snp");
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("containerd-shim-kata-qemu-snp-v2");
+        fs::write(&shim, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let digest = "d".repeat(64);
+        let kata = kata_isolation(42);
+        let config = launch_config(&root, &authorized_key, &jupyter_token, &kata);
+        let command = kata_snp_command_in(&config, &root, &digest, bin.as_os_str()).unwrap();
+
+        assert_eq!(
+            argv(&command),
+            vec![
+                "--namespace",
+                "prism",
+                "run",
+                "--rm",
+                "--pull",
+                "always",
+                "--runtime",
+                "io.containerd.kata-qemu-snp.v2",
+                "--read-only",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "CHOWN",
+                "--cap-add",
+                "DAC_OVERRIDE",
+                "--cap-add",
+                "KILL",
+                "--cap-add",
+                "SETGID",
+                "--cap-add",
+                "SETUID",
+                "--cap-add",
+                "SYS_CHROOT",
+                "--pids-limit",
+                "2048",
+                "--user",
+                "0:0",
+                "--sysctl",
+                "net.ipv6.conf.all.disable_ipv6=1",
+                "--device",
+                "/dev/vfio/vfio",
+                "--device",
+                "/dev/vfio/42",
+                "--tmpfs",
+                "/run:rw,nosuid,nodev,mode=0755",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+                "--tmpfs",
+                "/workspace:rw,nosuid,nodev,mode=0700",
+                "--mount",
+                &format!("type=bind,src={},dst=/run/prism/control,ro", root.display()),
+                "--publish",
+                "127.0.0.1:2222:2222",
+                "--publish",
+                "127.0.0.1:8888:8888",
+                "--hostname",
+                "lease-1",
+                "--snapshotter",
+                "nydus",
+                "--annotation",
+                &format!(
+                    "io.katacontainers.config.hypervisor.cc_init_data={}",
+                    crate::snp::initdata_annotation(config.lease_id, config.image, &digest)
+                ),
+                "--mount",
+                &format!(
+                    "type=bind,src={},dst=/run/prism/evidence",
+                    crate::snp::evidence_directory(&root).display()
+                ),
+                "--cap-add",
+                "SYS_ADMIN",
+                "--entrypoint",
+                "/bin/sh",
+                "--name",
+                "lease-1",
+                TEST_IMAGE,
+                "/run/prism/control/bootstrap.sh",
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_kata_batch_argv_is_what_it_has_always_been() {
+        let root = temporary_directory("golden-kata-batch");
+        let kata = kata_isolation(42);
+        let command = batch_command(&BatchConfig {
+            image: TEST_IMAGE,
+            lease_id: "77",
+            command: "nvidia-smi -L",
+            workspace_root: &root,
+            state_root: &root,
+            isolation: &kata,
+            limits: TEST_LIMITS,
+            duration_seconds: 600,
+        })
+        .unwrap();
+
+        assert_eq!(
+            argv(&command),
+            vec![
+                "--namespace",
+                "prism",
+                "run",
+                "--rm",
+                "--pull",
+                "always",
+                "--runtime",
+                "io.containerd.kata.v2",
+                "--read-only",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--cap-drop",
+                "ALL",
+                "--pids-limit",
+                "2048",
+                "--user",
+                "0:0",
+                "--sysctl",
+                "net.ipv6.conf.all.disable_ipv6=1",
+                "--device",
+                "/dev/vfio/vfio",
+                "--device",
+                "/dev/vfio/42",
+                "--tmpfs",
+                "/run:rw,nosuid,nodev,mode=0755",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+                "--tmpfs",
+                "/workspace:rw,nosuid,nodev,mode=0700",
+                "--hostname",
+                "77",
+                "--entrypoint",
+                "/bin/sh",
+                "--name",
+                "77",
+                TEST_IMAGE,
+                "-c",
+                "nvidia-smi -L",
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One card by UUID, the ordinary runtime named rather than assumed, and a
+    /// bound on everything the lease can take from a host it is sharing.
+    #[test]
+    fn the_shared_workspace_argv_takes_one_card_and_bounds_the_lease() {
+        let root = temporary_directory("golden-shared");
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let shared = shared_isolation();
+        let config = launch_config(&root, &authorized_key, &jupyter_token, &shared);
+        let command = shared_command(&config, &root).unwrap();
+
+        assert_eq!(
+            argv(&command),
+            vec![
+                "--namespace",
+                "prism",
+                "run",
+                "--rm",
+                "--pull",
+                "always",
+                "--runtime",
+                "io.containerd.runc.v2",
+                "--read-only",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "CHOWN",
+                "--cap-add",
+                "DAC_OVERRIDE",
+                "--cap-add",
+                "KILL",
+                "--cap-add",
+                "SETGID",
+                "--cap-add",
+                "SETUID",
+                "--cap-add",
+                "SYS_CHROOT",
+                "--pids-limit",
+                "2048",
+                "--user",
+                "0:0",
+                "--sysctl",
+                "net.ipv6.conf.all.disable_ipv6=1",
+                "--gpus",
+                &format!("device={TEST_GPU_UUID}"),
+                "--memory",
+                "24576m",
+                "--memory-swap",
+                "24576m",
+                "--cpus",
+                "7",
+                "--ulimit",
+                "nofile=8192:8192",
+                "--tmpfs",
+                "/run:rw,nosuid,nodev,mode=0755,size=64m",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=6144m",
+                "--tmpfs",
+                "/workspace:rw,nosuid,nodev,mode=0700,size=12288m",
+                "--mount",
+                &format!("type=bind,src={},dst=/run/prism/control,ro", root.display()),
+                "--publish",
+                "127.0.0.1:2222:2222",
+                "--publish",
+                "127.0.0.1:8888:8888",
+                "--hostname",
+                "lease-1",
+                "--entrypoint",
+                "/bin/sh",
+                "--name",
+                "lease-1",
+                TEST_IMAGE,
+                "/run/prism/control/bootstrap.sh",
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The batch profile drops every capability and adds none back. That
+    /// asymmetry with the interactive profile is deliberate and it holds in
+    /// both modes.
+    #[test]
+    fn the_shared_batch_argv_keeps_the_capability_set_it_had_under_kata() {
+        let root = temporary_directory("golden-shared-batch");
+        let shared = shared_isolation();
+        let command = batch_command(&BatchConfig {
+            image: TEST_IMAGE,
+            lease_id: "77",
+            command: "nvidia-smi -L",
+            workspace_root: &root,
+            state_root: &root,
+            isolation: &shared,
+            limits: TEST_LIMITS,
+            duration_seconds: 600,
+        })
+        .unwrap();
+
+        assert_eq!(
+            argv(&command),
+            vec![
+                "--namespace",
+                "prism",
+                "run",
+                "--rm",
+                "--pull",
+                "always",
+                "--runtime",
+                "io.containerd.runc.v2",
+                "--read-only",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--cap-drop",
+                "ALL",
+                "--pids-limit",
+                "2048",
+                "--user",
+                "0:0",
+                "--sysctl",
+                "net.ipv6.conf.all.disable_ipv6=1",
+                "--gpus",
+                &format!("device={TEST_GPU_UUID}"),
+                "--memory",
+                "24576m",
+                "--memory-swap",
+                "24576m",
+                "--cpus",
+                "7",
+                "--ulimit",
+                "nofile=8192:8192",
+                "--tmpfs",
+                "/run:rw,nosuid,nodev,mode=0755,size=64m",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=6144m",
+                "--tmpfs",
+                "/workspace:rw,nosuid,nodev,mode=0700,size=12288m",
+                "--hostname",
+                "77",
+                "--entrypoint",
+                "/bin/sh",
+                "--name",
+                "77",
+                TEST_IMAGE,
+                "-c",
+                "nvidia-smi -L",
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Neither mode may reach for the other's way of attaching a card. A Kata
+    /// launch that grew a `--gpus` flag would put the host driver in a guest
+    /// that has none, and a shared launch that grew a VFIO device would hand a
+    /// container the raw IOMMU node.
+    #[test]
+    fn neither_mode_borrows_the_other_way_of_attaching_the_card() {
+        let root = temporary_directory("device-separation");
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let kata = kata_isolation(42);
+        let shared = shared_isolation();
+
+        for command in [
+            kata_command(
+                &launch_config(&root, &authorized_key, &jupyter_token, &kata),
+                &root,
+            )
+            .unwrap(),
+            batch_command(&BatchConfig {
+                image: TEST_IMAGE,
+                lease_id: "77",
+                command: "true",
+                workspace_root: &root,
+                state_root: &root,
+                isolation: &kata,
+                limits: TEST_LIMITS,
+                duration_seconds: 60,
+            })
+            .unwrap(),
+        ] {
+            let arguments = argv(&command);
+            assert!(!arguments.iter().any(|argument| argument == "--gpus"));
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|argument| argument.starts_with("device="))
+            );
+        }
+
+        // Each entry point serves one mode and refuses the other, so a caller
+        // cannot reach the wrong argv by picking the wrong function.
+        assert!(
+            kata_command(
+                &launch_config(&root, &authorized_key, &jupyter_token, &shared),
+                &root
+            )
+            .is_err()
+        );
+        assert!(
+            shared_command(
+                &launch_config(&root, &authorized_key, &jupyter_token, &kata),
+                &root
+            )
+            .is_err()
+        );
+
+        for command in [
+            shared_command(
+                &launch_config(&root, &authorized_key, &jupyter_token, &shared),
+                &root,
+            )
+            .unwrap(),
+            batch_command(&BatchConfig {
+                image: TEST_IMAGE,
+                lease_id: "77",
+                command: "true",
+                workspace_root: &root,
+                state_root: &root,
+                isolation: &shared,
+                limits: TEST_LIMITS,
+                duration_seconds: 60,
+            })
+            .unwrap(),
+        ] {
+            let arguments = argv(&command);
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|argument| argument.contains("/dev/vfio"))
+            );
+            assert!(!arguments.iter().any(|argument| argument.contains("kata")));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A shared lease cannot produce a guest report, so a configuration that
+    /// asks for one is refused rather than served without evidence.
+    #[test]
+    fn a_shared_lease_refuses_to_pretend_it_can_attest() {
+        let root = temporary_directory("shared-attestation");
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let shared = shared_isolation();
+        let nonce = "b".repeat(64);
+        assert!(
+            validate_launch_config(&LaunchConfig {
+                attestation_challenge: Some(&nonce),
+                ..launch_config(&root, &authorized_key, &jupyter_token, &shared)
+            })
+            .is_err()
+        );
+        assert!(
+            validate_launch_config(&LaunchConfig {
+                agent_policy_digest: Some(&"d".repeat(64)),
+                ..launch_config(&root, &authorized_key, &jupyter_token, &shared)
+            })
+            .is_err()
+        );
+        assert!(
+            validate_launch_config(&LaunchConfig {
+                limits: LeaseLimits::UNUSED,
+                ..launch_config(&root, &authorized_key, &jupyter_token, &shared)
+            })
+            .is_err(),
+            "a shared lease with no memory limit would take the whole host"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The shared bootstrap is a separate script and the passthrough one is
+    /// never edited, so a lease gets the script written for the mode it runs
+    /// in.
+    #[test]
+    fn each_mode_gets_the_bootstrap_written_for_it() {
+        let root = temporary_directory("bootstrap-selection");
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let kata = kata_isolation(42);
+        let shared = shared_isolation();
+
+        let passthrough = root.join("passthrough");
+        fs::create_dir(&passthrough).unwrap();
+        prepare_control_directory(
+            &launch_config(&root, &authorized_key, &jupyter_token, &kata),
+            &passthrough,
+        )
+        .unwrap();
+        let open = root.join("open");
+        fs::create_dir(&open).unwrap();
+        prepare_control_directory(
+            &launch_config(&root, &authorized_key, &jupyter_token, &shared),
+            &open,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(passthrough.join("bootstrap.sh")).unwrap(),
+            WORKSPACE_BOOTSTRAP
+        );
+        let script = fs::read_to_string(open.join("bootstrap.sh")).unwrap();
+        assert_eq!(script, WORKSPACE_BOOTSTRAP_SHARED);
+        assert!(
+            !script.contains("snp-report"),
+            "a shared guest takes no report"
+        );
+        assert!(
+            !script.contains("chmod 0666"),
+            "the container toolkit brings the device nodes in already usable"
+        );
+        assert!(script.contains("attestation_challenge"));
+        assert!(script.contains("nvidia-smi -L | grep -c"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The reservation is per card, and the idle workload takes the same one a
+    /// lease would, so neither can start under the other.
+    #[test]
+    fn the_idle_workload_and_a_shared_lease_compete_for_one_lock() {
+        let root = temporary_directory("shared-lock");
+        let held = reserve_shared_gpu(&root, TEST_GPU_UUID, "idle").unwrap();
+        assert!(root.join(format!("gpu-{TEST_GPU_UUID}.lock")).exists());
+        assert!(
+            DeviceReservation::acquire_slot(
+                &root,
+                &DeviceSlot::shared_gpu(TEST_GPU_UUID),
+                "lease-1"
+            )
+            .is_err()
+        );
+        // A second card on the same host is a separate slot.
+        assert!(
+            reserve_shared_gpu(&root, "GPU-1a2b3c4d-0000-0000-0000-000000000002", "lease-1")
+                .is_ok()
+        );
+        drop(held);
+        assert!(
+            DeviceReservation::acquire_slot(
+                &root,
+                &DeviceSlot::shared_gpu(TEST_GPU_UUID),
+                "lease-1"
+            )
+            .is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The record names the process holding the card, so a lock another live
+    /// process wrote has to be refused rather than reclaimed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_lock_another_live_process_holds_is_not_reclaimed() {
+        let root = temporary_directory("live-lock");
+        let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
+        let path = root.join(format!("gpu-{TEST_GPU_UUID}.lock"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&ReservationRecord {
+                pid: holder.id(),
+                process_start_ticks: process_start_ticks(holder.id()),
+                lease_id: "other".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(reserve_shared_gpu(&root, TEST_GPU_UUID, "lease-1").is_err());
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert!(reserve_shared_gpu(&root, TEST_GPU_UUID, "lease-1").is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The passthrough policy is one hop away from the host across a hypervisor
+    /// boundary. The shared one sits on the host's bridge, so it also has to
+    /// say what the lease may send at the machine underneath it.
+    #[test]
+    fn the_shared_policy_adds_an_input_chain_and_leaves_the_kata_one_alone() {
+        let source = "10.48.0.2".parse().unwrap();
+        let kata = egress_policy(source, &kata_isolation(42)).unwrap();
+        assert_eq!(
+            kata,
+            concat!(
+                "table inet prism {\n",
+                "chain forward {\n",
+                "type filter hook forward priority -10; policy accept;\n",
+                "ip saddr 10.48.0.2 ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 } reject\n",
+                "ip saddr 10.48.0.2 tcp dport { 25, 465, 587 } reject\n",
+                "}\n",
+                "}\n",
+            )
+        );
+
+        // Everything the passthrough policy says, said the same way, with the
+        // table left open for one more chain.
+        let shared = egress_policy(source, &shared_isolation()).unwrap();
+        assert!(shared.starts_with(&kata[..kata.len() - 2]));
+        let input = shared.split_once("chain input {").unwrap().1;
+        // Without this first, the replies to the published SSH and Jupyter
+        // ports are rejected and every lease on the node fails.
+        assert!(
+            input.find("ct state established,related accept").unwrap()
+                < input.find("reject").unwrap()
+        );
+        assert!(input.contains("ip saddr 10.48.0.2 udp dport 53 accept"));
+        assert!(input.contains("ip saddr 10.48.0.2 tcp dport 53 accept"));
+        assert!(shared.ends_with("}\n"));
+    }
+
+    /// The renter's image supplies the container's first process, so the policy
+    /// has to hold before the address the per-lease one is keyed on exists. One
+    /// lease runs per host, which makes the bridge the same scope.
+    #[test]
+    fn the_startup_policy_says_the_same_thing_keyed_on_the_bridge() {
+        let startup = startup_policy();
+        let shared = egress_policy("10.48.0.2".parse().unwrap(), &shared_isolation()).unwrap();
+        for rule in [PRIVATE_DESTINATIONS, MAIL_PORTS] {
+            assert!(startup.contains(rule), "{startup}");
+            assert!(shared.contains(rule));
+        }
+        for chain in ["chain forward {", "chain input {"] {
+            assert!(startup.contains(chain), "{startup}");
+        }
+        let input = startup.split_once("chain input {").unwrap().1;
+        assert!(
+            input.find("ct state established,related accept").unwrap()
+                < input.find("reject").unwrap()
+        );
+        assert!(input.contains("iifname \"nerdctl0\" reject"));
+        assert!(!startup.contains("ip saddr"), "no address is known yet");
     }
 
     #[test]
@@ -1245,7 +2466,8 @@ mod tests {
             command: "nvidia-smi -L",
             workspace_root: &root,
             state_root: &root,
-            vfio_group: 42,
+            isolation: &kata_isolation(42),
+            limits: TEST_LIMITS,
             duration_seconds: 600,
         };
         let command = batch_command(&config).unwrap();
@@ -1281,13 +2503,15 @@ mod tests {
     fn batch_refuses_a_mutable_image_or_an_empty_command() {
         let root = temporary_directory("batch-validate");
         let pinned = "docker.io/library/debian@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let kata = kata_isolation(1);
         let base = BatchConfig {
             image: pinned,
             lease_id: "77",
             command: "true",
             workspace_root: &root,
             state_root: &root,
-            vfio_group: 1,
+            isolation: &kata,
+            limits: TEST_LIMITS,
             duration_seconds: 60,
         };
         assert!(validate_batch_config(&base).is_ok());
@@ -1317,15 +2541,9 @@ mod tests {
     #[test]
     fn kata_command_assigns_one_explicit_vfio_group() {
         let root = temporary_directory("command");
-        let authorized_key = root.join("authorized-key");
-        let jupyter_token = root.join("jupyter-token");
-        fs::write(
-            &authorized_key,
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest workspace\n",
-        )
-        .unwrap();
-        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
-        let config = launch_config(&root, &authorized_key, &jupyter_token);
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let kata = kata_isolation(42);
+        let config = launch_config(&root, &authorized_key, &jupyter_token, &kata);
         let command = kata_command(&config, &root).unwrap();
         let arguments = command
             .get_args()
@@ -1414,8 +2632,14 @@ mod tests {
         handle.join().unwrap();
         let _ = child.wait();
 
-        assert_eq!(fs::read(evidence.join("guest-report.bin")).unwrap(), b"report");
-        assert_eq!(fs::read(evidence.join("guest-chain.b64")).unwrap(), b"chain");
+        assert_eq!(
+            fs::read(evidence.join("guest-report.bin")).unwrap(),
+            b"report"
+        );
+        assert_eq!(
+            fs::read(evidence.join("guest-chain.b64")).unwrap(),
+            b"chain"
+        );
         assert!(
             !root.join("escape.bin").exists() && !evidence.join("../escape.bin").exists(),
             "a guest must not be able to name a path outside the evidence directory"
@@ -1429,14 +2653,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = temporary_directory("snp-command");
-        let authorized_key = root.join("authorized-key");
-        let jupyter_token = root.join("jupyter-token");
-        fs::write(
-            &authorized_key,
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest lease\n",
-        )
-        .unwrap();
-        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
         let shim = bin.join("containerd-shim-kata-qemu-snp-v2");
@@ -1444,7 +2661,8 @@ mod tests {
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
 
         let digest = "d".repeat(64);
-        let config = launch_config(&root, &authorized_key, &jupyter_token);
+        let kata = kata_isolation(42);
+        let config = launch_config(&root, &authorized_key, &jupyter_token, &kata);
         let command = kata_snp_command_in(&config, &root, &digest, bin.as_os_str()).unwrap();
         let arguments = command
             .get_args()
@@ -1513,17 +2731,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = temporary_directory("snp-refusal");
-        let authorized_key = root.join("authorized-key");
-        let jupyter_token = root.join("jupyter-token");
-        fs::write(
-            &authorized_key,
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest lease\n",
-        )
-        .unwrap();
-        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
-        let config = launch_config(&root, &authorized_key, &jupyter_token);
+        let kata = kata_isolation(42);
+        let config = launch_config(&root, &authorized_key, &jupyter_token, &kata);
         let digest = "d".repeat(64);
 
         assert!(kata_snp_command_in(&config, &root, "", bin.as_os_str()).is_err());
@@ -1568,19 +2780,13 @@ mod tests {
     #[test]
     fn the_control_directory_carries_the_challenge_only_when_there_is_one() {
         let root = temporary_directory("control-directory");
-        let authorized_key = root.join("authorized-key");
-        let jupyter_token = root.join("jupyter-token");
-        fs::write(
-            &authorized_key,
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest lease\n",
-        )
-        .unwrap();
-        fs::write(&jupyter_token, "a".repeat(32)).unwrap();
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let kata = kata_isolation(42);
 
         let plain = root.join("plain");
         fs::create_dir(&plain).unwrap();
         prepare_control_directory(
-            &launch_config(&root, &authorized_key, &jupyter_token),
+            &launch_config(&root, &authorized_key, &jupyter_token, &kata),
             &plain,
         )
         .unwrap();
@@ -1594,7 +2800,7 @@ mod tests {
             &LaunchConfig {
                 attestation_challenge: Some(&nonce),
                 agent_policy_digest: Some(&"d".repeat(64)),
-                ..launch_config(&root, &authorized_key, &jupyter_token)
+                ..launch_config(&root, &authorized_key, &jupyter_token, &kata)
             },
             &attested,
         )
@@ -1672,7 +2878,7 @@ mod tests {
 
     #[test]
     fn egress_policy_blocks_private_metadata_and_mail_destinations() {
-        let policy = egress_policy("10.48.0.2".parse().unwrap()).unwrap();
+        let policy = egress_policy("10.48.0.2".parse().unwrap(), &kata_isolation(42)).unwrap();
         for blocked in [
             "10.0.0.0/8",
             "169.254.0.0/16",
@@ -1682,7 +2888,7 @@ mod tests {
         ] {
             assert!(policy.contains(blocked));
         }
-        assert!(egress_policy("::1".parse().unwrap()).is_err());
+        assert!(egress_policy("::1".parse().unwrap(), &kata_isolation(42)).is_err());
     }
 
     #[test]
@@ -1714,10 +2920,11 @@ mod tests {
     #[test]
     fn prevents_double_reservation_of_a_vfio_group() {
         let root = temporary_directory("locks");
-        let first = DeviceReservation::acquire(&root, 7, "lease-one").unwrap();
-        assert!(DeviceReservation::acquire(&root, 7, "lease-two").is_err());
+        let first =
+            DeviceReservation::acquire_slot(&root, &DeviceSlot::vfio(7), "lease-one").unwrap();
+        assert!(DeviceReservation::acquire_slot(&root, &DeviceSlot::vfio(7), "lease-two").is_err());
         drop(first);
-        assert!(DeviceReservation::acquire(&root, 7, "lease-two").is_ok());
+        assert!(DeviceReservation::acquire_slot(&root, &DeviceSlot::vfio(7), "lease-two").is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1736,7 +2943,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(DeviceReservation::acquire(&root, 9, "lease-new").is_ok());
+        assert!(DeviceReservation::acquire_slot(&root, &DeviceSlot::vfio(9), "lease-new").is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }

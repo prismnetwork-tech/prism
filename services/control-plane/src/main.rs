@@ -83,6 +83,13 @@ const QUOTE_HOLD_SECONDS: i64 = 90;
 /// Mirrors the node's own limit, so the two agree on what it will accept.
 const MAX_BATCH_COMMAND_BYTES: usize = 8 * 1024;
 const QUOTE_TTL_MINUTES: i64 = 5;
+/// How long a node's command poll is remembered. It started as the replay
+/// guard's retention window and now also decides who can be handed batch work:
+/// an offer matches a command request only while one of its polls is still
+/// inside this window. Shortening it narrows the batch fleet, so change it
+/// against `a_node_that_stopped_polling_falls_out_of_batch_matching`, not on
+/// replay grounds alone.
+const NODE_REQUEST_TTL_MINUTES: i64 = 5;
 /// A single presigned PUT is all object storage accepts in one request, and it
 /// stops well below `MAX_WORKSPACE_BYTES`. Refusing here is better than minting
 /// a URL that the upload fails against after the renter has sent gigabytes.
@@ -266,7 +273,9 @@ struct MemoryMarketplace {
     consumed_quotes: BTreeSet<Uuid>,
     leases: BTreeMap<u64, (String, LeaseRecord)>,
     commands: BTreeMap<Uuid, MemoryCommand>,
-    node_requests: BTreeMap<Uuid, chrono::DateTime<Utc>>,
+    /// Request id to the node that sent it and when the record expires. The
+    /// node id is what makes this table answer "is this node still polling".
+    node_requests: BTreeMap<Uuid, (String, chrono::DateTime<Utc>)>,
     accounts: BTreeMap<String, bool>,
     suspended_accounts: BTreeSet<String>,
     sessions: BTreeMap<String, String>,
@@ -407,6 +416,20 @@ fn fresh_posture<'a>(
         .get(node_id)
         .filter(|telemetry| telemetry.observed_at >= cutoff)
         .and_then(|telemetry| telemetry.posture.as_ref())
+}
+
+/// A node polls the command channel every few seconds and every poll is
+/// signed by its device key, so a record inside the retention window is proof
+/// the node is still there to take a command.
+fn polls_command_channel(
+    market: &MemoryMarketplace,
+    node_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    market
+        .node_requests
+        .values()
+        .any(|(polled_by, expires_at)| polled_by == node_id && *expires_at > now)
 }
 
 struct MemoryCommand {
@@ -2963,6 +2986,8 @@ impl MarketplaceStore {
                             market.verdicts.get(&offer.node_id),
                             Utc::now(),
                         );
+                        offer.command_channel =
+                            polls_command_channel(&market, &offer.node_id, Utc::now());
                         offer
                     })
                     .collect())
@@ -2975,6 +3000,7 @@ impl MarketplaceStore {
                         bool,
                         Option<SqlJson<NodePosture>>,
                         Option<SqlJson<AttestationVerdict>>,
+                        bool,
                     ),
                 >(
                     "SELECT o.document, \
@@ -2985,7 +3011,11 @@ impl MarketplaceStore {
                             (SELECT nt.document->'posture' FROM node_telemetry nt \
                              WHERE nt.node_id = o.node_id AND nt.observed_at >= $1), \
                             (SELECT v.document FROM node_attestation_verdicts v \
-                             WHERE v.node_id = o.node_id AND v.expires_at > now()) \
+                             WHERE v.node_id = o.node_id AND v.expires_at > now()), \
+                            EXISTS ( \
+                                SELECT 1 FROM node_command_requests r \
+                                WHERE r.node_id = o.node_id AND r.expires_at > NOW() \
+                            ) \
                      FROM node_offers o \
                      WHERE (o.document->>'bonded')::boolean = true \
                        AND (document->>'public_image_only')::boolean = true \
@@ -3020,17 +3050,20 @@ impl MarketplaceStore {
                 let now = Utc::now();
                 Ok(documents
                     .into_iter()
-                    .map(|(SqlJson(mut offer), tunneled, posture, verdict)| {
-                        offer.online = true;
-                        offer.trust_class = class_for_verdict(
-                            &offer.node_id,
-                            tunneled,
-                            posture.as_ref().map(|SqlJson(posture)| posture),
-                            verdict.as_ref().map(|SqlJson(verdict)| verdict),
-                            now,
-                        );
-                        offer
-                    })
+                    .map(
+                        |(SqlJson(mut offer), tunneled, posture, verdict, polling)| {
+                            offer.online = true;
+                            offer.trust_class = class_for_verdict(
+                                &offer.node_id,
+                                tunneled,
+                                posture.as_ref().map(|SqlJson(posture)| posture),
+                                verdict.as_ref().map(|SqlJson(verdict)| verdict),
+                                now,
+                            );
+                            offer.command_channel = polling;
+                            offer
+                        },
+                    )
                     .collect())
             }
         }
@@ -3956,6 +3989,7 @@ impl MarketplaceStore {
                             market.verdicts.get(&offer.node_id),
                             now,
                         );
+                        offer.command_channel = polls_command_channel(&market, &offer.node_id, now);
                         offer
                     })
                     .collect::<Vec<_>>();
@@ -4052,6 +4086,17 @@ impl MarketplaceStore {
                 .into_iter()
                 .chain(tunneled.iter().cloned())
                 .collect();
+                // Every poll and every report a node makes is signed by its
+                // device key and lands here, so a live record is the node
+                // saying it is still ready to be handed a command.
+                let polling: BTreeSet<String> = query_scalar(
+                    "SELECT DISTINCT node_id FROM node_command_requests WHERE expires_at > NOW()",
+                )
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?
+                .into_iter()
+                .collect();
                 let evidence: BTreeMap<String, (Option<NodePosture>, Option<AttestationVerdict>)> =
                     query_as::<
                         _,
@@ -4102,6 +4147,7 @@ impl MarketplaceStore {
                             verdict,
                             now,
                         );
+                        offer.command_channel = polling.contains(&offer.node_id);
                         offer
                     })
                     .collect();
@@ -5163,7 +5209,7 @@ impl MarketplaceStore {
         match self {
             Self::Memory(market) => {
                 let mut market = market.write().await;
-                remember_node_request(&mut market, request_id, now)?;
+                remember_node_request(&mut market, node_id, request_id, now)?;
                 let command = market
                     .commands
                     .values_mut()
@@ -5237,7 +5283,7 @@ impl MarketplaceStore {
         match self {
             Self::Memory(market) => {
                 let mut market = market.write().await;
-                remember_node_request(&mut market, report.request_id, now)?;
+                remember_node_request(&mut market, &report.node_id, report.request_id, now)?;
                 let entry = market
                     .commands
                     .get_mut(&report.command_id)
@@ -5710,18 +5756,23 @@ async fn operator_target_state(
 
 fn remember_node_request(
     market: &mut MemoryMarketplace,
+    node_id: &str,
     request_id: Uuid,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), StoreError> {
     market
         .node_requests
-        .retain(|_, expires_at| *expires_at > now);
+        .retain(|_, (_, expires_at)| *expires_at > now);
     if market.node_requests.contains_key(&request_id) {
         return Err(StoreError::CommandReplay);
     }
-    market
-        .node_requests
-        .insert(request_id, now + Duration::minutes(5));
+    market.node_requests.insert(
+        request_id,
+        (
+            node_id.to_owned(),
+            now + Duration::minutes(NODE_REQUEST_TTL_MINUTES),
+        ),
+    );
     Ok(())
 }
 
@@ -5736,10 +5787,11 @@ async fn record_node_request(
         .map_err(StoreError::Storage)?;
     let inserted = query(
         "INSERT INTO node_command_requests (request_id, node_id, expires_at) \
-         VALUES ($1, $2, NOW() + INTERVAL '5 minutes') ON CONFLICT DO NOTHING",
+         VALUES ($1, $2, NOW() + make_interval(mins => $3)) ON CONFLICT DO NOTHING",
     )
     .bind(request_id)
     .bind(node_id)
+    .bind(NODE_REQUEST_TTL_MINUTES as i32)
     .execute(&mut **transaction)
     .await
     .map_err(StoreError::Storage)?;
@@ -5957,6 +6009,7 @@ async fn enroll_node(
         public_image_only: true,
         trust_class: TrustClass::Open,
         staker_only: false,
+        command_channel: false,
         updated_at: Utc::now(),
     };
     offer.bonded = state
@@ -7536,6 +7589,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0018_lease_attestation.sql")),
                 false,
             ),
+            Migration::new(
+                19,
+                Cow::Borrowed("node command polling"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0019_node_command_polling.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
@@ -7577,12 +7637,14 @@ fn quote_for_offers<'a>(
         // enough. Gating on the offer's own flag rather than on its price keeps
         // a cheap independent node visible to everybody.
         .filter(|offer| !offer.staker_only || offer.rate_per_second >= rate_floor)
-        // Only a node that takes work through the signed command channel can
-        // run a batch command, and the broker path does not: it is provisioned
-        // by the lifecycle worker and nothing there polls for commands. Matching
-        // a batch request to one would take the renter's money and hand back an
-        // interactive box their command never ran on.
-        .filter(|offer| request.command.is_none() || offer.trust_class >= TrustClass::Isolated)
+        // A batch command reaches the node over the signed command channel, so
+        // the only offers that can run one are the offers whose node is polling
+        // it. Broker capacity never is: it is provisioned by the lifecycle
+        // worker and nothing on it asks for commands. Matching a batch request
+        // to one would take the renter's money and hand back an interactive box
+        // their command never ran on. The window this is read against is
+        // `NODE_REQUEST_TTL_MINUTES`.
+        .filter(|offer| request.command.is_none() || offer.command_channel)
         .filter(|offer| {
             request
                 .preferred_node_id
@@ -8166,6 +8228,7 @@ mod tests {
             public_image_only: true,
             trust_class: TrustClass::Open,
             staker_only: false,
+            command_channel: false,
             updated_at: Utc::now(),
         }
     }
@@ -8515,14 +8578,13 @@ mod tests {
         );
     }
 
-    /// The batch filter has been in the matcher since batch leases shipped and
-    /// has never once been satisfiable: nothing ever set an offer above `Open`,
-    /// so `min_trust_class >= Isolated` matched no capacity at all. This is the
-    /// first time a `command` can find a node.
+    /// A batch command reaches the node over the signed command channel, so the
+    /// property the matcher filters on is whether the node polls it. The trust
+    /// class says nothing about that either way.
     #[tokio::test]
-    async fn a_batch_lease_finally_has_a_node_to_run_on() {
+    async fn a_batch_lease_matches_only_a_node_that_polls() {
         let node_id = attested_node_id();
-        let verified = attested_market(
+        let polling = attested_market(
             IsolationMode::KataVfio,
             true,
             Utc::now(),
@@ -8531,7 +8593,11 @@ mod tests {
                 Utc::now() + Duration::hours(1),
             )),
         );
-        let quote = verified
+        polling
+            .claim_command(&node_id, Uuid::now_v7())
+            .await
+            .expect("an empty queue is not an error");
+        let quote = polling
             .quote(
                 "renter",
                 &lease_request(TrustClass::Open, Some("nvidia-smi")),
@@ -8542,9 +8608,18 @@ mod tests {
         assert_eq!(quote.node_id, node_id);
         assert_eq!(quote.command.as_deref(), Some("nvidia-smi"));
 
-        let unverified = attested_market(IsolationMode::KataVfio, true, Utc::now(), None);
+        // The same node, the same class, and nobody has heard it poll.
+        let quiet = attested_market(
+            IsolationMode::KataVfio,
+            true,
+            Utc::now(),
+            Some(attestation_verdict(
+                &node_id,
+                Utc::now() + Duration::hours(1),
+            )),
+        );
         assert!(matches!(
-            unverified
+            quiet
                 .quote(
                     "renter",
                     &lease_request(TrustClass::Open, Some("nvidia-smi")),
@@ -9474,6 +9549,77 @@ mod tests {
             summary.nodes.len(),
             1,
             "a wallet is the same wallet in any casing"
+        );
+    }
+
+    /// A self-hosted node at `Open` runs the same daemon and polls the same
+    /// command channel as any other node, so it can take batch work. Until it
+    /// has polled, nothing knows that, and the quote has to fail rather than
+    /// bill a renter for a command that would never be collected.
+    #[tokio::test]
+    async fn an_open_node_that_polls_can_be_handed_a_batch_command() {
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("node-1".to_owned(), offer("node-1", 100, 10_000));
+        market.tunnels.insert("node-1".to_owned(), Utc::now());
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = LeaseRequest {
+            image: "registry.example/runtime@sha256:abc".to_owned(),
+            duration_seconds: 60,
+            min_vram_mib: 16_000,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: Some("nvidia-smi".to_owned()),
+        };
+
+        assert!(matches!(
+            store.quote("subject-1", &request, 0).await,
+            Err(StoreError::NoMatch)
+        ));
+
+        store
+            .claim_command("node-1", Uuid::now_v7())
+            .await
+            .expect("an empty queue is not an error");
+
+        let quote = store.quote("subject-1", &request, 0).await.unwrap();
+        assert_eq!(quote.node_id, "node-1");
+        assert_eq!(quote.trust_class, TrustClass::Open);
+
+        let listed = store.list_offers().await.unwrap();
+        assert!(listed[0].command_channel);
+    }
+
+    /// The window a poll is remembered for is the replay guard's retention
+    /// window, and batch matching now reads the same records. Shortening it to
+    /// tighten replay would quietly take nodes out of the batch fleet.
+    #[test]
+    fn a_node_that_stopped_polling_falls_out_of_batch_matching() {
+        let mut market = MemoryMarketplace::default();
+        let now = Utc::now();
+        remember_node_request(
+            &mut market,
+            "node-1",
+            Uuid::now_v7(),
+            now - Duration::minutes(NODE_REQUEST_TTL_MINUTES) - Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert!(!polls_command_channel(&market, "node-1", now));
+
+        remember_node_request(
+            &mut market,
+            "node-1",
+            Uuid::now_v7(),
+            now - Duration::seconds(30),
+        )
+        .unwrap();
+
+        assert!(polls_command_channel(&market, "node-1", now));
+        assert!(
+            !polls_command_channel(&market, "node-2", now),
+            "one node's poll says nothing about another node"
         );
     }
 
@@ -11153,14 +11299,15 @@ fn every_migration_file_is_registered() {
     );
 }
 
-/// The broker path is provisioned by the lifecycle worker and never polls
-/// for commands, so a batch request that matched one would bill the renter
-/// for a box their command never ran on.
+/// The broker path is provisioned by the lifecycle worker and never polls for
+/// commands, so a batch request that matched one would bill the renter for a
+/// box their command never ran on. The poll decides it rather than the class: a
+/// self-hosted node at `Open` runs the same daemon and takes the same commands.
 #[test]
 fn a_batch_request_never_matches_a_broker_node() {
     use prism_protocol::GpuSpec;
 
-    let offer = |node_id: &str, trust_class| NodeOffer {
+    let offer = |node_id: &str, trust_class, command_channel| NodeOffer {
         node_id: node_id.to_owned(),
         operator_wallet: "0xop".to_owned(),
         payout_wallet: "0xpay".to_owned(),
@@ -11178,10 +11325,12 @@ fn a_batch_request_never_matches_a_broker_node() {
         public_image_only: true,
         trust_class,
         staker_only: false,
+        command_channel,
         updated_at: Utc::now(),
     };
-    let broker = offer("0xbroker", TrustClass::Open);
-    let isolated = offer("0xisolated", TrustClass::Isolated);
+    let broker = offer("0xbroker", TrustClass::Open, false);
+    let isolated = offer("0xisolated", TrustClass::Isolated, true);
+    let self_hosted = offer("0xopen", TrustClass::Open, true);
     let request = |command: Option<&str>| LeaseRequest {
         image: "docker.io/library/debian@sha256:1".to_owned(),
         duration_seconds: 600,
@@ -11211,4 +11360,24 @@ fn a_batch_request_never_matches_a_broker_node() {
     .unwrap();
     assert_eq!(batch.node_id, "0xisolated");
     assert_eq!(batch.command.as_deref(), Some("nvidia-smi"));
+
+    // Same price, same class as the broker, and it matches, because it is the
+    // one of the two that polls.
+    let open = quote_for_offers(
+        &request(Some("nvidia-smi")),
+        [&broker, &self_hosted],
+        &reserved,
+        0,
+    )
+    .unwrap();
+    assert_eq!(open.node_id, "0xopen");
+    assert_eq!(open.trust_class, TrustClass::Open);
+
+    // A node inside a long interactive lease stops polling, and while it does
+    // it is out of batch matching whatever class it holds.
+    let quiet = offer("0xquiet", TrustClass::Isolated, false);
+    assert!(matches!(
+        quote_for_offers(&request(Some("nvidia-smi")), [&quiet], &reserved, 0),
+        Err(StoreError::NoMatch)
+    ));
 }

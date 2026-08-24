@@ -60,6 +60,17 @@ The project follows semantic versioning after its first stable release.
 
 ### Added
 
+- Open mode for suppliers: a node can now serve leases with the GPU left on the
+  host driver, so a stock Ubuntu 24.04 machine with an NVIDIA driver and
+  containerd can enroll without IOMMU passthrough or Kata. `deploy/node/install.sh`
+  prepares such a host and `deploy/node/OPEN_MODE.md` is the runbook. These
+  nodes publish the `open` trust class; the passthrough path is unchanged and
+  keeps its own class. Between leases the daemon can run one workload the
+  operator configures, typically a miner, and it takes the card back before a
+  lease starts. `prismd idle-check` measures that handover on the operator's own
+  hardware, which is how they find out whether their miner releases VRAM fast
+  enough before they bond.
+
 - A public `/network` page: what the network has settled (leases, GPU hours,
   USDG charged, the share that reached suppliers, refunds, and a per-GPU
   breakdown) beside what it can rent right now. Every settled figure is summed

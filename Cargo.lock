@@ -2648,6 +2648,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "libc",
  "prism-chain",
  "prism-protocol",
  "rand 0.8.7",
