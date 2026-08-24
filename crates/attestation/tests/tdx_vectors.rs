@@ -1,39 +1,65 @@
-//! Vectors over a genuine TDX quote.
+//! Vectors over a TDX quote captured from a live CVM.
 //!
-//! The quote and its collateral are vendored from Phala's dcap-qvl repository
-//! (sample/tdx_quote, sample/tdx_quote_collateral.json). Intel signed the
-//! quote and the collateral, so unlike the NVIDIA and SNP vectors nothing
-//! here is fabricated; the price of that is a fixed clock, because the
-//! collateral's revocation lists expired in July 2025 and verification at the
-//! real time refuses it, which is itself one of the things asserted below.
+//! The quote, collateral and event log were captured 2026-08-24 from a CVM we
+//! deployed on Phala Cloud (dstack, teepod prod9) running a known compose
+//! file, then torn down. Intel signed the quote, Intel's PCS signed the
+//! collateral (fetched through Phala's PCCS mirror), and the event log is
+//! what the guest agent reported; nothing is fabricated. The price of real
+//! evidence is a fixed clock: verification is pinned inside the collateral's
+//! validity window, and the same quote at a later clock refuses, which is
+//! itself one of the things asserted below.
+//!
+//! `sample-quote.bin` is the genuine Intel-signed sample from Phala's
+//! dcap-qvl repository, kept for the cross-platform negative: a quote from
+//! one platform must refuse under another platform's collateral.
 
 use chrono::{DateTime, TimeZone, Utc};
 use prism_attestation::{
-    Policy, TDX_VERIFIER_VERSION, TdxLaunchIdentity, VerificationError, verify_tdx_attestation,
+    Policy, TDX_VERIFIER_VERSION, TdxEvent, TdxExpectation, TdxLaunchIdentity, VerificationError,
+    verify_tdx_attestation,
 };
 use prism_protocol::{AttestationKind, HostTeeCapability, NodeAttestation, TrustClass};
 
-const QUOTE: &[u8] = include_bytes!("fixtures/tdx/quote.bin");
-const COLLATERAL: &str = include_str!("fixtures/tdx/collateral.json");
+const QUOTE: &[u8] = include_bytes!("fixtures/tdx/live-quote.bin");
+const COLLATERAL: &str = include_str!("fixtures/tdx/live-collateral.json");
+const EVENTS: &str = include_str!("fixtures/tdx/live-events.json");
+const SAMPLE_QUOTE: &[u8] = include_bytes!("fixtures/tdx/sample-quote.bin");
 
-const MR_TD: &str = "91eb2b44d141d4ece09f0c75c2c53d247a3c68edd7fafe8a3520c942a604a407de03ae6dc5f87f27428b2538873118b7";
-const RTMR0: &str = "44c0197b39157fdd7a4dcc44767f9d6b0bb3977c7a8e347b8492f827fe9d9e5c48aca29b220b80b6a540cf994b9bc9c0";
-const RTMR1: &str = "0084452c01668329d4bc06acdf58a7205c26743304509973949e5619bf81a6a7aea8c323c173019b3093d54e579e9378";
-const RTMR2: &str = "d833feef2cd945148aa38ead2c53e9b7f138190aaaebfc551dccd829fc207aa3ba80b70870d7330733642e01d48c3132";
-const REPORT_DATA: &str = "9a9d48e7f6799642d3d1b34e1e5e1742d4bb02dd6ddd551862c1211d35c304f9eca3efdbb481601c163cf52493d6e44aed55d51ec39b7e518fadb92c2b523f20";
+const MR_TD: &str = "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077";
+const RTMR0: &str = "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96";
+const RTMR1: &str = "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c";
+const RTMR2: &str = "a2a58c9a959a4fa44bd6da0c97a2270c051faf12084cfe91ae900e4fdff6cdd4f69a82005e04ee920f231497894d677f";
+const REPORT_DATA: &str = "e358fd518d38bb3cbda79bebcdfc1738873de340b4b721ec63c6f834fd3831fe821f5a17c0e741a08b413590c89a1394de95971308948cda9e06a3bad59faee3";
+const COMPOSE_HASH: &str = "c0fbe230ec1ce7ad7a092b8b698181a980df8555ab47e671f5464623c567b54f";
+const INSTANCE_ID: &str = "3ae8bc0689b80e022d2f3021dc467be445249cdf";
 
-/// Inside the collateral's validity window; the TCB info it carries ran out on
-/// 2025-07-19.
+/// Inside the collateral's validity window; its TCB info runs out 2026-09-23.
 fn vector_time() -> DateTime<Utc> {
-    Utc.timestamp_opt(1_751_000_000, 0).unwrap()
+    Utc.timestamp_opt(1_787_600_000, 0).unwrap()
 }
 
 fn digest48(hexed: &str) -> [u8; 48] {
     hex::decode(hexed).unwrap().try_into().unwrap()
 }
 
-fn expected_report_data() -> [u8; 64] {
-    hex::decode(REPORT_DATA).unwrap().try_into().unwrap()
+fn events() -> Vec<TdxEvent> {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(EVENTS).unwrap();
+    raw.iter()
+        .map(|entry| TdxEvent {
+            imr: entry["imr"].as_u64().unwrap() as u32,
+            event_type: entry["event_type"].as_u64().unwrap() as u32,
+            name: entry["event"].as_str().unwrap().to_string(),
+            digest: digest48(entry["digest"].as_str().unwrap()),
+            payload: hex::decode(entry["event_payload"].as_str().unwrap()).unwrap(),
+        })
+        .collect()
+}
+
+fn expectation() -> TdxExpectation {
+    TdxExpectation {
+        report_data: hex::decode(REPORT_DATA).unwrap().try_into().unwrap(),
+        compose_hash: hex::decode(COMPOSE_HASH).unwrap().try_into().unwrap(),
+    }
 }
 
 fn quote_identity() -> TdxLaunchIdentity {
@@ -65,34 +91,36 @@ fn accepting_policy() -> Policy {
 }
 
 #[test]
-fn a_genuine_quote_verifies_and_earns_attested() {
+fn a_live_quote_with_its_log_verifies_and_earns_attested() {
     let verdict = verify_tdx_attestation(
         &attestation(),
         COLLATERAL,
-        &expected_report_data(),
+        &events(),
+        &expectation(),
         vector_time(),
         &accepting_policy(),
     )
-    .expect("vendored quote");
+    .expect("captured quote");
 
     assert_eq!(verdict.kind, AttestationKind::Tdx);
     assert_eq!(verdict.granted_class, TrustClass::Attested);
     assert_eq!(verdict.verifier_version, TDX_VERIFIER_VERSION);
-    assert_eq!(verdict.device_identity, format!("tdx/{MR_TD}"));
+    assert_eq!(verdict.device_identity, format!("tdx/{INSTANCE_ID}"));
     assert_eq!(verdict.node_id, "0xtdxnode");
 }
 
-/// The same quote at today's clock refuses, because the collateral's
-/// revocation lists have run out. Stale collateral is indistinguishable from
-/// collateral chosen to hide a revocation, so there is no grace here.
+/// The same quote after the collateral's validity refuses. Stale collateral
+/// is indistinguishable from collateral chosen to hide a revocation, so
+/// there is no grace here.
 #[test]
-fn expired_collateral_refuses_the_quote() {
-    let now = Utc.timestamp_opt(1_787_000_000, 0).unwrap();
+fn stale_collateral_refuses_the_quote() {
+    let later = Utc.timestamp_opt(1_795_000_000, 0).unwrap();
     let refused = verify_tdx_attestation(
         &attestation(),
         COLLATERAL,
-        &expected_report_data(),
-        now,
+        &events(),
+        &expectation(),
+        later,
         &accepting_policy(),
     );
     assert_eq!(refused, Err(VerificationError::TdxQuoteRejected));
@@ -100,12 +128,13 @@ fn expired_collateral_refuses_the_quote() {
 
 #[test]
 fn report_data_binds_the_challenge() {
-    let mut wrong = expected_report_data();
-    wrong[0] ^= 1;
+    let mut expected = expectation();
+    expected.report_data[0] ^= 1;
     let refused = verify_tdx_attestation(
         &attestation(),
         COLLATERAL,
-        &wrong,
+        &events(),
+        &expected,
         vector_time(),
         &accepting_policy(),
     );
@@ -120,7 +149,8 @@ fn the_shipped_reference_set_refuses_a_genuine_quote() {
     let refused = verify_tdx_attestation(
         &attestation(),
         COLLATERAL,
-        &expected_report_data(),
+        &events(),
+        &expectation(),
         vector_time(),
         &Policy::for_tests(),
     );
@@ -134,11 +164,87 @@ fn a_launch_identity_matches_as_a_whole_or_not_at_all() {
     let refused = verify_tdx_attestation(
         &attestation(),
         COLLATERAL,
-        &expected_report_data(),
+        &events(),
+        &expectation(),
         vector_time(),
         &Policy::for_tests().with_tdx_test_identities(vec![identity]),
     );
     assert_eq!(refused, Err(VerificationError::TdxUnknownLaunchMeasurement));
+}
+
+#[test]
+fn the_log_must_bind_the_compose_file_the_caller_expected() {
+    let mut expected = expectation();
+    expected.compose_hash[0] ^= 1;
+    let refused = verify_tdx_attestation(
+        &attestation(),
+        COLLATERAL,
+        &events(),
+        &expected,
+        vector_time(),
+        &accepting_policy(),
+    );
+    assert_eq!(refused, Err(VerificationError::TdxComposeHashMismatch));
+}
+
+/// A payload cannot ride on the digest of a different claim: the digest that
+/// was folded is authentic, so a reworded payload no longer matches it.
+#[test]
+fn a_tampered_event_payload_is_caught_by_its_own_digest() {
+    let mut tampered = events();
+    let compose = tampered
+        .iter_mut()
+        .find(|event| event.name == "compose-hash")
+        .unwrap();
+    compose.payload[0] ^= 1;
+    let refused = verify_tdx_attestation(
+        &attestation(),
+        COLLATERAL,
+        &tampered,
+        &expectation(),
+        vector_time(),
+        &accepting_policy(),
+    );
+    assert_eq!(refused, Err(VerificationError::TdxEventDigestMismatch));
+}
+
+/// Dropping an event breaks the fold: the log must account for exactly what
+/// the TD extended, nothing missing and nothing invented.
+#[test]
+fn an_incomplete_log_does_not_fold_to_the_quoted_registers() {
+    let mut incomplete = events();
+    let position = incomplete
+        .iter()
+        .position(|event| event.name == "instance-id")
+        .unwrap();
+    incomplete.remove(position);
+    let refused = verify_tdx_attestation(
+        &attestation(),
+        COLLATERAL,
+        &incomplete,
+        &expectation(),
+        vector_time(),
+        &accepting_policy(),
+    );
+    assert_eq!(refused, Err(VerificationError::TdxEventLogMismatch));
+}
+
+/// A quote from one platform under another platform's collateral refuses:
+/// collateral is per-platform, not a bearer instrument.
+#[test]
+fn foreign_collateral_refuses_a_quote_from_another_platform() {
+    use base64::Engine as _;
+    let mut foreign = attestation();
+    foreign.evidence_base64 = base64::engine::general_purpose::STANDARD.encode(SAMPLE_QUOTE);
+    let refused = verify_tdx_attestation(
+        &foreign,
+        COLLATERAL,
+        &events(),
+        &expectation(),
+        vector_time(),
+        &accepting_policy(),
+    );
+    assert_eq!(refused, Err(VerificationError::TdxQuoteRejected));
 }
 
 #[test]
@@ -150,7 +256,8 @@ fn a_truncated_quote_is_rejected() {
     let refused = verify_tdx_attestation(
         &attestation,
         COLLATERAL,
-        &expected_report_data(),
+        &events(),
+        &expectation(),
         vector_time(),
         &accepting_policy(),
     );
@@ -162,7 +269,8 @@ fn malformed_collateral_is_its_own_refusal() {
     let refused = verify_tdx_attestation(
         &attestation(),
         "{\"not\": \"collateral\"}",
-        &expected_report_data(),
+        &events(),
+        &expectation(),
         vector_time(),
         &accepting_policy(),
     );
@@ -176,7 +284,8 @@ fn evidence_of_another_kind_is_malformed_here() {
     let refused = verify_tdx_attestation(
         &attestation,
         COLLATERAL,
-        &expected_report_data(),
+        &events(),
+        &expectation(),
         vector_time(),
         &accepting_policy(),
     );

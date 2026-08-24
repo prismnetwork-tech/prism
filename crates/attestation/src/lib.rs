@@ -39,6 +39,7 @@ pub use snp::SnpReportBuilder;
 /// Not a test helper: the control plane reads this before verification to work
 /// out which certificate to fetch.
 pub use snp::{ClaimedOrigin, claimed_origin};
+pub use tdx::TdxEvent;
 #[cfg(any(test, feature = "test-vectors"))]
 pub use tdx::TdxLaunchIdentity;
 
@@ -169,6 +170,14 @@ pub enum VerificationError {
     TdxReportDataMismatch,
     #[error("TDX quote carries a launch identity that is not in the reference set")]
     TdxUnknownLaunchMeasurement,
+    #[error("TDX event log does not fold to the registers the quote signed")]
+    TdxEventLogMismatch,
+    #[error("TDX event log entry's digest is not the digest of its own claim")]
+    TdxEventDigestMismatch,
+    #[error("TDX event log does not bind each required event exactly once")]
+    TdxEventLogIncomplete,
+    #[error("TDX event log binds a different compose file")]
+    TdxComposeHashMismatch,
 }
 
 /// Verifies one GPU attestation and, on success, returns the class it earns.
@@ -219,26 +228,44 @@ pub fn verify_nvidia_gpu_attestation(
     })
 }
 
-/// Verifies one TDX quote and, on success, returns the class it earns.
+/// What the control plane already knows before it opens a TDX quote, and what
+/// the quote and its event log therefore have to say.
+///
+/// `report_data` is the caller's binding of its own challenge to this node;
+/// comparing it is what makes a quote captured from another TD, or replayed
+/// from an earlier session, worthless. `compose_hash` is the digest of the
+/// workload the caller expects the TD to be running, checked against what the
+/// event log actually extended into `RTMR3`.
+#[derive(Debug, Clone)]
+pub struct TdxExpectation {
+    pub report_data: [u8; 64],
+    pub compose_hash: [u8; 32],
+}
+
+/// Verifies one TDX quote together with its runtime event log and, on
+/// success, returns the class the evidence earns.
 ///
 /// The collateral (Intel's TCB info, QE identity and revocation lists for the
 /// platform that produced the quote) is fetched by the caller, the way the
 /// control plane already fetches VCEKs from AMD. Passing it in keeps this
 /// crate offline; judging it stays here.
 ///
-/// `expected_report_data` is the caller's binding of its own challenge to this
-/// node. Comparing it here is what makes a quote captured from another TD, or
-/// replayed from an earlier session, worthless.
+/// The event log is judged against the registers the quote signed before any
+/// of its claims are believed: the digests must fold to every register, and a
+/// named event's digest must be recomputable from its own name and payload.
+/// See [`tdx::verify_tdx_event_log`] for the full argument.
 ///
-/// The verdict's `device_identity` is the launch identity (`MRTD`), which
-/// names the image and not a physical machine: two TDs launched from one
-/// image share it. Nothing may treat it as unique per node until runtime
-/// register replay binds an instance identity, so TDX verdicts must not feed
-/// the unique-device index the GPU path relies on.
+/// The verdict's `device_identity` is the instance id dstack mints per
+/// deployment and extends into `RTMR3`. It is per-instance rather than
+/// per-image, which is what makes it usable as a node identity at all, but it
+/// lives on the instance's data disk: an operator who clones that disk boots
+/// a second TD with the same identity. Uniqueness is bounded by that, the way
+/// GPU identity is bounded by nonce relaying, not eliminated by it.
 pub fn verify_tdx_attestation(
     attestation: &NodeAttestation,
     collateral_json: &str,
-    expected_report_data: &[u8; 64],
+    events: &[TdxEvent],
+    expected: &TdxExpectation,
     now: DateTime<Utc>,
     policy: &Policy,
 ) -> Result<AttestationVerdict, VerificationError> {
@@ -252,7 +279,7 @@ pub fn verify_tdx_attestation(
     let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
     let report = tdx::verify_quote(&quote, collateral_json, now_unix)?;
 
-    if !bool::from(report.report_data.ct_eq(expected_report_data)) {
+    if !bool::from(report.report_data.ct_eq(&expected.report_data)) {
         return Err(VerificationError::TdxReportDataMismatch);
     }
 
@@ -260,10 +287,15 @@ pub fn verify_tdx_attestation(
         return Err(VerificationError::TdxUnknownLaunchMeasurement);
     }
 
+    let bindings = tdx::verify_tdx_event_log(&report, events)?;
+    if !bool::from(bindings.compose_hash.ct_eq(&expected.compose_hash)) {
+        return Err(VerificationError::TdxComposeHashMismatch);
+    }
+
     Ok(AttestationVerdict {
         node_id: attestation.node_id.clone(),
         kind: AttestationKind::Tdx,
-        device_identity: format!("tdx/{}", hex::encode(report.mr_td)),
+        device_identity: format!("tdx/{}", hex::encode(&bindings.instance_id)),
         measurement_digest: tdx_measurement_digest(&report),
         claimed_capability: attestation.capability,
         granted_class: TDX_GRANTABLE_CLASS,
