@@ -75,6 +75,7 @@ pub async fn refresh(
 
     let attestation = NodeAttestation::sign(
         UnsignedNodeAttestation {
+            tdx_event_log: Vec::new(),
             node_id: node.clone(),
             challenge_id: challenge.challenge_id,
             kind: AttestationKind::NvidiaGpu,

@@ -3744,6 +3744,7 @@ impl MarketplaceStore {
                         &record.node_id,
                         record.trust_class,
                         Some(&verdict),
+                        None,
                         now,
                     );
                     record.updated_at = now;
@@ -3864,6 +3865,7 @@ impl MarketplaceStore {
                         &record.node_id,
                         record.trust_class,
                         Some(&verdict),
+                        None,
                         now,
                     );
                     record.updated_at = now;
@@ -4315,7 +4317,7 @@ impl MarketplaceStore {
                 // inside what the network can substantiate without anybody
                 // having to remember the ceiling.
                 lease.trust_class =
-                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, now);
+                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, None, now);
                 if market
                     .leases
                     .values()
@@ -4446,7 +4448,7 @@ impl MarketplaceStore {
                 // inside what the network can substantiate without anybody
                 // having to remember the ceiling.
                 lease.trust_class =
-                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, now);
+                    class_for_lease(lease.lease_id, &lease.node_id, quote.trust_class, None, None, now);
                 let node_busy = query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
@@ -5491,7 +5493,7 @@ impl MarketplaceStore {
                     market.verdicts.get(&lease.node_id),
                     now,
                 );
-                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, now) < quoted_class
+                if class_for_lease(lease_id, &lease.node_id, node_class, verdict, None, now) < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
                 }
@@ -5580,7 +5582,7 @@ impl MarketplaceStore {
                     node_verdict.as_ref().map(|SqlJson(verdict)| verdict),
                     now,
                 );
-                if class_for_lease(lease_id, &node_id, node_class, verdict.as_ref(), now)
+                if class_for_lease(lease_id, &node_id, node_class, verdict.as_ref(), None, now)
                     < quoted_class
                 {
                     return Err(StoreError::LeaseUnattested);
@@ -8326,6 +8328,7 @@ mod tests {
         let (evidence_base64, certificate_chain_base64) = h100_evidence(report_nonce, board_serial);
         NodeAttestation::sign(
             prism_protocol::UnsignedNodeAttestation {
+                tdx_event_log: Vec::new(),
                 node_id: challenge.node_id.clone(),
                 challenge_id: challenge.challenge_id,
                 kind: AttestationKind::NvidiaGpu,
@@ -8351,6 +8354,7 @@ mod tests {
     fn signed_attestation(challenge_id: Uuid, key: &SigningKey) -> NodeAttestation {
         NodeAttestation::sign(
             prism_protocol::UnsignedNodeAttestation {
+                tdx_event_log: Vec::new(),
                 node_id: attested_node_id(),
                 challenge_id,
                 kind: AttestationKind::NvidiaGpu,
@@ -9035,6 +9039,7 @@ mod tests {
                         GUEST_LEASE_ID,
                         &attested_node_id(),
                         quoted_class,
+                        None,
                         None,
                         Utc::now(),
                     ),

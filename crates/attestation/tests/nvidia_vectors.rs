@@ -71,6 +71,7 @@ fn chain() -> Vec<String> {
 /// so the vectors leave it empty and exercise the evidence path alone.
 fn attestation(evidence: Vec<u8>, chain: Vec<String>) -> NodeAttestation {
     NodeAttestation {
+        tdx_event_log: Vec::new(),
         node_id: NODE_ID.to_string(),
         challenge_id: Uuid::nil(),
         kind: AttestationKind::NvidiaGpu,

@@ -139,8 +139,16 @@ pub enum TrustClass {
 /// verdict for that lease on that node says the hardware earned it.
 ///
 /// `Confidential` stays above the ceiling. A launch measurement proves what
-/// booted, not that the operator cannot read guest memory afterwards, and
-/// nothing checked in here speaks to that.
+/// booted, not that the operator cannot read guest memory afterwards, and for
+/// the memory half TDX evidence now speaks to exactly that: a verified quote
+/// says the guest runs with memory the host cannot read. What is still
+/// missing is the other half of the word. Confidential is a claim about guest
+/// memory and VRAM together, [`class_for_lease`] refuses it without an
+/// `NvidiaCc` verdict beside the guest one, and no verifier for NVIDIA CC
+/// reports exists yet; the TDX launch reference also ships empty until
+/// measurements reproduced from a pinned image are on file. Moving the
+/// ceiling means closing both, with the same discipline the move to
+/// `Attested` documents above.
 pub const MAX_VERIFIABLE_TRUST_CLASS: TrustClass = TrustClass::Attested;
 
 impl TrustClass {
@@ -239,6 +247,45 @@ pub const MAX_ATTESTATION_CERTIFICATE_BYTES: usize = 16 * 1_024;
 /// what keeps evidence plus certificates inside the body limit.
 pub const MAX_ATTESTATION_CERTIFICATES: usize = 8;
 
+/// One entry of a dstack runtime event log, carried beside a TDX quote in the
+/// wire shape the guest agent reports it. The verifier judges it (the fold
+/// across digests has to land on the registers the quote signed), so nothing
+/// here is trusted as received; the caps below only bound what a body may
+/// cost to look at.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TdxEventEntry {
+    pub imr: u32,
+    pub event_type: u32,
+    pub event: String,
+    /// 48 bytes, hex.
+    pub digest: String,
+    /// Hex; empty for events that carry no payload.
+    pub event_payload: String,
+}
+
+/// A dstack boot logs around thirty events; the cap leaves room for runtime
+/// extensions without letting a log become the expensive part of a request.
+pub const MAX_TDX_EVENT_LOG_ENTRIES: usize = 256;
+pub const MAX_TDX_EVENT_PAYLOAD_BYTES: usize = 4 * 1_024;
+
+pub const TDX_REPORT_DATA_DOMAIN: &[u8] = b"prism.tdx.report-data.v1\0";
+
+/// REPORT_DATA is the only field of a TDX quote the guest chooses. Binding the
+/// control plane's nonce to the node id and the device key ties the quote to
+/// one enrollment the way [`attestation_report_nonce`] ties a GPU report to
+/// one: a quote relayed from another TD, or taken for another challenge,
+/// hashes to something else and fails. SHA-512 fills all 64 bytes.
+pub fn tdx_report_data(challenge_nonce: &[u8], node_id: &str, device_public_key: &str) -> [u8; 64] {
+    let mut hasher = Sha512::new();
+    hasher.update(TDX_REPORT_DATA_DOMAIN);
+    hasher.update(challenge_nonce);
+    hasher.update(node_id.as_bytes());
+    hasher.update(device_public_key.as_bytes());
+    let mut report_data = [0_u8; 64];
+    report_data.copy_from_slice(&hasher.finalize());
+    report_data
+}
+
 /// The value the GPU signs over. Binding the control plane's nonce to the node
 /// id and the device key is the only thing tying a vendor signature to one
 /// identity: a report relayed from another machine hashes to something else and
@@ -266,6 +313,12 @@ pub struct NodeAttestation {
     pub kind: AttestationKind,
     pub evidence_base64: String,
     pub certificate_chain_base64: Vec<String>,
+    /// TDX evidence only: the runtime event log the verifier replays against
+    /// the quoted registers. Empty for every other kind, and absent from the
+    /// canonical payload when empty, so attestations signed before the field
+    /// existed still verify.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tdx_event_log: Vec<TdxEventEntry>,
     pub capability: HostTeeCapability,
     pub pci_address: String,
     pub collected_at: DateTime<Utc>,
@@ -279,6 +332,8 @@ pub struct UnsignedNodeAttestation {
     pub kind: AttestationKind,
     pub evidence_base64: String,
     pub certificate_chain_base64: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tdx_event_log: Vec<TdxEventEntry>,
     pub capability: HostTeeCapability,
     pub pci_address: String,
     pub collected_at: DateTime<Utc>,
@@ -297,6 +352,7 @@ impl NodeAttestation {
             kind: unsigned.kind,
             evidence_base64: unsigned.evidence_base64,
             certificate_chain_base64: unsigned.certificate_chain_base64,
+            tdx_event_log: unsigned.tdx_event_log,
             capability: unsigned.capability,
             pci_address: unsigned.pci_address,
             collected_at: unsigned.collected_at,
@@ -314,6 +370,7 @@ impl NodeAttestation {
                 kind: self.kind,
                 evidence_base64: self.evidence_base64.clone(),
                 certificate_chain_base64: self.certificate_chain_base64.clone(),
+                tdx_event_log: self.tdx_event_log.clone(),
                 capability: self.capability,
                 pci_address: self.pci_address.clone(),
                 collected_at: self.collected_at,
@@ -343,6 +400,16 @@ impl NodeAttestation {
             .certificate_chain_base64
             .iter()
             .any(|certificate| certificate.len() > MAX_ATTESTATION_CERTIFICATE_BYTES)
+        {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self.tdx_event_log.len() > MAX_TDX_EVENT_LOG_ENTRIES {
+            return Err(ProtocolError::AttestationTooLarge);
+        }
+        if self
+            .tdx_event_log
+            .iter()
+            .any(|entry| entry.event_payload.len() > MAX_TDX_EVENT_PAYLOAD_BYTES)
         {
             return Err(ProtocolError::AttestationTooLarge);
         }
@@ -399,13 +466,22 @@ pub fn class_for_verdict(
         (true, Some(verdict)) => {
             let isolated =
                 posture.is_some_and(|posture| posture.isolation == IsolationMode::KataVfio);
-            if isolated
-                && verdict.kind == AttestationKind::NvidiaGpu
-                && verdict.granted_class >= TrustClass::Isolated
-            {
-                TrustClass::Isolated
-            } else {
-                TrustClass::Open
+            match verdict.kind {
+                AttestationKind::NvidiaGpu
+                    if isolated && verdict.granted_class >= TrustClass::Isolated =>
+                {
+                    TrustClass::Isolated
+                }
+                // A TDX verdict needs no posture beside it: the boundary it
+                // earns Isolated for is the TD itself, proven by the quote,
+                // not a host-side claim about a runtime. The verifier only
+                // mints one after the event log bound the node's compose
+                // file, so what runs inside that boundary is pinned the way
+                // the Kata image is.
+                AttestationKind::Tdx if verdict.granted_class >= TrustClass::Isolated => {
+                    TrustClass::Isolated
+                }
+                _ => TrustClass::Open,
             }
         }
     };
@@ -593,31 +669,50 @@ pub fn lease_verdict_digest(verdict: &LeaseAttestationVerdict) -> Result<String,
 /// VM, so it lifts a single lease and never the node: an operator who boots the
 /// blessed image once and serves everyone else from a bare container gets
 /// nothing out of it.
+///
+/// The two verdicts are two different claims, and the split is the point.
+/// `guest_verdict` is the measured, memory-encrypted guest itself, reported
+/// from inside (SEV-SNP or TDX); it carries a lease to `Attested`.
+/// `gpu_cc_verdict` is an NVIDIA CC report saying the GPU serving this lease
+/// holds VRAM in confidential mode; it means nothing alone, because encrypted
+/// VRAM behind an unmeasured host is a locked door in an open wall.
+/// `Confidential` is what both claims earn together, and only together:
+/// guest memory and VRAM, which is what the word promises.
 pub fn class_for_lease(
     lease_id: u64,
     node_id: &str,
     node_class: TrustClass,
-    verdict: Option<&LeaseAttestationVerdict>,
+    guest_verdict: Option<&LeaseAttestationVerdict>,
+    gpu_cc_verdict: Option<&LeaseAttestationVerdict>,
     now: DateTime<Utc>,
 ) -> TrustClass {
-    let class = match verdict {
-        None => node_class,
-        Some(verdict) => {
-            let bound = verdict.lease_id == lease_id && verdict.node_id == node_id;
-            // The node must already stand at `Isolated`, because a guest report
-            // says nothing about the bonded identity, the live tunnel or the
-            // GPU underneath it and cannot stand in for them.
-            if bound
-                && verdict.expires_at > now
-                && verdict.kind == AttestationKind::SevSnp
+    let bound_and_fresh = |verdict: &&LeaseAttestationVerdict| {
+        verdict.lease_id == lease_id && verdict.node_id == node_id && verdict.expires_at > now
+    };
+
+    // The node must already stand at `Isolated`, because a guest report says
+    // nothing about the bonded identity, the live tunnel or the GPU
+    // underneath it and cannot stand in for them.
+    let guest_attested = guest_verdict
+        .filter(bound_and_fresh)
+        .is_some_and(|verdict| {
+            matches!(verdict.kind, AttestationKind::SevSnp | AttestationKind::Tdx)
                 && verdict.granted_class >= TrustClass::Attested
                 && node_class >= TrustClass::Isolated
-            {
-                TrustClass::Attested
-            } else {
-                node_class
-            }
-        }
+        });
+    let vram_confidential = gpu_cc_verdict
+        .filter(bound_and_fresh)
+        .is_some_and(|verdict| {
+            verdict.kind == AttestationKind::NvidiaCc
+                && verdict.granted_class >= TrustClass::Confidential
+        });
+
+    let class = if guest_attested && vram_confidential {
+        TrustClass::Confidential
+    } else if guest_attested {
+        TrustClass::Attested
+    } else {
+        node_class
     };
     class.min(MAX_VERIFIABLE_TRUST_CLASS)
 }
@@ -1979,8 +2074,30 @@ mod tests {
         assert!(!receipt_hash_matches(&receipt).unwrap());
     }
 
+    /// An empty event log must vanish from the canonical payload, because an
+    /// attestation signed before the field existed has to keep verifying, and
+    /// the canonical form is exactly what the signature covers.
+    #[test]
+    fn an_empty_event_log_leaves_the_signed_payload_unchanged() {
+        let unsigned = unsigned_attestation("0xabc");
+        let serialized = serde_json::to_string(&unsigned).expect("canonical form");
+        assert!(!serialized.contains("tdx_event_log"));
+
+        let mut with_log = unsigned_attestation("0xabc");
+        with_log.tdx_event_log.push(TdxEventEntry {
+            imr: 3,
+            event_type: 134_217_729,
+            event: "compose-hash".to_owned(),
+            digest: "ab".repeat(48),
+            event_payload: "cd".repeat(32),
+        });
+        let serialized = serde_json::to_string(&with_log).expect("canonical form");
+        assert!(serialized.contains("tdx_event_log"));
+    }
+
     fn unsigned_attestation(node_id: &str) -> UnsignedNodeAttestation {
         UnsignedNodeAttestation {
+            tdx_event_log: Vec::new(),
             node_id: node_id.to_owned(),
             challenge_id: Uuid::now_v7(),
             kind: AttestationKind::NvidiaGpu,
@@ -2161,6 +2278,61 @@ mod tests {
         );
     }
 
+    /// A TDX verdict earns Isolated with no posture beside it, because the
+    /// boundary it attests is the TD itself rather than a host-side runtime
+    /// claim. Everything else about the derivation stays load-bearing: the
+    /// tunnel, the expiry and the node binding refuse exactly as they do for
+    /// GPU evidence, and a GPU verdict on a shared posture still earns
+    /// nothing, so the TDX arm widened one path and not the gate.
+    #[test]
+    fn a_tdx_verdict_earns_isolated_without_a_posture() {
+        let now = Utc::now();
+        let shared = NodePosture {
+            isolation: IsolationMode::Shared,
+            attestation: None,
+        };
+        let tdx = verdict_at(
+            AttestationKind::Tdx,
+            TrustClass::Attested,
+            now + chrono::Duration::hours(12),
+        );
+        let expired_tdx = verdict_at(
+            AttestationKind::Tdx,
+            TrustClass::Attested,
+            now - chrono::Duration::minutes(1),
+        );
+        let gpu = verdict_at(
+            AttestationKind::NvidiaGpu,
+            TrustClass::Isolated,
+            now + chrono::Duration::hours(12),
+        );
+
+        assert_eq!(
+            class_for_verdict("0xabc", true, Some(&shared), Some(&tdx), now),
+            TrustClass::Isolated
+        );
+        assert_eq!(
+            class_for_verdict("0xabc", true, None, Some(&tdx), now),
+            TrustClass::Isolated
+        );
+        assert_eq!(
+            class_for_verdict("0xabc", false, Some(&shared), Some(&tdx), now),
+            TrustClass::Open
+        );
+        assert_eq!(
+            class_for_verdict("0xabc", true, Some(&shared), Some(&expired_tdx), now),
+            TrustClass::Open
+        );
+        assert_eq!(
+            class_for_verdict("0xdef", true, Some(&shared), Some(&tdx), now),
+            TrustClass::Open
+        );
+        assert_eq!(
+            class_for_verdict("0xabc", true, Some(&shared), Some(&gpu), now),
+            TrustClass::Open
+        );
+    }
+
     // A verdict is a statement about one node. Pairing it with another grants
     // nothing, so a lookup that returns the wrong row cannot promote a node
     // that never attested.
@@ -2189,19 +2361,19 @@ mod tests {
         );
     }
 
-    // A kind the verifier does not walk a chain for cannot grant a class.
+    // A kind is only as good as the verifier behind it. GPU and TDX verdicts
+    // come from chains this workspace actually walks; SEV-SNP is lease-level
+    // evidence and grants nothing at the node, and NvidiaCc has no verifier,
+    // so a verdict claiming either kind at node level derives Open however it
+    // got minted.
     #[test]
-    fn only_a_gpu_verdict_grants_isolated_today() {
+    fn only_verified_kinds_grant_a_node_class() {
         let now = Utc::now();
         let kata = NodePosture {
             isolation: IsolationMode::KataVfio,
             attestation: None,
         };
-        for kind in [
-            AttestationKind::SevSnp,
-            AttestationKind::Tdx,
-            AttestationKind::NvidiaCc,
-        ] {
+        for kind in [AttestationKind::SevSnp, AttestationKind::NvidiaCc] {
             let verdict = verdict_at(kind, TrustClass::Isolated, now + chrono::Duration::hours(1));
             assert_eq!(
                 class_for_verdict("0xabc", true, Some(&kata), Some(&verdict), now),
@@ -2209,6 +2381,16 @@ mod tests {
                 "{kind:?}"
             );
         }
+        let tdx = verdict_at(
+            AttestationKind::Tdx,
+            TrustClass::Isolated,
+            now + chrono::Duration::hours(1),
+        );
+        assert_eq!(
+            class_for_verdict("0xabc", true, Some(&kata), Some(&tdx), now),
+            TrustClass::Isolated,
+            "Tdx"
+        );
     }
 
     const GUEST_CHANNEL_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 prism-guest";
@@ -2415,7 +2597,7 @@ mod tests {
 
         for (name, node, node_class, verdict, expected) in cases {
             assert_eq!(
-                class_for_lease(7, node, node_class, verdict, now),
+                class_for_lease(7, node, node_class, verdict, None, now),
                 expected.min(MAX_VERIFIABLE_TRUST_CLASS),
                 "{name}"
             );
@@ -2440,11 +2622,83 @@ mod tests {
         ] {
             for verdict in [None, Some(&overreaching)] {
                 assert!(
-                    class_for_lease(7, "0xabc", node_class, verdict, now)
+                    class_for_lease(7, "0xabc", node_class, verdict, None, now)
                         <= MAX_VERIFIABLE_TRUST_CLASS
                 );
             }
         }
+    }
+
+    /// Confidential is two claims or nothing. A guest verdict alone carries
+    /// the lease to Attested; a CC verdict alone carries it nowhere, because
+    /// encrypted VRAM behind an unmeasured host is a locked door in an open
+    /// wall. Together they derive Confidential, and the ceiling then says
+    /// whether the network can serve what the evidence earned: today it
+    /// clamps to Attested, and this test states both facts so moving the
+    /// ceiling flips the second assertion and not the derivation.
+    #[test]
+    fn confidential_takes_the_guest_and_the_gpu_together() {
+        let now = Utc::now();
+        let fresh = now + chrono::Duration::hours(2);
+        let snp = lease_verdict_at(7, AttestationKind::SevSnp, TrustClass::Attested, fresh);
+        let tdx = lease_verdict_at(7, AttestationKind::Tdx, TrustClass::Attested, fresh);
+        let cc = lease_verdict_at(
+            7,
+            AttestationKind::NvidiaCc,
+            TrustClass::Confidential,
+            fresh,
+        );
+        let stale_cc = lease_verdict_at(
+            7,
+            AttestationKind::NvidiaCc,
+            TrustClass::Confidential,
+            now - chrono::Duration::minutes(1),
+        );
+
+        for guest in [&snp, &tdx] {
+            let derived = class_for_lease(
+                7,
+                "0xabc",
+                TrustClass::Isolated,
+                Some(guest),
+                Some(&cc),
+                now,
+            );
+            assert_eq!(
+                derived,
+                TrustClass::Confidential.min(MAX_VERIFIABLE_TRUST_CLASS)
+            );
+            assert_eq!(derived, TrustClass::Attested, "the ceiling clamps today");
+        }
+
+        assert_eq!(
+            class_for_lease(7, "0xabc", TrustClass::Isolated, None, Some(&cc), now),
+            TrustClass::Isolated,
+            "a CC verdict alone lifts nothing"
+        );
+        assert_eq!(
+            class_for_lease(7, "0xabc", TrustClass::Isolated, Some(&tdx), None, now),
+            TrustClass::Attested
+        );
+        assert_eq!(
+            class_for_lease(
+                7,
+                "0xabc",
+                TrustClass::Isolated,
+                Some(&snp),
+                Some(&stale_cc),
+                now
+            ),
+            TrustClass::Attested,
+            "a stale CC verdict subtracts the confidential half only"
+        );
+        // The two roles are not interchangeable: a guest verdict presented as
+        // the CC claim, or a CC verdict presented as the guest, derives from
+        // neither.
+        assert_eq!(
+            class_for_lease(7, "0xabc", TrustClass::Isolated, Some(&cc), Some(&snp), now),
+            TrustClass::Isolated
+        );
     }
 
     #[test]
