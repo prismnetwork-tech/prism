@@ -39,6 +39,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.8,
     },
     {
+      url: new URL("/docs/open-mode", siteUrl).href,
+      changeFrequency: "monthly",
+      priority: 0.6,
+    },
+    {
       url: new URL("/privacy", siteUrl).href,
       changeFrequency: "yearly",
       priority: 0.3,

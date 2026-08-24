@@ -320,6 +320,12 @@ export function DeveloperDocs() {
               <RuntimeRow label="Evidence" cloud="Provider instance and hourly cost" physical="Device-signed telemetry and gateway timing" />
               <RuntimeRow label="Availability" cloud="Live" physical="Planned; not available for production leases" />
             </div>
+            <p>
+              Operators can also serve open-class leases from machines they already own, with the
+              card left on the host driver and an optional workload filling the time between
+              leases. <Link href="/docs/open-mode">Serving leases from a machine you already own</Link>{" "}
+              covers the host requirements, the preflight, and the idle workload.
+            </p>
             <Subheading id="container-requirements">Container requirements</Subheading>
             <ul className="docs-list">
               <li>Publicly pullable Linux/amd64 OCI image.</li>
