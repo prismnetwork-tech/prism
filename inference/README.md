@@ -13,6 +13,11 @@ The gateway is itself a renter. It leases through the same escrow as everyone
 else with its own funded wallet, pays per second, and its leases settle with
 the same public receipts.
 
+A second class of model is not served here at all. Those requests are relayed to
+a Phala GPU TEE, which signs a receipt over the bytes it received and the bytes
+it returned, and the caller can encrypt the prompt so that the relay carries
+ciphertext. See [Confidential generations](#confidential-generations).
+
 ## Run it
 
 ```sh
@@ -132,6 +137,108 @@ and `response` are `sha256:` digests of the text. `lease_ids` names the leases
 that did the work, and those settle on-chain with their own public receipts, so
 the chain runs batch root to item to lease to settlement.
 
+## Confidential generations
+
+There is a second class of model on this gateway that Prism does not serve. A
+confidential request is relayed to Phala's attested gateway, where the model
+runs inside an Intel TDX enclave on an NVIDIA GPU, and the enclave signs a
+receipt over the exact bytes of your request and the exact bytes of its answer.
+You pay Prism the same way you pay for anything else here, and you can check the
+work yourself rather than take our word for it.
+
+```sh
+curl -s -X POST http://localhost:8500/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+        "model": "phala/gemma-4-26b-a4b-uncensored",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "What is a prism?"}]
+      }'
+```
+
+The body and the response are the OpenAI chat-completions shape. With no payment
+this answers `402` with the price for the `max_tokens` you asked for, exactly
+like `/v1/inference`. `max_tokens` is required on this route: your bytes go
+upstream unchanged, so a cap the gateway cannot rewrite is a cap you have to
+state. Streaming is not offered, because a relay that returns one response body
+verbatim cannot also return it in pieces.
+
+The response carries `X-Receipt-Id`, the enclave's `X-ACI-Version` and
+`X-ACI-Keyset-Digest`, and any `X-E2EE-*` headers it set. Fetch the receipt
+promptly; upstream keeps them in memory and a restart loses them.
+
+### What the gateway reads
+
+Two fields, `model` and `max_tokens`, taken with a parse that never touches the
+buffer it forwards. Your request reaches the enclave as the bytes you sent, and
+the enclave's answer reaches you as the bytes it returned. That is the whole
+contract of this route: any re-serialization, however faithful, would change a
+hash the signed receipt commits to, and every check you can run on it would
+fail. Message content is never logged; the log line for a confidential request
+carries the model, the token counts, the upstream cost, and the receipt id.
+
+Send the five `X-E2EE-*` headers and the gateway passes them straight through.
+Message content is then encrypted to the enclave's public key, which is bound
+into the attested keyset, and the relay carries ciphertext it cannot read. The
+[E2EE v2 specification](https://github.com/Dstack-TEE/private-ai-gateway) defines
+the envelope; the Prism SDK implements it.
+
+### Checking the work
+
+Four free endpoints, unauthenticated and rate limited:
+
+| Endpoint | What it gives you |
+| --- | --- |
+| `GET /v1/attestation?nonce=` | The TDX quote, the measured compose, and the workload keyset, bound to a nonce you choose (64 lowercase hex). |
+| `GET /v1/receipts/{id}` | The signed receipt for one completion: the hash of the request bytes the enclave received, the hash of the response bytes it returned, and the upstream GPU verification outcome. |
+| `GET /v1/sessions` and `GET /v1/sessions/{id}` | The attested upstream sessions currently serving, with the evidence each receipt cites. |
+| `GET /v1/gpu-evidence?model=` | The GPU evidence in the shape NVIDIA's attestation service takes as a request body, so the GPU leg can be verified by NVIDIA rather than by us. |
+
+Receipts are owned upstream by whoever paid for the completion, which is this
+gateway. Relaying them under our key is what makes yours reachable.
+
+### The trust boundary
+
+What the attestation proves: a genuine Intel TDX enclave, running the measured
+compose whose source commit the report names, holding the keys that signed your
+receipt, in front of a GPU that NVIDIA attests with secure boot on and debug
+off. What it does not prove: that TLS terminates inside that enclave, or who
+holds the keys at rest. The protocol publishes no custody evidence today, and
+the TLS key pin shows only that you reached the right terminator. End-to-end
+encryption is the part that does not depend on either: with it on, the enclave's
+key is the only one that can read your message content, and this gateway carries
+bytes it cannot open.
+
+Prism operates the relay and the verification tooling. Prism hardware does not
+run these models. The `phala/` model ids are not pinned to a build upstream: the
+attestation binds the workload that serves them, not the weights behind the
+name.
+
+### Rates
+
+| Model | Base | Per output token | A 256-token answer | Full 1024-token answer |
+| --- | --- | --- | --- | --- |
+| `phala/gemma-4-26b-a4b-uncensored` | 10000 | 5 | $0.011280 | $0.015120 |
+| `phala/qwen3.6-35b-a3b-uncensored` | 20000 | 10 | $0.022560 | $0.030240 |
+
+These cover what the upstream charges rather than what a lease burns, at roughly
+eight times the upstream catalog price at the caps this route enforces: a 32 KiB
+body and 1024 output tokens.
+
+The daily cap is `INFERENCE_CONFIDENTIAL_DAILY_USD`. A request is counted
+against it before it is relayed: the gateway holds the request's own quoted
+price against the day while the call is in flight, then replaces that figure
+with the upstream's `usage.cost` once a response carries one. A response with no
+cost keeps the held figure, and the gateway logs once that the upstream stopped
+reporting. A request the day's remaining room cannot cover answers `503` with
+nothing charged, so set the cap above the full-cap price of one call.
+
+A confidential payment is consumed only when a response is served, the same rule
+as everywhere else here. An upstream that is out of quota, rate limited, or down
+answers `503` and leaves your payment header good for the retry. One that did
+serve replays its own answer byte for byte, marked with `X-Prism-Replayed`, so a
+lost connection costs you nothing.
+
 ## Configuration
 
 | Variable | Meaning |
@@ -148,6 +255,28 @@ the chain runs batch root to item to lease to settlement.
 | `INFERENCE_BATCH_ITEMS_PER_BOX` | Prompts a batch must carry before it is worth another GPU (default 25). |
 | `INFERENCE_PORT` / `INFERENCE_TUNNEL_PORT` | HTTP port (8500) and local ollama tunnel port (11435). |
 | `INFERENCE_PAYMENTS_FILE` | Consumed-payment ledger (default `./inference-consumed.log`). |
+| `INFERENCE_CONFIDENTIAL` | Turns the confidential class on. JSON, see below. Unset leaves those routes answering 404. |
+| `INFERENCE_CONFIDENTIAL_DAILY_USD` | Upstream spend the confidential relay may commit in a UTC day, in-flight requests included (default 1.0). Set it above one call's full-cap price. |
+| `PHALA_API_KEY` | The upstream bearer, named by `key_env`. Server-side only. |
+
+```json
+{
+  "upstream": "https://tee.redpill.ai/v1",
+  "key_env": "PHALA_API_KEY",
+  "models": { "phala/gemma-4-26b-a4b-uncensored": {} }
+}
+```
+
+`models` is the allowlist: a model that is not listed is refused before anything
+is charged. An empty object per model takes the shipped rates above, and
+`{"base_micros": 12000, "per_token_micros": 6}` overrides them. `legacy_upstream`
+moves the GPU evidence host off its `https://api.redpill.ai/v1` default.
+
+The upstream key belongs in the deployment's environment file and nowhere else.
+It is read once at boot, never returned by any route, and never written to a
+log line. Callers reach the upstream only through the endpoints above, and the
+free ones are rate limited so the gateway does not become an open proxy for a
+key it pays for.
 
 Generations are capped at 1024 output tokens and prompts at 32 KiB, so the
 price bounds what one request can spend of the warm window. `ssh` must be on

@@ -32,6 +32,26 @@ export const MAX_PROMPT_BYTES = 32 * 1024;
 export const MAX_PREDICT_TOKENS = 1_024;
 export const MAX_BATCH_ITEMS = 64;
 
+// The confidential class is not served on our own GPUs: the gateway relays a
+// paid request to Phala's attested TEE gateway and hands the bytes back
+// untouched. The rate card therefore covers what the upstream charges rather
+// than what a lease burns, and it is set at roughly eight times the upstream
+// catalog price at the caps below.
+//
+// gemma-4-26b lists at $0.15/M input and $0.70/M output, qwen3.6-35b at $0.30
+// and $1.50. A request is bounded by a 32 KiB body and a stated `max_tokens`
+// of at most 1024, so the worst upstream cost per call is about 1,950 micros
+// for gemma and 4,000 for qwen.
+export const DEFAULT_CONFIDENTIAL_PRICING = {
+  "phala/gemma-4-26b-a4b-uncensored": { base: 10_000, perToken: 5 },
+  "phala/qwen3.6-35b-a3b-uncensored": { base: 20_000, perToken: 10 },
+};
+export const CONFIDENTIAL_UPSTREAM = "https://tee.redpill.ai/v1";
+// The GPU evidence the NVIDIA attestation service wants as its request body is
+// only published by the general host, not the confidential-only one.
+export const CONFIDENTIAL_LEGACY_UPSTREAM = "https://api.redpill.ai/v1";
+export const MAX_CONFIDENTIAL_BODY_BYTES = 32 * 1024;
+
 // A request's price is the model's base plus its per-token rate over the
 // output cap the caller asked for. The full-cap price is what /v1/models
 // advertises, so a client that pays it without asking for a request-specific
@@ -57,16 +77,110 @@ const ROUTES = {
   single: {
     path: "/v1/inference",
     unit: "One generation",
+    where: "on Prism GPUs",
+    rail: ", which is where the serving leases settle",
     resource: "One LLM generation on a rented GPU, priced per request.",
   },
   batch: {
     path: "/v1/batch",
     unit: "A batch of independent generations",
+    where: "on Prism GPUs",
+    rail: ", which is where the serving leases settle",
     resource:
       "Many independent prompts in one paid call, spread across the rented GPUs the gateway " +
       "holds, returned with a Merkle receipt over the set.",
   },
+  confidential: {
+    path: "/v1/chat/completions",
+    unit: "One confidential generation",
+    where: "in a Phala GPU TEE",
+    resource:
+      "One OpenAI-shaped chat completion served inside a Phala GPU TEE, priced per request. " +
+      "The gateway relays the request bytes and returns the response bytes unchanged, and the " +
+      "TEE signs a receipt over both.",
+  },
 };
+
+// Sent up to the TEE when the caller encrypts. The gateway does not read or
+// produce them; it carries whichever ones arrive, and the upstream rejects a
+// partial set.
+const E2EE_REQUEST_HEADERS = [
+  "x-e2ee-version",
+  "x-client-pub-key",
+  "x-model-pub-key",
+  "x-e2ee-nonce",
+  "x-e2ee-timestamp",
+];
+// What a caller needs off the response to fetch and verify its receipt.
+const RELAY_RESPONSE_HEADERS = [
+  "x-receipt-id",
+  "x-aci-version",
+  "x-aci-keyset-digest",
+  "x-e2ee-applied",
+  "x-e2ee-version",
+  "x-e2ee-algo",
+];
+
+const HEX_64 = /^[0-9a-f]{64}$/;
+const RECEIPT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const UPSTREAM_NAME = /^[A-Za-z0-9._:/-]{1,128}$/;
+
+/// A confidential model nobody costed is priced as the most expensive one that
+/// was, for the same reason the ollama card does it: guessing low loses money
+/// on every call.
+const PRICIEST_CONFIDENTIAL = Object.values(DEFAULT_CONFIDENTIAL_PRICING).reduce((a, b) =>
+  a.base + a.perToken * MAX_PREDICT_TOKENS >= b.base + b.perToken * MAX_PREDICT_TOKENS ? a : b,
+);
+
+function confidentialCard(cfg) {
+  const entries = Object.entries(cfg.models ?? {});
+  if (!entries.length) throw new Error("the confidential class needs at least one model");
+  const pricing = {};
+  for (const [model, over] of entries) {
+    const card = DEFAULT_CONFIDENTIAL_PRICING[model] ?? PRICIEST_CONFIDENTIAL;
+    const base = Number(over?.base_micros ?? over?.base ?? card.base);
+    const perToken = Number(over?.per_token_micros ?? over?.per_token ?? over?.perToken ?? card.perToken);
+    if (!Number.isFinite(base) || base < 0 || !Number.isFinite(perToken) || perToken < 0) {
+      throw new Error(`confidential pricing for ${model} must be non-negative numbers`);
+    }
+    pricing[model] = { base, perToken };
+  }
+  if (!cfg.key) throw new Error("the confidential class needs an upstream API key");
+  const dailyUsd = Number(cfg.dailyUsd ?? 1);
+  if (!Number.isFinite(dailyUsd) || dailyUsd <= 0) {
+    throw new Error("the confidential daily spend cap must be a positive number of dollars");
+  }
+  return {
+    upstream: String(cfg.upstream ?? CONFIDENTIAL_UPSTREAM).replace(/\/$/, ""),
+    legacyUpstream: String(cfg.legacyUpstream ?? CONFIDENTIAL_LEGACY_UPSTREAM).replace(/\/$/, ""),
+    key: cfg.key,
+    dailyUsd,
+    pricing,
+  };
+}
+
+/// Reads the two fields the gateway is allowed to look at. The buffer this was
+/// parsed from is what gets forwarded, so nothing here can reshape the request.
+function peek(bytes) {
+  try {
+    const value = JSON.parse(bytes.toString("utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function readUsage(bytes) {
+  const body = peek(bytes);
+  const usage = body?.usage;
+  if (!usage || typeof usage !== "object") return {};
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  return {
+    prompt_tokens: num(usage.prompt_tokens),
+    completion_tokens: num(usage.completion_tokens),
+    cost: num(usage.cost),
+  };
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -119,6 +233,18 @@ export function createGateway({
   // The batch takes a different body, and an indexer that reads the single
   // request's schema off a batch 402 publishes a call that cannot work.
   batchSchemas = null,
+  confidentialSchemas = null,
+  // Null leaves the confidential class off entirely, which is what an operator
+  // without an upstream key gets: the routes answer 404 rather than half-work.
+  confidential = null,
+  maxConfidentialBytes = MAX_CONFIDENTIAL_BODY_BYTES,
+  // A generation in a TEE is not faster than one on a lease, and the relay
+  // holds the connection for the whole of it.
+  confidentialTimeoutMs = 180_000,
+  relayTimeoutMs = 30_000,
+  // The free relay endpoints cost us an upstream request each. Enough headroom
+  // for an agent verifying every call it makes, not enough to be a proxy.
+  relayPerMinute = 120,
   // Sets the base for every model when given, so an operator can move the
   // whole card without listing it. Null leaves the shipped card alone.
   priceMicros = null,
@@ -147,6 +273,7 @@ export function createGateway({
   verify,
   spawnTunnel,
   fetchOllama,
+  fetchUpstream = fetch,
   log = (line) => console.error(line),
   now = () => Date.now(),
 }) {
@@ -167,6 +294,23 @@ export function createGateway({
   }
   const fullCap = (m) => priceFor(pricing, m, null).micros;
   const maxPriceMicros = models.map(fullCap).reduce((a, b) => (a > b ? a : b));
+  const conf = confidential ? confidentialCard(confidential) : null;
+  const confModels = conf ? Object.keys(conf.pricing) : [];
+  const confFullCap = (m) => priceFor(conf.pricing, m, null).micros;
+  const maxConfidentialMicros = conf
+    ? confModels.map(confFullCap).reduce((a, b) => (a > b ? a : b))
+    : 0n;
+  // Paths as a caller sees them. The gateway is mounted under a prefix in
+  // production, and an agent handed "/v1/attestation" from behind it fetches
+  // the wrong host's root.
+  const prefix = (() => {
+    try {
+      return new URL(originUrl).pathname.replace(/\/$/, "");
+    } catch {
+      return "";
+    }
+  })();
+  const publicPath = (p) => `${prefix}${p}`;
   const stats = {
     since: now(), generations: 0, tokens_in: 0, tokens_out: 0,
     revenue_micros: 0n, leases_warmed: 0,
@@ -177,7 +321,15 @@ export function createGateway({
     // until someone checks the chain.
     unconfirmed: 0,
     batches: 0, batch_items: 0,
+    // The confidential class is bought from upstream rather than served, so
+    // what it costs is tracked next to what it earns.
+    confidential_generations: 0, confidential_tokens_in: 0, confidential_tokens_out: 0,
+    confidential_cost_usd: 0,
   };
+  // Reset on the UTC day boundary, which is what the cap is stated in. `usd`
+  // carries settled cost plus what in-flight requests have reserved.
+  const spend = { day: null, usd: 0 };
+  let costUnreported = false;
 
   const consumed = loadConsumed(paymentsFile);
   // A client that paid and then lost the connection must be able to fetch what
@@ -387,7 +539,11 @@ export function createGateway({
 
   /// Both stablecoins carry six decimals, so one price in micros is the price
   /// on either rail with no conversion.
-  const schemasFor = (route) => (route === ROUTES.batch ? batchSchemas ?? schemas : schemas);
+  function schemasFor(route) {
+    if (route === ROUTES.batch) return batchSchemas ?? schemas;
+    if (route === ROUTES.confidential) return confidentialSchemas;
+    return schemas;
+  }
 
   function accepted(amount, route = ROUTES.single) {
     const shape = schemasFor(route);
@@ -401,7 +557,7 @@ export function createGateway({
         amount: amount.toString(),
         resource: `${originUrl}${route.path}`,
         description:
-          `${route.unit} on Prism GPUs, paid in USDC on Base. Sign an EIP-3009 ` +
+          `${route.unit} ${route.where}, paid in USDC on Base. Sign an EIP-3009 ` +
           "transferWithAuthorization for the quoted amount and send it as the payment header. " +
           "You need no gas: the authorization is broadcast for you.",
         mimeType: "application/json",
@@ -418,8 +574,8 @@ export function createGateway({
       amount: amount.toString(),
       resource: `${originUrl}${route.path}`,
       description:
-        `${route.unit} on Prism GPUs, paid in USDG on Robinhood Chain, which is where the ` +
-        "serving leases settle. Sign an EIP-3009 transferWithAuthorization for the quoted amount " +
+        `${route.unit} ${route.where}, paid in USDG on Robinhood Chain${route.rail ?? ""}. ` +
+        "Sign an EIP-3009 transferWithAuthorization for the quoted amount " +
         "and send it as the payment header; you need no gas, because the authorization is " +
         "broadcast for you. The older flow, a direct transfer plus a signed tx hash, still works.",
       mimeType: "application/json",
@@ -437,7 +593,8 @@ export function createGateway({
   /// name, v2 wants `amount` and CAIP-2. The prices and networks are the same
   /// either way.
   function requirements(state, quote = null, version = 2, error = null, route = ROUTES.single) {
-    const amount = quote?.micros ?? maxPriceMicros;
+    const amount =
+      quote?.micros ?? (route === ROUTES.confidential ? maxConfidentialMicros : maxPriceMicros);
     return paymentRequired(version, {
       error,
       accepts: accepted(amount, route),
@@ -584,6 +741,43 @@ export function createGateway({
     };
   }
 
+  /// Under the exact scheme nothing has moved until this call, so the money is
+  /// taken only once there is something to hand back. The exposure is the
+  /// reverse window: a payer who empties their wallet between verification and
+  /// this broadcast gets one generation free. That is bounded by a single
+  /// request's price, needs a deliberate race, and is cheaper to absorb than a
+  /// refund path that can fail on its own.
+  ///
+  /// Null when there is nothing to broadcast, which is the legacy scheme, where
+  /// the money moved before the request arrived.
+  async function settlePayment(payment, micros, what = "") {
+    if (!payment.settle) return null;
+    let settlement;
+    try {
+      settlement = await payment.settle();
+    } catch (err) {
+      // The broadcast may well have gone through, so this cannot throw out of
+      // here: the caller has already paid for work that is already done, and a
+      // 500 would hand them nothing for it.
+      log(`settlement threw after serving${what}: ${err.message}`);
+      settlement = { success: false, settled: null, errorReason: "settlement_unconfirmed", payer: payment.payer };
+    }
+    if (settlement.success) return settlement;
+    // `settled === null` means the money may have moved and we could not read
+    // whether it did, which is not the same as being unpaid. Counting it as
+    // revenue would overstate; counting it as a loss would understate. It is
+    // recorded apart from both.
+    if (settlement.settled === null) {
+      stats.unconfirmed += 1;
+      log(`settlement unconfirmed${what}: tx=${settlement.transaction ?? "none"} payer=${payment.payer} detail=${settlement.detail ?? "none"}`);
+    } else {
+      stats.unsettled += 1;
+      stats.unsettled_micros += micros;
+      log(`settlement failed after serving${what}: ${settlement.errorReason ?? "unknown"} payer=${payment.payer} detail=${settlement.detail ?? "none"}`);
+    }
+    return settlement;
+  }
+
   async function handleInference(body, paymentHeader, paymentVersion = null) {
     // v2 unless the caller showed us they speak v1. The scanners and the
     // agent tooling read v2 only, and an unpaid probe tells us nothing about
@@ -620,7 +814,11 @@ export function createGateway({
     const quote = { model: body.model, cap, micros };
     const payment = await checkPayment(String(paymentHeader), micros, ROUTES.single);
     if (!payment.ok) {
-      if (payment.replay) return { status: 200, body: { ...payment.replay, replayed: true } };
+      // A payment already spent on the confidential relay replays there, as
+      // raw bytes, and has no JSON result to hand back here.
+      if (payment.replay && !payment.replay.relay) {
+        return { status: 200, body: { ...payment.replay, replayed: true } };
+      }
       // A refused payment is still a 402, and a v2 client reads the terms from
       // the header rather than the body, so it has to carry them here too.
       const refused = requirements(phase(), quote, version, payment.reason);
@@ -666,43 +864,9 @@ export function createGateway({
       };
     }
 
-    // Under the exact scheme nothing has moved until this call, so the money is
-    // taken only once there is something to hand back. The exposure is the
-    // reverse window: a payer who empties their wallet between verification and
-    // this broadcast gets one generation free. That is bounded by a single
-    // request's price, needs a deliberate race, and is cheaper to absorb than a
-    // refund path that can fail on its own.
-    let settlement = null;
-    if (payment.settle) {
-      try {
-        settlement = await payment.settle();
-      } catch (err) {
-        // The broadcast may well have gone through, so this cannot throw out of
-        // here: the caller has already paid for work that is already done, and
-        // a 500 would hand them nothing for it.
-        settlement = { success: false, settled: null, errorReason: "settlement_unconfirmed", payer: payment.payer };
-        log(`settlement threw after serving: ${err.message}`);
-      }
-      if (!settlement.success) {
-        // `settled === null` means the money may have moved and we could not
-        // read whether it did, which is not the same as being unpaid. Counting
-        // it as revenue would overstate; counting it as a loss would understate.
-        // It is recorded apart from both.
-        if (settlement.settled === null) {
-          stats.unconfirmed += 1;
-          log(`settlement unconfirmed: tx=${settlement.transaction ?? "none"} payer=${payment.payer} detail=${settlement.detail ?? "none"}`);
-        } else {
-          stats.unsettled += 1;
-          stats.unsettled_micros += micros;
-          log(`settlement failed after serving: ${settlement.errorReason ?? "unknown"} payer=${payment.payer} detail=${settlement.detail ?? "none"}`);
-        }
-        payment.commit(result);
-        return { status: 200, body: result, headers: paymentResponse(version, settlement).headers };
-      }
-    }
-
+    const settlement = await settlePayment(payment, micros);
     payment.commit(result);
-    stats.revenue_micros += micros;
+    if (!settlement || settlement.success) stats.revenue_micros += micros;
     return {
       status: 200,
       body: result,
@@ -815,7 +979,9 @@ export function createGateway({
     const quote = { model: body.model, cap, micros, count: prompts.length };
     const payment = await checkPayment(String(paymentHeader), micros, ROUTES.batch);
     if (!payment.ok) {
-      if (payment.replay) return { status: 200, body: { ...payment.replay, replayed: true } };
+      if (payment.replay && !payment.replay.relay) {
+        return { status: 200, body: { ...payment.replay, replayed: true } };
+      }
       const refused = batchRequirements(phase(), quote, version, payment.reason);
       return { status: 402, body: refused.body, headers: refused.headers };
     }
@@ -858,26 +1024,7 @@ export function createGateway({
       };
     }
 
-    let settlement = null;
-    if (payment.settle) {
-      try {
-        settlement = await payment.settle();
-      } catch (err) {
-        settlement = { success: false, settled: null, errorReason: "settlement_unconfirmed", payer: payment.payer };
-        log(`settlement threw after serving a batch: ${err.message}`);
-      }
-      if (!settlement.success) {
-        if (settlement.settled === null) {
-          stats.unconfirmed += 1;
-          log(`batch settlement unconfirmed: tx=${settlement.transaction ?? "none"} payer=${payment.payer}`);
-        } else {
-          stats.unsettled += 1;
-          stats.unsettled_micros += micros;
-          log(`batch settlement failed after serving: ${settlement.errorReason ?? "unknown"} payer=${payment.payer}`);
-        }
-      }
-    }
-
+    const settlement = await settlePayment(payment, micros, " a batch");
     const result = assembleBatch({ items, prompts, model: body.model, payment, micros, settlement });
     stats.batches += 1;
     stats.batch_items += items.length;
@@ -930,6 +1077,373 @@ export function createGateway({
     };
   }
 
+  // The confidential class. Nothing below leases, generates, or reshapes a
+  // body: the gateway takes payment, forwards the caller's bytes to Phala's
+  // attested gateway, and hands back what came out. Byte transparency is the
+  // whole point, because the TEE signs a receipt over the request bytes it
+  // received and the response bytes it returned, and a relay that re-serialized
+  // either one would break every hash the caller checks.
+
+  const spendToday = () => {
+    const day = new Date(now()).toISOString().slice(0, 10);
+    if (spend.day !== day) {
+      spend.day = day;
+      spend.usd = 0;
+    }
+    return spend.usd;
+  };
+
+  /// What a request is assumed to cost us until the upstream says otherwise.
+  /// The rate card sits well above the upstream catalog price at these caps, so
+  /// a figure modelled from it overstates the cost rather than understating it.
+  const modelledUsd = (micros) => Number(micros) / 1e6;
+
+  /// The cap is decided on committed plus in-flight: a request holds its
+  /// modelled cost from before the round trip until the upstream has either
+  /// served it or not. Reserving before the call is what stops concurrent
+  /// requests from all reading the same pre-call total and all going through.
+  function reserveSpend(usd) {
+    if (spendToday() + usd > conf.dailyUsd) return false;
+    spend.usd += usd;
+    return true;
+  }
+
+  /// Gives a reservation back and books what the request actually cost, which
+  /// is nothing when the upstream served nothing.
+  function settleSpend(reserved, actual = 0) {
+    spendToday();
+    spend.usd = Math.max(0, spend.usd - reserved + actual);
+  }
+
+  const relayCalls = [];
+  function relayAllowed() {
+    const cutoff = now() - 60_000;
+    while (relayCalls.length && relayCalls[0] <= cutoff) relayCalls.shift();
+    if (relayCalls.length >= relayPerMinute) return false;
+    relayCalls.push(now());
+    return true;
+  }
+
+  function headersUp(headers) {
+    const out = {};
+    for (const [name, value] of Object.entries(headers ?? {})) {
+      const key = name.toLowerCase();
+      if (E2EE_REQUEST_HEADERS.includes(key) && typeof value === "string") out[key] = value;
+    }
+    return out;
+  }
+
+  function headersDown(headers) {
+    const out = { "content-type": headers.get("content-type") ?? "application/json" };
+    for (const name of RELAY_RESPONSE_HEADERS) {
+      const value = headers.get(name);
+      if (value != null) out[name] = value;
+    }
+    return out;
+  }
+
+  /// Reads an upstream response whole. The bytes are what the caller gets and
+  /// what the receipt is signed over, so they are never decoded and re-encoded.
+  async function readUpstream(res) {
+    return { status: res.status, headers: headersDown(res.headers), bytes: Buffer.from(await res.arrayBuffer()) };
+  }
+
+  const disabled = () => ({ status: 404, body: { error: "confidential_disabled" } });
+
+  /// A free pass-through to one of the TEE's transparency endpoints. The
+  /// upstream bearer stays here; what the caller gets back is the document.
+  async function relayGet(path, { auth = false, label } = {}) {
+    if (!relayAllowed()) {
+      return { status: 429, headers: { "retry-after": "60" }, body: { error: "rate_limited" } };
+    }
+    try {
+      const res = await fetchUpstream(`${conf.upstream}${path}`, {
+        method: "GET",
+        headers: {
+          accept: "application/json",
+          ...(auth ? { authorization: `Bearer ${conf.key}` } : {}),
+        },
+        signal: AbortSignal.timeout(relayTimeoutMs),
+      });
+      return await readUpstream(res);
+    } catch (err) {
+      log(`${label} relay failed: ${err.message}`);
+      return { status: 503, body: { error: "upstream_unavailable" } };
+    }
+  }
+
+  async function attestation(nonce) {
+    if (!conf) return disabled();
+    if (typeof nonce !== "string" || !HEX_64.test(nonce)) {
+      return {
+        status: 400,
+        body: {
+          error: "invalid_nonce",
+          detail: "nonce must be 64 lowercase hex characters, freshly chosen by the caller",
+        },
+      };
+    }
+    return relayGet(`/aci/attestation?nonce=${nonce}`, { label: "attestation" });
+  }
+
+  // Receipts are owned upstream by whoever paid for the completion, and that is
+  // this gateway's bearer. Relaying them under our own key is what makes a
+  // receipt reachable for the agent that bought the generation.
+  async function receipt(id) {
+    if (!conf) return disabled();
+    if (typeof id !== "string" || !RECEIPT_ID.test(id)) {
+      return { status: 400, body: { error: "invalid_receipt_id" } };
+    }
+    return relayGet(`/aci/receipts/${encodeURIComponent(id)}`, { auth: true, label: "receipt" });
+  }
+
+  async function session(id) {
+    if (!conf) return disabled();
+    if (typeof id !== "string" || !HEX_64.test(id)) {
+      return { status: 400, body: { error: "invalid_session_id" } };
+    }
+    return relayGet(`/aci/sessions/${id}`, { label: "session" });
+  }
+
+  async function sessions({ model = null, upstreamName = null } = {}) {
+    if (!conf) return disabled();
+    if (model != null && !conf.pricing[model]) {
+      return { status: 400, body: { error: "unknown_model", models: confModels } };
+    }
+    if (upstreamName != null && !UPSTREAM_NAME.test(upstreamName)) {
+      return { status: 400, body: { error: "invalid_upstream_name" } };
+    }
+    const query = new URLSearchParams();
+    if (model) query.set("model", model);
+    if (upstreamName) query.set("upstream_name", upstreamName);
+    const suffix = query.size ? `?${query}` : "";
+    return relayGet(`/aci/sessions${suffix}`, { label: "sessions" });
+  }
+
+  /// The GPU leg. This body is what NVIDIA's attestation service wants posted
+  /// to it, and only the general host publishes it, so it does not go through
+  /// `relayGet`.
+  async function gpuEvidence(model) {
+    if (!conf) return disabled();
+    if (typeof model !== "string" || !conf.pricing[model]) {
+      return { status: 400, body: { error: "unknown_model", models: confModels } };
+    }
+    if (!relayAllowed()) {
+      return { status: 429, headers: { "retry-after": "60" }, body: { error: "rate_limited" } };
+    }
+    try {
+      const res = await fetchUpstream(
+        `${conf.legacyUpstream}/attestation/report?model=${encodeURIComponent(model)}`,
+        { method: "GET", headers: { accept: "application/json" }, signal: AbortSignal.timeout(relayTimeoutMs) },
+      );
+      return await readUpstream(res);
+    } catch (err) {
+      log(`gpu evidence relay failed: ${err.message}`);
+      return { status: 503, body: { error: "upstream_unavailable" } };
+    }
+  }
+
+  async function handleConfidential(raw, headers = {}, paymentHeader, paymentVersion = null) {
+    const version = paymentVersion ?? 2;
+    if (!conf) return disabled();
+    const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw ?? "");
+    const body = bytes.length && bytes.length <= maxConfidentialBytes ? peek(bytes) : null;
+    const model = typeof body?.model === "string" ? body.model : null;
+    const known = model != null && conf.pricing[model] != null;
+    // The only other field the gateway reads. A cap it cannot rewrite is a cap
+    // the caller has to state.
+    const asked = Number.isInteger(body?.max_tokens) ? body.max_tokens : null;
+
+    if (!paymentHeader) {
+      const quote = known ? { model, ...priceFor(conf.pricing, model, asked) } : null;
+      const required = requirements("relay", quote, version, null, ROUTES.confidential);
+      return { status: 402, body: required.body, headers: required.headers };
+    }
+
+    if (!bytes.length) return { status: 400, body: { error: "body_required" } };
+    if (bytes.length > maxConfidentialBytes) {
+      return { status: 413, body: { error: "body_too_large", max_bytes: maxConfidentialBytes } };
+    }
+    if (!body) return { status: 400, body: { error: "invalid_json" } };
+    if (!known) return { status: 400, body: { error: "unknown_model", models: confModels } };
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      return { status: 400, body: { error: "messages_required" } };
+    }
+    if (body.stream) {
+      return {
+        status: 400,
+        body: {
+          error: "stream_unsupported",
+          detail: "the relay returns one response body verbatim, which a stream cannot be",
+        },
+      };
+    }
+    if (body.n != null && body.n !== 1) {
+      return { status: 400, body: { error: "n_unsupported", detail: "one completion per paid request" } };
+    }
+    // The body goes upstream untouched, so an unbounded or oversized cap cannot
+    // be clamped on the way. It is refused instead, before anything is charged.
+    if (asked == null || asked < 1 || asked > MAX_PREDICT_TOKENS) {
+      return {
+        status: 400,
+        body: {
+          error: "max_tokens_required",
+          max: MAX_PREDICT_TOKENS,
+          detail: `send an integer max_tokens between 1 and ${MAX_PREDICT_TOKENS}; the price is quoted on it`,
+        },
+      };
+    }
+
+    const { cap, micros } = priceFor(conf.pricing, model, asked);
+    const modelled = modelledUsd(micros);
+    if (!reserveSpend(modelled)) {
+      return {
+        status: 503,
+        headers: { "retry-after": "3600" },
+        body: {
+          error: "spend_cap_reached",
+          detail: "the confidential relay has reached its daily upstream spend cap",
+          retry: "nothing was charged; the cap resets at 00:00 UTC",
+        },
+      };
+    }
+
+    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.confidential);
+    if (!payment.ok) {
+      settleSpend(modelled);
+      const replay = payment.replay?.relay;
+      if (replay) {
+        return { status: replay.status, bytes: replay.bytes, headers: { ...replay.headers, "x-prism-replayed": "true" } };
+      }
+      const refused = requirements("relay", { model, cap, micros }, version, payment.reason, ROUTES.confidential);
+      return { status: 402, body: refused.body, headers: refused.headers };
+    }
+
+    let upstream;
+    try {
+      const res = await fetchUpstream(`${conf.upstream}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          authorization: `Bearer ${conf.key}`,
+          ...headersUp(headers),
+        },
+        body: bytes,
+        signal: AbortSignal.timeout(confidentialTimeoutMs),
+      });
+      upstream = await readUpstream(res);
+    } catch (err) {
+      payment.release();
+      settleSpend(modelled);
+      log(`confidential relay failed for ${model}: ${err.message}`);
+      return {
+        status: 503,
+        body: {
+          error: "upstream_unavailable",
+          detail: String(err.message ?? err),
+          retry: "the payment was not consumed; retry with the same payment header",
+        },
+      };
+    }
+
+    if (upstream.status < 200 || upstream.status >= 300) {
+      payment.release();
+      settleSpend(modelled);
+      log(`confidential upstream answered ${upstream.status} for ${model}`);
+      // Exhausted quota, a rate limit, or a fault upstream: none of it is the
+      // caller's to fix, and none of it took their money.
+      if (upstream.status >= 500 || upstream.status === 403 || upstream.status === 429) {
+        return {
+          status: 503,
+          body: {
+            error: "upstream_unavailable",
+            upstream_status: upstream.status,
+            retry: "the payment was not consumed; retry with the same payment header",
+          },
+        };
+      }
+      // A rejected request is worth quoting back, bounded, because the caller
+      // is the only one who can correct it.
+      return {
+        status: 400,
+        body: {
+          error: "upstream_rejected",
+          upstream_status: upstream.status,
+          detail: upstream.bytes.toString("utf8").slice(0, 500),
+          retry: "the payment was not consumed; fix the request and retry with the same payment header",
+        },
+      };
+    }
+
+    const usage = readUsage(upstream.bytes);
+    // What the upstream says it charged replaces the reservation. When it says
+    // nothing, the modelled figure stands as the charge.
+    const cost = usage.cost ?? modelled;
+    settleSpend(modelled, cost);
+    stats.confidential_cost_usd += cost;
+    if (usage.cost == null && !costUnreported) {
+      costUnreported = true;
+      log(
+        "confidential upstream reported no usage.cost; the modelled price of each request " +
+          "is charged against the daily cap until it does",
+      );
+    }
+    stats.confidential_generations += 1;
+    stats.confidential_tokens_in += usage.prompt_tokens ?? 0;
+    stats.confidential_tokens_out += usage.completion_tokens ?? 0;
+    // Model, usage, cost, receipt id. Message content never reaches a log line,
+    // and under e2ee it never reaches this process in the clear at all.
+    log(
+      `confidential ${model} in=${usage.prompt_tokens ?? "?"} out=${usage.completion_tokens ?? "?"} ` +
+        `cost=${usage.cost ?? `~${modelled.toFixed(6)}`} receipt=${upstream.headers["x-receipt-id"] ?? "none"}`,
+    );
+
+    const settlement = await settlePayment(payment, micros, " a confidential request");
+    const record = { relay: { status: upstream.status, headers: upstream.headers, bytes: upstream.bytes } };
+    payment.commit(record);
+    if (!settlement || settlement.success) stats.revenue_micros += micros;
+    return {
+      status: upstream.status,
+      bytes: upstream.bytes,
+      headers: {
+        ...upstream.headers,
+        ...(settlement ? paymentResponse(version, settlement).headers : {}),
+      },
+    };
+  }
+
+  function confidentialView() {
+    if (!conf) return {};
+    return {
+      confidential: {
+        endpoint: publicPath(ROUTES.confidential.path),
+        attestation: publicPath("/v1/attestation"),
+        receipts: publicPath("/v1/receipts/{id}"),
+        sessions: publicPath("/v1/sessions"),
+        gpu_evidence: publicPath("/v1/gpu-evidence"),
+        upstream: conf.upstream,
+        price_micros: maxConfidentialMicros.toString(),
+        max_tokens: MAX_PREDICT_TOKENS,
+        max_body_bytes: maxConfidentialBytes,
+        models: Object.fromEntries(
+          confModels.map((m) => [m, {
+            base_micros: conf.pricing[m].base,
+            per_token_micros: conf.pricing[m].perToken,
+            full_cap_micros: confFullCap(m).toString(),
+            confidential: true,
+            // The GPU model is not ours to assert: the verified NVIDIA claim is
+            // the only place one is named.
+            tee: "intel-tdx + nvidia",
+            provider: "phala",
+            e2ee: true,
+            attestation: publicPath("/v1/attestation"),
+          }]),
+        ),
+      },
+    };
+  }
+
   return {
     state: () => {
       const first = warmBoxes()[0] ?? null;
@@ -953,6 +1467,7 @@ export function createGateway({
         }]),
       ),
       pay_to: payTo,
+      ...confidentialView(),
       ...boxView(),
     }),
     stats: () => ({
@@ -969,6 +1484,16 @@ export function createGateway({
       unconfirmed: stats.unconfirmed,
       batches: stats.batches,
       batch_items: stats.batch_items,
+      ...(conf
+        ? {
+            confidential_generations: stats.confidential_generations,
+            confidential_tokens_in: stats.confidential_tokens_in,
+            confidential_tokens_out: stats.confidential_tokens_out,
+            confidential_cost_usd: Number(stats.confidential_cost_usd.toFixed(6)),
+            confidential_spend_today_usd: Number(spendToday().toFixed(6)),
+            confidential_daily_cap_usd: conf.dailyUsd,
+          }
+        : {}),
       ...boxView(),
     }),
     ensureWarm,
@@ -976,8 +1501,16 @@ export function createGateway({
     drainAll,
     handleInference,
     handleBatch,
+    handleConfidential,
+    attestation,
+    receipt,
+    session,
+    sessions,
+    gpuEvidence,
+    confidential: () => confidentialView().confidential ?? null,
     requirements: () => requirements(phase()).body,
     batchRequirements: () => batchRequirements(phase()).body,
+    confidentialRequirements: () => requirements("relay", null, 2, null, ROUTES.confidential).body,
   };
 
   /// One line for the whole pool, so a caller reading `/v1/models` learns how

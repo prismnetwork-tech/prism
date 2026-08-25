@@ -24,6 +24,8 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 | `prism_leases` | yes |
 | `prism_infer` | yes |
 | `prism_infer_batch` | yes |
+| `prism_confidential_infer` | yes |
+| `prism_verify_attestation` | no |
 | `prism_lease_and_run` | yes |
 | `prism_lease` | yes |
 | `prism_run` | yes |
@@ -51,6 +53,17 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
   list of prompts finishes far sooner than the same prompts sent one at a time.
   Returns every answer in order with a Merkle receipt naming the leases that did
   the work.
+- `prism_confidential_infer`: buy one generation that runs inside a GPU TEE.
+  The message contents are encrypted to a key the enclave's own attestation
+  commits to, so this server's relay carries ciphertext and cannot read the
+  prompt or the answer. Returns the answer, the cost and a receipt id the
+  workload signed over the exact bytes of the exchange.
+- `prism_verify_attestation`: check one of those generations against its
+  receipt and the hardware behind it. The server remembers the digests of the
+  last few confidential calls, so the verdict is bound to the bytes it actually
+  sent and received. Every check is reported with its result, including the two
+  that cannot be established today: private-key custody, and where TLS
+  terminates.
 - `prism_lease_and_run`: lease a GPU, run a command, return the output (one shot).
 - `prism_lease`: lease a GPU and keep it; returns a `lease_id` and SSH access.
 - `prism_run`: run a command on an existing lease.

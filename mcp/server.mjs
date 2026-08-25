@@ -2,10 +2,17 @@
 // Prism Network MCP server: lets an MCP client (Claude, agents) see and lease
 // real GPUs. Looking is free and needs no configuration. Leasing spends money,
 // so it needs a wallet: PRISM_AGENT_KEY, PRISM_ESCROW.
+import { createHash } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { DEFAULT_IMAGE, DEFAULT_TRUST_FLOOR, PrismAgent, TRUST_CLASSES } from "@prismnetwork/agent-sdk";
+import {
+  DEFAULT_IMAGE,
+  DEFAULT_TRUST_FLOOR,
+  PrismAgent,
+  TRUST_CLASSES,
+  verifyConfidential,
+} from "@prismnetwork/agent-sdk";
 
 const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 
@@ -82,53 +89,30 @@ async function publicJson(url, what) {
 }
 
 const leases = new Map();
-// Unconsumed inference payments, keyed by endpoint and price, so a failed
-// generation is retried with the same paid header instead of paying again.
-const pendingInference = new Map();
 // null in, null out: a missing price must never render as 0.000000 USDG.
 const usdg = (micros) =>
   micros == null || !Number.isFinite(Number(micros)) ? null : `${(Number(micros) / 1e6).toFixed(6)} USDG`;
 
-/// Pays once and keeps the header until the endpoint actually serves. A 503
-/// means the box is warming and a 402 for a payment that is merely too young
-/// heals by itself, so both retry with the same payment; everything else is
-/// final, and the header stays cached for the next call rather than paying
-/// twice for work that was never done.
+/// The SDK pays once and keeps the payment until the endpoint actually serves,
+/// so a generation that never happened is retried with the payment already made.
 async function payAndPost({ base, path, price, payTo, body, tool }) {
-  const pendingKey = `${base}${path}:${price}`;
-  let pending = pendingInference.get(pendingKey);
-  if (!pending) {
-    const paymentTx = await agent.transferUsdg(payTo, price);
-    const signature = await agent.account.signMessage({ message: paymentTx });
-    pending = {
-      tx: paymentTx,
-      header: Buffer.from(JSON.stringify({ txHash: paymentTx, signature })).toString("base64"),
-    };
-    pendingInference.set(pendingKey, pending);
-  }
-  const deadline = Date.now() + 600_000;
-  for (;;) {
-    const res = await fetch(`${base}${path}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-payment": pending.header },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(620_000),
-    });
-    const answered = await res.json().catch(() => null);
-    if (res.status === 200 && answered) {
-      pendingInference.delete(pendingKey);
-      return { ...answered, paid: usdg(price), payment_tx: pending.tx };
-    }
-    const last = answered?.detail ?? answered?.error ?? `status ${res.status}`;
-    const retryable =
-      res.status === 503 ||
-      (res.status === 402 && ["insufficient_confirmations", "tx_not_found"].includes(answered?.error));
-    if (!retryable || Date.now() > deadline) {
-      throw new Error(
-        `inference failed: ${last}. The payment (tx ${pending.tx}) was not consumed and is kept; the next ${tool} call retries with it instead of paying again.`,
-      );
-    }
-    await new Promise((r) => setTimeout(r, 15_000));
+  const served = await agent.payAndPost({ base, path, price, payTo, body, caller: tool });
+  return { ...JSON.parse(served.bytes.toString("utf8")), paid: usdg(price), payment_tx: served.tx };
+}
+
+// What the last few confidential calls sent and received, as digests only, so
+// prism_verify_attestation binds its verdict to the real bytes of a call
+// without keeping anyone's prompt in memory.
+const confidentialCalls = new Map();
+const CONFIDENTIAL_HISTORY = 16;
+
+const sha256Prefixed = (bytes) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+
+function rememberConfidentialCall(receiptId, record) {
+  if (!receiptId) return;
+  confidentialCalls.set(receiptId, record);
+  while (confidentialCalls.size > CONFIDENTIAL_HISTORY) {
+    confidentialCalls.delete(confidentialCalls.keys().next().value);
   }
 }
 
@@ -267,6 +251,33 @@ const TOOLS = [
         max_usdg: { type: "number", description: "Refuse if the quoted total exceeds this (default 0.5)." },
       },
       required: ["prompts"],
+    },
+  },
+  {
+    name: "prism_confidential_infer",
+    description: "Buy one LLM generation that runs inside a GPU TEE, with the message contents encrypted end to end to a key the enclave's own attestation commits to, so Prism's relay in between carries ciphertext and cannot read the prompt or the answer. Costs a little more than prism_infer. Returns the answer, the cost, and a receipt id the workload signed over the exact bytes of the exchange; pass that id to prism_verify_attestation to check the whole chain. Use it for anything the operator of an ordinary endpoint should not be able to read.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "The prompt to generate from." },
+        model: { type: "string", description: "Confidential model to use; defaults to the endpoint's first." },
+        max_tokens: { type: "integer", description: "Cap on generated tokens (default 512). The price is quoted against this cap." },
+        max_usdg: { type: "number", description: "Refuse if the quoted price exceeds this (default 0.25)." },
+        e2ee: { type: "boolean", description: "Encrypt message contents to the attested enclave key (default true). Turn it off only when the relay is allowed to read the prompt." },
+      },
+      required: ["prompt"],
+    },
+  },
+  {
+    name: "prism_verify_attestation",
+    description: "Check a confidential generation against its signed receipt and the hardware behind it: the TDX quote verifies to Intel's root and commits to the key set that signed the receipt, the boot log replays to the measurement in that quote, the receipt covers the exact bytes of this call, the upstream that ran the model was itself verified, and the GPU is attested by NVIDIA. Returns every check with its result, including the ones that cannot be established today. Needs no wallet.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        receipt_id: { type: "string", description: "The receipt_id from prism_confidential_infer." },
+        model: { type: "string", description: "Model to fetch GPU evidence for; defaults to the one recorded for this receipt." },
+      },
+      required: ["receipt_id"],
     },
   },
   {
@@ -536,6 +547,78 @@ async function handle(name, args) {
       tool: "prism_infer_batch",
     });
   }
+  if (name === "prism_confidential_infer") {
+    if (typeof args.prompt !== "string" || args.prompt.trim() === "") {
+      throw new Error("prompt is required.");
+    }
+    requireWallet(name);
+    const base = inferenceBase();
+    const run = await agent.confidentialInfer({
+      prompt: args.prompt,
+      model: args.model,
+      maxTokens: args.max_tokens ?? 512,
+      maxUsdg: args.max_usdg ?? 0.25,
+      e2ee: args.e2ee ?? true,
+      endpoint: base,
+    });
+    rememberConfidentialCall(run.receiptId, {
+      base,
+      model: run.model,
+      e2ee: run.e2ee,
+      keysetDigest: run.keysetDigest,
+      responseHash: sha256Prefixed(run.bytes.response),
+      requestHash: sha256Prefixed(run.bytes.request),
+      restoredRequestHash: run.bytes.restoredRequest ? sha256Prefixed(run.bytes.restoredRequest) : null,
+    });
+    return {
+      model: run.model,
+      content: run.content,
+      usage: run.usage,
+      receipt_id: run.receiptId,
+      paid: usdg(run.priceMicros),
+      payment_tx: run.tx,
+      e2ee: run.e2ee
+        ? "on: the prompt and the answer were encrypted to the enclave's attested key, and the relay carried ciphertext"
+        : "off: the relay could read this prompt",
+      next: `prism_verify_attestation with receipt_id ${run.receiptId} checks the hardware, the receipt and the GPU behind this answer`,
+    };
+  }
+  if (name === "prism_verify_attestation") {
+    if (typeof args.receipt_id !== "string" || args.receipt_id.trim() === "") {
+      throw new Error("receipt_id is required: the id prism_confidential_infer returned.");
+    }
+    // Without the bytes of the call, a receipt still proves what the workload
+    // signed, but not that it signed this exchange. That is `incomplete`, and it
+    // is a different thing to tell an agent than a failure.
+    const remembered = confidentialCalls.get(args.receipt_id) ?? {};
+    const bound = remembered.responseHash != null;
+    const result = await verifyConfidential({
+      base: remembered.base ?? inferenceBase(),
+      receiptId: args.receipt_id,
+      model: args.model ?? remembered.model,
+      e2ee: Boolean(remembered.e2ee),
+      requestHash: remembered.requestHash ?? null,
+      responseHash: remembered.responseHash ?? null,
+      restoredRequestHash: remembered.restoredRequestHash ?? null,
+      expectedKeysetDigest: remembered.keysetDigest ?? null,
+    });
+    const mark = { pass: "ok", fail: "FAIL", skip: "skip" };
+    return {
+      receipt_id: args.receipt_id,
+      verdict: result.verdict,
+      verdict_means: {
+        verified: "every check that ran passed, and the only skips are the documented ones",
+        incomplete: "nothing failed, and evidence some check needed was not available here",
+        failed: "a check failed",
+      }[result.verdict],
+      bound_to_this_session: bound,
+      ...(bound
+        ? {}
+        : { unbound_because: "this server has no record of that call, so the request and response checks could not run" }),
+      measured_source: result.provenance,
+      checks: result.checks.map((c) => `${mark[c.status]} ${c.title}${c.detail ? `: ${c.detail}` : ""}`),
+    };
+  }
   if (name === "prism_lease_and_run" || name === "prism_lease") {
     if (name === "prism_lease_and_run") requireCommand(args.command);
     requireWallet(name);
@@ -644,7 +727,7 @@ async function handleVault(name, args) {
   throw new Error(`unknown tool ${name}`);
 }
 
-const server = new Server({ name: "prism", version: "0.8.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "prism", version: "0.9.0" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {

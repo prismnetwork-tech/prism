@@ -155,6 +155,7 @@ The repository contains:
 - `inference`: managed inference, a warm ollama lease behind an x402-paid endpoint.
 - `integrations`: LangChain, CrewAI, AG2/AutoGen, elizaOS and Virtuals GAME adapters.
 - `examples/trading`: agents that rent a GPU for research, then trade on what it finds.
+- `examples/confidential`: an agent pays for TEE-served inference and verifies the attestation itself.
 - `deploy/ec2`: lean Vast launch topology with the web application on Render.
 - `deploy/lightsail`: full single-host reference topology.
 - `deploy/node`: Ubuntu node service units and configuration.

@@ -17,3 +17,7 @@ minimumReleaseAgeExclude:
   - '@next/swc-win32-x64-msvc@16.2.11'
   - postcss@8.5.23
 trustPolicy: no-downgrade
+# jose@4.15.9 predates the trust policy and sits under @privy-io/react-auth;
+# without this exclusion no lockfile refresh in this repository can complete.
+trustPolicyExclude:
+  - jose@4.15.9

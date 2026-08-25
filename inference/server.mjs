@@ -15,7 +15,13 @@ import { createExactEvm } from "@prismnetwork/x402/exact-evm";
 import { createCdpFacilitator, routeByNetwork } from "@prismnetwork/x402/cdp-facilitator";
 import { bazaar, detect } from "@prismnetwork/x402/codec";
 import { base as baseChain } from "viem/chains";
-import { createGateway, USDC_BASE, USDC_BASE_DOMAIN, USDG_ROBINHOOD_DOMAIN } from "./gateway.mjs";
+import {
+  createGateway,
+  MAX_CONFIDENTIAL_BODY_BYTES,
+  USDC_BASE,
+  USDC_BASE_DOMAIN,
+  USDG_ROBINHOOD_DOMAIN,
+} from "./gateway.mjs";
 import {
   batchExample,
   batchInput,
@@ -41,6 +47,24 @@ function requireEnv(name) {
   return v;
 }
 
+// The confidential class is off unless an operator configures it. The upstream
+// key is named by the config and read here; it never leaves this process, and
+// nothing downstream of `createGateway` puts it in a response or a log line.
+function confidentialConfig() {
+  if (!process.env.INFERENCE_CONFIDENTIAL) return null;
+  const cfg = JSON.parse(process.env.INFERENCE_CONFIDENTIAL);
+  const keyEnv = cfg.key_env ?? "PHALA_API_KEY";
+  const key = process.env[keyEnv];
+  if (!key) throw new Error(`INFERENCE_CONFIDENTIAL names ${keyEnv} for its upstream key, but ${keyEnv} is not set`);
+  return {
+    upstream: cfg.upstream,
+    legacyUpstream: cfg.legacy_upstream,
+    key,
+    dailyUsd: Number(process.env.INFERENCE_CONFIDENTIAL_DAILY_USD ?? cfg.daily_usd ?? 1),
+    models: cfg.models,
+  };
+}
+
 let config;
 let agent;
 try {
@@ -51,6 +75,7 @@ try {
     // overwrite every model's base with the same number and quietly undo it.
     priceMicros: process.env.INFERENCE_PRICE_MICROS ? BigInt(process.env.INFERENCE_PRICE_MICROS) : null,
     pricing: process.env.INFERENCE_PRICING ? JSON.parse(process.env.INFERENCE_PRICING) : null,
+    confidential: confidentialConfig(),
     payTo: getAddress(requireEnv("INFERENCE_PAY_TO")),
     durationSeconds: Number(process.env.INFERENCE_WARM_SECONDS ?? 1800),
     minVramMib: Number(process.env.INFERENCE_MIN_VRAM_MIB ?? 16000),
@@ -199,6 +224,86 @@ const batchSchemas = {
   method: "POST",
 };
 
+// The confidential route takes and returns the OpenAI chat-completions shape,
+// so it describes itself rather than borrowing the ollama schemas.
+const confidentialModels = Object.keys(config.confidential?.models ?? {});
+const confidentialSchemas = config.confidential
+  ? {
+      method: "POST",
+      input: {
+        type: "object",
+        required: ["model", "messages", "max_tokens"],
+        properties: {
+          model: { type: "string", enum: confidentialModels },
+          messages: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              required: ["role", "content"],
+              properties: { role: { type: "string" }, content: { type: "string" } },
+            },
+          },
+          max_tokens: {
+            type: "integer",
+            minimum: 1,
+            maximum: 1024,
+            description:
+              "Output token cap; the price scales with it. Required, because the body is forwarded unchanged.",
+          },
+          temperature: { type: "number" },
+        },
+      },
+      output: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          model: { type: "string" },
+          choices: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                index: { type: "integer" },
+                message: {
+                  type: "object",
+                  properties: { role: { type: "string" }, content: { type: ["string", "null"] } },
+                },
+                finish_reason: { type: ["string", "null"] },
+              },
+            },
+          },
+          usage: {
+            type: "object",
+            properties: {
+              prompt_tokens: { type: "integer" },
+              completion_tokens: { type: "integer" },
+              total_tokens: { type: "integer" },
+            },
+          },
+        },
+        required: ["choices"],
+      },
+      inputExample: {
+        model: confidentialModels[0],
+        messages: [{ role: "user", content: "Explain metered GPU compute in one sentence." }],
+        max_tokens: 64,
+      },
+      example: {
+        id: "chatcmpl-2f9c",
+        model: confidentialModels[0],
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "Metered GPU compute bills by the second and settles onchain." },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 14, completion_tokens: 13, total_tokens: 27 },
+      },
+    }
+  : null;
+
 const cdp = process.env.CDP_API_KEY_ID && process.env.CDP_API_KEY_SECRET
   ? createCdpFacilitator({
       keyId: process.env.CDP_API_KEY_ID,
@@ -227,8 +332,10 @@ const gateway = createGateway({
   exact,
   schemas: inferenceSchemas,
   batchSchemas,
+  confidentialSchemas,
   priceMicros: config.priceMicros,
   pricing: config.pricing,
+  confidential: config.confidential,
   image: process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE,
   durationSeconds: config.durationSeconds,
   minVramMib: config.minVramMib,
@@ -276,13 +383,19 @@ const server = createServer(async (req, res) => {
   // it are the prices the 402 will actually quote.
   if (req.method === "GET" && url.pathname === "/.well-known/x402.json") {
     const m = gateway.models();
+    const confidential = gateway.confidential();
     return json(res, 200, {
       x402Version: 1,
       name: "Prism Network managed inference",
       description:
         "Pay-per-generation LLM inference on rented GPUs. Pay in USDC on Base or USDG on Robinhood " +
         "Chain; an unpaid request answers 402 with the exact price on each. The serving lease " +
-        "settles onchain with a public receipt.",
+        "settles onchain with a public receipt." +
+        (confidential
+          ? " A confidential tier serves the same pay-per-request interface from a Phala GPU TEE, " +
+            "with a signed receipt over the request and response bytes and optional end-to-end " +
+            "encryption between the caller and the enclave."
+          : ""),
       image: "https://prismnetwork.tech/brand/prism-mark-400.png",
       endpoints: [
         {
@@ -328,6 +441,7 @@ const server = createServer(async (req, res) => {
           accepts: gateway.batchRequirements().accepts,
           inputSchema: batchInput(m.models),
         },
+        ...(confidential ? confidentialEndpoints(confidential) : []),
         {
           path: "/inference/v1/models",
           method: "GET",
@@ -368,6 +482,45 @@ const server = createServer(async (req, res) => {
     const out = await gateway.handleBatch(body, payment?.header, payment?.version ?? null);
     return json(res, out.status, out.body, out.headers);
   }
+  // The confidential class. The body goes upstream exactly as it arrived and
+  // the response comes back exactly as it left the TEE, because the receipt is
+  // signed over both sets of bytes.
+  if (req.method === "GET" && url.pathname === "/v1/chat/completions") {
+    const out = await gateway.handleConfidential(null, {}, undefined, detect(req.headers)?.version ?? 2);
+    return relayed(res, out);
+  }
+  if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+    let bytes;
+    try {
+      bytes = await readRaw(req, MAX_CONFIDENTIAL_BODY_BYTES);
+    } catch (err) {
+      return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_body" });
+    }
+    const payment = detect(req.headers);
+    const out = await gateway.handleConfidential(bytes, req.headers, payment?.header, payment?.version ?? null);
+    return relayed(res, out);
+  }
+  // The transparency endpoints, free and unauthenticated. Each one is a
+  // pass-through: the documents are hashed and signature-checked by the caller,
+  // so they are returned as the bytes the TEE served.
+  if (req.method === "GET" && url.pathname === "/v1/attestation") {
+    return relayed(res, await gateway.attestation(url.searchParams.get("nonce")));
+  }
+  if (req.method === "GET" && url.pathname === "/v1/gpu-evidence") {
+    return relayed(res, await gateway.gpuEvidence(url.searchParams.get("model")));
+  }
+  if (req.method === "GET" && url.pathname === "/v1/sessions") {
+    return relayed(res, await gateway.sessions({
+      model: url.searchParams.get("model"),
+      upstreamName: url.searchParams.get("upstream_name"),
+    }));
+  }
+  if (req.method === "GET" && url.pathname.startsWith("/v1/sessions/")) {
+    return relayed(res, await gateway.session(segment(url.pathname, "/v1/sessions/")));
+  }
+  if (req.method === "GET" && url.pathname.startsWith("/v1/receipts/")) {
+    return relayed(res, await gateway.receipt(segment(url.pathname, "/v1/receipts/")));
+  }
   if (req.method === "POST" && url.pathname === "/v1/inference") {
     let body;
     try {
@@ -385,6 +538,66 @@ const server = createServer(async (req, res) => {
   json(res, 404, { error: "not_found" });
 });
 
+/// The confidential tier's half of the discovery manifest. The free endpoints
+/// are listed because they are what a caller needs to check the work: an agent
+/// that cannot find the attestation or the receipt has bought an answer it has
+/// to take on trust.
+function confidentialEndpoints(confidential) {
+  return [
+    {
+      path: "/inference/v1/chat/completions",
+      method: "POST",
+      description:
+        "One chat completion served inside a Phala GPU TEE, in the OpenAI request and response " +
+        "shape. The price is the model's base plus its per-token rate over the max_tokens you ask " +
+        "for, and the unpaid 402 quotes the exact figure. The gateway forwards your request bytes " +
+        "unchanged and returns the upstream bytes unchanged, so the receipt the enclave signs over " +
+        "both covers exactly what you sent and exactly what you received; the id to fetch it comes " +
+        "back in X-Receipt-Id. Send the five X-E2EE-* headers to encrypt message content to the " +
+        "enclave's key, in which case the relay carries ciphertext. A payment is consumed only when " +
+        "a response is served.",
+      price: `up to ${(Number(confidential.price_micros) / 1e6).toFixed(6)} USDC or USDG per generation, quoted per request`,
+      accepts: gateway.confidentialRequirements().accepts,
+      inputSchema: confidentialSchemas.input,
+    },
+    {
+      path: "/inference/v1/attestation",
+      method: "GET",
+      description:
+        "The TEE's attestation report for a caller-chosen nonce of 64 lowercase hex characters: " +
+        "the TDX quote, the measured compose, and the workload keyset the receipt signing keys and " +
+        "encryption keys are drawn from. Free.",
+      price: "free",
+    },
+    {
+      path: "/inference/v1/receipts/{id}",
+      method: "GET",
+      description:
+        "The signed receipt for one completion, by the id its response carried. It binds the hash " +
+        "of the request bytes the enclave received, the hash of the response bytes it returned, and " +
+        "the upstream GPU verification outcome. Fetch it promptly; upstream retention is short. Free.",
+      price: "free",
+    },
+    {
+      path: "/inference/v1/sessions",
+      method: "GET",
+      description:
+        "The attested upstream sessions currently serving, with the evidence each receipt cites. " +
+        "Add {id} to the path for one session's full record. Free.",
+      price: "free",
+    },
+    {
+      path: "/inference/v1/gpu-evidence",
+      method: "GET",
+      description:
+        "The GPU attestation evidence for a model, in the shape NVIDIA's remote attestation service " +
+        "takes as a request body, so a caller can have the GPU leg verified by NVIDIA directly " +
+        "rather than by us. Free.",
+      price: "free",
+    },
+  ];
+}
+
 function json(res, status, obj, extra = {}) {
   const payload = JSON.stringify(obj);
   res.writeHead(status, {
@@ -395,7 +608,28 @@ function json(res, status, obj, extra = {}) {
   res.end(payload);
 }
 
-async function readJson(req, limit = MAX_BODY_BYTES) {
+/// A relay answer is either bytes the gateway must not touch or a refusal it
+/// wrote itself.
+function relayed(res, out) {
+  if (!out.bytes) return json(res, out.status, out.body, out.headers);
+  res.writeHead(out.status, {
+    "content-type": "application/json",
+    ...out.headers,
+    "content-length": out.bytes.length,
+  });
+  res.end(out.bytes);
+}
+
+function segment(pathname, prefix) {
+  const raw = pathname.slice(prefix.length);
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+async function readRaw(req, limit) {
   if (Number(req.headers["content-length"] ?? "0") > limit) {
     throw Object.assign(new Error("body too large"), { code: "too_large" });
   }
@@ -409,9 +643,14 @@ async function readJson(req, limit = MAX_BODY_BYTES) {
     }
     chunks.push(chunk);
   }
-  if (!chunks.length) return {};
+  return Buffer.concat(chunks);
+}
+
+async function readJson(req, limit = MAX_BODY_BYTES) {
+  const bytes = await readRaw(req, limit);
+  if (!bytes.length) return {};
   try {
-    return JSON.parse(Buffer.concat(chunks).toString());
+    return JSON.parse(bytes.toString());
   } catch {
     throw Object.assign(new Error("invalid json"), { code: "invalid_json" });
   }
@@ -422,10 +661,19 @@ server.requestTimeout = 600_000;
 server.headersTimeout = 620_000;
 
 // The resolved card, not the env var: what is quoted is what should be logged.
-const card = Object.entries(gateway.models().pricing)
-  .map(([m, p]) => `${m} ${p.base_micros}+${p.per_token_micros}/token`)
-  .join(", ");
+const rates = (pricing) =>
+  Object.entries(pricing)
+    .map(([m, p]) => `${m} ${p.base_micros}+${p.per_token_micros}/token`)
+    .join(", ");
+const card = rates(gateway.models().pricing);
+const confidentialCard = gateway.confidential();
 
-server.listen(config.port, () =>
-  console.error(`prism inference gateway on :${config.port}, ${card} micros to ${config.payTo}`),
-);
+server.listen(config.port, () => {
+  console.error(`prism inference gateway on :${config.port}, ${card} micros to ${config.payTo}`);
+  if (confidentialCard) {
+    console.error(
+      `confidential relay to ${confidentialCard.upstream}: ${rates(confidentialCard.models)} micros, ` +
+        `daily cap $${config.confidential.dailyUsd}`,
+    );
+  }
+});
