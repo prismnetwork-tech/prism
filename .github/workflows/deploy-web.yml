@@ -29,6 +29,7 @@ concurrency:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   deploy:
@@ -72,7 +73,7 @@ jobs:
         id: image
         run: |
           set -euo pipefail
-          tag="ghcr.io/${GITHUB_REPOSITORY}-web:${GITHUB_SHA::7}"
+          tag="ghcr.io/${GITHUB_REPOSITORY}/web:${GITHUB_SHA::7}"
           args=()
           while IFS= read -r line; do args+=(--build-arg "$line"); done < public-build-args.env
           docker build --platform linux/amd64 -f deploy/Dockerfile.web "${args[@]}" -t "$tag" .
