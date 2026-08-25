@@ -53,17 +53,30 @@ jobs:
           # log is public so only the names are printed.
           cut -d= -f1 public-build-args.env
 
-      # No buildx: the runner is already amd64, so there is nothing to emulate,
-      # and its container driver builds somewhere the plain `docker push` below
-      # cannot authenticate from.
+      # No buildx: the runner is already amd64, so there is nothing to emulate.
+      #
+      # `docker login` cannot report a bad credential here. The registry serves
+      # reads anonymously, so its ping answers 200 with no challenge and the
+      # login succeeds against nothing. Only a write is challenged, so a write
+      # is what this checks, and the credential is written to the config the
+      # daemon reads rather than left to the login to negotiate.
       - name: Sign in to the image registry
         env:
           REGISTRY_USER: ${{ secrets.PRISM_REGISTRY_USER }}
           REGISTRY_PASS: ${{ secrets.PRISM_REGISTRY_PASS }}
         run: |
           set -euo pipefail
-          printf '%s' "$REGISTRY_PASS" \
-            | docker login registry.prismnetwork.tech -u "$REGISTRY_USER" --password-stdin
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            -u "$REGISTRY_USER:$REGISTRY_PASS" \
+            -X POST "https://registry.prismnetwork.tech/v2/prism-web/blobs/uploads/")
+          if [ "$code" != "202" ]; then
+            printf 'the registry refused an authenticated write: HTTP %s\n' "$code" >&2
+            exit 1
+          fi
+          mkdir -p ~/.docker
+          jq -nc --arg auth "$(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_PASS" | base64 -w0)" \
+            '{auths: {"registry.prismnetwork.tech": {auth: $auth}}}' > ~/.docker/config.json
+          printf 'the registry accepts writes from this credential\n'
 
       - name: Build and publish the site image
         id: image
