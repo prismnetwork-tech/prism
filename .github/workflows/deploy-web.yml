@@ -73,20 +73,33 @@ jobs:
             printf 'the registry refused an authenticated write: HTTP %s\n' "$code" >&2
             exit 1
           fi
-          mkdir -p ~/.docker
-          jq -nc --arg auth "$(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_PASS" | base64 -w0)" \
-            '{auths: {"registry.prismnetwork.tech": {auth: $auth}}}' > ~/.docker/config.json
           printf 'the registry accepts writes from this credential\n'
+
+      # `docker push` will not send it. The client picks its auth scheme from
+      # the registry ping, the ping is anonymous and answers 200 with no
+      # challenge, and from then on it pushes as nobody however the credential
+      # is stored. skopeo is told the credential outright instead of inferring
+      # one, which is the whole reason it is here.
+      - name: Install skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo >/dev/null
+          skopeo --version
 
       - name: Build and publish the site image
         id: image
+        env:
+          REGISTRY_USER: ${{ secrets.PRISM_REGISTRY_USER }}
+          REGISTRY_PASS: ${{ secrets.PRISM_REGISTRY_PASS }}
         run: |
           set -euo pipefail
           tag="registry.prismnetwork.tech/prism-web:${GITHUB_SHA::7}"
           args=()
           while IFS= read -r line; do args+=(--build-arg "$line"); done < public-build-args.env
           docker build --platform linux/amd64 -f deploy/Dockerfile.web "${args[@]}" -t "$tag" .
-          docker push "$tag"
+          skopeo copy --dest-creds "$REGISTRY_USER:$REGISTRY_PASS" \
+            "docker-daemon:$tag" "docker://$tag"
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
       # Pinning the tag is what makes the deploy carry this commit. Without it
