@@ -53,8 +53,9 @@ jobs:
           # log is public so only the names are printed.
           cut -d= -f1 public-build-args.env
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
+      # No buildx: the runner is already amd64, so there is nothing to emulate,
+      # and its container driver builds somewhere the plain `docker push` below
+      # cannot authenticate from.
       - name: Sign in to the image registry
         env:
           REGISTRY_USER: ${{ secrets.PRISM_REGISTRY_USER }}
