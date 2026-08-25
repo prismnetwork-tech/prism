@@ -27,7 +27,7 @@ export default function ContactPage() {
         <p>
           For reproducible bugs, documentation corrections, integration questions, and feature
           proposals, open an issue in the{" "}
-          <a href="https://github.com/prismnetwork-tech/prism/issues" target="_blank" rel="noopener noreferrer">
+          <a href="https://github.com/winter0x/prism/issues" target="_blank" rel="noopener noreferrer">
             Prism repository
           </a>. Remove wallet secrets, access credentials, private workload data, and personal
           information before posting.

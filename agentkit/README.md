@@ -53,7 +53,7 @@ export PRISM_AGENT_KEY=0x...   # agent wallet private key, funded with USDG + ga
 export PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA   # optional, this is the default
 ```
 
-The wallet needs USDG (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`) and Robinhood-Chain ETH for gas. See the [Prism SDK](https://github.com/prismnetwork-tech/prism) for how to fund a fresh wallet.
+The wallet needs USDG (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`) and Robinhood-Chain ETH for gas. See the [Prism SDK](https://github.com/winter0x/prism) for how to fund a fresh wallet.
 
 ## Notes
 

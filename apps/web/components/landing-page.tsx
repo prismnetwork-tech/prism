@@ -225,7 +225,7 @@ function SocialLinks() {
       </a>
       <a
         className="landing-social-link"
-        href="https://github.com/prismnetwork-tech"
+        href="https://github.com/winter0x"
         target="_blank"
         rel="noopener noreferrer"
         aria-label="Prism on GitHub"

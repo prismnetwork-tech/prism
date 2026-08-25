@@ -53,7 +53,7 @@ export default function AboutPage() {
         </p>
         <p>
           Review the{" "}
-          <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">
+          <a href="https://github.com/winter0x/prism" target="_blank" rel="noopener noreferrer">
             Prism source repository
           </a>{" "}
           or read the <a href="https://docs.prismnetwork.tech">developer documentation</a>.

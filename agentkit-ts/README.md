@@ -72,7 +72,7 @@ easy to try before funding anything.
 and `minTrustClass` to refuse suppliers weaker than the workload needs. All
 capacity live today is `open`, which means the host operator can read anything
 the workload touches: keep credentials, private datasets and model weights off
-it. The [security model](https://github.com/prismnetwork-tech/prism/blob/main/docs/SECURITY_MODEL.md)
+it. The [security model](https://github.com/winter0x/prism/blob/main/docs/SECURITY_MODEL.md)
 sets out what each class does and does not promise.
 
 ## Known upstream issue

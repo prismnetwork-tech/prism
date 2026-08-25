@@ -150,4 +150,4 @@ The wallet needs two balances on Robinhood Chain (id 4663): USDG (`0x5fc5360D040
 Node >= 20, `viem` ^2 (peer), and `ssh` + `ssh-keygen` on PATH for `run()` and
 for workspace save and restore.
 
-See [example.mjs](https://github.com/prismnetwork-tech/prism/blob/main/sdk/example.mjs) for a full run.
+See [example.mjs](https://github.com/winter0x/prism/blob/main/sdk/example.mjs) for a full run.
