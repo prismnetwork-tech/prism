@@ -6,6 +6,15 @@ name: deploy web
 # redeploys whatever tag is already pinned while reporting success. That is a
 # green check over an unchanged site, which is worse than a red one.
 #
+# The image goes to ghcr rather than the self-hosted registry. That registry
+# exists to keep the site publishable while this project had no usable GitHub
+# account, and it serves reads anonymously so that Render can pull without a
+# credential. The same anonymous read is what stops anything pushing to it from
+# here: a client picks its auth scheme from the registry ping, the ping answers
+# 200 with no challenge, and from then on it writes as nobody. docker and
+# skopeo both refuse, while the credential itself authenticates a write fine.
+# The account works now, so the workaround can go.
+#
 # The runner builds amd64 natively, which is what Render runs and what an arm64
 # laptop can only reach through emulation.
 
@@ -53,53 +62,21 @@ jobs:
           # log is public so only the names are printed.
           cut -d= -f1 public-build-args.env
 
-      # No buildx: the runner is already amd64, so there is nothing to emulate.
-      #
-      # `docker login` cannot report a bad credential here. The registry serves
-      # reads anonymously, so its ping answers 200 with no challenge and the
-      # login succeeds against nothing. Only a write is challenged, so a write
-      # is what this checks, and the credential is written to the config the
-      # daemon reads rather than left to the login to negotiate.
-      - name: Sign in to the image registry
-        env:
-          REGISTRY_USER: ${{ secrets.PRISM_REGISTRY_USER }}
-          REGISTRY_PASS: ${{ secrets.PRISM_REGISTRY_PASS }}
-        run: |
-          set -euo pipefail
-          code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-            -u "$REGISTRY_USER:$REGISTRY_PASS" \
-            -X POST "https://registry.prismnetwork.tech/v2/prism-web/blobs/uploads/")
-          if [ "$code" != "202" ]; then
-            printf 'the registry refused an authenticated write: HTTP %s\n' "$code" >&2
-            exit 1
-          fi
-          printf 'the registry accepts writes from this credential\n'
-
-      # `docker push` will not send it. The client picks its auth scheme from
-      # the registry ping, the ping is anonymous and answers 200 with no
-      # challenge, and from then on it pushes as nobody however the credential
-      # is stored. skopeo is told the credential outright instead of inferring
-      # one, which is the whole reason it is here.
-      - name: Install skopeo
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq skopeo >/dev/null
-          skopeo --version
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and publish the site image
         id: image
-        env:
-          REGISTRY_USER: ${{ secrets.PRISM_REGISTRY_USER }}
-          REGISTRY_PASS: ${{ secrets.PRISM_REGISTRY_PASS }}
         run: |
           set -euo pipefail
-          tag="registry.prismnetwork.tech/prism-web:${GITHUB_SHA::7}"
+          tag="ghcr.io/${GITHUB_REPOSITORY}-web:${GITHUB_SHA::7}"
           args=()
           while IFS= read -r line; do args+=(--build-arg "$line"); done < public-build-args.env
           docker build --platform linux/amd64 -f deploy/Dockerfile.web "${args[@]}" -t "$tag" .
-          skopeo copy --dest-creds "$REGISTRY_USER:$REGISTRY_PASS" \
-            "docker-daemon:$tag" "docker://$tag"
+          docker push "$tag"
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
       # Pinning the tag is what makes the deploy carry this commit. Without it
