@@ -399,7 +399,7 @@ export function DeveloperDocs() {
               </InfoCard>
               <InfoCard title="Excluded protections">
                 <ul>
-                  <li>Host confidentiality or trusted execution.</li>
+                  <li>Host confidentiality or trusted execution on a GPU lease. Confidential inference is a separate tier, served from a relayed enclave with its own attestation endpoint, and does not run on leased Prism GPUs.</li>
                   <li>Protection from a malicious provider operator.</li>
                   <li>Durable workspace storage.</li>
                   <li>Uninterrupted infrastructure-provider availability.</li>

@@ -90,6 +90,11 @@ array of hex strings.
 with `digest_id` set to the empty string, hash that, then write the result into
 the field.
 
+Confidential inference is a different product from a confidential lease, and a
+receipt does not blur them. Receipts here cover GPU leases, whose ceiling is
+`isolated`. The confidential inference tier runs in a relayed enclave and is
+attested through its own endpoint, not through this feed.
+
 Proof establishes an onchain payment event paired with a platform-attested
 usage record, under a stated trust class. It does not establish that a supplier
 executed a workload faithfully, that hardware was unmodified, or that the
