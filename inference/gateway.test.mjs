@@ -580,14 +580,14 @@ test("a cold box answers immediately with when to retry instead of holding the c
       lease: () => new Promise((r) => { release = r; }),
     },
   });
-  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact(), readyWaitMs: 30, retryAfterMs: 90_000 });
+  const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact: fakeExact(), readyWaitMs: 30, retryAfterMs: 300_000 });
   const started = Date.now();
   const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
   assert.ok(Date.now() - started < 2_000, "the caller must not wait on a GPU");
   assert.equal(out.status, 503);
   assert.equal(out.body.error, "warming_up");
-  assert.equal(out.body.retry_after_seconds, 90);
-  assert.equal(out.headers["retry-after"], "90");
+  assert.equal(out.body.retry_after_seconds, 300);
+  assert.equal(out.headers["retry-after"], "300");
   release?.({ leaseId: 1, access: {} });
 });
 

@@ -75,6 +75,12 @@ revenue, and leases warmed since boot.
 
 The first paid request on a cold gateway waits through provisioning, usually
 one to four minutes. `POST /v1/warm` (free) starts the warmup early, and
+A `503 warming_up` carries `state` and `retry_after_seconds`. The estimate is
+minutes because a cold start leases a GPU onchain, waits for confirmations,
+boots the box and pulls the model. `GET /v1/models` reports the same state for
+free, so a caller that wants to avoid paying into a cold start can check there
+first and only pay once a GPU is warm.
+
 `POST /v1/warm?slots=N` brings N boxes up at once, which is what a batch
 needs: a box leased after the prompts are already moving arrives too late to
 take any of them. `GET /v1/models` reports the models, price, current state,
@@ -91,12 +97,57 @@ curl -s -X POST http://localhost:8500/v1/batch \
 ```
 
 The price is the single-request price times the number of prompts, and the
-unpaid `402` quotes the exact figure. Every prompt runs whole on one GPU, the
+unpaid `402` quotes the exact figure. For the two-prompt call above that is
+`2 x (3000 + 3 x 1024) = 12144` micros: a `llama3.2:3b` base of 3000 plus 3 per
+token over the 1024-token cap, which is the default when the request names no
+`num_predict`. Every prompt runs whole on one GPU, the
 same way a single request does; what the batch adds is that they run on all the
 gateway's GPUs at once, and a box still warming joins the work as it comes up
 rather than after the batch has finished without it. A batch is all or nothing:
 if a prompt cannot be answered even after a retry on another box, the answer is
 `503` and the same payment header works on the retry.
+
+### Reproducing the Merkle root
+
+The receipt is a Merkle tree in the RFC 6962 style, so an independent verifier
+can recompute the root from the items it received. Four details decide whether
+the leaf hash comes out right, and none of them are guessable:
+
+1. **The leaf is a fixed field order**, not whatever order your object happens
+   to have. Serialise exactly these keys, in this order, as compact JSON with
+   no spaces:
+
+   ```
+   index, model, prompt, response, prompt_tokens, completion_tokens, lease_id
+   ```
+
+2. **`prompt` and `response` are digests, and they keep their `sha256:`
+   prefix.** Each is `sha256:` followed by the lowercase hex SHA-256 of the
+   UTF-8 text. The prefix is part of the bytes that get hashed. Stripping it
+   changes the leaf.
+
+3. **Absent values are `null`, never omitted.** `prompt_tokens`,
+   `completion_tokens` and `lease_id` are always present as keys; when unknown
+   they serialise as `null`.
+
+4. **Leaves and interior nodes are hashed under different prefixes**, so no
+   interior node can be replayed as a leaf:
+
+   ```
+   leaf   = SHA-256(0x00 || utf8(canonical_item))
+   node   = SHA-256(0x01 || left_hash || right_hash)
+   ```
+
+   Both prefixes are single raw bytes, not the text `"0x00"`.
+
+Pairs combine left to right at each level. **An odd node at the end of a level
+is promoted unchanged to the next level; it is not duplicated or paired with
+itself.** `merkle_root` and every hash in an audit path are rendered as
+`sha256:` plus lowercase hex.
+
+To check one item: hash its canonical form into a leaf, then fold the audit
+path, applying each sibling on the side its `side` field names, and compare the
+result with `merkle_root`.
 
 ### The receipt
 
@@ -111,7 +162,7 @@ A batch comes back with a Merkle receipt over the set:
   "merkle_root": "sha256:...",
   "lease_ids": [1041, 1042],
   "payer": "0x...",
-  "paid_micros": "30480",
+  "paid_micros": "12144",
   "settlement_tx": "0x...",
   "issued_at": "2026-08-24T09:00:00.000Z"
 }

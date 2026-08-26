@@ -312,8 +312,8 @@ export function DeveloperDocs() {
 
           <DocsSection id="runtime" index="07" eyebrow="Execution environments" title="Runtime modes">
             <div className="runtime-table">
-              <div className="runtime-head"><span>Property</span><span>Managed L40S</span><span>Operator-owned infrastructure</span></div>
-              <RuntimeRow label="Capacity" cloud="Managed NVIDIA L40S capacity" physical="Bonded operator-owned NVIDIA host" />
+              <div className="runtime-head"><span>Property</span><span>Managed cloud capacity</span><span>Operator-owned infrastructure</span></div>
+              <RuntimeRow label="Capacity" cloud="Managed NVIDIA capacity: RTX 6000 Ada, RTX 5880 Ada, RTX A6000, A40, L40S as stock allows" physical="Bonded operator-owned NVIDIA host" />
               <RuntimeRow label="Isolation" cloud="Disposable provider container" physical="Kata sandbox with VFIO GPU assignment" />
               <RuntimeRow label="Access" cloud="Temporary direct root SSH" physical="Revocable SSH/Jupyter grant via mTLS gateway" />
               <RuntimeRow label="Readiness" cloud="Provider state, GPU, VRAM, cost, SSH endpoint" physical="Signed telemetry plus independent active gateway probes" />

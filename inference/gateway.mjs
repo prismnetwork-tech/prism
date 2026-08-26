@@ -259,7 +259,13 @@ export function createGateway({
   // Long enough to catch a box whose tunnel is already coming up, short enough
   // that no reasonable client gives up first.
   readyWaitMs = 12_000,
-  retryAfterMs = 90_000,
+  // What to tell a caller to wait. Warming means a lease is already in flight,
+  // which still has to clear confirmations, boot the box and pull the model:
+  // minutes, not seconds. Cold means none of that has started yet. The old
+  // flat 90s was shorter than the work takes, so agents honoured it, gave up,
+  // and reported the endpoint as broken.
+  retryAfterMs = 300_000,
+  coldRetryAfterMs = 600_000,
   // How many boxes the gateway may hold at once. One by default: a second box
   // is a second prepaid lease, so growing the pool is a cost the operator opts
   // into rather than something a single caller can trigger.
@@ -505,6 +511,12 @@ export function createGateway({
     if (warmBoxes().length) return "warm";
     if (warming.size) return "warming";
     return "cold";
+  }
+
+  // `/v1/models` reports the same state for free, so a caller that wants to
+  // avoid paying into a cold start can check there first.
+  function retryAfterFor(state) {
+    return Math.ceil((state === "cold" ? coldRetryAfterMs : retryAfterMs) / 1000);
   }
 
   function drainAll(reason) {
@@ -834,12 +846,12 @@ export function createGateway({
       payment.release();
       return {
         status: 503,
-        headers: { "retry-after": String(Math.ceil(retryAfterMs / 1000)) },
+        headers: { "retry-after": String(retryAfterFor(phase())) },
         body: {
           error: "warming_up",
           detail: "A GPU is being leased and the models are being pulled.",
           state: phase(),
-          retry_after_seconds: Math.ceil(retryAfterMs / 1000),
+          retry_after_seconds: retryAfterFor(phase()),
           retry: "nothing was charged; send the same payment header again.",
         },
       };
@@ -995,12 +1007,12 @@ export function createGateway({
       payment.release();
       return {
         status: 503,
-        headers: { "retry-after": String(Math.ceil(retryAfterMs / 1000)) },
+        headers: { "retry-after": String(retryAfterFor(phase())) },
         body: {
           error: "warming_up",
           detail: "GPUs are being leased and the models are being pulled.",
           state: phase(),
-          retry_after_seconds: Math.ceil(retryAfterMs / 1000),
+          retry_after_seconds: retryAfterFor(phase()),
           retry: "nothing was charged; send the same payment header again.",
         },
       };

@@ -382,7 +382,7 @@ export const batchExample = {
     merkle_root: "sha256:c3e8...",
     lease_ids: [1047, 1048],
     payer: "0x0000000000000000000000000000000000000001",
-    paid_micros: "30480",
+    paid_micros: "12144",
     settlement_tx: "0x...",
     issued_at: "2026-08-24T09:00:00.000Z",
   },
