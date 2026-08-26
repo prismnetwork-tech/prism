@@ -56,6 +56,15 @@ receipt artifacts from the generated directory. The public site does not
 expose wallet addresses, precise geography, image digests, files, terminal
 output or private telemetry.
 
+## Walking the whole set
+
+`index.json` carries `total`, `page_size`, `pages` and `first_page`. `receipts`
+is the window the index itself lists; `total` is how many exist. When `total`
+is larger than that window, the index is truncated and the complete set is read
+by following `first_page` and then each page's `next` until it is `null`. Pages
+are newest first and each one repeats `total` and `pages`, so a verifier can
+tell mid-walk that the feed moved under it.
+
 ## Reproducing the hashes
 
 Everything below is SHA-256 over UTF-8, written as lowercase hex. Three rules
