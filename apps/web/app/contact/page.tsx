@@ -26,11 +26,10 @@ export default function ContactPage() {
       <InformationSection index="02" title="Technical support">
         <p>
           For reproducible bugs, documentation corrections, integration questions, and feature
-          proposals, open an issue in the{" "}
-          <a href="https://github.com/winter0x/prism/issues" target="_blank" rel="noopener noreferrer">
-            Prism repository
-          </a>. Remove wallet secrets, access credentials, private workload data, and personal
-          information before posting.
+          proposals, write to{" "}
+          <a href="mailto:support@prismnetwork.tech">support@prismnetwork.tech</a>. Remove wallet
+          secrets, access credentials, private workload data, and personal information before
+          sending.
         </p>
       </InformationSection>
 

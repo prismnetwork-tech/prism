@@ -56,14 +56,7 @@ export default function SecurityPage() {
       <InformationSection index="04" title="Report a vulnerability">
         <p>
           Send security reports to{" "}
-          <a href="mailto:security@prismnetwork.tech">security@prismnetwork.tech</a> or use{" "}
-          <a
-            href="https://github.com/winter0x/prism/security/advisories/new"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            GitHub private vulnerability reporting
-          </a>.
+          <a href="mailto:security@prismnetwork.tech">security@prismnetwork.tech</a>.
         </p>
         <p>
           Include the affected component, impact, reproduction steps, and a safe proof of concept.

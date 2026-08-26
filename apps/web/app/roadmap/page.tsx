@@ -125,17 +125,9 @@ export default function RoadmapPage() {
           yet protect. This roadmap holds to the same standard.
         </p>
         <p>
-          Track what has shipped in the live <Link href="/proof">receipts</Link>, in the{" "}
+          Track what has shipped in the live <Link href="/proof">receipts</Link> and in the{" "}
           <a href="https://docs.prismnetwork.tech" target="_blank" rel="noopener noreferrer">
             documentation
-          </a>
-          , and in the{" "}
-          <a
-            href="https://github.com/winter0x/prism"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            source
           </a>
           .
         </p>

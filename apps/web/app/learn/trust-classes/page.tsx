@@ -51,15 +51,11 @@ export default function TrustClassesPage() {
         <p>
           It does not stop the operator watching. Work on its way to the GPU leaves the protected
           part of memory, so this grade tells you what ran. Who could see it is the next grade up.
-          No capacity is served at this grade yet.{" "}
-          <a
-            href="https://github.com/winter0x/prism/blob/main/docs/ATTESTATION.md"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            How the proof is checked
+          No capacity is served at this grade yet. The{" "}
+          <a href="https://docs.prismnetwork.tech" target="_blank" rel="noopener noreferrer">
+            documentation
           </a>{" "}
-          covers the mechanism and what it leaves open.
+          covers how the proof is checked and what it leaves open.
         </p>
         <h3>Confidential</h3>
         <p>

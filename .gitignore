@@ -35,3 +35,4 @@ __pycache__/
 
 # npm pack output, which is a build artifact and not source.
 *.tgz
+agentkit-ts/package-lock.json
