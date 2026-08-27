@@ -55,6 +55,12 @@ export const CONFIDENTIAL_LEGACY_UPSTREAM = "https://api.redpill.ai/v1";
 /// It picks per request across a handful of instances, so a few tries reaches
 /// any one of them; the cap is what stops a vanished instance spinning here.
 export const GPU_EVIDENCE_ATTEMPTS = 8;
+
+/// How long an instance's evidence stays usable, and how many instances are
+/// worth holding. Fifteen minutes covers the drift without approaching the
+/// NVIDIA attestation token's own validity.
+export const GPU_EVIDENCE_TTL_MS = 15 * 60_000;
+export const GPU_EVIDENCE_HELD = 16;
 const KEYSET_DIGEST = /^sha256:[0-9a-f]{64}$/;
 
 /// Which instance a relayed evidence response came from. The relay passes the
@@ -1265,6 +1271,9 @@ export function createGateway({
   /// asked again until one answers with that key set, which works because the
   /// choice is per request. The last answer is returned either way; deciding
   /// whether it binds belongs to the verifier, not here.
+  // One GPU evidence answer per instance, keyed by the key set that gave it.
+  const remember = new Map();
+
   async function gpuEvidence(model, keysetDigest = null) {
     if (!conf) return disabled();
     if (typeof model !== "string" || !conf.pricing[model]) {
@@ -1276,6 +1285,16 @@ export function createGateway({
     if (!relayAllowed()) {
       return { status: 429, headers: { "retry-after": "60" }, body: { error: "rate_limited" } };
     }
+    // Which instances the upstream offers drifts over minutes, so the retries
+    // below miss in bursts: inside one of those windows every attempt reaches
+    // the wrong set however many are made. Evidence is a standing artifact
+    // about an instance rather than an answer to this request, so the way out
+    // is to keep what previous requests saw. Every answer is kept under the
+    // instance that gave it, and a few minutes of traffic accumulates one per
+    // instance, after which the drift stops mattering.
+    const held = keysetDigest ? remember.get(keysetDigest) : null;
+    if (held && now() - held.at < GPU_EVIDENCE_TTL_MS) return held.relayed;
+
     const attempts = keysetDigest ? GPU_EVIDENCE_ATTEMPTS : 1;
     let last = null;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -1289,10 +1308,22 @@ export function createGateway({
         log(`gpu evidence relay failed: ${err.message}`);
         return last ?? { status: 503, body: { error: "upstream_unavailable" } };
       }
-      if (!keysetDigest || servedKeyset(last) === keysetDigest) return last;
+      const reached = servedKeyset(last);
+      if (reached) keep(reached, last);
+      if (!keysetDigest || reached === keysetDigest) return last;
     }
     log(`gpu evidence: ${attempts} attempts did not reach key set ${keysetDigest}`);
     return last;
+  }
+
+  /// Hold one answer per instance, dropping whatever was seen longest ago once
+  /// there are more than a fleet's worth. The TTL is well inside the NVIDIA
+  /// token's life, so nothing served from here is evidence the verifier would
+  /// have rejected had it fetched the same thing itself.
+  function keep(digest, relayed) {
+    if (remember.has(digest)) remember.delete(digest);
+    remember.set(digest, { at: now(), relayed });
+    while (remember.size > GPU_EVIDENCE_HELD) remember.delete(remember.keys().next().value);
   }
 
   async function handleConfidential(raw, headers = {}, paymentHeader, paymentVersion = null) {

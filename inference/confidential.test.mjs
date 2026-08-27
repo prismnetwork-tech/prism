@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   createGateway,
+  GPU_EVIDENCE_TTL_MS,
   DEFAULT_CONFIDENTIAL_PRICING,
   MAX_CONFIDENTIAL_BODY_BYTES,
   MAX_PREDICT_TOKENS,
@@ -543,4 +544,64 @@ test("gpu evidence refuses a key set digest that is not one", async () => {
   assert.equal(out.status, 400);
   assert.equal(out.body.error, "invalid_keyset_digest");
   assert.equal(upstream.calls.length, 0, "a malformed digest must not reach the upstream");
+});
+
+test("evidence seen once is held, so a later caller does not depend on the rotation", async () => {
+  // The upstream offers a different set of instances from one minute to the
+  // next, so retrying inside a bad window cannot help. What previous requests
+  // saw is what carries a caller through it.
+  const wanted = `sha256:${"a".repeat(64)}`;
+  const other = `sha256:${"b".repeat(64)}`;
+  let offering = wanted;
+  let asked = 0;
+  const { gateway } = build({
+    upstream: () => {
+      asked += 1;
+      return new Response(JSON.stringify({ workload_keyset_digest: offering }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const digestOf = (r) => JSON.parse(Buffer.from(r.bytes).toString("utf8")).workload_keyset_digest;
+
+  assert.equal(digestOf(await gateway.gpuEvidence(MODEL, wanted)), wanted);
+  const afterFirst = asked;
+
+  // The rotation moves on. Without the cache this is the burst that costs a
+  // paid generation: every attempt reaches the wrong instance.
+  offering = other;
+  const held = await gateway.gpuEvidence(MODEL, wanted);
+  assert.equal(digestOf(held), wanted);
+  assert.equal(asked, afterFirst, "a held answer must not go back to the upstream");
+
+  // An instance never seen still has to be looked for, and the looking is what
+  // fills the cache for next time.
+  const missing = await gateway.gpuEvidence(MODEL, `sha256:${"c".repeat(64)}`);
+  assert.ok(asked > afterFirst);
+  assert.equal(digestOf(missing), other);
+  assert.equal(digestOf(await gateway.gpuEvidence(MODEL, other)), other);
+});
+
+test("held evidence is dropped once it is too old to stand in for a fresh fetch", async () => {
+  const wanted = `sha256:${"d".repeat(64)}`;
+  let asked = 0;
+  const { gateway, tick } = build({
+    upstream: () => {
+      asked += 1;
+      return new Response(JSON.stringify({ workload_keyset_digest: wanted }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await gateway.gpuEvidence(MODEL, wanted);
+  assert.equal(asked, 1);
+  await gateway.gpuEvidence(MODEL, wanted);
+  assert.equal(asked, 1, "still fresh");
+
+  tick(GPU_EVIDENCE_TTL_MS + 1);
+  await gateway.gpuEvidence(MODEL, wanted);
+  assert.equal(asked, 2, "past its life it is fetched again");
 });
