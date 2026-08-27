@@ -683,7 +683,13 @@ async function sessionChecks(t, { root, fetchImpl, sessionId, servedAt }) {
 async function gpuChecks(t, { root, fetchImpl, model, digest, quote, collateralUrl, now }) {
   let fetched;
   try {
-    const query = model ? `?model=${encodeURIComponent(model)}` : "";
+    // Name the instance we need. The model runs on several, and the endpoint
+    // answers from whichever the upstream picks, so asking blind returns a
+    // sibling most of the time: same image, same compose, different RTMR3.
+    const params = new URLSearchParams();
+    if (model) params.set("model", model);
+    if (digest) params.set("keyset_digest", digest);
+    const query = params.size ? `?${params}` : "";
     fetched = await getJson(fetchImpl, `${root}/v1/gpu-evidence${query}`, "the GPU evidence endpoint");
   } catch (err) {
     fetched = { ok: false, detail: err?.message ?? String(err) };

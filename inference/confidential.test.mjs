@@ -503,3 +503,44 @@ test("a misconfigured class fails at boot rather than at the first paid request"
     /non-negative numbers/,
   );
 });
+
+test("gpu evidence asks again until the named instance answers", async () => {
+  // The model runs on several instances and the upstream picks one per request,
+  // so naming the instance we need is only useful if the relay asks more than
+  // once. Everything below RTMR3 matches between siblings, which is exactly why
+  // the wrong one cannot be waved through.
+  const served = `sha256:${"a".repeat(64)}`;
+  const answers = [`sha256:${"b".repeat(64)}`, `sha256:${"c".repeat(64)}`, served];
+  let asked = 0;
+  const { gateway, upstream } = build({
+    upstream: (url) => {
+      const digest = answers[Math.min(asked++, answers.length - 1)];
+      return new Response(JSON.stringify({ workload_keyset_digest: digest }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  // The relay hands the upstream's bytes back untouched, so the instance it
+  // reached is read out of those rather than off a parsed body.
+  const digestOf = (relayed) => JSON.parse(Buffer.from(relayed.bytes).toString("utf8")).workload_keyset_digest;
+
+  const found = await gateway.gpuEvidence(MODEL, served);
+  assert.equal(digestOf(found), served);
+  assert.equal(asked, 3);
+  assert.ok(upstream.calls.every((c) => c.url.includes("/attestation/report")));
+
+  asked = 0;
+  const blind = await gateway.gpuEvidence(MODEL);
+  assert.equal(asked, 1, "a caller that names no instance must not make the relay loop");
+  assert.equal(digestOf(blind), answers[0]);
+});
+
+test("gpu evidence refuses a key set digest that is not one", async () => {
+  const { gateway, upstream } = build();
+  const out = await gateway.gpuEvidence(MODEL, "not-a-digest");
+  assert.equal(out.status, 400);
+  assert.equal(out.body.error, "invalid_keyset_digest");
+  assert.equal(upstream.calls.length, 0, "a malformed digest must not reach the upstream");
+});

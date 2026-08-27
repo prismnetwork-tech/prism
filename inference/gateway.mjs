@@ -50,6 +50,25 @@ export const CONFIDENTIAL_UPSTREAM = "https://tee.redpill.ai/v1";
 // The GPU evidence the NVIDIA attestation service wants as its request body is
 // only published by the general host, not the confidential-only one.
 export const CONFIDENTIAL_LEGACY_UPSTREAM = "https://api.redpill.ai/v1";
+
+/// How many times to ask the upstream for GPU evidence from a named instance.
+/// It picks per request across a handful of instances, so a few tries reaches
+/// any one of them; the cap is what stops a vanished instance spinning here.
+export const GPU_EVIDENCE_ATTEMPTS = 8;
+const KEYSET_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+/// Which instance a relayed evidence response came from. The relay passes the
+/// upstream's bytes through untouched, so the digest has to be read back out of
+/// them rather than off a parsed body that does not exist.
+function servedKeyset(relayed) {
+  if (relayed?.status !== 200 || !relayed.bytes) return null;
+  try {
+    const digest = JSON.parse(Buffer.from(relayed.bytes).toString("utf8"))?.workload_keyset_digest;
+    return typeof digest === "string" ? digest : null;
+  } catch {
+    return null;
+  }
+}
 export const MAX_CONFIDENTIAL_BODY_BYTES = 32 * 1024;
 
 // A request's price is the model's base plus its per-token rate over the
@@ -1235,24 +1254,45 @@ export function createGateway({
   /// The GPU leg. This body is what NVIDIA's attestation service wants posted
   /// to it, and only the general host publishes it, so it does not go through
   /// `relayGet`.
-  async function gpuEvidence(model) {
+  /// The model is served by several instances of one workload, and the upstream
+  /// answers this route from whichever one it picks, so evidence fetched blind
+  /// describes a sibling of the instance that served a given completion about
+  /// two times in three. Everything below RTMR3 matches in that case, which is
+  /// precisely why it cannot be waved through: RTMR3 carries the instance, and
+  /// binding the GPU leg to the serving TD is the whole point of the check.
+  ///
+  /// `keysetDigest` lets a caller name the instance it needs. The upstream is
+  /// asked again until one answers with that key set, which works because the
+  /// choice is per request. The last answer is returned either way; deciding
+  /// whether it binds belongs to the verifier, not here.
+  async function gpuEvidence(model, keysetDigest = null) {
     if (!conf) return disabled();
     if (typeof model !== "string" || !conf.pricing[model]) {
       return { status: 400, body: { error: "unknown_model", models: confModels } };
     }
+    if (keysetDigest != null && !KEYSET_DIGEST.test(keysetDigest)) {
+      return { status: 400, body: { error: "invalid_keyset_digest" } };
+    }
     if (!relayAllowed()) {
       return { status: 429, headers: { "retry-after": "60" }, body: { error: "rate_limited" } };
     }
-    try {
-      const res = await fetchUpstream(
-        `${conf.legacyUpstream}/attestation/report?model=${encodeURIComponent(model)}`,
-        { method: "GET", headers: { accept: "application/json" }, signal: AbortSignal.timeout(relayTimeoutMs) },
-      );
-      return await readUpstream(res);
-    } catch (err) {
-      log(`gpu evidence relay failed: ${err.message}`);
-      return { status: 503, body: { error: "upstream_unavailable" } };
+    const attempts = keysetDigest ? GPU_EVIDENCE_ATTEMPTS : 1;
+    let last = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const res = await fetchUpstream(
+          `${conf.legacyUpstream}/attestation/report?model=${encodeURIComponent(model)}`,
+          { method: "GET", headers: { accept: "application/json" }, signal: AbortSignal.timeout(relayTimeoutMs) },
+        );
+        last = await readUpstream(res);
+      } catch (err) {
+        log(`gpu evidence relay failed: ${err.message}`);
+        return last ?? { status: 503, body: { error: "upstream_unavailable" } };
+      }
+      if (!keysetDigest || servedKeyset(last) === keysetDigest) return last;
     }
+    log(`gpu evidence: ${attempts} attempts did not reach key set ${keysetDigest}`);
+    return last;
   }
 
   async function handleConfidential(raw, headers = {}, paymentHeader, paymentVersion = null) {

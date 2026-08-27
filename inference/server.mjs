@@ -507,7 +507,7 @@ const server = createServer(async (req, res) => {
     return relayed(res, await gateway.attestation(url.searchParams.get("nonce")));
   }
   if (req.method === "GET" && url.pathname === "/v1/gpu-evidence") {
-    return relayed(res, await gateway.gpuEvidence(url.searchParams.get("model")));
+    return relayed(res, await gateway.gpuEvidence(url.searchParams.get("model"), url.searchParams.get("keyset_digest")));
   }
   if (req.method === "GET" && url.pathname === "/v1/sessions") {
     return relayed(res, await gateway.sessions({
