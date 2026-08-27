@@ -621,6 +621,40 @@ test("a transcript is bound to the key set the prompt was sealed to", async () =
   assert.equal(bound.checks.find((c) => c.id === "keyset-digest").status, "pass");
 });
 
+test("a mislabelled key set no longer stops the GPU evidence being bound", async () => {
+  // The evidence endpoint and the completions endpoint are served by different
+  // replicas of the same workload, so the plaintext label routinely names a
+  // sibling. Failing there hid whether the quotes actually tied together; the
+  // binding has to be decided by the quotes, and the reported reason has to say
+  // which one broke.
+  const gateway = fakeGateway({});
+  const fetchImpl = async (url) => {
+    const target = new URL(url);
+    if (target.pathname.endsWith("/v1/gpu-evidence")) {
+      return json({
+        api_version: "aci/1",
+        workload_keyset_digest: "sha256:" + "9".repeat(64),
+        nvidia_payload: JSON.stringify({ nonce: "ab".repeat(32) }),
+        signing_address: "0x" + "1".repeat(40),
+        intel_quote: "not-a-quote",
+      });
+    }
+    return gateway.fetch(url);
+  };
+
+  const result = await verifyConfidential({
+    base: "https://gateway.test/inference",
+    receiptId: "rcpt-0001",
+    model: "demo-model",
+    now: NOW,
+    fetchImpl,
+  });
+
+  const binding = result.checks.find((c) => c.id === "gpu-binding");
+  assert.equal(binding.status, "fail");
+  assert.doesNotMatch(binding.detail, /names key set/);
+});
+
 test("a malformed quote comes back as a verdict, not as an exception", async () => {
   const gateway = {
     async fetch(url) {
