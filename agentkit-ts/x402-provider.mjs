@@ -186,7 +186,9 @@ export class PrismX402ActionProvider extends ActionProvider {
 
       // A cold pool is not a failure and is not billed. Saying so plainly stops
       // an agent retrying in a tight loop or reporting an outage to its user.
-      if (response.status === 503) {
+      // Prism answers 429 while it leases a GPU and 503 only for a real fault;
+      // older deployments answered 503 for both, so both are read here.
+      if (response.status === 429 || response.status === 503) {
         return JSON.stringify({
           charged: false,
           retryAfterSeconds: payload.retry_after_seconds ?? null,

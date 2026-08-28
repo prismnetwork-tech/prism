@@ -16,6 +16,7 @@
     "receipt.mjs",
     "server.mjs",
     "openapi.mjs",
+    "provider.mjs",
     "README.md"
   ],
   "engines": {

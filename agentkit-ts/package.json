@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/agentkit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Prism GPU compute as Coinbase AgentKit actions. Pay per call from the agent's own wallet in USDC on Base over x402, or lease a whole GPU in USDG.",
   "type": "module",
   "main": "index.mjs",

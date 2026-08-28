@@ -198,6 +198,48 @@ test("a batch that cannot finish charges nothing and leaves the payment usable",
   assert.equal((await recovered.handleBatch({ model: MODEL, prompts: prompts(4) }, pay())).status, 200);
 });
 
+test("a batch that runs out of GPU partway is capacity, not a fault", async () => {
+  const deps = fakeDeps();
+  const serve = deps.fetchOllama;
+  let gateway;
+  let served = 0;
+  deps.fetchOllama = async (slot, path, init) => {
+    const out = await serve(slot, path, init);
+    // The box goes away under the batch, which is what a lapsed lease looks
+    // like from in here.
+    if (path !== "/api/tags" && ++served === 1) gateway.drainAll("the lease lapsed");
+    return out;
+  };
+  gateway = build(deps, { poolMax: 1, itemsPerBox: 4 });
+  const out = await gateway.handleBatch({ model: MODEL, prompts: prompts(3) }, pay());
+  assert.equal(out.status, 429);
+  assert.equal(out.body.error, "batch_unavailable");
+  assert.match(out.body.detail, /no GPU was available/);
+  assert.equal(out.headers["retry-after"], String(out.body.retry_after_seconds));
+  assert.equal(gateway.stats().batches, 0, "an unfinished batch is not a batch");
+});
+
+test("a GPU that was leased and could not be used is a fault, not a queue", async () => {
+  const deps = fakeDeps();
+  deps.spawnTunnel = async () => {
+    throw new Error("ssh: connect to host h port 22: Connection refused");
+  };
+  const gateway = build(deps, { poolMax: 1, itemsPerBox: 2, coolDownMs: 600_000 });
+  const out = await gateway.handleBatch({ model: MODEL, prompts: prompts(4) }, pay());
+  assert.equal(out.status, 503);
+  assert.equal(out.body.error, "batch_unavailable");
+  assert.match(out.body.detail, /Connection refused/);
+  assert.equal(out.headers, undefined, "a fault carries no retry-after; nothing here is on a timer");
+
+  // And it stays a fault for as long as it is what keeps the pool down. Told
+  // "come back in ten minutes" instead, an operator watching for 5xx sees a
+  // busy endpoint while every request fails and every hold-off buys a GPU.
+  const during = await gateway.handleBatch({ model: MODEL, prompts: prompts(4) }, pay("cd"));
+  assert.equal(during.status, 503);
+  assert.match(during.body.detail, /cooling down after ssh: connect to host/);
+  assert.equal(deps.calls.leases, 1);
+});
+
 test("a batch is refused before payment when the request cannot be served", async () => {
   const deps = fakeDeps();
   const gateway = build(deps, { poolMax: 2, maxBatchItems: 4 });
@@ -241,7 +283,7 @@ test("a cold gateway answers a batch with when to come back, and charges nothing
   deps.agent.lease = () => new Promise(() => {});
   const gateway = build(deps, { poolMax: 2, readyWaitMs: 30, retryAfterMs: 90_000 });
   const out = await gateway.handleBatch({ model: MODEL, prompts: prompts(4) }, pay());
-  assert.equal(out.status, 503);
+  assert.equal(out.status, 429);
   assert.equal(out.body.error, "warming_up");
   assert.equal(out.headers["retry-after"], "90");
 });
@@ -311,6 +353,6 @@ test("a chain fault is logged with the reason, not just its code", async () => {
   };
   const gateway = build(deps, { poolMax: 2 });
   const out = await gateway.handleBatch({ model: MODEL, prompts: prompts(2) }, pay());
-  assert.equal(out.status, 503);
+  assert.equal(out.status, 429);
   assert.match(lines.join("\n"), /chain_error: Nonce provided/);
 });

@@ -68,14 +68,18 @@ Set `options.num_predict` to what you actually want. The quote is priced on the
 cap, not on what the model happens to produce, so an uncapped request for a
 one-line answer pays for 1024 tokens.
 
-A payment is consumed only when a response is served. If the box is still
-warming or the generation fails, the answer is `503` and the same `X-PAYMENT`
-header works on the retry. `GET /v1/stats` reports generations served, tokens,
-revenue, and leases warmed since boot.
+A payment is consumed only when a response is served. If no GPU is warm yet the
+answer is `429`. If one could not be brought up for the request, or took it and
+could not answer, the answer is `503`. Either way the same `X-PAYMENT` header
+works on the retry.
+`GET /v1/stats` reports generations served, tokens, revenue, and leases warmed
+since boot.
 
 The first paid request on a cold gateway waits through provisioning, usually
-one to four minutes. `POST /v1/warm` (free) starts the warmup early, and
-A `503 warming_up` carries `state` and `retry_after_seconds`. The estimate is
+one to four minutes. `POST /v1/warm` (free) starts that early, before there is
+a payment waiting on it.
+
+A `429 warming_up` carries `state` and `retry_after_seconds`. The estimate is
 minutes because a cold start leases a GPU onchain, waits for confirmations,
 boots the box and pulls the model. `GET /v1/models` reports the same state for
 free, so a caller that wants to avoid paying into a cold start can check there
@@ -105,7 +109,7 @@ same way a single request does; what the batch adds is that they run on all the
 gateway's GPUs at once, and a box still warming joins the work as it comes up
 rather than after the batch has finished without it. A batch is all or nothing:
 if a prompt cannot be answered even after a retry on another box, the answer is
-`503` and the same payment header works on the retry.
+`503`, and the same payment header works on the retry.
 
 ### Reproducing the Merkle root
 
@@ -211,8 +215,19 @@ The body and the response are the OpenAI chat-completions shape. With no payment
 this answers `402` with the price for the `max_tokens` you asked for, exactly
 like `/v1/inference`. `max_tokens` is required on this route: your bytes go
 upstream unchanged, so a cap the gateway cannot rewrite is a cap you have to
-state. Streaming is not offered, because a relay that returns one response body
-verbatim cannot also return it in pieces.
+state.
+
+Set `stream` to `true` and the answer comes back as server-sent events, each
+frame written the moment the enclave produces it. The receipt covers the whole
+stream, framing included, so hash the bytes you read off the wire from the first
+frame to the last. Two things differ from a buffered answer. The payment settles
+after the final frame rather than before the body, so a streamed response
+carries no `PAYMENT-RESPONSE` header. And a stream that stops before its
+terminator closes with one error frame naming the truncation: the status was
+sent long before the enclave stopped and cannot be withdrawn, nothing is
+charged, and the same payment header buys the retry. Add
+`stream_options.include_usage` if you want the token counts; a stream carries
+none without it.
 
 The response carries `X-Receipt-Id`, the enclave's `X-ACI-Version` and
 `X-ACI-Keyset-Digest`, and any `X-E2EE-*` headers it set. Fetch the receipt
@@ -220,13 +235,14 @@ promptly; upstream keeps them in memory and a restart loses them.
 
 ### What the gateway reads
 
-Two fields, `model` and `max_tokens`, taken with a parse that never touches the
-buffer it forwards. Your request reaches the enclave as the bytes you sent, and
-the enclave's answer reaches you as the bytes it returned. That is the whole
-contract of this route: any re-serialization, however faithful, would change a
-hash the signed receipt commits to, and every check you can run on it would
-fail. Message content is never logged; the log line for a confidential request
-carries the model, the token counts, the upstream cost, and the receipt id.
+Three fields, `model`, `max_tokens` and `stream`, taken with a parse that never
+touches the buffer it forwards. Your request reaches the enclave as the bytes
+you sent, and the enclave's answer reaches you as the bytes it returned. That
+is the whole contract of this route: any re-serialization, however faithful,
+would change a hash the signed receipt commits to, and every check you can run
+on it would fail. Message content is never logged; the log line for a
+confidential request carries the model, the token counts, the upstream cost,
+and the receipt id.
 
 Send the five `X-E2EE-*` headers and the gateway passes them straight through.
 Message content is then encrypted to the enclave's public key, which is bound
@@ -276,13 +292,22 @@ These cover what the upstream charges rather than what a lease burns, at roughly
 eight times the upstream catalog price at the caps this route enforces: a 32 KiB
 body and 1024 output tokens.
 
+`GET /v1/provider/models` (free) publishes the same rates as a provider
+catalogue, in the model-discovery format inference aggregators poll: the base
+price as a per-request charge, the per-token rate as a completion price, the
+output cap and the request-body limit, and a daily request ceiling worked out
+from the spend cap below. Only the confidential tier appears there. The open
+tier leases a GPU per request, and a cold start reads as unavailability to
+anything scoring the endpoint.
+
 The daily cap is `INFERENCE_CONFIDENTIAL_DAILY_USD`. A request is counted
 against it before it is relayed: the gateway holds the request's own quoted
 price against the day while the call is in flight, then replaces that figure
 with the upstream's `usage.cost` once a response carries one. A response with no
 cost keeps the held figure, and the gateway logs once that the upstream stopped
-reporting. A request the day's remaining room cannot cover answers `503` with
-nothing charged, so set the cap above the full-cap price of one call.
+reporting. A request the day's remaining room cannot cover answers `429` with
+`retry-after: 3600` and nothing charged, so set the cap above the full-cap price
+of one call.
 
 A confidential payment is consumed only when a response is served, the same rule
 as everywhere else here. An upstream that is out of quota, rate limited, or down

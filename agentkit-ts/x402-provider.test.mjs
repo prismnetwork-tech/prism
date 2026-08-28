@@ -111,9 +111,13 @@ describe("PrismX402ActionProvider", () => {
   });
 
   test("a cold pool reports unbilled, not an error", async () => {
-    stub(async () => reply(503, { error: "warming_up", detail: "leasing", retry_after_seconds: 300 }));
-    const out = JSON.parse(await actions().prism_run_inference.invoke({ prompt: "hi" }));
-    assert.deepEqual(out, { charged: false, retryAfterSeconds: 300, detail: "leasing" });
+    // 429 is what a current deployment answers while it leases a GPU; 503 is
+    // what older ones answered for the same state.
+    for (const status of [429, 503]) {
+      stub(async () => reply(status, { error: "warming_up", detail: "leasing", retry_after_seconds: 300 }));
+      const out = JSON.parse(await actions().prism_run_inference.invoke({ prompt: "hi" }));
+      assert.deepEqual(out, { charged: false, retryAfterSeconds: 300, detail: "leasing" });
+    }
   });
 
   test("a non-JSON gateway page does not become a parse error", async () => {

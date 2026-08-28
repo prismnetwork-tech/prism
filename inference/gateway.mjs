@@ -207,6 +207,43 @@ function readUsage(bytes) {
   };
 }
 
+/// What a stream says about itself, read back out of the bytes that were sent.
+/// `usage` rides a data frame rather than the body, and only when the caller
+/// asked the upstream for it; `[DONE]` is the only thing in the stream that
+/// says the answer is whole.
+function readStream(bytes) {
+  let usage = {};
+  let done = false;
+  for (const line of bytes.toString("utf8").split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const frame = line.slice(5).trim();
+    if (frame === "[DONE]") {
+      done = true;
+      continue;
+    }
+    if (!frame) continue;
+    const found = readUsage(Buffer.from(frame));
+    if (found.prompt_tokens != null || found.completion_tokens != null || found.cost != null) usage = found;
+  }
+  return { usage, done };
+}
+
+/// The one thing the relay ever adds to a body, and only to a stream that
+/// stopped before its terminator: an OpenAI-shaped error frame, because a
+/// status already sent cannot be taken back and silence reads as a short
+/// answer rather than a broken one.
+const STREAM_TRUNCATED = Buffer.from(
+  `data: ${JSON.stringify({
+    error: {
+      type: "upstream_unavailable",
+      code: "stream_truncated",
+      message:
+        "the enclave stopped before the stream ended; the payment was not consumed, so the same " +
+        "payment header buys the retry",
+    },
+  })}\n\n`,
+);
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /// An error worth acting on. The SDK carries the reason in `body.cause` and the
@@ -375,6 +412,10 @@ export function createGateway({
   }));
   const warming = new Map();
   let coolUntil = 0;
+  // What the failed warmup was, kept for as long as the hold-off it started.
+  // Every caller that arrives inside that window is answered from here, and a
+  // fault nobody wrote down cannot be told apart from a queue.
+  let coolCause = null;
 
   function reservePayment(key) {
     if (consumed.has(key)) return false;
@@ -397,6 +438,17 @@ export function createGateway({
     }
   }
 
+  /// Holds warming off for a while and records what stopped it. `capacity`
+  /// separates the network having no machine to give us, which is a queue, from
+  /// a machine we hold and cannot use, which is a fault: the pool is equally
+  /// unable to serve either way, but only one of them is ours to fix and only
+  /// one of them should read as an outage to anything watching.
+  function holdOff(err, capacity) {
+    coolUntil = now() + coolDownMs;
+    coolCause = { why: String(err?.message ?? err), capacity };
+    return Object.assign(err, { capacity });
+  }
+
   async function warmUp(box) {
     box.phase = "warming";
     let lease;
@@ -404,16 +456,13 @@ export function createGateway({
       lease = await agent.lease({ image, durationSeconds, minVramMib });
     } catch (err) {
       // Nothing was funded when the match itself fails, but hammering the
-      // network with fresh quote attempts helps nobody. Say why: every later
-      // caller is told only that a cooldown is running, so a cause that is not
-      // written down here cannot be recovered from outside at all.
-      // The SDK reports a chain fault as a status and a code, and puts what
-      // actually went wrong in the body. Logging only the message throws that
-      // away and leaves a cooldown with no stated cause.
+      // network with fresh quote attempts helps nobody. The SDK reports a chain
+      // fault as a status and a code and puts what actually went wrong in the
+      // body, so the log takes the whole of it: a caller inside the hold-off is
+      // told the short reason and nothing else is recoverable from outside.
       log(`warmup failed while leasing: ${describe(err)}`);
       box.phase = "cold";
-      coolUntil = now() + coolDownMs;
-      throw err;
+      throw holdOff(err, true);
     }
     try {
       // The supplier replaces the image entrypoint with its own SSH bootstrap,
@@ -456,11 +505,10 @@ export function createGateway({
       // lease, so a persistent fault must not chain them.
       agent.endLease(lease);
       box.phase = "cold";
-      coolUntil = now() + coolDownMs;
       // A lease was paid for and is being dropped, so this is the expensive
       // failure and the one worth naming precisely.
       log(`warmup failed after lease ${lease.leaseId}: ${describe(err)}`);
-      throw err;
+      throw holdOff(err, false);
     }
   }
 
@@ -493,11 +541,21 @@ export function createGateway({
     const pending = grow(target);
     if (warmBoxes().length) return Promise.resolve();
     if (!pending.length) {
-      return Promise.reject(
-        now() < coolUntil
-          ? new Error(`warmup is cooling down after a failure; retry in ${Math.ceil((coolUntil - now()) / 1000)}s`)
-          : new Error("no slot is free to warm"),
-      );
+      // A hold-off answers with whatever started it, so a fault stays a fault
+      // for as long as it is keeping the pool down rather than reading as a
+      // queue from the second caller on.
+      if (now() < coolUntil) {
+        const seconds = Math.ceil((coolUntil - now()) / 1000);
+        return Promise.reject(
+          Object.assign(
+            new Error(`warmup is cooling down after ${coolCause.why}; retry in ${seconds}s`),
+            { capacity: coolCause.capacity },
+          ),
+        );
+      }
+      // Every slot is spoken for, which is the pool being full rather than
+      // anything having gone wrong.
+      return Promise.reject(Object.assign(new Error("no slot is free to warm"), { capacity: true }));
     }
     // Any one of them is enough, and the aggregate error hides the cause.
     return Promise.any(pending).then(
@@ -542,6 +600,44 @@ export function createGateway({
   // avoid paying into a cold start can check there first.
   function retryAfterFor(state) {
     return Math.ceil((state === "cold" ? coldRetryAfterMs : retryAfterMs) / 1000);
+  }
+
+  /// The pool has nowhere to run this yet: no box is up, or the network had
+  /// none to give. Nothing has broken and nothing was charged, so it answers
+  /// like a rate limit rather than like a fault. Aggregators score an endpoint
+  /// on how often it returns 5xx and exempt 429 for exactly this case, and a
+  /// queue counted as downtime costs the pool the traffic that would have
+  /// warmed it.
+  function busy(error, detail) {
+    const seconds = retryAfterFor(phase());
+    return {
+      status: 429,
+      headers: { "retry-after": String(seconds) },
+      body: {
+        error,
+        detail,
+        state: phase(),
+        retry_after_seconds: seconds,
+        retry: "nothing was charged; send the same payment header again.",
+      },
+    };
+  }
+
+  /// Something the gateway holds could not do the work: a box that took a
+  /// generation and failed it, or a lease that was paid for and never came up.
+  /// Nothing was charged here either, but a fault answered as a queue is an
+  /// outage nobody is told about: the endpoint keeps saying "come back later"
+  /// while every request fails and every hold-off buys another GPU to abandon.
+  function broken(error, detail) {
+    return {
+      status: 503,
+      body: {
+        error,
+        detail,
+        state: phase(),
+        retry: "nothing was charged; retry with the same payment header",
+      },
+    };
   }
 
   function drainAll(reason) {
@@ -869,36 +965,32 @@ export function createGateway({
     const failure = await Promise.race([warming, sleep(readyWaitMs).then(() => TIMED_OUT)]);
     if (failure === TIMED_OUT) {
       payment.release();
-      return {
-        status: 503,
-        headers: { "retry-after": String(retryAfterFor(phase())) },
-        body: {
-          error: "warming_up",
-          detail: "A GPU is being leased and the models are being pulled.",
-          state: phase(),
-          retry_after_seconds: retryAfterFor(phase()),
-          retry: "nothing was charged; send the same payment header again.",
-        },
-      };
+      return busy("warming_up", "A GPU is being leased and the models are being pulled.");
+    }
+    // Either the warmup failed outright, or the box that was up lapsed between
+    // the wait and the pick. The work never started either way, so nothing was
+    // charged; what the warmup failed at is what decides whether this is the
+    // pool queueing or the pool being down.
+    const target = failure ? null : pick();
+    if (!target) {
+      payment.release();
+      const why = failure
+        ? String(failure.message ?? failure)
+        : "the warm box went away before the request reached it";
+      log(`inference has nowhere to run: ${why}`);
+      return failure && !failure.capacity
+        ? broken("inference_unavailable", why)
+        : busy("inference_unavailable", why);
     }
     let result;
     try {
-      if (failure) throw failure;
-      const target = pick();
-      if (!target) throw new Error("the warm box went away before the request reached it");
       result = await generate(body, cap, target);
     } catch (err) {
+      // A box took the work and could not do it. That is a fault rather than a
+      // queue, and it keeps the status a fault gets.
       payment.release();
       log(`inference failed: ${err.message}`);
-      return {
-        status: 503,
-        body: {
-          error: "inference_unavailable",
-          detail: String(err.message ?? err),
-          state: phase(),
-          retry: "the payment was not consumed; retry with the same payment header",
-        },
-      };
+      return broken("inference_unavailable", String(err.message ?? err));
     }
 
     const settlement = await settlePayment(payment, micros);
@@ -947,8 +1039,13 @@ export function createGateway({
         // Nothing warm to hand the rest of the batch to. Worth waiting only
         // while a box is actually on its way up.
         if (!warming.size || now() > deadline) {
-          failure = new Error(
-            warming.size ? "the batch ran out of time waiting for a GPU" : "no GPU was available to finish the batch",
+          // Marked, because running out of GPU partway is the same shortage as
+          // never having one and the caller is owed the same answer.
+          failure = Object.assign(
+            new Error(
+              warming.size ? "the batch ran out of time waiting for a GPU" : "no GPU was available to finish the batch",
+            ),
+            { capacity: true },
           );
           break;
         }
@@ -1030,35 +1127,23 @@ export function createGateway({
     const failure = await Promise.race([warmingUp, sleep(readyWaitMs).then(() => TIMED_OUT)]);
     if (failure === TIMED_OUT) {
       payment.release();
-      return {
-        status: 503,
-        headers: { "retry-after": String(retryAfterFor(phase())) },
-        body: {
-          error: "warming_up",
-          detail: "GPUs are being leased and the models are being pulled.",
-          state: phase(),
-          retry_after_seconds: retryAfterFor(phase()),
-          retry: "nothing was charged; send the same payment header again.",
-        },
-      };
+      return busy("warming_up", "GPUs are being leased and the models are being pulled.");
+    }
+    if (failure) {
+      payment.release();
+      const why = String(failure.message ?? failure);
+      log(`batch has nowhere to run: ${why}`);
+      return failure.capacity ? busy("batch_unavailable", why) : broken("batch_unavailable", why);
     }
 
     let items;
     try {
-      if (failure) throw failure;
       items = await runBatch({ model: body.model, prompts, cap, options: body.options });
     } catch (err) {
       payment.release();
       log(`batch failed: ${err.message}`);
-      return {
-        status: 503,
-        body: {
-          error: "batch_unavailable",
-          detail: String(err.message ?? err),
-          state: phase(),
-          retry: "nothing was charged; retry with the same payment header",
-        },
-      };
+      const why = String(err.message ?? err);
+      return err.capacity ? busy("batch_unavailable", why) : broken("batch_unavailable", why);
     }
 
     const settlement = await settlePayment(payment, micros, " a batch");
@@ -1170,6 +1255,8 @@ export function createGateway({
     return out;
   }
 
+  const sse = (headers) => (headers.get("content-type") ?? "").includes("text/event-stream");
+
   function headersDown(headers) {
     const out = { "content-type": headers.get("content-type") ?? "application/json" };
     for (const name of RELAY_RESPONSE_HEADERS) {
@@ -1183,6 +1270,48 @@ export function createGateway({
   /// what the receipt is signed over, so they are never decoded and re-encoded.
   async function readUpstream(res) {
     return { status: res.status, headers: headersDown(res.headers), bytes: Buffer.from(await res.arrayBuffer()) };
+  }
+
+  /// Reads a streamed upstream response, handing each chunk on as it lands and
+  /// keeping a copy of it. The copy is not something the caller waits behind:
+  /// it is what the enclave signed its receipt over, what the usage frame is
+  /// read out of, and what a reconnecting client replays, and `max_tokens`
+  /// bounds it at the same size a buffered answer would have been anyway.
+  ///
+  /// The read runs on its own rather than on whoever is consuming it. A caller
+  /// that hangs up halfway through has still bought a whole generation, so the
+  /// rest of it is read, paid for, and kept for the reconnect to replay.
+  function pumpUpstream(body) {
+    const chunks = [];
+    let wake = null;
+    let ended = false;
+    let failure = null;
+    const drained = (async () => {
+      try {
+        for await (const chunk of body) {
+          chunks.push(Buffer.from(chunk));
+          wake?.();
+        }
+      } catch (err) {
+        failure = err;
+      }
+      ended = true;
+      wake?.();
+    })();
+    return {
+      chunks,
+      drained,
+      failure: () => failure,
+      async *arriving() {
+        for (let sent = 0; ;) {
+          while (sent < chunks.length) yield chunks[sent++];
+          if (ended) return;
+          await new Promise((resolve) => {
+            wake = resolve;
+          });
+        }
+      },
+    };
   }
 
   const disabled = () => ({ status: 404, body: { error: "confidential_disabled" } });
@@ -1326,6 +1455,127 @@ export function createGateway({
     while (remember.size > GPU_EVIDENCE_HELD) remember.delete(remember.keys().next().value);
   }
 
+  /// What a served confidential generation costs, earns and is logged as. None
+  /// of it depends on whether the answer arrived whole or in frames, so both
+  /// paths book it here, and both take the money last.
+  ///
+  /// Everything up to the broadcast runs before the first await, so a caller
+  /// that already holds the answer can be let go the moment this is called: the
+  /// payment is recorded as spent and the bytes are held for a replay before
+  /// the chain is touched, and only the settlement outcome arrives later.
+  async function bookConfidential({ model, usage, modelled, micros, payment, relay, note = "" }) {
+    // What the upstream says it charged replaces the reservation. When it says
+    // nothing, the modelled figure stands as the charge.
+    const cost = usage.cost ?? modelled;
+    settleSpend(modelled, cost);
+    stats.confidential_cost_usd += cost;
+    if (usage.cost == null && !costUnreported) {
+      costUnreported = true;
+      log(
+        "confidential upstream reported no usage.cost; the modelled price of each request " +
+          "is charged against the daily cap until it does",
+      );
+    }
+    stats.confidential_generations += 1;
+    stats.confidential_tokens_in += usage.prompt_tokens ?? 0;
+    stats.confidential_tokens_out += usage.completion_tokens ?? 0;
+    // Model, usage, cost, receipt id. Message content never reaches a log line,
+    // and under e2ee it never reaches this process in the clear at all.
+    log(
+      `confidential ${model}${note} in=${usage.prompt_tokens ?? "?"} out=${usage.completion_tokens ?? "?"} ` +
+        `cost=${usage.cost ?? `~${modelled.toFixed(6)}`} receipt=${relay.headers["x-receipt-id"] ?? "none"}`,
+    );
+
+    payment.commit({ relay });
+    const settlement = await settlePayment(payment, micros, " a confidential request");
+    if (!settlement || settlement.success) stats.revenue_micros += micros;
+    return settlement;
+  }
+
+  /// Books a finished stream and says whether it was one. `[DONE]` is the only
+  /// thing that makes a stream the answer, so it is the only thing asked here:
+  /// a connection that drops after the terminator delivered the whole of what
+  /// the enclave signed, and a caller told otherwise would be handed an error
+  /// frame after the frame it stops reading at, over bytes it already paid for
+  /// and can still verify. An answer that stopped short is charged for neither.
+  ///
+  /// The verdict is the caller's to have straight away. The booking behind it
+  /// is not: it reaches the chain, and by the time it starts the caller holds
+  /// every frame, so it is left running rather than waited on.
+  function finishStream(status, headers, answer, failure, ctx) {
+    if (!answer.done) {
+      ctx.payment.release();
+      settleSpend(ctx.modelled);
+      log(
+        `confidential stream for ${ctx.model} stopped after ${answer.bytes.length} bytes: ` +
+          `${failure?.message ?? "the upstream closed without a terminator"}`,
+      );
+      return false;
+    }
+    bookConfidential({
+      ...ctx,
+      usage: answer.usage,
+      relay: { status, headers, bytes: answer.bytes },
+      // A drop after the terminator changes nothing about what was served, but
+      // it is the difference between a clean close and a reset on the wire.
+      note: failure ? " stream (dropped after the terminator)" : " stream",
+    }).catch((err) => log(`confidential stream bookkeeping failed for ${ctx.model}: ${err.message}`));
+    return true;
+  }
+
+  /// A streamed answer, from the moment the enclave commits to serving one.
+  ///
+  /// Settlement stays where the buffered path puts it, after the last byte and
+  /// never before, so a stream that dies halfway costs its caller nothing. What
+  /// that costs is the PAYMENT-RESPONSE header, which reports a broadcast that
+  /// has not happened when the head is written. A streamed answer carries none,
+  /// and the settlement is where every other one is, on the chain the
+  /// authorization named. Moving the broadcast ahead of the first frame would
+  /// buy the header back at the cost of charging for answers that never
+  /// finished, and it would put a chain round trip in front of the first token.
+  ///
+  /// What a caller sees when the enclave stops mid-stream: the 200 and the
+  /// frames already sent stand, because a status cannot be withdrawn once it is
+  /// on the wire, and the relay closes with an error frame naming the
+  /// truncation and the payment it did not take. That frame is the only thing
+  /// the relay ever adds to a body, and it can only reach a stream that never
+  /// carried its terminator, whose receipt hash the caller had already lost.
+  ///
+  /// Nothing else is allowed to hold the body open. Whether the terminator
+  /// arrived is known the moment the last byte does, and that is the only thing
+  /// still to be decided; the broadcast that follows takes seconds the caller
+  /// would spend waiting on a response it has already read in full.
+  function relayStream(res, ctx) {
+    const headers = headersDown(res.headers);
+    const upstream = pumpUpstream(res.body);
+    let read = null;
+    // The bytes as they went out, which is what the enclave signed its receipt
+    // over. Read once the stream has ended, and only then.
+    const answer = () => {
+      if (!read) {
+        const bytes = Buffer.concat(upstream.chunks);
+        read = { bytes, ...readStream(bytes) };
+      }
+      return read;
+    };
+    const whole = upstream.drained
+      .then(() => finishStream(res.status, headers, answer(), upstream.failure(), ctx))
+      .catch((err) => {
+        // An error frame appended to an answer that may well be whole is the
+        // worse of the two mistakes available here.
+        log(`confidential stream could not be closed out for ${ctx.model}: ${err.message}`);
+        return true;
+      });
+    return {
+      status: res.status,
+      headers,
+      stream: (async function* () {
+        yield* upstream.arriving();
+        if (!(await whole)) yield STREAM_TRUNCATED;
+      })(),
+    };
+  }
+
   async function handleConfidential(raw, headers = {}, paymentHeader, paymentVersion = null) {
     const version = paymentVersion ?? 2;
     if (!conf) return disabled();
@@ -1352,15 +1602,6 @@ export function createGateway({
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return { status: 400, body: { error: "messages_required" } };
     }
-    if (body.stream) {
-      return {
-        status: 400,
-        body: {
-          error: "stream_unsupported",
-          detail: "the relay returns one response body verbatim, which a stream cannot be",
-        },
-      };
-    }
     if (body.n != null && body.n !== 1) {
       return { status: 400, body: { error: "n_unsupported", detail: "one completion per paid request" } };
     }
@@ -1379,13 +1620,16 @@ export function createGateway({
 
     const { cap, micros } = priceFor(conf.pricing, model, asked);
     const modelled = modelledUsd(micros);
+    // The day's budget is a limit the operator set, not a fault, so it answers
+    // the way any other exhausted allowance does.
     if (!reserveSpend(modelled)) {
       return {
-        status: 503,
+        status: 429,
         headers: { "retry-after": "3600" },
         body: {
           error: "spend_cap_reached",
           detail: "the confidential relay has reached its daily upstream spend cap",
+          retry_after_seconds: 3600,
           retry: "nothing was charged; the cap resets at 00:00 UTC",
         },
       };
@@ -1402,19 +1646,29 @@ export function createGateway({
       return { status: 402, body: refused.body, headers: refused.headers };
     }
 
+    // The caller's own body is what asks for a stream; all the relay adds is
+    // the accept header that goes with the ask.
+    const wantsStream = Boolean(body.stream);
     let upstream;
     try {
       const res = await fetchUpstream(`${conf.upstream}/chat/completions`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          accept: "application/json",
+          accept: wantsStream ? "text/event-stream" : "application/json",
           authorization: `Bearer ${conf.key}`,
           ...headersUp(headers),
         },
         body: bytes,
         signal: AbortSignal.timeout(confidentialTimeoutMs),
       });
+      // Asking for a stream is not being given one. Until the enclave has
+      // answered with frames, nothing has been served and everything below
+      // still applies: a refusal is read whole and answered with a status the
+      // caller can act on.
+      if (wantsStream && res.ok && res.body && sse(res.headers)) {
+        return relayStream(res, { model, modelled, micros, payment });
+      }
       upstream = await readUpstream(res);
     } catch (err) {
       payment.release();
@@ -1459,33 +1713,14 @@ export function createGateway({
       };
     }
 
-    const usage = readUsage(upstream.bytes);
-    // What the upstream says it charged replaces the reservation. When it says
-    // nothing, the modelled figure stands as the charge.
-    const cost = usage.cost ?? modelled;
-    settleSpend(modelled, cost);
-    stats.confidential_cost_usd += cost;
-    if (usage.cost == null && !costUnreported) {
-      costUnreported = true;
-      log(
-        "confidential upstream reported no usage.cost; the modelled price of each request " +
-          "is charged against the daily cap until it does",
-      );
-    }
-    stats.confidential_generations += 1;
-    stats.confidential_tokens_in += usage.prompt_tokens ?? 0;
-    stats.confidential_tokens_out += usage.completion_tokens ?? 0;
-    // Model, usage, cost, receipt id. Message content never reaches a log line,
-    // and under e2ee it never reaches this process in the clear at all.
-    log(
-      `confidential ${model} in=${usage.prompt_tokens ?? "?"} out=${usage.completion_tokens ?? "?"} ` +
-        `cost=${usage.cost ?? `~${modelled.toFixed(6)}`} receipt=${upstream.headers["x-receipt-id"] ?? "none"}`,
-    );
-
-    const settlement = await settlePayment(payment, micros, " a confidential request");
-    const record = { relay: { status: upstream.status, headers: upstream.headers, bytes: upstream.bytes } };
-    payment.commit(record);
-    if (!settlement || settlement.success) stats.revenue_micros += micros;
+    const settlement = await bookConfidential({
+      model,
+      usage: readUsage(upstream.bytes),
+      modelled,
+      micros,
+      payment,
+      relay: { status: upstream.status, headers: upstream.headers, bytes: upstream.bytes },
+    });
     return {
       status: upstream.status,
       bytes: upstream.bytes,
