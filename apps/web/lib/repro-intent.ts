@@ -9,10 +9,11 @@ import {
   isGpuReproCommand,
   isPinnedPublicImage,
   type GpuReproSpec,
+  type GpuReproExecutor,
 } from "./gpu-capability";
 
-const intentVersion = "prism.gpu-repro.intent.v1";
-const intentKeyDomain = "prism-gpu-repro-intent-key-v1\0";
+const intentVersion = "prism.gpu-repro.intent.v2";
+const intentKeyDomain = "prism-gpu-repro-intent-key-v2\0";
 const specDomain = "prism-gpu-repro-spec-v1\0";
 const tokenBytes = 32;
 const intentTtlSeconds = 30 * 60;
@@ -20,6 +21,7 @@ const maxEnvelopeBytes = 8 * 1_024;
 
 export type ReproIntentPayload = GpuReproSpec & {
   version: typeof intentVersion;
+  executor: GpuReproExecutor;
   maximum_escrow: string;
   token_hash: string;
   spec_hash: string;
@@ -35,17 +37,20 @@ export class ReproIntentError extends Error {
 
 export function createReproIntent(
   spec: GpuReproSpec,
+  executor: GpuReproExecutor,
   maximumEscrow: bigint,
   origin: URL,
   now = new Date(),
 ) {
   validateSpec(spec);
+  if (executor !== "node" && executor !== "managed") throw new ReproIntentError("invalid");
   if (maximumEscrow <= 0n) throw new ReproIntentError("invalid");
 
   const token = randomBytes(tokenBytes);
   const issuedAt = Math.floor(now.getTime() / 1_000);
   const payload: ReproIntentPayload = {
     version: intentVersion,
+    executor,
     image: spec.image,
     command: spec.command,
     duration_seconds: spec.duration_seconds,
@@ -143,6 +148,7 @@ function isReproIntentPayload(value: unknown): value is ReproIntentPayload {
   const payload = value as Partial<ReproIntentPayload>;
   const exactKeys = [
     "version",
+    "executor",
     "image",
     "command",
     "duration_seconds",
@@ -158,6 +164,7 @@ function isReproIntentPayload(value: unknown): value is ReproIntentPayload {
     return false;
   }
   if (payload.version !== intentVersion) return false;
+  if (payload.executor !== "node" && payload.executor !== "managed") return false;
   try {
     validateSpec(payload as GpuReproSpec);
   } catch {

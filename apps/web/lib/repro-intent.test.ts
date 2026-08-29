@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ReproIntentError,
@@ -41,11 +42,13 @@ describe("GPU repro approval intents", () => {
   });
 
   it("binds the exact spec, cap, token hash, and expiry", () => {
-    const intent = createReproIntent(spec, 399_600n, new URL("https://prism.example"), now);
+    const intent = createReproIntent(spec, "managed", 399_600n, new URL("https://prism.example"), now);
     const verified = verifyReproIntent(intent.envelope, new Date(now.getTime() + 60_000));
 
     expect(verified).toMatchObject({
       ...spec,
+      version: "prism.gpu-repro.intent.v2",
+      executor: "managed",
       maximum_escrow: "399600",
       spec_hash: hashReproSpec(spec),
       token_hash: hashReproToken(intent.reproToken),
@@ -56,8 +59,21 @@ describe("GPU repro approval intents", () => {
     expect(intent.approvalUrl).not.toContain(intent.reproToken);
   });
 
+  it("does not accept the unpublished v1 intent contract", () => {
+    const intent = createReproIntent(spec, "managed", 399_600n, new URL("https://prism.example"), now);
+    const [encoded] = intent.envelope.split(".");
+    const legacy = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    legacy.version = "prism.gpu-repro.intent.v1";
+    const legacyEncoded = Buffer.from(JSON.stringify(legacy)).toString("base64url");
+    const root = Buffer.from(process.env.PRISM_CONTROL_PLANE_AUTH_KEY!, "hex");
+    const legacyKey = createHmac("sha256", root).update("prism-gpu-repro-intent-key-v1\0").digest();
+    const legacySignature = createHmac("sha256", legacyKey).update(legacyEncoded).digest("base64url");
+
+    expect(() => verifyReproIntent(`${legacyEncoded}.${legacySignature}`, now)).toThrowError(ReproIntentError);
+  });
+
   it("rejects a payload changed after signing", () => {
-    const intent = createReproIntent(spec, 399_600n, new URL("https://prism.example"), now);
+    const intent = createReproIntent(spec, "managed", 399_600n, new URL("https://prism.example"), now);
     const [encoded, signature] = intent.envelope.split(".");
     const changed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
     changed.command = "curl https://example.invalid";
@@ -67,7 +83,7 @@ describe("GPU repro approval intents", () => {
   });
 
   it("rejects an expired envelope", () => {
-    const intent = createReproIntent(spec, 399_600n, new URL("https://prism.example"), now);
+    const intent = createReproIntent(spec, "managed", 399_600n, new URL("https://prism.example"), now);
     expect(() => verifyReproIntent(
       intent.envelope,
       new Date(now.getTime() + 30 * 60_000),
@@ -76,7 +92,7 @@ describe("GPU repro approval intents", () => {
 
   it("requires a dedicated key derived from the control-plane secret", () => {
     delete process.env.PRISM_CONTROL_PLANE_AUTH_KEY;
-    expect(() => createReproIntent(spec, 399_600n, new URL("https://prism.example"), now))
+    expect(() => createReproIntent(spec, "managed", 399_600n, new URL("https://prism.example"), now))
       .toThrowError(expect.objectContaining({ code: "configuration" }));
   });
 });

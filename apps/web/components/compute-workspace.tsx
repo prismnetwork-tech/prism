@@ -52,11 +52,13 @@ type LeaseQuote = {
     token_hash: string;
     spec_hash: string;
     expected_exit_code: number;
+    executor: "node" | "managed";
   };
 };
 
 type ReproIntent = {
-  version: "prism.gpu-repro.intent.v1";
+  version: "prism.gpu-repro.intent.v2";
+  executor: "node" | "managed";
   image: string;
   command: string;
   duration_seconds: number;
@@ -229,7 +231,7 @@ export function ComputeWorkspace() {
       return;
     }
     if (!isPinnedPublicImage(image)) {
-      setNotice("Use a public OCI image pinned to an immutable sha256 digest.");
+      setNotice("Use a public OCI image pinned to an immutable lowercase sha256 digest.");
       return;
     }
     if (!reproIntent && !isSshPublicKey(sshKey)) {
@@ -388,6 +390,7 @@ export function ComputeWorkspace() {
                 <div><dt>Runtime</dt><dd>{formatDuration(reproIntent.duration_seconds)}</dd></div>
                 <div><dt>Minimum VRAM</dt><dd>{formatVram(reproIntent.min_vram_mib)}</dd></div>
                 <div><dt>Expected exit</dt><dd>{reproIntent.expected_exit_code}</dd></div>
+                <div><dt>Executor</dt><dd>{reproIntent.executor === "managed" ? "Prism-managed GPU" : "Provider node"}</dd></div>
                 <div><dt>Cost ceiling</dt><dd>{formatUsd(BigInt(reproIntent.maximum_escrow))}</dd></div>
                 <div><dt>Spec hash</dt><dd className="mono">{shortDigest(reproIntent.spec_hash)}</dd></div>
               </dl>
@@ -585,6 +588,7 @@ async function requestMatch(
         token_hash: repro.token_hash,
         spec_hash: repro.spec_hash,
         expected_exit_code: repro.expected_exit_code,
+        executor: repro.executor,
       },
     } : {}),
   };
@@ -648,7 +652,8 @@ function assertReproQuote(quote: LeaseQuote, intent: ReproIntent) {
     || BigInt(quote.maximum_escrow) > BigInt(intent.maximum_escrow)
     || quote.repro?.token_hash !== intent.token_hash
     || quote.repro?.spec_hash !== intent.spec_hash
-    || quote.repro?.expected_exit_code !== intent.expected_exit_code) {
+    || quote.repro?.expected_exit_code !== intent.expected_exit_code
+    || quote.repro?.executor !== intent.executor) {
     throw new Error("The live quote does not match the signed GPU repro or exceeds its cost ceiling.");
   }
 }
@@ -728,7 +733,8 @@ async function loadReproProgress(leaseId: number): Promise<ReproProgress> {
 function isReproIntent(value: unknown): value is ReproIntent {
   if (!value || typeof value !== "object") return false;
   const intent = value as Partial<ReproIntent>;
-  return intent.version === "prism.gpu-repro.intent.v1"
+  return intent.version === "prism.gpu-repro.intent.v2"
+    && (intent.executor === "node" || intent.executor === "managed")
     && isPinnedPublicImage(intent.image ?? "")
     && isGpuReproCommand(intent.command ?? "")
     && isPositiveInteger(intent.duration_seconds)

@@ -56,7 +56,7 @@ const errors = [
 
 const quoteExample = `{
   "request": {
-    "image": "docker.io/nvidia/cuda@sha256:<64 hex chars>",
+    "image": "docker.io/nvidia/cuda@sha256:<64 lowercase hex chars>",
     "duration_seconds": 3600,
     "min_vram_mib": 45000,
     "preferred_node_id": null

@@ -148,6 +148,12 @@ The v1 repro hashes are lowercase hexadecimal SHA-256:
 - `stdout_hash` and `stderr_hash` hash the exact UTF-8 stream bytes without a
   domain prefix. `truncated` states whether either captured stream lost data.
 
+The private `ReproCapability` also commits to `executor: node | managed`. That
+field is carried unchanged by the approval intent, quote, lease, execution
+evidence, and settlement validation. If the approved path is no longer live at
+funding confirmation, the control plane rejects the confirmation for recovery;
+it never substitutes the other executor.
+
 `expected_exit_code` is an integer from 0 through 255. `exit_code` is from -255
 through 255 so a future executor can preserve signal-style failures. `succeeded`
 must equal `exit_code == expected_exit_code`; it is not an independent claim.

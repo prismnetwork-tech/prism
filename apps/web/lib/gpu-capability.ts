@@ -24,16 +24,31 @@ export type GpuReproSpec = {
   expected_exit_code: number;
 };
 
+export type GpuReproExecutor = "node" | "managed";
+
 export type GpuLeasePlan = GpuReproSpec & {
   estimatedGpu: {
     model: string;
     vramMib: number;
     cudaMajor: number;
   };
-  estimatedExecutor: "node" | "managed";
+  estimatedExecutor: GpuReproExecutor;
   maximumEscrowBaseUnits: bigint;
   maximumEscrowUsdg: string;
 };
+
+const trustedRegistries = new Set([
+  "docker.io",
+  "index.docker.io",
+  "registry-1.docker.io",
+  "quay.io",
+  "nvcr.io",
+  "public.ecr.aws",
+  "mcr.microsoft.com",
+  "registry.k8s.io",
+  "gcr.io",
+  "ghcr.io",
+]);
 
 export class GpuCapabilityError extends Error {
   constructor(
@@ -57,7 +72,7 @@ export function prepareGpuLeasePlan(
   if (!isPinnedPublicImage(input.image)) {
     throw new GpuCapabilityError(
       "invalid_image",
-      "Use a public OCI image pinned to an immutable sha256 digest.",
+      "Use a public OCI image pinned to an immutable lowercase sha256 digest.",
     );
   }
   if (!gpuLeaseDurations.includes(input.durationMinutes as (typeof gpuLeaseDurations)[number])) {
@@ -180,16 +195,15 @@ export function isMarketplaceOffer(value: unknown): value is MarketplaceOffer {
 export function isPinnedPublicImage(image: string) {
   if (!image || image.length > 512 || /\s/.test(image) || image.includes("..")) return false;
   const marker = image.lastIndexOf("@sha256:");
-  if (marker < 1 || !/^[0-9a-f]{64}$/i.test(image.slice(marker + 8))) return false;
+  if (marker < 1 || !/^[0-9a-f]{64}$/.test(image.slice(marker + 8))) return false;
   const reference = image.slice(0, marker);
   if (!/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[1-9][0-9]{0,4})?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$/.test(reference)) {
     return false;
   }
   const registry = reference.split("/")[0]?.toLowerCase();
   if (!registry || (!registry.includes(".") && !registry.includes(":") && registry !== "localhost")) return true;
-  const port = registry.split(":")[1];
-  if (port && Number(port) > 65_535) return false;
-  return !isPrivateRegistry(registry);
+  if (registry.includes(":")) return false;
+  return isTrustedRegistry(registry);
 }
 
 export function isSshPublicKey(value: string) {
@@ -252,26 +266,9 @@ function readUint32(bytes: Uint8Array, offset: number) {
     + bytes[offset + 3];
 }
 
-function isPrivateRegistry(registry: string) {
-  const host = registry.startsWith("[")
-    ? registry.slice(1).split("]")[0] ?? registry
-    : registry.split(":")[0] ?? registry;
-  const normalized = host.replace(/\.$/, "");
-  if (normalized === "localhost" || normalized.endsWith(".local") || normalized.endsWith(".internal")) {
-    return true;
-  }
-  const octets = normalized.split(".").map(Number);
-  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
-    return normalized === "::1" || normalized === "::" || /^f[cd][0-9a-f:]+$/i.test(normalized) || /^fe[89ab][0-9a-f:]+$/i.test(normalized);
-  }
-  const [first, second] = octets;
-  return first === 0
-    || first === 10
-    || first === 127
-    || (first === 169 && second === 254)
-    || (first === 172 && second >= 16 && second <= 31)
-    || (first === 192 && second === 168)
-    || first >= 224;
+function isTrustedRegistry(registry: string) {
+  const normalized = registry.replace(/\.$/, "");
+  return trustedRegistries.has(normalized) || normalized.endsWith(".pkg.dev");
 }
 
 function isBytes32(value: unknown): value is `0x${string}` {

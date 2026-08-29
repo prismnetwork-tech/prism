@@ -23,18 +23,18 @@ afterEach(() => {
 
 describe("POST /api/repro/intent", () => {
   it("returns an immutable verified payload without the raw read token", async () => {
-    const intent = createReproIntent(spec, 399_600n, new URL("http://localhost"));
+    const intent = createReproIntent(spec, "managed", 399_600n, new URL("http://localhost"));
     const response = await POST(request(intent.envelope));
     const payload = await response.json();
 
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
-    expect(payload).toMatchObject(spec);
+    expect(payload).toMatchObject({ ...spec, version: "prism.gpu-repro.intent.v2" });
     expect(JSON.stringify(payload)).not.toContain(intent.reproToken);
   });
 
   it("rejects a tampered envelope", async () => {
-    const intent = createReproIntent(spec, 399_600n, new URL("http://localhost"));
+    const intent = createReproIntent(spec, "managed", 399_600n, new URL("http://localhost"));
     const changed = `${intent.envelope.slice(0, -1)}${intent.envelope.endsWith("a") ? "b" : "a"}`;
     const response = await POST(request(changed));
 

@@ -18,6 +18,7 @@ const statuses = new Set([
 export type GpuReproStatus = {
   version: "prism.gpu-repro.status.v1";
   status: string;
+  executor?: "node" | "managed";
   spec?: unknown;
   spec_hash?: string;
   quote_id?: string;
@@ -91,7 +92,8 @@ function isGpuReproStatus(value: unknown): value is GpuReproStatus {
   const record = value as Partial<GpuReproStatus>;
   if (record.version !== "prism.gpu-repro.status.v1"
     || typeof record.status !== "string"
-    || !statuses.has(record.status)) return false;
+    || !statuses.has(record.status)
+    || (record.executor !== "node" && record.executor !== "managed")) return false;
   if (record.spec_hash !== undefined && !isHash(record.spec_hash)) return false;
   if (record.lease_id !== undefined && (!Number.isSafeInteger(record.lease_id) || record.lease_id <= 0)) return false;
   if (record.checks !== undefined && (!record.checks || typeof record.checks !== "object" || Array.isArray(record.checks))) {

@@ -87,6 +87,9 @@ describe("GPU capability planning", () => {
   it("rejects mutable and private-registry images", () => {
     expect(isPinnedPublicImage("ghcr.io/prism-network/gpu-repro:latest")).toBe(false);
     expect(isPinnedPublicImage(`127.0.0.1/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(false);
+    expect(isPinnedPublicImage(`registry.example/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(false);
+    expect(isPinnedPublicImage(`docker.io/library/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(true);
+    expect(isPinnedPublicImage(`docker.io/library/gpu-repro@sha256:${"A".repeat(64)}`)).toBe(false);
     expect(isPinnedPublicImage(`https://ghcr.io/prism-network/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(false);
     expect(isPinnedPublicImage(image)).toBe(true);
   });

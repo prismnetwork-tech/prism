@@ -7,6 +7,9 @@ ALTER TABLE cloud_instances
         gpu_vram_mib IS NULL OR gpu_vram_mib BETWEEN 1 AND 196608
     );
 
+ALTER TABLE lifecycle_outbox
+    ADD COLUMN claim_generation BIGINT NOT NULL DEFAULT 0 CHECK (claim_generation >= 0);
+
 CREATE TABLE managed_repro_jobs (
     command_id UUID PRIMARY KEY,
     lease_id BIGINT NOT NULL UNIQUE REFERENCES leases(lease_id) ON DELETE CASCADE,
@@ -36,6 +39,9 @@ CREATE TABLE managed_repro_jobs (
     ),
     prepared_provider_instance_id BIGINT CHECK (
         prepared_provider_instance_id IS NULL OR prepared_provider_instance_id > 0
+    ),
+    prepared_hourly_cost_micros BIGINT CHECK (
+        prepared_hourly_cost_micros IS NULL OR prepared_hourly_cost_micros > 0
     ),
     report JSONB CHECK (report IS NULL OR jsonb_typeof(report) = 'object'),
     attempts SMALLINT NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 255),
@@ -70,6 +76,7 @@ CREATE TABLE managed_repro_jobs (
         )
         OR (
             prepared_provider_instance_id IS NOT NULL
+            AND prepared_hourly_cost_micros IS NOT NULL
             AND transport_host_key IS NOT NULL
             AND transport_host_key_sha256 IS NOT NULL
             AND gpu_model IS NOT NULL
@@ -81,6 +88,72 @@ CREATE TABLE managed_repro_jobs (
         OR (runner_private_key IS NOT NULL AND runner_public_key IS NOT NULL)
     )
 );
+
+CREATE FUNCTION bind_managed_repro_execution()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    capture_cost BOOLEAN := FALSE;
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND (
+           OLD.status IN ('launching', 'running', 'completed')
+           OR NEW.status IN ('launching', 'running', 'completed')
+           OR OLD.report IS NOT NULL
+           OR NEW.report IS NOT NULL
+       )
+       AND ROW(
+           NEW.prepared_provider_instance_id,
+           NEW.prepared_hourly_cost_micros,
+           NEW.transport_host_key,
+           NEW.transport_host_key_sha256,
+           NEW.gpu_model,
+           NEW.gpu_vram_mib
+       ) IS DISTINCT FROM ROW(
+           OLD.prepared_provider_instance_id,
+           OLD.prepared_hourly_cost_micros,
+           OLD.transport_host_key,
+           OLD.transport_host_key_sha256,
+           OLD.gpu_model,
+           OLD.gpu_vram_mib
+       ) THEN
+        RAISE EXCEPTION 'managed repro execution binding is immutable after launch';
+    END IF;
+
+    IF NEW.status = 'ready' THEN
+        IF TG_OP = 'INSERT' THEN
+            capture_cost := TRUE;
+        ELSIF OLD.status <> 'ready'
+              OR NEW.prepared_provider_instance_id IS DISTINCT FROM OLD.prepared_provider_instance_id THEN
+            capture_cost := TRUE;
+        END IF;
+    END IF;
+
+    IF capture_cost THEN
+        SELECT hourly_cost_micros
+        INTO NEW.prepared_hourly_cost_micros
+        FROM cloud_instances
+        WHERE lease_id = NEW.lease_id
+          AND provider_instance_id = NEW.prepared_provider_instance_id
+          AND status = 'running';
+
+        IF NEW.prepared_hourly_cost_micros IS NULL THEN
+            RAISE EXCEPTION 'managed repro preflight has no matching running provider cost';
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.prepared_provider_instance_id IS DISTINCT FROM OLD.prepared_provider_instance_id THEN
+            NEW.prepared_hourly_cost_micros := NULL;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER managed_repro_execution_binding
+BEFORE INSERT OR UPDATE ON managed_repro_jobs
+FOR EACH ROW EXECUTE FUNCTION bind_managed_repro_execution();
 
 CREATE INDEX managed_repro_jobs_claim_idx
     ON managed_repro_jobs(status, available_at, lease_until, created_at);

@@ -34,6 +34,7 @@ check() {
 check control-plane services/control-plane/src/main.rs
 check access-gateway services/access-gateway/src/main.rs
 check lifecycle-worker workers/lifecycle-worker/src/main.rs
+check repro-worker workers/repro-worker/src/main.rs
 check settlement-worker workers/settlement-worker/src/main.rs
 check reconciliation-monitor services/reconciliation-monitor/src/main.rs
 

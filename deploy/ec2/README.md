@@ -67,20 +67,48 @@ value inline on the `docker compose` command line survives exactly one
 
 ### Images
 
-The `images` workflow builds each service and pushes
-`ghcr.io/winter0x/prism/<binary>:<sha>` plus a moving `:main` tag, so a
-deploy is a pull rather than a local build. The published images are
-**linux/arm64**, matching the host: `aws-lc-sys` reliably crashes the compiler
-under emulation, so every build runs on the architecture it targets. An amd64
-deployment needs a second native runner in that workflow, not a `--platform`
-flag.
+Service images are **linux/arm64**, matching the host: `aws-lc-sys` reliably
+crashes the compiler under emulation, so every build runs on the architecture
+it targets. Build `deploy/Dockerfile.rust` on arm64, tag each image with the
+release commit, then load it directly on the host or push it to Prism's image
+registry. An amd64 deployment needs a native amd64 builder, not emulation.
 
 ```sh
-PRISM_LIFECYCLE_WORKER_IMAGE=ghcr.io/winter0x/prism/prism-lifecycle-worker:<git-sha>
-PRISM_REPRO_WORKER_IMAGE=ghcr.io/winter0x/prism/prism-repro-worker:<git-sha>
-docker compose pull lifecycle-worker repro-worker
-docker compose up -d lifecycle-worker repro-worker
+release=$(git rev-parse HEAD)
+tag=$(git rev-parse --short=12 HEAD)
+
+for binary in prism-control-plane prism-lifecycle-worker prism-repro-worker prism-settlement-worker; do
+  docker buildx build --platform linux/arm64 --provenance=false --load \
+    --file deploy/Dockerfile.rust \
+    --build-arg "BINARY=$binary" \
+    --build-arg "GIT_SHA=$release" \
+    --tag "$binary:$tag" .
+done
 ```
+
+Transfer and load those exact images on the host. Persist all four references
+in `/opt/prism/.env`; shell-only assignments do not survive the next Compose
+operation:
+
+```dotenv
+PRISM_CONTROL_PLANE_IMAGE=prism-control-plane:<tag>
+PRISM_LIFECYCLE_WORKER_IMAGE=prism-lifecycle-worker:<tag>
+PRISM_REPRO_WORKER_IMAGE=prism-repro-worker:<tag>
+PRISM_SETTLEMENT_WORKER_IMAGE=prism-settlement-worker:<tag>
+```
+
+Back up Postgres and the deployment files first. Start the control plane alone,
+wait for its health check, and verify the newly applied migrations before
+starting the coordinated workers:
+
+```sh
+docker compose up -d --no-deps --pull never control-plane
+docker compose up -d --no-deps --pull never lifecycle-worker repro-worker settlement-worker
+```
+
+The public web/MCP image and any deployed proof worker or node daemon must be
+built from the same release commit. Verify every service's recorded build SHA
+before admitting new work.
 
 ### Alerts
 

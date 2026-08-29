@@ -7,7 +7,7 @@ use prism_chain::EthereumSigner;
 use prism_protocol::{
     CommandResult, CredentialCipher, EncryptedSecret, LeaseQuote, LeaseRecord, LeaseState,
     ManagedCommandReport, ManagedCommandReportPayload, ManagedProvider, NodeCommand,
-    NodeCommandOutcome, managed_command_report_digest,
+    NodeCommandOutcome, ReproExecutor, managed_command_report_digest,
 };
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
@@ -1161,6 +1161,7 @@ fn ensure_job_contract(job: &Job) -> anyhow::Result<()> {
         || job.quote.command.as_ref() != Some(command)
         || job.quote.duration_seconds != *duration_seconds
         || job.quote.repro.as_ref() != Some(repro)
+        || repro.executor != ReproExecutor::Managed
         || job.quote.min_vram_mib == 0
         || job.quote.min_vram_mib > MAX_GPU_VRAM_MIB
     {

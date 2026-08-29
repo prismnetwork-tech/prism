@@ -3,7 +3,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::Path as FilePath,
     sync::{Arc, OnceLock},
 };
@@ -107,6 +107,13 @@ const REPRO_STATUS_LEASE_QUERY: &str = "SELECT q.document, l.lease_id, l.chain_l
 const REPRO_STATUS_QUOTE_QUERY: &str = "SELECT document FROM lease_quotes \
     WHERE document #>> '{repro,token_hash}' = $1 \
     ORDER BY created_at DESC LIMIT 1";
+const REPRO_STATUS_CLAIM_COUNT_QUERY: &str = "SELECT COUNT(*) FROM ( \
+        SELECT quote_id FROM lease_quotes \
+        WHERE document #>> '{repro,token_hash}' = $1 \
+        UNION \
+        SELECT quote_id FROM leases \
+        WHERE document #>> '{repro,token_hash}' = $1 \
+    ) claims";
 const QUOTE_TTL_MINUTES: i64 = 5;
 /// How long a node's command poll is remembered. It started as the replay
 /// guard's retention window and now also decides who can be handed batch work:
@@ -324,6 +331,7 @@ struct MemoryMarketplace {
     open_quotes: BTreeMap<Uuid, LeaseQuote>,
     quote_subjects: BTreeMap<Uuid, String>,
     consumed_quotes: BTreeSet<Uuid>,
+    repro_token_hashes: BTreeSet<String>,
     leases: BTreeMap<u64, (String, LeaseRecord)>,
     commands: BTreeMap<Uuid, MemoryCommand>,
     /// Request id to the node that sent it and when the record expires. The
@@ -918,6 +926,14 @@ enum StoreError {
     EscrowLimit,
     #[error("the node this quote names has been suspended")]
     NodeSuspended,
+    #[error("the execution path bound into this repro quote is no longer available")]
+    ReproExecutorUnavailable,
+    #[error("this repro capability token was already used")]
+    ReproTokenAlreadyUsed,
+    #[error("this repro capability token resolves to more than one quote")]
+    AmbiguousReproToken,
+    #[error("the capacity named by this funded quote is no longer available")]
+    FundingCapacityUnavailable,
     #[error("telemetry sequence was already accepted")]
     TelemetryReplay,
     #[error("internal identity request was already accepted")]
@@ -1178,7 +1194,8 @@ struct ReproStatusChecks {
     token_bound: bool,
     spec_hash_valid: bool,
     command_bound: Option<bool>,
-    executor_signature_valid: Option<bool>,
+    report_signature_valid: Option<bool>,
+    executor_identity_valid: Option<bool>,
     report_bound: Option<bool>,
     receipt_hash_valid: Option<bool>,
     receipt_bound: Option<bool>,
@@ -1197,6 +1214,7 @@ struct ReproStatusEvidence {
 struct ReproStatusResponse {
     version: &'static str,
     status: ReproStatus,
+    executor: ReproExecutor,
     spec: GpuReproSpec,
     spec_hash: String,
     quote_id: Uuid,
@@ -4854,6 +4872,43 @@ impl MarketplaceStore {
         match self {
             Self::Memory(market) => {
                 let mut market = market.write().await;
+                if let Some(capability) = request.repro.as_ref() {
+                    let existing: Vec<&LeaseQuote> = market
+                        .open_quotes
+                        .values()
+                        .filter(|quote| {
+                            quote
+                                .repro
+                                .as_ref()
+                                .is_some_and(|repro| repro.token_hash == capability.token_hash)
+                        })
+                        .collect();
+                    if existing.len() == 1 {
+                        let quote = existing[0];
+                        if market
+                            .quote_subjects
+                            .get(&quote.quote_id)
+                            .is_some_and(|owner| owner == subject)
+                            && !market.consumed_quotes.contains(&quote.quote_id)
+                            && quote.expires_at > Utc::now()
+                            && quote_matches_request(quote, request)
+                        {
+                            return Ok(quote.clone());
+                        }
+                    }
+                    let leased = market.leases.values().any(|(_, lease)| {
+                        lease
+                            .repro
+                            .as_ref()
+                            .is_some_and(|repro| repro.token_hash == capability.token_hash)
+                    });
+                    if market.repro_token_hashes.contains(&capability.token_hash)
+                        || !existing.is_empty()
+                        || leased
+                    {
+                        return Err(StoreError::ReproTokenAlreadyUsed);
+                    }
+                }
                 market
                     .open_quotes
                     .retain(|_, quote| quote.expires_at > Utc::now() - Duration::hours(24));
@@ -4941,6 +4996,11 @@ impl MarketplaceStore {
                 let offers = mark_staker_capacity(offers);
                 let quote =
                     quote_for_offers(request, offers.iter(), &reserved, staked_whole_tokens)?;
+                if let Some(capability) = quote.repro.as_ref() {
+                    market
+                        .repro_token_hashes
+                        .insert(capability.token_hash.clone());
+                }
                 market
                     .quote_subjects
                     .insert(quote.quote_id, subject.to_owned());
@@ -4954,6 +5014,40 @@ impl MarketplaceStore {
                     .execute(&mut *transaction)
                     .await
                     .map_err(StoreError::Storage)?;
+                if let Some(capability) = request.repro.as_ref() {
+                    let existing = query_as::<_, (SqlJson<LeaseQuote>, String, bool, bool)>(
+                        "SELECT document, subject, consumed_at IS NOT NULL, expires_at > NOW() \
+                         FROM lease_quotes \
+                         WHERE document #>> '{repro,token_hash}' = $1 \
+                         ORDER BY created_at LIMIT 2",
+                    )
+                    .bind(&capability.token_hash)
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                    if let [(SqlJson(quote), owner, false, true)] = existing.as_slice()
+                        && owner == subject
+                        && quote_matches_request(quote, request)
+                    {
+                        let quote = quote.clone();
+                        transaction.commit().await.map_err(StoreError::Storage)?;
+                        return Ok(quote);
+                    }
+                    if !existing.is_empty() {
+                        return Err(StoreError::ReproTokenAlreadyUsed);
+                    }
+                    let claimed = query(
+                        "INSERT INTO repro_token_claims (token_hash) VALUES ($1) \
+                         ON CONFLICT (token_hash) DO NOTHING",
+                    )
+                    .bind(&capability.token_hash)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                    if claimed.rows_affected() != 1 {
+                        return Err(StoreError::ReproTokenAlreadyUsed);
+                    }
+                }
                 query(
                     "DELETE FROM lease_quotes \
                      WHERE consumed_at IS NULL AND expires_at <= NOW() - INTERVAL '24 hours'",
@@ -5250,6 +5344,12 @@ impl MarketplaceStore {
                 }) {
                     return Err(StoreError::FundingMismatch);
                 }
+                if let Some(capability) = quote.repro.as_ref()
+                    && (capability.executor != ReproExecutor::Node
+                        || !polls_command_channel(&market, &quote.node_id, now))
+                {
+                    return Err(StoreError::ReproExecutorUnavailable);
+                }
                 lease.lease_id = market
                     .leases
                     .keys()
@@ -5277,11 +5377,7 @@ impl MarketplaceStore {
                     .values()
                     .any(|(_, current)| current.node_id == lease.node_id && occupies_node(current))
                 {
-                    tracing::warn!(
-                        lease_id = lease.lease_id,
-                        node_id = %lease.node_id,
-                        "funding confirmed for a node this store still thinks is busy"
-                    );
+                    return Err(StoreError::FundingCapacityUnavailable);
                 }
                 market.consumed_quotes.insert(quote.quote_id);
                 market
@@ -5416,7 +5512,7 @@ impl MarketplaceStore {
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
                          WHERE document->>'node_id' = $1 \
-                           AND state IN ('funded', 'provisioning', 'ready', 'active', 'closing') \
+                           AND state NOT IN ('finalized', 'refunded') \
                      )",
                 )
                 .bind(&lease.node_id)
@@ -5424,11 +5520,7 @@ impl MarketplaceStore {
                 .await
                 .map_err(StoreError::Storage)?;
                 if node_busy {
-                    tracing::warn!(
-                        lease_id = lease.lease_id,
-                        node_id = %lease.node_id,
-                        "funding confirmed for a node this store still thinks is busy"
-                    );
+                    return Err(StoreError::FundingCapacityUnavailable);
                 }
                 let consumed = query(
                     "UPDATE lease_quotes SET consumed_at = NOW() \
@@ -5454,17 +5546,39 @@ impl MarketplaceStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
-                let cloud_backed = query_scalar::<_, bool>(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM cloud_capacity \
-                         WHERE node_id = $1 AND provider = 'vast' \
-                     )",
+                let (managed_available, node_available) = query_as::<_, (bool, bool)>(
+                    "SELECT \
+                         EXISTS ( \
+                             SELECT 1 FROM cloud_capacity \
+                             WHERE node_id = $1 AND provider = 'vast' \
+                               AND available AND observed_at >= $2 \
+                         ), \
+                         EXISTS ( \
+                             SELECT 1 FROM node_command_requests \
+                             WHERE node_id = $1 AND expires_at > NOW() \
+                         )",
                 )
                 .bind(&lease.node_id)
+                .bind(cutoff)
                 .fetch_one(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
+                let cloud_backed =
+                    confirmed_cloud_execution(quote, managed_available, node_available)?;
                 if cloud_backed {
+                    let reserved = query(
+                        "UPDATE cloud_capacity SET available = FALSE \
+                         WHERE node_id = $1 AND provider = 'vast' \
+                           AND available AND observed_at >= $2",
+                    )
+                    .bind(&lease.node_id)
+                    .bind(cutoff)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                    if reserved.rows_affected() != 1 {
+                        return Err(StoreError::FundingCapacityUnavailable);
+                    }
                     lease.state = LeaseState::Provisioning;
                     lease.updated_at = Utc::now();
                 }
@@ -6586,6 +6700,33 @@ impl MarketplaceStore {
         match self {
             Self::Memory(market) => {
                 let market = market.read().await;
+                let quote_ids: BTreeSet<Uuid> = market
+                    .open_quotes
+                    .values()
+                    .filter(|quote| {
+                        quote
+                            .repro
+                            .as_ref()
+                            .is_some_and(|repro| repro.token_hash == token_hash)
+                    })
+                    .map(|quote| quote.quote_id)
+                    .chain(
+                        market
+                            .leases
+                            .values()
+                            .map(|(_, lease)| lease)
+                            .filter(|lease| {
+                                lease
+                                    .repro
+                                    .as_ref()
+                                    .is_some_and(|repro| repro.token_hash == token_hash)
+                            })
+                            .map(|lease| lease.quote_id),
+                    )
+                    .collect();
+                if quote_ids.len() > 1 {
+                    return Err(StoreError::AmbiguousReproToken);
+                }
                 let lease = market
                     .leases
                     .values()
@@ -6649,6 +6790,14 @@ impl MarketplaceStore {
                     .map(|quote| StoredReproStatus { quote, lease: None }))
             }
             Self::Postgres(pool) => {
+                let claims = query_scalar::<_, i64>(REPRO_STATUS_CLAIM_COUNT_QUERY)
+                    .bind(token_hash)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                if claims > 1 {
+                    return Err(StoreError::AmbiguousReproToken);
+                }
                 type ReproLeaseRow = (
                     SqlJson<LeaseQuote>,
                     i64,
@@ -7492,7 +7641,7 @@ async fn get_repro_status(
         .store
         .repro_status(&token_hash)
         .await
-        .map_err(internal_error)?
+        .map_err(store_error)?
         .ok_or_else(|| not_found("repro_not_found", "this repro capability has no quote"))?;
     let response = build_repro_status(&token_hash, stored).map_err(internal_error)?;
     let response_bytes = serde_json::to_vec(&response).map_err(|_| {
@@ -9408,6 +9557,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(include_str!("../migrations/0022_managed_repros.sql")),
                 false,
             ),
+            Migration::new(
+                23,
+                Cow::Borrowed("repro token claims"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0023_repro_token_claims.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
@@ -9418,6 +9574,19 @@ fn embedded_migrator() -> Migrator {
 fn holds_node(quote: &LeaseQuote) -> bool {
     let issued_at = quote.expires_at - Duration::minutes(QUOTE_TTL_MINUTES);
     Utc::now() < issued_at + Duration::seconds(QUOTE_HOLD_SECONDS)
+}
+
+fn quote_matches_request(quote: &LeaseQuote, request: &LeaseRequest) -> bool {
+    quote.image == request.image
+        && quote.duration_seconds == request.duration_seconds
+        && quote.min_vram_mib == request.min_vram_mib
+        && quote.trust_class >= request.min_trust_class
+        && quote.command == request.command
+        && quote.repro == request.repro
+        && request
+            .preferred_node_id
+            .as_ref()
+            .is_none_or(|node_id| node_id == &quote.node_id)
 }
 
 /// The cheapest staker-only rate this renter may reach. The escrow charges a
@@ -9449,13 +9618,17 @@ fn quote_for_offers<'a>(
         // enough. Gating on the offer's own flag rather than on its price keeps
         // a cheap independent node visible to everybody.
         .filter(|offer| !offer.staker_only || offer.rate_per_second >= rate_floor)
-        // Native batches require a fresh signed poll. Managed capacity can run
-        // only the narrower repro contract, never an arbitrary command: its
-        // capability binds the exact image, command, duration and GPU floor.
+        // A repro approval fixes its executor as well as its workload. Capacity
+        // changing between preparation and matching must fail or re-quote, not
+        // silently move the command across a different trust boundary.
         .filter(|offer| {
-            request.command.is_none()
-                || offer.command_channel
-                || (request.repro.is_some() && offer.managed_batch)
+            request.repro.as_ref().map_or_else(
+                || request.command.is_none() || offer.command_channel,
+                |capability| match capability.executor {
+                    ReproExecutor::Node => offer.command_channel,
+                    ReproExecutor::Managed => offer.managed_batch,
+                },
+            )
         })
         .filter(|offer| {
             request
@@ -9500,6 +9673,19 @@ fn quote_for_offers<'a>(
     })
 }
 
+fn confirmed_cloud_execution(
+    quote: &LeaseQuote,
+    managed_available: bool,
+    node_available: bool,
+) -> Result<bool, StoreError> {
+    match quote.repro.as_ref().map(|repro| repro.executor) {
+        Some(ReproExecutor::Managed) if managed_available => Ok(true),
+        Some(ReproExecutor::Node) if node_available => Ok(false),
+        Some(_) => Err(StoreError::ReproExecutorUnavailable),
+        None => Ok(quote.command.is_none() && managed_available),
+    }
+}
+
 fn is_pinned_image(image: &str) -> bool {
     if image.is_empty() || image.len() > 512 || image.chars().any(char::is_whitespace) {
         return false;
@@ -9516,8 +9702,7 @@ fn is_pinned_image(image: &str) -> bool {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'.' | b'_' | b'-' | b':' | b'[' | b']' | b'/')
         })
-        || digest.len() != 64
-        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !is_lower_sha256(digest)
     {
         return false;
     }
@@ -9530,6 +9715,9 @@ fn is_pinned_image(image: &str) -> bool {
     if !explicit_registry {
         return true;
     }
+    if first.contains(':') {
+        return false;
+    }
     let Ok(reference) = url::Url::parse(&format!("https://{repository}")) else {
         return false;
     };
@@ -9537,54 +9725,30 @@ fn is_pinned_image(image: &str) -> bool {
         && reference.password().is_none()
         && reference.query().is_none()
         && reference.fragment().is_none()
-        && reference.host_str().is_some_and(is_public_registry_host)
+        && reference.port().is_none()
+        && reference.host_str().is_some_and(is_trusted_registry_host)
 }
 
-fn is_public_registry_host(host: &str) -> bool {
+fn is_trusted_registry_host(host: &str) -> bool {
     let normalized = host
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(host)
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if normalized == "localhost"
-        || normalized.ends_with(".localhost")
-        || normalized.ends_with(".local")
-        || normalized.ends_with(".internal")
-    {
-        return false;
-    }
-    let Ok(address) = normalized.parse::<IpAddr>() else {
-        return !normalized.is_empty();
-    };
-    match address {
-        IpAddr::V4(address) => {
-            let [first, second, third, _] = address.octets();
-            !(first == 0
-                || first == 10
-                || first == 127
-                || (first == 100 && (64..=127).contains(&second))
-                || (first == 169 && second == 254)
-                || (first == 172 && (16..=31).contains(&second))
-                || (first == 192 && second == 0 && third == 0)
-                || (first == 192 && second == 0 && third == 2)
-                || (first == 192 && second == 168)
-                || (first == 198 && (second == 18 || second == 19))
-                || (first == 198 && second == 51 && third == 100)
-                || (first == 203 && second == 0 && third == 113)
-                || first >= 224)
-        }
-        IpAddr::V6(address) => {
-            let segments = address.segments();
-            !address.is_unspecified()
-                && !address.is_loopback()
-                && segments[0] & 0xfe00 != 0xfc00
-                && segments[0] & 0xffc0 != 0xfe80
-                && segments[0] & 0xff00 != 0xff00
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
-                && address.to_ipv4_mapped().is_none()
-        }
-    }
+    matches!(
+        normalized.as_str(),
+        "docker.io"
+            | "index.docker.io"
+            | "registry-1.docker.io"
+            | "quay.io"
+            | "nvcr.io"
+            | "public.ecr.aws"
+            | "mcr.microsoft.com"
+            | "registry.k8s.io"
+            | "gcr.io"
+            | "ghcr.io"
+    ) || normalized.ends_with(".pkg.dev")
 }
 
 fn canonical_repro_token_hash(token: &str) -> Option<String> {
@@ -9624,7 +9788,8 @@ fn build_repro_status(
         token_bound: capability.token_hash == token_hash,
         spec_hash_valid: spec.hash().ok().as_deref() == Some(capability.spec_hash.as_str()),
         command_bound: None,
-        executor_signature_valid: None,
+        report_signature_valid: None,
+        executor_identity_valid: None,
         report_bound: None,
         receipt_hash_valid: None,
         receipt_bound: None,
@@ -9633,6 +9798,7 @@ fn build_repro_status(
     let mut response = ReproStatusResponse {
         version: REPRO_STATUS_VERSION,
         status: ReproStatus::Quoted,
+        executor: capability.executor,
         spec,
         spec_hash: capability.spec_hash.clone(),
         quote_id: stored.quote.quote_id,
@@ -9656,6 +9822,15 @@ fn build_repro_status(
     let mut execution_status = None;
     let mut execution_outcome = None;
     if let Some(execution) = lease.execution.as_ref() {
+        if !matches!(
+            (capability.executor, execution),
+            (ReproExecutor::Node, StoredReproExecution::Node { .. })
+                | (ReproExecutor::Managed, StoredReproExecution::Managed { .. })
+        ) {
+            return Err(StoreError::InvalidStoredState(
+                "repro execution does not match its approved executor".to_owned(),
+            ));
+        }
         match execution {
             StoredReproExecution::Node {
                 status,
@@ -9674,7 +9849,8 @@ fn build_repro_status(
                 if let Some(report) = report {
                     execution_outcome = Some(&report.outcome);
                     if final_command_outcome(&report.outcome) {
-                        checks.executor_signature_valid = Some(native_signature_valid(
+                        checks.report_signature_valid = Some(native_report_signature_valid(report));
+                        checks.executor_identity_valid = Some(native_executor_identity_valid(
                             report,
                             enrolled_device_public_key.as_deref(),
                             &lease.node_id,
@@ -9711,7 +9887,7 @@ fn build_repro_status(
                     execution_outcome = Some(&report.outcome);
                     response.result = report.result.clone();
                     if final_command_outcome(&report.outcome) {
-                        checks.executor_signature_valid = Some(report.verify().is_ok());
+                        checks.report_signature_valid = Some(report.verify().is_ok());
                         checks.report_bound = Some(managed_report_bound(
                             report,
                             command,
@@ -9819,14 +9995,23 @@ fn ensure_public_repro_command(command: &NodeCommand) -> Result<(), StoreError> 
     ))
 }
 
-fn native_signature_valid(
+fn native_report_signature_valid(report: &NodeCommandReport) -> bool {
+    verifying_key(&report.device_public_key)
+        .ok()
+        .is_some_and(|key| report.verify(&key).is_ok())
+}
+
+fn native_executor_identity_valid(
     report: &NodeCommandReport,
     enrolled_key: Option<&str>,
     expected_node_id: &str,
 ) -> bool {
-    enrolled_key
-        .and_then(|encoded| verifying_key(encoded).ok())
-        .is_some_and(|key| node_id(&key) == expected_node_id && report.verify(&key).is_ok())
+    enrolled_key == Some(report.device_public_key.as_str())
+        && enrolled_key
+            .and_then(|encoded| verifying_key(encoded).ok())
+            .is_some_and(|key| {
+                node_id(&key) == expected_node_id && report.node_id == expected_node_id
+            })
 }
 
 fn native_report_bound(
@@ -9964,6 +10149,7 @@ fn repro_receipt_bound(
             )
         && is_hash(&receipt.transaction_hash)
         && repro.executor == executor
+        && capability.executor == executor
         && repro.token_hash == capability.token_hash
         && repro.spec_hash == capability.spec_hash
         && image_digest == Some(repro.image_digest.as_str())
@@ -10012,9 +10198,7 @@ fn is_lower_sha256(value: &str) -> bool {
 }
 
 fn is_sha256_digest(digest: &str) -> bool {
-    digest.len() == 71
-        && digest.starts_with("sha256:")
-        && digest[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    digest.strip_prefix("sha256:").is_some_and(is_lower_sha256)
 }
 
 fn is_sha256_fingerprint(value: &str) -> bool {
@@ -10229,6 +10413,23 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
             "node_suspended",
             "the node this quote names has been suspended; the funding was not \
              claimed and can be recovered with cancelUnprovisioned",
+        ),
+        StoreError::ReproExecutorUnavailable => conflict(
+            "repro_executor_unavailable",
+            "the approved GPU repro execution path is no longer available; the funding was not \
+             claimed and can be recovered with cancelUnprovisioned",
+        ),
+        StoreError::ReproTokenAlreadyUsed => conflict(
+            "repro_token_already_used",
+            "this GPU repro capability token already names another quote; prepare a new repro",
+        ),
+        StoreError::AmbiguousReproToken => conflict(
+            "ambiguous_repro_token",
+            "this legacy GPU repro capability resolves to more than one quote and cannot be read safely",
+        ),
+        StoreError::FundingCapacityUnavailable => conflict(
+            "funding_capacity_unavailable",
+            "the quoted GPU capacity is already occupied; the funding was not claimed and can be recovered with cancelUnprovisioned",
         ),
         StoreError::TelemetryReplay => conflict(
             "telemetry_replay",
@@ -10771,6 +10972,30 @@ mod tests {
             min_trust_class,
             command: command.map(str::to_owned),
             repro: None,
+        }
+    }
+
+    fn funding_confirmation<'a>(
+        subject: &'a str,
+        quote: &'a LeaseQuote,
+        transaction_hash: &'a str,
+        chain_lease_id: u64,
+    ) -> FundingConfirmation<'a> {
+        FundingConfirmation {
+            subject,
+            quote,
+            transaction_hash,
+            funding: ConfirmedFunding {
+                lease_id: chain_lease_id,
+                escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+                renter_wallet: format!("0x{}", "33".repeat(20)),
+            },
+            ssh_authorized_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA"),
+            jupyter_token: "token",
+            encrypted_jupyter_token: EncryptedSecret {
+                nonce: "bm9uY2U".to_owned(),
+                ciphertext: "Y2lwaGVy".to_owned(),
+            },
         }
     }
 
@@ -12844,16 +13069,28 @@ mod tests {
     #[test]
     fn image_reference_requires_a_complete_digest() {
         assert!(is_pinned_image(&format!(
-            "registry.example/runtime@sha256:{}",
+            "docker.io/library/runtime@sha256:{}",
             "a".repeat(64)
         )));
         assert!(is_pinned_image(&format!(
             "pytorch/pytorch@sha256:{}",
             "a".repeat(64)
         )));
+        assert!(!is_pinned_image(&format!(
+            "docker.io/library/runtime@sha256:{}",
+            "A".repeat(64)
+        )));
         assert!(!is_pinned_image("registry.example/runtime@sha256:abc"));
         assert!(!is_pinned_image(&format!(
             "registry.example/../runtime@sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(!is_pinned_image(&format!(
+            "registry.example/runtime@sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(!is_pinned_image(&format!(
+            "docker.io:443/library/runtime@sha256:{}",
             "a".repeat(64)
         )));
         for registry in [
@@ -12897,6 +13134,7 @@ mod tests {
             token_hash: "b".repeat(64),
             spec_hash: spec.hash().unwrap(),
             expected_exit_code: 0,
+            executor: ReproExecutor::Managed,
         });
         assert_eq!(validate_repro_request(&request), Ok(()));
 
@@ -13168,6 +13406,80 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn funding_confirmation_refuses_a_node_claimed_by_another_quote() {
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 100, 10_000));
+        market.tunnels.insert("only".to_owned(), Utc::now());
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = lease_request(TrustClass::Open, None);
+        let first = store.quote("first", &request, 0).await.unwrap();
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market
+            .write()
+            .await
+            .open_quotes
+            .get_mut(&first.quote_id)
+            .unwrap()
+            .expires_at = Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES)
+            - Duration::seconds(QUOTE_HOLD_SECONDS + 1);
+        let second = store.quote("second", &request, 0).await.unwrap();
+        let first_hash = format!("0x{}", "aa".repeat(32));
+        let second_hash = format!("0x{}", "bb".repeat(32));
+
+        store
+            .confirm_funding(funding_confirmation("first", &first, &first_hash, 1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .confirm_funding(funding_confirmation("second", &second, &second_hash, 2))
+                .await,
+            Err(StoreError::FundingCapacityUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replayed_repro_confirmation_does_not_require_a_new_node_poll() {
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 100, 10_000));
+        market.tunnels.insert("only".to_owned(), Utc::now());
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        store.claim_command("only", Uuid::now_v7()).await.unwrap();
+        let (template, _) = repro_quote("c".repeat(64), "only");
+        let request = LeaseRequest {
+            image: template.image,
+            duration_seconds: template.duration_seconds,
+            min_vram_mib: template.min_vram_mib,
+            preferred_node_id: None,
+            min_trust_class: template.trust_class,
+            command: template.command,
+            repro: template.repro,
+        };
+        let quote = store.quote("renter", &request, 0).await.unwrap();
+        let transaction_hash = format!("0x{}", "cc".repeat(32));
+        let first = store
+            .confirm_funding(funding_confirmation("renter", &quote, &transaction_hash, 3))
+            .await
+            .unwrap();
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market.write().await.node_requests.clear();
+
+        let replay = store
+            .confirm_funding(funding_confirmation("renter", &quote, &transaction_hash, 3))
+            .await
+            .unwrap();
+        assert_eq!(replay.lease_id, first.lease_id);
     }
 
     #[tokio::test]
@@ -14515,10 +14827,41 @@ mod tests {
                 token_hash,
                 spec_hash: spec.hash().unwrap(),
                 expected_exit_code: spec.expected_exit_code,
+                executor: ReproExecutor::Node,
             }),
             expires_at: Utc::now() + Duration::minutes(5),
         };
         (quote, spec)
+    }
+
+    #[tokio::test]
+    async fn a_repro_token_can_create_only_one_quote() {
+        let token_hash = "a".repeat(64);
+        let (template, _) = repro_quote(token_hash, "node-1");
+        let request = LeaseRequest {
+            image: template.image,
+            duration_seconds: template.duration_seconds,
+            min_vram_mib: template.min_vram_mib,
+            preferred_node_id: None,
+            min_trust_class: template.trust_class,
+            command: template.command,
+            repro: template.repro,
+        };
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("node-1".to_owned(), offer("node-1", 222, 10_000));
+        market.tunnels.insert("node-1".to_owned(), Utc::now());
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        store.claim_command("node-1", Uuid::now_v7()).await.unwrap();
+
+        let first = store.quote("first", &request, 0).await.unwrap();
+        let replay = store.quote("first", &request, 0).await.unwrap();
+        assert_eq!(replay.quote_id, first.quote_id);
+        assert!(matches!(
+            store.quote("second", &request, 0).await,
+            Err(StoreError::ReproTokenAlreadyUsed)
+        ));
     }
 
     #[test]
@@ -14584,6 +14927,22 @@ mod tests {
         assert!(store.repro_status(&"f".repeat(64)).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn repro_status_rejects_a_token_reused_by_multiple_quotes() {
+        let token_hash = "a".repeat(64);
+        let (first, _) = repro_quote(token_hash.clone(), "node-1");
+        let (second, _) = repro_quote(token_hash.clone(), "node-2");
+        let mut market = MemoryMarketplace::default();
+        market.open_quotes.insert(first.quote_id, first);
+        market.open_quotes.insert(second.quote_id, second);
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        assert!(matches!(
+            store.repro_status(&token_hash).await,
+            Err(StoreError::AmbiguousReproToken)
+        ));
+    }
+
     #[test]
     fn repro_status_queries_use_only_indexed_public_fields() {
         for query in [REPRO_STATUS_LEASE_QUERY, REPRO_STATUS_QUOTE_QUERY] {
@@ -14604,6 +14963,13 @@ mod tests {
                 assert!(!lower.contains(forbidden), "query exposes {forbidden}");
             }
         }
+        assert_eq!(
+            REPRO_STATUS_CLAIM_COUNT_QUERY
+                .matches("document #>> '{repro,token_hash}' = $1")
+                .count(),
+            2
+        );
+        assert!(REPRO_STATUS_CLAIM_COUNT_QUERY.contains("UNION"));
         let migration = include_str!("../migrations/0022_managed_repros.sql");
         assert!(
             migration
@@ -14611,6 +14977,11 @@ mod tests {
                 .count()
                 >= 2
         );
+        let claims = include_str!("../migrations/0023_repro_token_claims.sql");
+        assert!(claims.contains("token_hash TEXT PRIMARY KEY"));
+        assert!(claims.contains("SELECT DISTINCT token_hash"));
+        assert!(claims.contains("UNION ALL"));
+        assert!(claims.contains("ON CONFLICT (token_hash) DO NOTHING"));
     }
 
     #[test]
@@ -14713,11 +15084,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status, ReproStatus::Settled);
+        assert_eq!(response.executor, ReproExecutor::Node);
         assert!(response.evidence.is_some());
         assert!(response.checks.token_bound);
         assert!(response.checks.spec_hash_valid);
         assert_eq!(response.checks.command_bound, Some(true));
-        assert_eq!(response.checks.executor_signature_valid, Some(true));
+        assert_eq!(response.checks.report_signature_valid, Some(true));
+        assert_eq!(response.checks.executor_identity_valid, Some(true));
         assert_eq!(response.checks.report_bound, Some(true));
         assert_eq!(response.checks.receipt_hash_valid, Some(true));
         assert_eq!(response.checks.receipt_bound, Some(true));
@@ -14738,6 +15111,67 @@ mod tests {
         ] {
             assert!(!encoded.contains(forbidden), "response exposes {forbidden}");
         }
+    }
+
+    #[test]
+    fn managed_status_does_not_claim_an_unresolved_executor_identity() {
+        let token_hash = "d".repeat(64);
+        let (mut quote, spec) = repro_quote(token_hash.clone(), "broker");
+        quote.repro.as_mut().unwrap().executor = ReproExecutor::Managed;
+        let now = Utc::now();
+        let command = NodeCommand {
+            command_id: Uuid::now_v7(),
+            node_id: "broker".to_owned(),
+            lease_id: 1_002,
+            issued_at: now,
+            expires_at: now + Duration::minutes(10),
+            kind: NodeCommandKind::Batch {
+                image: spec.image.clone(),
+                command: spec.command.clone(),
+                duration_seconds: spec.duration_seconds,
+            },
+        };
+        let report = ManagedCommandReport {
+            report_id: Uuid::now_v7(),
+            signer: format!("0x{}", "11".repeat(20)),
+            command_id: command.command_id,
+            lease_id: command.lease_id,
+            provider: ManagedProvider::Vast,
+            provider_instance_id: 42,
+            gpu_model: "NVIDIA L4".to_owned(),
+            gpu_vram_mib: 24_576,
+            transport_host_key_sha256: "e".repeat(64),
+            started_at: now + Duration::seconds(1),
+            finished_at: now + Duration::seconds(2),
+            outcome: NodeCommandOutcome::Failed,
+            error: Some("runner failed".to_owned()),
+            result: None,
+            signature: "0x00".to_owned(),
+        };
+        let response = build_repro_status(
+            &token_hash,
+            StoredReproStatus {
+                quote,
+                lease: Some(StoredReproLease {
+                    lease_id: command.lease_id,
+                    chain_lease_id: 78,
+                    state: LeaseState::Closing,
+                    node_id: command.node_id.clone(),
+                    token_hash: Some(token_hash.clone()),
+                    spec_hash: Some(spec.hash().unwrap()),
+                    execution: Some(StoredReproExecution::Managed {
+                        status: "failed".to_owned(),
+                        command,
+                        report: Some(report),
+                    }),
+                    receipt: None,
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.checks.report_signature_valid, Some(false));
+        assert_eq!(response.checks.executor_identity_valid, None);
     }
 
     #[test]
@@ -14879,9 +15313,34 @@ fn managed_capacity_matches_only_capability_bound_repros() {
         token_hash: "a".repeat(64),
         spec_hash: spec.hash().unwrap(),
         expected_exit_code: 0,
+        executor: ReproExecutor::Managed,
     });
     let managed = quote_for_offers(&repro, [&broker], &reserved, 0).unwrap();
     assert_eq!(managed.node_id, "0xbroker");
+    assert!(matches!(
+        confirmed_cloud_execution(&managed, false, true),
+        Err(StoreError::ReproExecutorUnavailable)
+    ));
+    assert!(matches!(
+        confirmed_cloud_execution(&managed, true, false),
+        Ok(true)
+    ));
+
+    let mut node_repro = repro.clone();
+    node_repro.repro.as_mut().unwrap().executor = ReproExecutor::Node;
+    assert!(matches!(
+        quote_for_offers(&node_repro, [&broker], &reserved, 0),
+        Err(StoreError::NoMatch)
+    ));
+    let native = quote_for_offers(&node_repro, [&self_hosted], &reserved, 0).unwrap();
+    assert!(matches!(
+        confirmed_cloud_execution(&native, false, true),
+        Ok(false)
+    ));
+    assert!(matches!(
+        confirmed_cloud_execution(&native, true, false),
+        Err(StoreError::ReproExecutorUnavailable)
+    ));
 
     let batch = quote_for_offers(
         &request(Some("nvidia-smi")),

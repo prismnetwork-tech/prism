@@ -9,11 +9,11 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use prism_chain::EthereumSigner;
 use prism_protocol::{
-    CommandResult, ExecutionEvidence, MAX_VERIFIABLE_TRUST_CLASS, ManagedProvider, NodeCommandKind,
-    NodeCommandOutcome, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, ReproExecutionReport,
-    ReproExecutor, ReproReceiptEvidence, SettlementEvidence, TrustClass, gpu_repro_spec_hash,
-    managed_repro_report_hash, node_id, receipt_hash, repro_command_hash, repro_report_hash,
-    repro_result_hash, repro_stream_hash, verifying_key,
+    CommandResult, ExecutionEvidence, MAX_VERIFIABLE_TRUST_CLASS, ManagedCommandReport,
+    ManagedProvider, NodeCommandKind, NodeCommandOutcome, PublicReceipt, ROBINHOOD_CHAIN_ID,
+    ReceiptOutcome, ReproExecutionReport, ReproExecutor, ReproReceiptEvidence, SettlementEvidence,
+    TrustClass, gpu_repro_spec_hash, managed_repro_report_hash, node_id, receipt_hash,
+    repro_command_hash, repro_report_hash, repro_result_hash, repro_stream_hash, verifying_key,
 };
 use rlp::RlpStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,7 +22,7 @@ use sha3::Keccak256;
 use sqlx_core::{
     query::query, query_as::query_as, query_scalar::query_scalar, types::Json as SqlJson,
 };
-use sqlx_postgres::{PgPool, PgPoolOptions};
+use sqlx_postgres::{PgConnection, PgPool, PgPoolOptions};
 use tracing_subscriber::EnvFilter;
 
 /// Rebuild a settlement proposal rather than resubmit it after this many
@@ -67,6 +67,16 @@ struct Submission {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Outbox {
     submissions: BTreeMap<u64, Submission>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedReproBinding {
+    provider_instance_id: u64,
+    hourly_cost_micros: u64,
+    gpu_model: String,
+    gpu_vram_mib: u32,
+    transport_host_key_sha256: String,
+    report: Option<ManagedCommandReport>,
 }
 
 struct ChainClient {
@@ -281,6 +291,66 @@ async fn claim_settlement(pool: &PgPool) -> anyhow::Result<Option<(u64, Settleme
     Ok(Some((u64::try_from(lease_id)?, evidence)))
 }
 
+async fn load_managed_repro_binding(
+    connection: &mut PgConnection,
+    lease_id: u64,
+) -> anyhow::Result<Option<ManagedReproBinding>> {
+    let Some((
+        provider_instance_id,
+        hourly_cost_micros,
+        gpu_model,
+        gpu_vram_mib,
+        transport_host_key_sha256,
+        report,
+    )) = query_as::<
+        _,
+        (
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i32>,
+            Option<String>,
+            Option<SqlJson<ManagedCommandReport>>,
+        ),
+    >(
+        "SELECT prepared_provider_instance_id, prepared_hourly_cost_micros, \
+                gpu_model, gpu_vram_mib, \
+                transport_host_key_sha256, report \
+         FROM managed_repro_jobs WHERE lease_id = $1",
+    )
+    .bind(i64::try_from(lease_id)?)
+    .fetch_optional(connection)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let provider_instance_id = provider_instance_id
+        .and_then(|value| u64::try_from(value).ok())
+        .context("managed settlement has no prepared provider instance")?;
+    let hourly_cost_micros = hourly_cost_micros
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .context("managed settlement has no captured provider cost")?;
+    let gpu_model = gpu_model
+        .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+        .context("managed settlement has no valid captured GPU model")?;
+    let gpu_vram_mib = gpu_vram_mib
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0 && *value <= 196_608)
+        .context("managed settlement has no valid captured GPU memory")?;
+    let transport_host_key_sha256 = transport_host_key_sha256
+        .filter(|value| is_lower_sha256(value))
+        .context("managed settlement has no valid captured host-key commitment")?;
+    Ok(Some(ManagedReproBinding {
+        provider_instance_id,
+        hourly_cost_micros,
+        gpu_model,
+        gpu_vram_mib,
+        transport_host_key_sha256,
+        report: report.map(|SqlJson(report)| report),
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_settlement(
     pool: &PgPool,
@@ -379,7 +449,10 @@ async fn prepare_durable_submission(
         .await?;
     let result = async {
         let gateway = chain.gateway(escrow).await?;
-        let proposal = reconcile_with_gateway(evidence, Some(gateway))?;
+        let managed_binding =
+            load_managed_repro_binding(&mut connection, evidence.lease_id).await?;
+        let proposal =
+            reconcile_with_managed_binding(evidence, Some(gateway), managed_binding.as_ref())?;
         // Reusing the stored submission is what makes settlement idempotent, but
         // those bytes carry the gas price they were signed at. If the chain has
         // rejected them repeatedly they can never land, and resubmitting until
@@ -473,6 +546,14 @@ fn reconcile_with_gateway(
     evidence: &SettlementEvidence,
     managed_gateway: Option<[u8; 20]>,
 ) -> anyhow::Result<SettlementProposal> {
+    reconcile_with_managed_binding(evidence, managed_gateway, None)
+}
+
+fn reconcile_with_managed_binding(
+    evidence: &SettlementEvidence,
+    managed_gateway: Option<[u8; 20]>,
+    managed_binding: Option<&ManagedReproBinding>,
+) -> anyhow::Result<SettlementProposal> {
     if evidence.lease_id == 0
         || evidence.lease_nonce == 0
         || evidence.rate_per_second == 0
@@ -538,7 +619,8 @@ fn reconcile_with_gateway(
     };
     let credited_seconds = interrupted.then(|| closed_at.saturating_sub(end));
     validate_execution_evidence(evidence, start, end)?;
-    let repro = validate_repro_evidence(evidence, managed_gateway)?;
+    validate_managed_execution_binding(evidence, managed_binding)?;
+    let repro = validate_repro_evidence(evidence, managed_gateway, managed_binding)?;
     let trust_class = settled_trust_class(evidence)?;
     let maximum_by_deposit = evidence.deposit_base_units / evidence.rate_per_second;
     let usage_seconds = end
@@ -589,6 +671,38 @@ fn reconcile_with_gateway(
         evidence_hash,
         receipt,
     })
+}
+
+fn validate_managed_execution_binding(
+    evidence: &SettlementEvidence,
+    binding: Option<&ManagedReproBinding>,
+) -> anyhow::Result<()> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let ExecutionEvidence::Vast {
+        instance_id,
+        hourly_cost_micros,
+    } = &evidence.execution
+    else {
+        anyhow::bail!("managed repro is not backed by managed execution");
+    };
+    if *instance_id != binding.provider_instance_id
+        || *hourly_cost_micros != binding.hourly_cost_micros
+        || evidence.gpu_model != binding.gpu_model
+    {
+        anyhow::bail!("managed repro execution does not match its preflight binding");
+    }
+    match (
+        binding.report.as_ref(),
+        evidence.repro.as_ref().map(|repro| &repro.report),
+    ) {
+        (Some(stored), Some(ReproExecutionReport::Managed { report })) if stored == report => {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => anyhow::bail!("managed repro report does not match its stored execution binding"),
+    }
 }
 
 /// Settlement is where a trust class stops being a row in a database and
@@ -685,6 +799,7 @@ fn validate_execution_evidence(
 fn validate_repro_evidence(
     evidence: &SettlementEvidence,
     managed_gateway: Option<[u8; 20]>,
+    managed_binding: Option<&ManagedReproBinding>,
 ) -> anyhow::Result<Option<ReproReceiptEvidence>> {
     let Some(repro) = &evidence.repro else {
         return Ok(None);
@@ -773,7 +888,13 @@ fn validate_repro_evidence(
         }
         ReproExecutionReport::Managed { report } => {
             let gateway = managed_gateway.context("managed repro gateway was not resolved")?;
-            let ExecutionEvidence::Vast { instance_id, .. } = &evidence.execution else {
+            let binding =
+                managed_binding.context("managed repro database binding was not resolved")?;
+            let ExecutionEvidence::Vast {
+                instance_id,
+                hourly_cost_micros,
+            } = &evidence.execution
+            else {
                 anyhow::bail!(
                     "lease {} managed repro report is not backed by managed execution",
                     evidence.lease_id
@@ -787,10 +908,16 @@ fn validate_repro_evidence(
                 || report.command_id != repro.command.command_id
                 || report.lease_id != evidence.lease_id
                 || report.provider != ManagedProvider::Vast
-                || report.provider_instance_id != *instance_id
-                || report.gpu_model != evidence.gpu_model
-                || report.gpu_vram_mib < repro.spec.min_vram_mib
+                || binding.report.as_ref() != Some(report)
+                || binding.provider_instance_id != *instance_id
+                || binding.hourly_cost_micros != *hourly_cost_micros
+                || report.provider_instance_id != binding.provider_instance_id
+                || binding.gpu_model != evidence.gpu_model
+                || report.gpu_model != binding.gpu_model
+                || report.gpu_vram_mib != binding.gpu_vram_mib
+                || binding.gpu_vram_mib < repro.spec.min_vram_mib
                 || report.gpu_vram_mib > 196_608
+                || report.transport_host_key_sha256 != binding.transport_host_key_sha256
                 || !is_lower_sha256(&report.transport_host_key_sha256)
                 || report.started_at < repro.command.issued_at
                 || started_at < evidence.access_started_at
@@ -817,6 +944,12 @@ fn validate_repro_evidence(
             )
         }
     };
+    if repro.capability.executor != executor {
+        anyhow::bail!(
+            "lease {} repro report does not match its approved executor",
+            evidence.lease_id
+        );
+    }
     let Some(result) = result else {
         return Ok(None);
     };
@@ -1395,6 +1528,7 @@ mod tests {
             token_hash: "1".repeat(64),
             spec_hash: gpu_repro_spec_hash(&spec).unwrap(),
             expected_exit_code,
+            executor: ReproExecutor::Node,
         };
         let command = NodeCommand {
             command_id: uuid::Uuid::now_v7(),
@@ -1444,6 +1578,7 @@ mod tests {
         };
         evidence.node_telemetry.clear();
         let repro = evidence.repro.as_mut().unwrap();
+        repro.capability.executor = ReproExecutor::Managed;
         let payload = ManagedCommandReportPayload {
             report_id: uuid::Uuid::now_v7(),
             signer: "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_owned(),
@@ -1486,6 +1621,35 @@ mod tests {
         sign_managed_report(&mut report);
         repro.report = ReproExecutionReport::Managed { report };
         (evidence, gateway)
+    }
+
+    fn binding_for(evidence: &SettlementEvidence) -> ManagedReproBinding {
+        let ReproExecutionReport::Managed { report } =
+            &evidence.repro.as_ref().expect("repro").report
+        else {
+            panic!("managed report")
+        };
+        ManagedReproBinding {
+            provider_instance_id: report.provider_instance_id,
+            hourly_cost_micros: match &evidence.execution {
+                ExecutionEvidence::Vast {
+                    hourly_cost_micros, ..
+                } => *hourly_cost_micros,
+                ExecutionEvidence::Physical => panic!("managed execution"),
+            },
+            gpu_model: report.gpu_model.clone(),
+            gpu_vram_mib: report.gpu_vram_mib,
+            transport_host_key_sha256: report.transport_host_key_sha256.clone(),
+            report: Some(report.clone()),
+        }
+    }
+
+    fn reconcile_managed(
+        evidence: &SettlementEvidence,
+        gateway: [u8; 20],
+    ) -> anyhow::Result<SettlementProposal> {
+        let binding = binding_for(evidence);
+        reconcile_with_managed_binding(evidence, Some(gateway), Some(&binding))
     }
 
     fn sign_managed_report(report: &mut ManagedCommandReport) {
@@ -1666,12 +1830,42 @@ mod tests {
     #[test]
     fn reconciliation_accepts_a_gateway_signed_managed_report() {
         let (evidence, gateway) = managed_repro_evidence();
-        let proposal = reconcile_with_gateway(&evidence, Some(gateway)).unwrap();
+        let proposal = reconcile_managed(&evidence, gateway).unwrap();
         let receipt = proposal.receipt.repro.unwrap();
 
         assert_eq!(receipt.executor, ReproExecutor::Managed);
         assert!(receipt.succeeded);
         assert_eq!(receipt.stdout_hash, repro_stream_hash("42\n"));
+    }
+
+    #[test]
+    fn reconciliation_rejects_mutable_cloud_terms_after_preflight() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        let binding = binding_for(&evidence);
+        evidence.execution = ExecutionEvidence::Vast {
+            instance_id: binding.provider_instance_id + 1,
+            hourly_cost_micros: binding.hourly_cost_micros + 1,
+        };
+
+        assert!(reconcile_with_managed_binding(&evidence, Some(gateway), Some(&binding)).is_err());
+    }
+
+    #[test]
+    fn reportless_post_launch_failure_still_uses_preflight_terms() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        let mut binding = binding_for(&evidence);
+        binding.report = None;
+        evidence.repro = None;
+
+        assert!(reconcile_with_managed_binding(&evidence, Some(gateway), Some(&binding)).is_ok());
+    }
+
+    #[test]
+    fn reconciliation_rejects_an_executor_changed_after_approval() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        evidence.repro.as_mut().unwrap().capability.executor = ReproExecutor::Node;
+
+        assert!(reconcile_managed(&evidence, gateway).is_err());
     }
 
     #[test]
@@ -1686,7 +1880,7 @@ mod tests {
         report.result = None;
         sign_managed_report(report);
 
-        let proposal = reconcile_with_gateway(&evidence, Some(gateway)).unwrap();
+        let proposal = reconcile_managed(&evidence, gateway).unwrap();
         assert!(proposal.receipt.repro.is_none());
         assert!(prism_protocol::receipt_hash_matches(&proposal.receipt).unwrap());
     }
@@ -1695,7 +1889,7 @@ mod tests {
     fn reconciliation_rejects_a_managed_report_from_the_wrong_gateway() {
         let (evidence, _) = managed_repro_evidence();
 
-        assert!(reconcile_with_gateway(&evidence, Some([9_u8; 20])).is_err());
+        assert!(reconcile_managed(&evidence, [9_u8; 20]).is_err());
         assert!(reconcile(&evidence).is_err());
     }
 
@@ -1708,7 +1902,7 @@ mod tests {
         };
         report.result.as_mut().unwrap().stdout = "43\n".to_owned();
 
-        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+        assert!(reconcile_managed(&evidence, gateway).is_err());
     }
 
     #[test]
@@ -1721,7 +1915,7 @@ mod tests {
         report.finished_at = Utc.timestamp_opt(121, 0).unwrap();
         sign_managed_report(report);
 
-        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+        assert!(reconcile_managed(&evidence, gateway).is_err());
     }
 
     #[test]
@@ -1734,7 +1928,7 @@ mod tests {
         report.provider_instance_id += 1;
         sign_managed_report(report);
 
-        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+        assert!(reconcile_managed(&evidence, gateway).is_err());
     }
 
     #[test]
@@ -1747,7 +1941,7 @@ mod tests {
         report.gpu_model = "NVIDIA H100".to_owned();
         sign_managed_report(report);
 
-        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+        assert!(reconcile_managed(&evidence, gateway).is_err());
     }
 
     #[test]

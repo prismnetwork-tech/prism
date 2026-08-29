@@ -27,6 +27,7 @@ beforeEach(() => {
       return Response.json({
         version: "prism.gpu-repro.status.v1",
         status: "completed",
+        executor: "managed",
         spec_hash: "a".repeat(64),
         lease_id: 42,
         result: { exit_code: 0, stdout: "ok\n", stderr: "", truncated: false },
@@ -118,9 +119,11 @@ describe("Prism MCP endpoint", () => {
     const payload = JSON.parse(called.result.content[0].text);
 
     expect(payload).toMatchObject({
+      intent_version: "prism.gpu-repro.intent.v2",
       duration_minutes: 30,
       maximum_escrow: "399600",
       maximum_escrow_usdg: "0.3996",
+      estimated_executor: "managed",
       lease_created: false,
     });
     expect(payload.approval_url).toContain("/compute#repro=");
@@ -129,6 +132,22 @@ describe("Prism MCP endpoint", () => {
     expect(payload.approval_url).not.toContain(payload.repro_token);
     expect(payload.approval_url).not.toContain(command);
     expect(called.result.content[0].text).not.toContain(offer.node_id);
+  });
+
+  it("rejects noncanonical uppercase sha256 digests", async () => {
+    const called = await rpc("tools/call", {
+      name: "prism_prepare_gpu_repro",
+      arguments: {
+        image: `pytorch/pytorch@sha256:${"A".repeat(64)}`,
+        command: "python -c 'print(42)'",
+        duration_minutes: 30,
+        min_vram_gib: 40,
+        expected_exit_code: 0,
+      },
+    });
+
+    expect(called.result.isError).toBe(true);
+    expect(called.result.content[0].text).toContain("lowercase sha256 digest");
   });
 
   it("reads status, evidence, and verification through one scoped token", async () => {
@@ -177,6 +196,15 @@ describe("Prism MCP endpoint", () => {
     });
     expect(payload.receipts).toHaveLength(1);
     expect(payload.receipts[0].repro.spec_hash).toBe("b".repeat(64));
+  });
+
+  it("rejects uppercase repro spec hashes at the MCP boundary", async () => {
+    const called = await rpc("tools/call", {
+      name: "prism_gpu_receipts",
+      arguments: { limit: 5, repro_spec_hash: "B".repeat(64) },
+    });
+
+    expect(called.result.isError).toBe(true);
   });
 
   it("rejects an oversized body without relying on content-length", async () => {

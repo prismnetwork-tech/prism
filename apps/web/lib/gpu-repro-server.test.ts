@@ -17,6 +17,7 @@ describe("GPU repro status client", () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => Response.json({
       version: "prism.gpu-repro.status.v1",
       status: "running",
+      executor: "managed",
       spec_hash: "a".repeat(64),
       lease_id: 7,
     }));

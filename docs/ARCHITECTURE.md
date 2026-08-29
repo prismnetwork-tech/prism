@@ -133,8 +133,8 @@ after, money moves. See [integrity monitoring](#integrity-monitoring).
 - `POST /v1/leases/match` returns a five-minute quote; the wallet creates the
   actual escrow directly onchain with a quote-derived client reference.
 - `POST /v1/leases/confirm` verifies the finalized quote-bound funding event,
-  records the renter wallet, and queues either the physical node command or
-  cloud-provider launch.
+  records the renter wallet, rechecks the executor fixed by a repro approval,
+  and queues exactly that physical-node or managed-cloud path.
 - `GET /v1/leases` returns the authenticated account's indexed leases.
 - `GET /v1/leases/{lease_id}/access` returns either the active account-owned
   gateway grant or the direct cloud SSH endpoint.

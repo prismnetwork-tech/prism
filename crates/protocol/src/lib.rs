@@ -1337,6 +1337,7 @@ pub struct ReproCapability {
     pub token_hash: String,
     pub spec_hash: String,
     pub expected_exit_code: i32,
+    pub executor: ReproExecutor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2928,6 +2929,17 @@ mod tests {
         .unwrap();
 
         assert!(request.repro.is_none());
+    }
+
+    #[test]
+    fn repro_capabilities_require_an_explicit_executor() {
+        let capability = serde_json::from_value::<ReproCapability>(serde_json::json!({
+            "token_hash": "0".repeat(64),
+            "spec_hash": "1".repeat(64),
+            "expected_exit_code": 0
+        }));
+
+        assert!(capability.is_err());
     }
 
     fn unsigned_attestation(node_id: &str) -> UnsignedNodeAttestation {

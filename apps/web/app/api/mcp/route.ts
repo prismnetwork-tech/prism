@@ -57,7 +57,7 @@ const mcpHandler = createMcpHandler((server) => {
       title: "Prepare a bounded GPU repro",
       description: "Bind an exact command and digest-pinned image into a short-lived approval intent with a live cost ceiling. This tool cannot spend funds, sign a wallet transaction, or create a lease.",
       inputSchema: z.object({
-        image: z.string().min(1).max(512).describe("Public OCI image pinned as repository@sha256:<64 hex characters>."),
+        image: z.string().min(1).max(512).describe("Public OCI image pinned as repository@sha256:<64 lowercase hex characters>."),
         command: z.string().min(1).max(maxGpuReproCommandBytes).describe("Exact command to run on the GPU, up to 2 KiB UTF-8."),
         duration_minutes: z.union([z.literal(30), z.literal(60), z.literal(120), z.literal(360)]),
         min_vram_gib: z.number().int().min(1).max(192),
@@ -76,8 +76,14 @@ const mcpHandler = createMcpHandler((server) => {
           expectedExitCode: expected_exit_code,
         },
       );
-      const intent = createReproIntent(plan, plan.maximumEscrowBaseUnits, siteUrl);
+      const intent = createReproIntent(
+        plan,
+        plan.estimatedExecutor,
+        plan.maximumEscrowBaseUnits,
+        siteUrl,
+      );
       return {
+        intent_version: intent.payload.version,
         approval_url: intent.approvalUrl,
         repro_token: intent.reproToken,
         spec_hash: intent.payload.spec_hash,
@@ -172,7 +178,7 @@ const mcpHandler = createMcpHandler((server) => {
         limit: z.number().int().min(1).max(100).default(20),
         receipt_id: z.string().min(1).max(128).optional(),
         transaction_hash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
-        repro_spec_hash: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        repro_spec_hash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
       }),
       annotations: readOnly,
     },
@@ -181,7 +187,7 @@ const mcpHandler = createMcpHandler((server) => {
       const receipts = index.receipts
         .filter((receipt) => !receipt_id || receipt.receipt_id === receipt_id)
         .filter((receipt) => !transaction_hash || receipt.transaction_hash.toLowerCase() === transaction_hash.toLowerCase())
-        .filter((receipt) => !repro_spec_hash || receipt.repro?.spec_hash.toLowerCase() === repro_spec_hash.toLowerCase())
+        .filter((receipt) => !repro_spec_hash || receipt.repro?.spec_hash === repro_spec_hash)
         .slice(0, limit);
       return { generated_at: index.generated_at, receipts };
     }),
