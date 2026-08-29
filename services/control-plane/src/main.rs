@@ -3,7 +3,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::Path as FilePath,
     sync::{Arc, OnceLock},
 };
@@ -19,23 +19,29 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use prism_protocol::{
     Account, AttestationChallenge, AttestationKind, AttestationVerdict, CommandResult,
     CredentialCipher, DEFAULT_WORKSPACE_TRUST_FLOOR, EncryptedSecret, GpuCcAttestation,
-    GuestAttestation, LeaseAccess, LeaseAttestationVerdict, LeaseGpuCcVerdict, LeaseQuote,
-    LeaseRecord, LeaseRequest, LeaseState, LeaseTdxGuestVerdict, MAX_ESCROW_BASE_UNITS,
+    GpuReproSpec, GuestAttestation, LeaseAccess, LeaseAttestationVerdict, LeaseGpuCcVerdict,
+    LeaseQuote, LeaseRecord, LeaseRequest, LeaseState, LeaseTdxGuestVerdict, MAX_ESCROW_BASE_UNITS,
     MAX_LEASE_SECONDS, MAX_NETWORK_LEASES, MAX_VAULT_CIPHERTEXT_BYTES, MAX_VAULT_ITEMS_PER_ACCOUNT,
     MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_NAME_BYTES,
-    MAX_WORKSPACES_PER_ACCOUNT, NodeAttestation, NodeCertificateBundle, NodeCertificateRequest,
-    NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll, NodeCommandReport,
-    NodeEnrollment, NodeOffer, NodePosture, NodeTelemetry, STANDARD_RATE_PER_SECOND,
-    SettlementEvidence, TdxEventEntry, TdxLeaseAttestation, TrustClass, VaultEnvelope, VaultItem,
-    VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot, attestation_report_nonce,
-    class_for_lease, class_for_verdict, discounted_rate, node_id, snp_report_data,
+    MAX_WORKSPACES_PER_ACCOUNT, ManagedCommandReport, ManagedProvider, NodeAttestation,
+    NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
+    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture,
+    NodeTelemetry, PublicReceipt, ReceiptOutcome, ReproExecutionReport, ReproExecutor,
+    STANDARD_RATE_PER_SECOND, SettlementEvidence, TdxEventEntry, TdxLeaseAttestation, TrustClass,
+    VaultEnvelope, VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot,
+    attestation_report_nonce, class_for_lease, class_for_verdict, discounted_rate,
+    managed_repro_report_hash, node_id, receipt_hash_matches, repro_command_hash,
+    repro_report_hash, repro_result_hash, repro_stream_hash, repro_token_hash, snp_report_data,
     stake_discount_bps, tdx_lease_report_data, tdx_report_data, vault_release_permitted,
     verifying_key,
 };
@@ -84,6 +90,23 @@ const OFFER_MAX_AGE_SECONDS: i64 = 90;
 const QUOTE_HOLD_SECONDS: i64 = 90;
 /// Mirrors the node's own limit, so the two agree on what it will accept.
 const MAX_BATCH_COMMAND_BYTES: usize = 8 * 1024;
+const MAX_REPRO_STATUS_RESPONSE_BYTES: usize = 512 * 1_024;
+const REPRO_STATUS_VERSION: &str = "prism.gpu-repro.status.v1";
+const REPRO_STATUS_LEASE_QUERY: &str = "SELECT q.document, l.lease_id, l.chain_lease_id, l.state, \
+        l.document->>'node_id', l.document #>> '{repro,token_hash}', \
+        l.document #>> '{repro,spec_hash}', nc.status, nc.document, nc.verified_report, nc.result, \
+        mj.status, mj.command, mj.report, pr.document, o.document->>'device_public_key' \
+    FROM leases l \
+    JOIN lease_quotes q ON q.quote_id = l.quote_id \
+    JOIN node_offers o ON o.node_id = l.document->>'node_id' \
+    LEFT JOIN node_commands nc ON nc.lease_id = l.lease_id \
+    LEFT JOIN managed_repro_jobs mj ON mj.lease_id = l.lease_id \
+    LEFT JOIN proof_receipts pr ON pr.lease_id = l.lease_id \
+    WHERE l.document #>> '{repro,token_hash}' = $1 \
+    ORDER BY l.created_at DESC LIMIT 1";
+const REPRO_STATUS_QUOTE_QUERY: &str = "SELECT document FROM lease_quotes \
+    WHERE document #>> '{repro,token_hash}' = $1 \
+    ORDER BY created_at DESC LIMIT 1";
 const QUOTE_TTL_MINUTES: i64 = 5;
 /// How long a node's command poll is remembered. It started as the replay
 /// guard's retention window and now also decides who can be handed batch work:
@@ -283,7 +306,7 @@ struct FundingConfirmation<'a> {
     quote: &'a LeaseQuote,
     transaction_hash: &'a str,
     funding: ConfirmedFunding,
-    ssh_authorized_key: &'a str,
+    ssh_authorized_key: Option<&'a str>,
     jupyter_token: &'a str,
     encrypted_jupyter_token: EncryptedSecret,
 }
@@ -847,7 +870,9 @@ struct MemoryCommand {
     command: NodeCommand,
     status: &'static str,
     lease_until: Option<chrono::DateTime<Utc>>,
+    authorization_request_id: Option<Uuid>,
     result: Option<CommandResult>,
+    verified_report: Option<NodeCommandReport>,
     updated_at: chrono::DateTime<Utc>,
 }
 
@@ -911,6 +936,10 @@ enum StoreError {
     CommandNotFound,
     #[error("node command request was already accepted")]
     CommandReplay,
+    #[error("node command execution was claimed by another poll")]
+    CommandClaimed,
+    #[error("interactive lease credentials are missing")]
+    AccessCredentialsMissing,
     #[error("node certificate request was already accepted")]
     CertificateReplay,
     #[error("node certificate is not active")]
@@ -1067,6 +1096,24 @@ fn parse_trust_class(value: &str) -> Result<TrustClass, StoreError> {
     }
 }
 
+fn parse_lease_state(value: &str) -> Result<LeaseState, StoreError> {
+    match value {
+        "funded" => Ok(LeaseState::Funded),
+        "provisioning" => Ok(LeaseState::Provisioning),
+        "ready" => Ok(LeaseState::Ready),
+        "active" => Ok(LeaseState::Active),
+        "closing" => Ok(LeaseState::Closing),
+        "settlement_pending" => Ok(LeaseState::SettlementPending),
+        "disputed" => Ok(LeaseState::Disputed),
+        "finalized" => Ok(LeaseState::Finalized),
+        "refunded" => Ok(LeaseState::Refunded),
+        "failed" => Ok(LeaseState::Failed),
+        other => Err(StoreError::InvalidStoredState(format!(
+            "unknown lease state {other}"
+        ))),
+    }
+}
+
 #[derive(Deserialize)]
 struct MatchRequest {
     request: LeaseRequest,
@@ -1105,10 +1152,104 @@ struct LeaseAccessResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReproStatusRequest {
+    token: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ReproStatus {
+    Quoted,
+    Funded,
+    Preparing,
+    Ready,
+    Running,
+    Completed,
+    Failed,
+    Settling,
+    Settled,
+    Refunded,
+    Disputed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ReproStatusChecks {
+    token_bound: bool,
+    spec_hash_valid: bool,
+    command_bound: Option<bool>,
+    executor_signature_valid: Option<bool>,
+    report_bound: Option<bool>,
+    receipt_hash_valid: Option<bool>,
+    receipt_bound: Option<bool>,
+    expected_exit_code: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ReproStatusEvidence {
+    command: NodeCommand,
+    report: ReproExecutionReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<PublicReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ReproStatusResponse {
+    version: &'static str,
+    status: ReproStatus,
+    spec: GpuReproSpec,
+    spec_hash: String,
+    quote_id: Uuid,
+    maximum_escrow: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_state: Option<LeaseState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<CommandResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<ReproStatusEvidence>,
+    checks: ReproStatusChecks,
+}
+
+struct StoredReproStatus {
+    quote: LeaseQuote,
+    lease: Option<StoredReproLease>,
+}
+
+struct StoredReproLease {
+    lease_id: u64,
+    chain_lease_id: u64,
+    state: LeaseState,
+    node_id: String,
+    token_hash: Option<String>,
+    spec_hash: Option<String>,
+    execution: Option<StoredReproExecution>,
+    receipt: Option<PublicReceipt>,
+}
+
+enum StoredReproExecution {
+    Node {
+        status: String,
+        command: NodeCommand,
+        report: Option<NodeCommandReport>,
+        result: Option<CommandResult>,
+        enrolled_device_public_key: Option<String>,
+    },
+    Managed {
+        status: String,
+        command: NodeCommand,
+        report: Option<ManagedCommandReport>,
+    },
+}
+
+#[derive(Deserialize)]
 struct ConfirmLeaseRequest {
     quote_id: Uuid,
     transaction_hash: String,
-    ssh_authorized_key: String,
+    ssh_authorized_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1476,6 +1617,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/offers", get(list_offers))
+        .route("/v1/repros/status", post(get_repro_status))
         .route("/v1/price-index", get(price_index))
         .route("/v1/nodes/enroll", post(enroll_node))
         .route(
@@ -1496,6 +1638,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/nodes/{node_id}/commands/{command_id}/report",
             post(report_node_command),
+        )
+        .route(
+            "/v1/nodes/{node_id}/commands/{command_id}/authorize",
+            post(authorize_node_command),
         )
         .route("/v1/leases/match", post(match_lease))
         .route("/v1/leases", get(list_account_leases))
@@ -3422,6 +3568,7 @@ impl MarketplaceStore {
                         );
                         offer.command_channel =
                             polls_command_channel(&market, &offer.node_id, Utc::now());
+                        offer.managed_batch = false;
                         offer
                     })
                     .collect())
@@ -3434,6 +3581,7 @@ impl MarketplaceStore {
                         bool,
                         Option<SqlJson<NodePosture>>,
                         Option<SqlJson<AttestationVerdict>>,
+                        bool,
                         bool,
                     ),
                 >(
@@ -3449,6 +3597,13 @@ impl MarketplaceStore {
                             EXISTS ( \
                                 SELECT 1 FROM node_command_requests r \
                                 WHERE r.node_id = o.node_id AND r.expires_at > NOW() \
+                            ), \
+                            EXISTS ( \
+                                SELECT 1 FROM cloud_capacity cc \
+                                WHERE cc.node_id = o.node_id \
+                                  AND cc.provider = 'vast' \
+                                  AND cc.available \
+                                  AND cc.observed_at >= $1 \
                             ) \
                      FROM node_offers o \
                      WHERE (o.document->>'bonded')::boolean = true \
@@ -3485,7 +3640,14 @@ impl MarketplaceStore {
                 Ok(documents
                     .into_iter()
                     .map(
-                        |(SqlJson(mut offer), tunneled, posture, verdict, polling)| {
+                        |(
+                            SqlJson(mut offer),
+                            tunneled,
+                            posture,
+                            verdict,
+                            polling,
+                            managed_batch,
+                        )| {
                             offer.online = true;
                             offer.trust_class = class_for_verdict(
                                 &offer.node_id,
@@ -3495,6 +3657,7 @@ impl MarketplaceStore {
                                 now,
                             );
                             offer.command_channel = polling;
+                            offer.managed_batch = managed_batch;
                             offer
                         },
                     )
@@ -4769,6 +4932,7 @@ impl MarketplaceStore {
                             now,
                         );
                         offer.command_channel = polls_command_channel(&market, &offer.node_id, now);
+                        offer.managed_batch = false;
                         offer
                     })
                     .collect::<Vec<_>>();
@@ -4854,7 +5018,7 @@ impl MarketplaceStore {
                         .map_err(StoreError::Storage)?
                         .into_iter()
                         .collect();
-                let online: BTreeSet<String> = query_scalar(
+                let managed_batch: BTreeSet<String> = query_scalar(
                     "SELECT node_id FROM cloud_capacity \
                      WHERE provider = 'vast' AND available AND observed_at >= $1",
                 )
@@ -4863,8 +5027,12 @@ impl MarketplaceStore {
                 .await
                 .map_err(StoreError::Storage)?
                 .into_iter()
-                .chain(tunneled.iter().cloned())
                 .collect();
+                let online: BTreeSet<String> = managed_batch
+                    .iter()
+                    .cloned()
+                    .chain(tunneled.iter().cloned())
+                    .collect();
                 // Every poll and every report a node makes is signed by its
                 // device key and lands here, so a live record is the node
                 // saying it is still ready to be handed a command.
@@ -4927,6 +5095,7 @@ impl MarketplaceStore {
                             now,
                         );
                         offer.command_channel = polling.contains(&offer.node_id);
+                        offer.managed_batch = managed_batch.contains(&offer.node_id);
                         offer
                     })
                     .collect();
@@ -5016,6 +5185,7 @@ impl MarketplaceStore {
             funding_transaction_hash: transaction_hash.to_ascii_lowercase(),
             state: LeaseState::Funded,
             command: quote.command.clone(),
+            repro: quote.repro.clone(),
             created_at: now,
             updated_at: now,
         };
@@ -5123,14 +5293,16 @@ impl MarketplaceStore {
                 market
                     .lifecycle
                     .insert(lease.lease_id, MemoryLifecycle::default());
-                let command = launch_command(&lease, ssh_authorized_key, jupyter_token);
+                let command = launch_command(&lease, ssh_authorized_key, jupyter_token)?;
                 market.commands.insert(
                     command.command_id,
                     MemoryCommand {
                         command,
                         status: "queued",
                         lease_until: None,
+                        authorization_request_id: None,
                         result: None,
+                        verified_report: None,
                         updated_at: now,
                     },
                 );
@@ -5331,15 +5503,39 @@ impl MarketplaceStore {
                 .await
                 .map_err(StoreError::Storage)?;
                 if cloud_backed {
+                    let managed_repro = lease.repro.is_some();
+                    if lease.command.is_some() != managed_repro {
+                        return Err(StoreError::InvalidStoredState(
+                            "cloud batch leases require a repro capability".to_owned(),
+                        ));
+                    }
+                    let cloud_ssh_key = if managed_repro {
+                        None
+                    } else {
+                        Some(ssh_authorized_key.ok_or(StoreError::AccessCredentialsMissing)?)
+                    };
                     query(
                         "INSERT INTO cloud_instances (lease_id, ssh_authorized_key) \
                          VALUES ($1, $2)",
                     )
                     .bind(lease.lease_id as i64)
-                    .bind(ssh_authorized_key)
+                    .bind(cloud_ssh_key)
                     .execute(&mut *transaction)
                     .await
                     .map_err(StoreError::Storage)?;
+                    if managed_repro {
+                        let command = launch_command(&lease, None, jupyter_token)?;
+                        query(
+                            "INSERT INTO managed_repro_jobs (command_id, lease_id, command) \
+                             VALUES ($1, $2, $3)",
+                        )
+                        .bind(command.command_id)
+                        .bind(lease.lease_id as i64)
+                        .bind(SqlJson(command))
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(StoreError::Storage)?;
+                    }
                     query(
                         "INSERT INTO lifecycle_outbox \
                              (action_id, lease_id, kind, available_at) \
@@ -5352,7 +5548,7 @@ impl MarketplaceStore {
                     .await
                     .map_err(StoreError::Storage)?;
                 } else {
-                    let command = launch_command(&lease, ssh_authorized_key, jupyter_token);
+                    let command = launch_command(&lease, ssh_authorized_key, jupyter_token)?;
                     query(
                         "INSERT INTO node_commands \
                              (command_id, node_id, lease_id, document, status) \
@@ -6086,7 +6282,10 @@ impl MarketplaceStore {
                             || (entry.status == "leased"
                                 && entry.lease_until.is_none_or(|until| until <= now))
                             || (entry.status == "ready"
-                                && entry.updated_at <= now - Duration::minutes(2))
+                                && entry
+                                    .lease_until
+                                    .unwrap_or(entry.updated_at + Duration::minutes(2))
+                                    <= now)
                     })
                     .min_by_key(|entry| entry.command.issued_at);
                 let Some(entry) = command else {
@@ -6094,9 +6293,15 @@ impl MarketplaceStore {
                 };
                 entry.status = "leased";
                 entry.lease_until = Some(now + Duration::minutes(2));
+                entry.authorization_request_id = None;
                 entry.updated_at = now;
                 let command = entry.command.clone();
-                if let Some((_, lease)) = market.leases.get_mut(&command.lease_id) {
+                if let Some((_, lease)) = market.leases.get_mut(&command.lease_id)
+                    && matches!(
+                        lease.state,
+                        LeaseState::Funded | LeaseState::Provisioning | LeaseState::Ready
+                    )
+                {
                     lease.state = LeaseState::Provisioning;
                     lease.updated_at = now;
                 }
@@ -6110,7 +6315,8 @@ impl MarketplaceStore {
                      WHERE node_id = $1 AND attempts < 10 \
                        AND (status = 'queued' \
                             OR (status = 'leased' AND lease_until <= NOW()) \
-                            OR (status = 'ready' AND updated_at <= NOW() - INTERVAL '2 minutes')) \
+                            OR (status = 'ready' AND COALESCE(lease_until, \
+                                updated_at + INTERVAL '2 minutes') <= NOW())) \
                      ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
                 )
                 .bind(node_id)
@@ -6125,7 +6331,8 @@ impl MarketplaceStore {
                 query(
                     "UPDATE node_commands \
                      SET status = 'leased', attempts = attempts + 1, \
-                         lease_until = NOW() + INTERVAL '2 minutes', updated_at = NOW() \
+                         lease_until = NOW() + INTERVAL '2 minutes', \
+                         authorization_request_id = NULL, updated_at = NOW() \
                      WHERE command_id = $1",
                 )
                 .bind(command.command_id)
@@ -6142,103 +6349,404 @@ impl MarketplaceStore {
 
     async fn report_command(&self, report: &NodeCommandReport) -> Result<(), StoreError> {
         let now = Utc::now();
-        let (status, lease_state, action) = match report.outcome {
-            NodeCommandOutcome::Ready => ("ready", LeaseState::Ready, "start_access"),
-            NodeCommandOutcome::Completed => ("completed", LeaseState::Closing, "close_access"),
-            NodeCommandOutcome::Failed => ("failed", LeaseState::Closing, "expire_provision"),
-        };
         match self {
             Self::Memory(market) => {
                 let mut market = market.write().await;
                 remember_node_request(&mut market, &report.node_id, report.request_id, now)?;
                 let entry = market
                     .commands
-                    .get_mut(&report.command_id)
+                    .get(&report.command_id)
                     .filter(|entry| entry.command.node_id == report.node_id)
                     .ok_or(StoreError::CommandNotFound)?;
-                if !valid_command_transition(entry.status, status) {
-                    return Err(StoreError::CommandNotFound);
-                }
-                entry.status = status;
-                entry.lease_until = None;
+                let lease_id = entry.command.lease_id;
+                let lease = &market
+                    .leases
+                    .get(&lease_id)
+                    .ok_or(StoreError::CommandNotFound)?
+                    .1;
+                let transition =
+                    command_report_transition(&entry.command, entry.status, &lease.state, report)
+                        .ok_or(StoreError::CommandNotFound)?;
+                let entry = market
+                    .commands
+                    .get_mut(&report.command_id)
+                    .ok_or(StoreError::CommandNotFound)?;
+                entry.status = transition.status;
+                entry.lease_until = transition.renew_claim.then_some(now + Duration::minutes(2));
                 if report.result.is_some() {
                     entry.result = report.result.clone();
                 }
+                entry.verified_report = Some(report.clone());
                 entry.updated_at = now;
-                let lease_id = entry.command.lease_id;
-                if let Some((_, lease)) = market.leases.get_mut(&lease_id) {
+                if let Some(lease_state) = transition.lease_state
+                    && let Some((_, lease)) = market.leases.get_mut(&lease_id)
+                {
                     lease.state = lease_state;
                     lease.updated_at = report.observed_at;
                 }
-                market.lifecycle_actions.insert((lease_id, action));
+                if let Some(action) = transition.action {
+                    market.lifecycle_actions.insert((lease_id, action));
+                }
                 Ok(())
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
                 record_node_request(&mut transaction, &report.node_id, report.request_id).await?;
-                let current: Option<(i64, String)> = query_as(
-                    "SELECT lease_id, status FROM node_commands \
-                     WHERE command_id = $1 AND node_id = $2 FOR UPDATE",
-                )
-                .bind(report.command_id)
-                .bind(&report.node_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(StoreError::Storage)?;
-                let Some((lease_id, current)) = current else {
+                let current: Option<(i64, String, SqlJson<NodeCommand>, SqlJson<LeaseRecord>)> =
+                    query_as(
+                        "SELECT c.lease_id, c.status, c.document, l.document \
+                     FROM node_commands c JOIN leases l ON l.lease_id = c.lease_id \
+                     WHERE c.command_id = $1 AND c.node_id = $2 FOR UPDATE OF c, l",
+                    )
+                    .bind(report.command_id)
+                    .bind(&report.node_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                let Some((lease_id, current, SqlJson(command), SqlJson(lease))) = current else {
                     return Err(StoreError::CommandNotFound);
                 };
-                if !valid_command_transition(&current, status) {
-                    return Err(StoreError::CommandNotFound);
-                }
+                let transition =
+                    command_report_transition(&command, &current, &lease.state, report)
+                        .ok_or(StoreError::CommandNotFound)?;
                 query(
                     "UPDATE node_commands \
-                     SET status = $2, lease_until = NULL, last_error = $3, \
-                         result = COALESCE($4, result), updated_at = NOW() \
+                     SET status = $2, last_error = $3, \
+                         result = COALESCE($4, result), \
+                         lease_until = CASE WHEN $5 THEN NOW() + INTERVAL '2 minutes' END, \
+                         verified_report = $6, updated_at = NOW() \
                      WHERE command_id = $1",
                 )
                 .bind(report.command_id)
-                .bind(status)
+                .bind(transition.status)
                 .bind(&report.error)
                 .bind(report.result.as_ref().map(SqlJson))
+                .bind(transition.renew_claim)
+                .bind(SqlJson(report))
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
-                update_lease_state(&mut transaction, lease_id as u64, lease_state).await?;
-                query(
-                    "INSERT INTO lease_lifecycle (lease_id, connection_id, node_ready_at) \
-                     SELECT $1, t.connection_id, CASE WHEN $2 = 'start_access' THEN $3 ELSE NULL END \
-                     FROM leases l LEFT JOIN node_tunnels t \
-                       ON t.node_id = l.document->>'node_id' \
-                     WHERE l.lease_id = $1 \
-                     ON CONFLICT (lease_id) DO UPDATE SET \
-                       connection_id = COALESCE(EXCLUDED.connection_id, lease_lifecycle.connection_id), \
-                       node_ready_at = COALESCE(EXCLUDED.node_ready_at, lease_lifecycle.node_ready_at), \
-                       updated_at = NOW()",
-                )
-                .bind(lease_id)
-                .bind(action)
-                .bind(report.observed_at)
-                .execute(&mut *transaction)
-                .await
-                .map_err(StoreError::Storage)?;
-                query(
-                    "INSERT INTO lifecycle_outbox \
-                         (action_id, lease_id, kind, available_at) \
-                     SELECT $1, $2, $3, \
-                         CASE WHEN $3 = 'expire_provision' \
-                              THEN GREATEST(NOW(), l.created_at + INTERVAL '10 minutes') \
-                              ELSE NOW() END \
-                     FROM leases l WHERE l.lease_id = $2 \
-                     ON CONFLICT (lease_id, kind) DO NOTHING",
-                )
-                .bind(Uuid::now_v7())
-                .bind(lease_id)
-                .bind(action)
-                .execute(&mut *transaction)
-                .await
-                .map_err(StoreError::Storage)?;
+                if let Some(lease_state) = transition.lease_state {
+                    update_lease_state(&mut transaction, lease_id as u64, lease_state).await?;
+                }
+                if let Some(action) = transition.action {
+                    query(
+                        "INSERT INTO lease_lifecycle (lease_id, connection_id, node_ready_at) \
+                         SELECT $1, t.connection_id, CASE WHEN $2 = 'start_access' THEN $3 ELSE NULL END \
+                         FROM leases l LEFT JOIN node_tunnels t \
+                           ON t.node_id = l.document->>'node_id' \
+                         WHERE l.lease_id = $1 \
+                         ON CONFLICT (lease_id) DO UPDATE SET \
+                           connection_id = COALESCE(EXCLUDED.connection_id, lease_lifecycle.connection_id), \
+                           node_ready_at = COALESCE(EXCLUDED.node_ready_at, lease_lifecycle.node_ready_at), \
+                           updated_at = NOW()",
+                    )
+                    .bind(lease_id)
+                    .bind(action)
+                    .bind(report.observed_at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                    query(
+                        "INSERT INTO lifecycle_outbox \
+                             (action_id, lease_id, kind, available_at) \
+                         SELECT $1, $2, $3, \
+                             CASE WHEN $3 = 'expire_provision' \
+                                  THEN GREATEST(NOW(), l.created_at + INTERVAL '10 minutes') \
+                                  ELSE NOW() END \
+                         FROM leases l WHERE l.lease_id = $2 \
+                         ON CONFLICT (lease_id, kind) DO NOTHING",
+                    )
+                    .bind(Uuid::now_v7())
+                    .bind(lease_id)
+                    .bind(action)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                }
                 transaction.commit().await.map_err(StoreError::Storage)
+            }
+        }
+    }
+
+    async fn authorize_command(
+        &self,
+        node_id: &str,
+        command_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let now = Utc::now();
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let entry = market
+                    .commands
+                    .get(&command_id)
+                    .filter(|entry| entry.command.node_id == node_id)
+                    .filter(|entry| matches!(entry.command.kind, NodeCommandKind::Batch { .. }))
+                    .ok_or(StoreError::CommandNotFound)?;
+                if entry.status == "running" {
+                    return if entry.authorization_request_id == Some(request_id) {
+                        Ok(true)
+                    } else {
+                        Err(StoreError::CommandClaimed)
+                    };
+                }
+                if entry.status != "ready" {
+                    return Err(StoreError::CommandClaimed);
+                }
+                let lease_id = entry.command.lease_id;
+                let same_request = entry.authorization_request_id == Some(request_id);
+                if !same_request {
+                    remember_node_request(&mut market, node_id, request_id, now)?;
+                }
+                let active = market
+                    .leases
+                    .get(&lease_id)
+                    .is_some_and(|(_, lease)| lease.state == LeaseState::Active);
+                let entry = market
+                    .commands
+                    .get_mut(&command_id)
+                    .ok_or(StoreError::CommandNotFound)?;
+                entry.authorization_request_id = Some(request_id);
+                entry.updated_at = now;
+                if active {
+                    entry.status = "running";
+                    entry.lease_until = None;
+                } else {
+                    entry.lease_until = Some(now + Duration::minutes(2));
+                }
+                Ok(active)
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                let fresh_request =
+                    insert_node_request(&mut transaction, node_id, request_id).await?;
+                type CommandAuthorizationRow = (
+                    String,
+                    Option<Uuid>,
+                    SqlJson<NodeCommand>,
+                    SqlJson<LeaseRecord>,
+                );
+                let current: Option<CommandAuthorizationRow> = query_as(
+                    "SELECT c.status, c.authorization_request_id, c.document, l.document \
+                     FROM node_commands c JOIN leases l ON l.lease_id = c.lease_id \
+                     WHERE c.command_id = $1 AND c.node_id = $2 FOR UPDATE OF c, l",
+                )
+                .bind(command_id)
+                .bind(node_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                let Some((status, authorization_request_id, SqlJson(command), SqlJson(lease))) =
+                    current
+                else {
+                    return Err(StoreError::CommandNotFound);
+                };
+                if !matches!(command.kind, NodeCommandKind::Batch { .. }) {
+                    return Err(StoreError::CommandNotFound);
+                }
+                if !fresh_request && authorization_request_id != Some(request_id) {
+                    return Err(StoreError::CommandReplay);
+                }
+                if status == "running" {
+                    if authorization_request_id != Some(request_id) {
+                        return Err(StoreError::CommandClaimed);
+                    }
+                    transaction.commit().await.map_err(StoreError::Storage)?;
+                    return Ok(true);
+                }
+                if status != "ready" {
+                    return Err(StoreError::CommandClaimed);
+                }
+                let active = lease.state == LeaseState::Active;
+                query(
+                    "UPDATE node_commands SET authorization_request_id = $2, \
+                         status = CASE WHEN $3 THEN 'running' ELSE status END, \
+                         lease_until = CASE WHEN $3 THEN NULL \
+                              ELSE NOW() + INTERVAL '2 minutes' END, \
+                         updated_at = NOW() WHERE command_id = $1",
+                )
+                .bind(command_id)
+                .bind(request_id)
+                .bind(active)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(active)
+            }
+        }
+    }
+
+    async fn repro_status(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<StoredReproStatus>, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let market = market.read().await;
+                let lease = market
+                    .leases
+                    .values()
+                    .map(|(_, lease)| lease)
+                    .filter(|lease| {
+                        lease
+                            .repro
+                            .as_ref()
+                            .is_some_and(|repro| repro.token_hash == token_hash)
+                    })
+                    .max_by_key(|lease| lease.created_at);
+                if let Some(lease) = lease {
+                    let quote = market
+                        .open_quotes
+                        .get(&lease.quote_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            StoreError::InvalidStoredState(
+                                "repro lease has no corresponding quote".to_owned(),
+                            )
+                        })?;
+                    let execution = market
+                        .commands
+                        .values()
+                        .find(|entry| entry.command.lease_id == lease.lease_id)
+                        .map(|entry| StoredReproExecution::Node {
+                            status: entry.status.to_owned(),
+                            command: entry.command.clone(),
+                            report: entry.verified_report.clone(),
+                            result: entry.result.clone(),
+                            enrolled_device_public_key: market
+                                .offers
+                                .get(&lease.node_id)
+                                .map(|offer| offer.device_public_key.clone()),
+                        });
+                    return Ok(Some(StoredReproStatus {
+                        quote,
+                        lease: Some(StoredReproLease {
+                            lease_id: lease.lease_id,
+                            chain_lease_id: lease.chain_lease_id,
+                            state: lease.state.clone(),
+                            node_id: lease.node_id.clone(),
+                            token_hash: lease.repro.as_ref().map(|repro| repro.token_hash.clone()),
+                            spec_hash: lease.repro.as_ref().map(|repro| repro.spec_hash.clone()),
+                            execution,
+                            receipt: None,
+                        }),
+                    }));
+                }
+                Ok(market
+                    .open_quotes
+                    .values()
+                    .filter(|quote| {
+                        quote
+                            .repro
+                            .as_ref()
+                            .is_some_and(|repro| repro.token_hash == token_hash)
+                    })
+                    .max_by_key(|quote| quote.expires_at)
+                    .cloned()
+                    .map(|quote| StoredReproStatus { quote, lease: None }))
+            }
+            Self::Postgres(pool) => {
+                type ReproLeaseRow = (
+                    SqlJson<LeaseQuote>,
+                    i64,
+                    i64,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<SqlJson<NodeCommand>>,
+                    Option<SqlJson<NodeCommandReport>>,
+                    Option<SqlJson<CommandResult>>,
+                    Option<String>,
+                    Option<SqlJson<NodeCommand>>,
+                    Option<SqlJson<ManagedCommandReport>>,
+                    Option<SqlJson<PublicReceipt>>,
+                    Option<String>,
+                );
+                let row = query_as::<_, ReproLeaseRow>(REPRO_STATUS_LEASE_QUERY)
+                    .bind(token_hash)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(StoreError::Storage)?;
+                if let Some((
+                    SqlJson(quote),
+                    lease_id,
+                    chain_lease_id,
+                    state,
+                    node_id,
+                    lease_token_hash,
+                    lease_spec_hash,
+                    node_status,
+                    node_command,
+                    node_report,
+                    node_result,
+                    managed_status,
+                    managed_command,
+                    managed_report,
+                    receipt,
+                    enrolled_device_public_key,
+                )) = row
+                {
+                    let execution = match (node_command, managed_command) {
+                        (Some(SqlJson(command)), None) => Some(StoredReproExecution::Node {
+                            status: node_status.ok_or_else(|| {
+                                StoreError::InvalidStoredState(
+                                    "node repro command has no status".to_owned(),
+                                )
+                            })?,
+                            command,
+                            report: node_report.map(|SqlJson(report)| report),
+                            result: node_result.map(|SqlJson(result)| result),
+                            enrolled_device_public_key,
+                        }),
+                        (None, Some(SqlJson(command))) => Some(StoredReproExecution::Managed {
+                            status: managed_status.ok_or_else(|| {
+                                StoreError::InvalidStoredState(
+                                    "managed repro command has no status".to_owned(),
+                                )
+                            })?,
+                            command,
+                            report: managed_report.map(|SqlJson(report)| report),
+                        }),
+                        (None, None) => None,
+                        (Some(_), Some(_)) => {
+                            return Err(StoreError::InvalidStoredState(
+                                "repro lease has two executors".to_owned(),
+                            ));
+                        }
+                    };
+                    return Ok(Some(StoredReproStatus {
+                        quote,
+                        lease: Some(StoredReproLease {
+                            lease_id: u64::try_from(lease_id).map_err(|_| {
+                                StoreError::InvalidStoredState("invalid repro lease ID".to_owned())
+                            })?,
+                            chain_lease_id: u64::try_from(chain_lease_id).map_err(|_| {
+                                StoreError::InvalidStoredState(
+                                    "invalid repro chain lease ID".to_owned(),
+                                )
+                            })?,
+                            state: parse_lease_state(&state)?,
+                            node_id,
+                            token_hash: lease_token_hash,
+                            spec_hash: lease_spec_hash,
+                            execution,
+                            receipt: receipt.map(|SqlJson(receipt)| receipt),
+                        }),
+                    }));
+                }
+                Ok(
+                    query_scalar::<_, SqlJson<LeaseQuote>>(REPRO_STATUS_QUOTE_QUERY)
+                        .bind(token_hash)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(StoreError::Storage)?
+                        .map(|SqlJson(quote)| StoredReproStatus { quote, lease: None }),
+                )
             }
         }
     }
@@ -6266,17 +6774,37 @@ impl MarketplaceStore {
                     .and_then(|entry| entry.result.clone()))
             }
             Self::Postgres(pool) => {
-                let stored: Option<Option<SqlJson<CommandResult>>> = query_scalar(
-                    "SELECT c.result FROM node_commands c \
-                     JOIN leases l ON l.lease_id = c.lease_id \
-                     WHERE c.lease_id = $1 AND l.subject = $2",
+                let stored = query_as::<
+                    _,
+                    (
+                        Option<SqlJson<CommandResult>>,
+                        Option<SqlJson<ManagedCommandReport>>,
+                    ),
+                >(
+                    "SELECT c.result, m.report \
+                     FROM leases l \
+                     LEFT JOIN node_commands c ON c.lease_id = l.lease_id \
+                     LEFT JOIN managed_repro_jobs m ON m.lease_id = l.lease_id \
+                     WHERE l.lease_id = $1 AND l.subject = $2",
                 )
                 .bind(lease_id as i64)
                 .bind(subject)
                 .fetch_optional(pool)
                 .await
                 .map_err(StoreError::Storage)?;
-                Ok(stored.flatten().map(|SqlJson(result)| result))
+                let Some((native, managed)) = stored else {
+                    return Ok(None);
+                };
+                if let Some(SqlJson(result)) = native {
+                    return Ok(Some(result));
+                }
+                Ok(managed.and_then(|SqlJson(report)| {
+                    (report.outcome == NodeCommandOutcome::Completed
+                        && report.error.is_none()
+                        && report.verify().is_ok())
+                    .then_some(report.result)
+                    .flatten()
+                }))
             }
         }
     }
@@ -6305,13 +6833,7 @@ impl MarketplaceStore {
                         .fetch_optional(pool)
                         .await
                         .map_err(StoreError::Storage)?;
-                stored
-                    .map(|state| {
-                        serde_json::from_value(serde_json::Value::String(state)).map_err(|_| {
-                            StoreError::InvalidStoredState("unknown lease state".to_owned())
-                        })
-                    })
-                    .transpose()
+                stored.map(|state| parse_lease_state(&state)).transpose()
             }
         }
     }
@@ -6492,6 +7014,7 @@ impl MarketplaceStore {
                      JOIN lease_lifecycle lc ON lc.lease_id = l.lease_id \
                      JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
                      WHERE l.lease_id = $1 AND l.subject = $2 AND l.state = 'active' \
+                       AND l.document->>'command' IS NULL \
                        AND ci.status = 'running' \
                        AND ci.ssh_host IS NOT NULL AND ci.ssh_port IS NOT NULL \
                        AND lc.access_started_at IS NOT NULL \
@@ -6679,6 +7202,17 @@ async fn record_node_request(
     node_id: &str,
     request_id: Uuid,
 ) -> Result<(), StoreError> {
+    if !insert_node_request(transaction, node_id, request_id).await? {
+        return Err(StoreError::CommandReplay);
+    }
+    Ok(())
+}
+
+async fn insert_node_request(
+    transaction: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+    node_id: &str,
+    request_id: Uuid,
+) -> Result<bool, StoreError> {
     query("DELETE FROM node_command_requests WHERE expires_at <= NOW()")
         .execute(&mut **transaction)
         .await
@@ -6693,10 +7227,7 @@ async fn record_node_request(
     .execute(&mut **transaction)
     .await
     .map_err(StoreError::Storage)?;
-    if inserted.rows_affected() != 1 {
-        return Err(StoreError::CommandReplay);
-    }
-    Ok(())
+    Ok(inserted.rows_affected() == 1)
 }
 
 async fn update_lease_state(
@@ -6714,6 +7245,14 @@ async fn update_lease_state(
     let Some(SqlJson(mut lease)) = current else {
         return Err(StoreError::CommandNotFound);
     };
+    if state == LeaseState::Provisioning
+        && !matches!(
+            lease.state,
+            LeaseState::Funded | LeaseState::Provisioning | LeaseState::Ready
+        )
+    {
+        return Ok(());
+    }
     lease.state = state;
     lease.updated_at = Utc::now();
     let state = lease_state_name(&lease.state);
@@ -6727,13 +7266,98 @@ async fn update_lease_state(
     Ok(())
 }
 
-fn valid_command_transition(current: &str, next: &str) -> bool {
-    current == next
-        || matches!(
-            (current, next),
-            ("queued" | "leased", "ready" | "completed" | "failed")
-                | ("ready", "completed" | "failed")
-        )
+struct CommandReportTransition {
+    status: &'static str,
+    lease_state: Option<LeaseState>,
+    action: Option<&'static str>,
+    renew_claim: bool,
+}
+
+fn command_report_transition(
+    command: &NodeCommand,
+    current: &str,
+    lease_state: &LeaseState,
+    report: &NodeCommandReport,
+) -> Option<CommandReportTransition> {
+    let batch = matches!(&command.kind, NodeCommandKind::Batch { .. });
+    if (batch && report.outcome == NodeCommandOutcome::Completed && report.result.is_none())
+        || (!batch && report.result.is_some())
+    {
+        return None;
+    }
+    let status = match &report.outcome {
+        NodeCommandOutcome::Ready => "ready",
+        NodeCommandOutcome::Completed => "completed",
+        NodeCommandOutcome::Failed => "failed",
+    };
+    if current == status {
+        return Some(CommandReportTransition {
+            status,
+            lease_state: None,
+            action: None,
+            renew_claim: status == "ready",
+        });
+    }
+
+    match &report.outcome {
+        NodeCommandOutcome::Ready
+            if matches!(current, "queued" | "leased")
+                && matches!(
+                    lease_state,
+                    LeaseState::Funded
+                        | LeaseState::Provisioning
+                        | LeaseState::Ready
+                        | LeaseState::Active
+                ) =>
+        {
+            let already_active = *lease_state == LeaseState::Active;
+            Some(CommandReportTransition {
+                status,
+                lease_state: (!already_active).then_some(LeaseState::Ready),
+                action: (!already_active).then_some("start_access"),
+                renew_claim: true,
+            })
+        }
+        NodeCommandOutcome::Completed
+            if *lease_state == LeaseState::Active
+                && match &command.kind {
+                    NodeCommandKind::Batch { .. } => current == "running",
+                    _ => current == "ready",
+                } =>
+        {
+            Some(CommandReportTransition {
+                status,
+                lease_state: Some(LeaseState::Closing),
+                action: Some("close_access"),
+                renew_claim: false,
+            })
+        }
+        NodeCommandOutcome::Failed
+            if *lease_state == LeaseState::Active
+                && matches!(current, "queued" | "leased" | "ready" | "running") =>
+        {
+            Some(CommandReportTransition {
+                status,
+                lease_state: Some(LeaseState::Closing),
+                action: Some("close_access"),
+                renew_claim: false,
+            })
+        }
+        NodeCommandOutcome::Failed
+            if matches!(
+                lease_state,
+                LeaseState::Funded | LeaseState::Provisioning | LeaseState::Ready
+            ) && matches!(current, "queued" | "leased" | "ready") =>
+        {
+            Some(CommandReportTransition {
+                status,
+                lease_state: Some(LeaseState::Closing),
+                action: Some("expire_provision"),
+                renew_claim: false,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Whether a lease still holds its machine. Settlement runs for a further 24
@@ -6775,9 +7399,9 @@ fn lease_state_name(state: &LeaseState) -> &'static str {
 /// batch lease rather than being issued and left lying around.
 fn launch_command(
     lease: &LeaseRecord,
-    ssh_authorized_key: &str,
+    ssh_authorized_key: Option<&str>,
     jupyter_token: &str,
-) -> NodeCommand {
+) -> Result<NodeCommand, StoreError> {
     let now = Utc::now();
     let kind = match lease.command.as_deref() {
         Some(command) => NodeCommandKind::Batch {
@@ -6788,18 +7412,20 @@ fn launch_command(
         None => NodeCommandKind::Launch {
             image: lease.image.clone(),
             duration_seconds: lease.duration_seconds,
-            ssh_authorized_key: ssh_authorized_key.to_owned(),
+            ssh_authorized_key: ssh_authorized_key
+                .ok_or(StoreError::AccessCredentialsMissing)?
+                .to_owned(),
             jupyter_token: jupyter_token.to_owned(),
         },
     };
-    NodeCommand {
+    Ok(NodeCommand {
         command_id: Uuid::now_v7(),
         node_id: lease.node_id.clone(),
         lease_id: lease.lease_id,
         issued_at: now,
         expires_at: now + Duration::minutes(10),
         kind,
-    }
+    })
 }
 
 async fn health(
@@ -6844,6 +7470,42 @@ async fn list_offers(
             .filter(|offer| offer.trust_class >= filter.min_trust)
             .collect(),
     ))
+}
+
+async fn get_repro_status(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<ReproStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let request: ReproStatusRequest = serde_json::from_slice(&body).map_err(|_| {
+        bad_request(
+            "invalid_token",
+            "body must contain one canonical 256-bit repro token",
+        )
+    })?;
+    let token_hash = canonical_repro_token_hash(&request.token).ok_or_else(|| {
+        bad_request(
+            "invalid_token",
+            "body must contain one canonical 256-bit repro token",
+        )
+    })?;
+    let stored = state
+        .store
+        .repro_status(&token_hash)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found("repro_not_found", "this repro capability has no quote"))?;
+    let response = build_repro_status(&token_hash, stored).map_err(internal_error)?;
+    let response_bytes = serde_json::to_vec(&response).map_err(|_| {
+        internal_error(StoreError::InvalidStoredState(
+            "repro status response is not serializable".to_owned(),
+        ))
+    })?;
+    if response_bytes.len() > MAX_REPRO_STATUS_RESPONSE_BYTES {
+        return Err(internal_error(StoreError::InvalidStoredState(
+            "repro status response exceeds its size limit".to_owned(),
+        )));
+    }
+    Ok(Json(response))
 }
 
 async fn enroll_node(
@@ -6908,6 +7570,7 @@ async fn enroll_node(
         trust_class: TrustClass::Open,
         staker_only: false,
         command_channel: false,
+        managed_batch: false,
         updated_at: Utc::now(),
     };
     offer.bonded = state
@@ -7836,6 +8499,20 @@ async fn next_node_command(
         .map_err(store_error)
 }
 
+async fn authorize_node_command(
+    State(state): State<AppState>,
+    Path((node_id, command_id)): Path<(String, Uuid)>,
+    Json(poll): Json<NodeCommandPoll>,
+) -> Result<Json<bool>, (StatusCode, Json<ApiError>)> {
+    verify_command_poll(&state, &node_id, &poll).await?;
+    state
+        .store
+        .authorize_command(&node_id, command_id, poll.request_id)
+        .await
+        .map(Json)
+        .map_err(store_error)
+}
+
 async fn report_node_command(
     State(state): State<AppState>,
     Path((node_id, command_id)): Path<(String, Uuid)>,
@@ -7855,6 +8532,11 @@ async fn report_node_command(
             .is_some_and(|error| error.is_empty() || error.len() > 512)
         || (report.outcome == NodeCommandOutcome::Failed && report.error.is_none())
         || (report.outcome != NodeCommandOutcome::Failed && report.error.is_some())
+        || (report.outcome != NodeCommandOutcome::Completed && report.result.is_some())
+        || report
+            .result
+            .as_ref()
+            .is_some_and(|result| !result.within_limits())
     {
         return Err(bad_request(
             "invalid_command_report",
@@ -7993,6 +8675,9 @@ async fn match_lease(
                 "a batch command cannot exceed 8 KiB",
             ));
         }
+    }
+    if let Err(message) = validate_repro_request(&payload.request) {
+        return Err(bad_request("invalid_repro", message));
     }
     if payload
         .request
@@ -8507,17 +9192,18 @@ async fn confirm_lease(
             "funding transaction hash must be 32-byte hex",
         ));
     }
-    if !is_ssh_authorized_key(&request.ssh_authorized_key) {
-        return Err(bad_request(
-            "invalid_ssh_key",
-            "SSH access requires one Ed25519 public key",
-        ));
-    }
     let quote = state
         .store
         .quote_for_subject(&account.subject, request.quote_id)
         .await
         .map_err(store_error)?;
+    let ssh_authorized_key = request.ssh_authorized_key.as_deref();
+    if quote.command.is_none() && !ssh_authorized_key.is_some_and(is_ssh_authorized_key) {
+        return Err(bad_request(
+            "invalid_ssh_key",
+            "interactive access requires one Ed25519 public key",
+        ));
+    }
     let funding = state
         .chain
         .verify_funding(&request.transaction_hash, &quote)
@@ -8535,7 +9221,7 @@ async fn confirm_lease(
             quote: &quote,
             transaction_hash: &request.transaction_hash,
             funding,
-            ssh_authorized_key: &request.ssh_authorized_key,
+            ssh_authorized_key,
             jupyter_token: &jupyter_token,
             encrypted_jupyter_token,
         })
@@ -8708,6 +9394,20 @@ fn embedded_migrator() -> Migrator {
                 )),
                 false,
             ),
+            Migration::new(
+                21,
+                Cow::Borrowed("batch authorization"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0021_batch_authorization.sql")),
+                false,
+            ),
+            Migration::new(
+                22,
+                Cow::Borrowed("managed repros"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0022_managed_repros.sql")),
+                false,
+            ),
         ]),
         ..Migrator::DEFAULT
     }
@@ -8749,14 +9449,14 @@ fn quote_for_offers<'a>(
         // enough. Gating on the offer's own flag rather than on its price keeps
         // a cheap independent node visible to everybody.
         .filter(|offer| !offer.staker_only || offer.rate_per_second >= rate_floor)
-        // A batch command reaches the node over the signed command channel, so
-        // the only offers that can run one are the offers whose node is polling
-        // it. Broker capacity never is: it is provisioned by the lifecycle
-        // worker and nothing on it asks for commands. Matching a batch request
-        // to one would take the renter's money and hand back an interactive box
-        // their command never ran on. The window this is read against is
-        // `NODE_REQUEST_TTL_MINUTES`.
-        .filter(|offer| request.command.is_none() || offer.command_channel)
+        // Native batches require a fresh signed poll. Managed capacity can run
+        // only the narrower repro contract, never an arbitrary command: its
+        // capability binds the exact image, command, duration and GPU floor.
+        .filter(|offer| {
+            request.command.is_none()
+                || offer.command_channel
+                || (request.repro.is_some() && offer.managed_batch)
+        })
         .filter(|offer| {
             request
                 .preferred_node_id
@@ -8795,6 +9495,7 @@ fn quote_for_offers<'a>(
         maximum_escrow,
         trust_class: selected.trust_class,
         command: request.command.clone(),
+        repro: request.repro.clone(),
         expires_at: Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES),
     })
 }
@@ -8806,10 +9507,508 @@ fn is_pinned_image(image: &str) -> bool {
     let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
         return false;
     };
-    !repository.is_empty()
-        && !repository.contains("..")
-        && digest.len() == 64
-        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if repository.is_empty()
+        || repository.starts_with('/')
+        || repository.ends_with('/')
+        || repository.contains("//")
+        || repository.split('/').any(|part| matches!(part, "." | ".."))
+        || !repository.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'[' | b']' | b'/')
+        })
+        || digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+
+    let first = repository.split('/').next().unwrap_or_default();
+    let explicit_registry = first.contains('.')
+        || first.contains(':')
+        || first.starts_with('[')
+        || first.eq_ignore_ascii_case("localhost");
+    if !explicit_registry {
+        return true;
+    }
+    let Ok(reference) = url::Url::parse(&format!("https://{repository}")) else {
+        return false;
+    };
+    reference.username().is_empty()
+        && reference.password().is_none()
+        && reference.query().is_none()
+        && reference.fragment().is_none()
+        && reference.host_str().is_some_and(is_public_registry_host)
+}
+
+fn is_public_registry_host(host: &str) -> bool {
+    let normalized = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if normalized == "localhost"
+        || normalized.ends_with(".localhost")
+        || normalized.ends_with(".local")
+        || normalized.ends_with(".internal")
+    {
+        return false;
+    }
+    let Ok(address) = normalized.parse::<IpAddr>() else {
+        return !normalized.is_empty();
+    };
+    match address {
+        IpAddr::V4(address) => {
+            let [first, second, third, _] = address.octets();
+            !(first == 0
+                || first == 10
+                || first == 127
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 169 && second == 254)
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 0 && third == 0)
+                || (first == 192 && second == 0 && third == 2)
+                || (first == 192 && second == 168)
+                || (first == 198 && (second == 18 || second == 19))
+                || (first == 198 && second == 51 && third == 100)
+                || (first == 203 && second == 0 && third == 113)
+                || first >= 224)
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && segments[0] & 0xfe00 != 0xfc00
+                && segments[0] & 0xffc0 != 0xfe80
+                && segments[0] & 0xff00 != 0xff00
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && address.to_ipv4_mapped().is_none()
+        }
+    }
+}
+
+fn canonical_repro_token_hash(token: &str) -> Option<String> {
+    if token.len() != 43
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(token).ok()?;
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(&decoded) != token {
+        return None;
+    }
+    repro_token_hash(token).ok()
+}
+
+fn build_repro_status(
+    token_hash: &str,
+    stored: StoredReproStatus,
+) -> Result<ReproStatusResponse, StoreError> {
+    let capability = stored.quote.repro.clone().ok_or_else(|| {
+        StoreError::InvalidStoredState("repro quote has no capability".to_owned())
+    })?;
+    let command_text =
+        stored.quote.command.clone().ok_or_else(|| {
+            StoreError::InvalidStoredState("repro quote has no command".to_owned())
+        })?;
+    let spec = GpuReproSpec {
+        image: stored.quote.image.clone(),
+        command: command_text,
+        duration_seconds: stored.quote.duration_seconds,
+        min_vram_mib: stored.quote.min_vram_mib,
+        expected_exit_code: capability.expected_exit_code,
+    };
+    let mut checks = ReproStatusChecks {
+        token_bound: capability.token_hash == token_hash,
+        spec_hash_valid: spec.hash().ok().as_deref() == Some(capability.spec_hash.as_str()),
+        command_bound: None,
+        executor_signature_valid: None,
+        report_bound: None,
+        receipt_hash_valid: None,
+        receipt_bound: None,
+        expected_exit_code: None,
+    };
+    let mut response = ReproStatusResponse {
+        version: REPRO_STATUS_VERSION,
+        status: ReproStatus::Quoted,
+        spec,
+        spec_hash: capability.spec_hash.clone(),
+        quote_id: stored.quote.quote_id,
+        maximum_escrow: stored.quote.maximum_escrow,
+        lease_id: None,
+        lease_state: None,
+        command_status: None,
+        result: None,
+        evidence: None,
+        checks: checks.clone(),
+    };
+    let Some(lease) = stored.lease else {
+        return Ok(response);
+    };
+
+    checks.token_bound &= lease.token_hash.as_deref() == Some(token_hash);
+    checks.spec_hash_valid &= lease.spec_hash.as_deref() == Some(capability.spec_hash.as_str());
+    response.lease_id = Some(lease.lease_id);
+    response.lease_state = Some(lease.state.clone());
+
+    let mut execution_status = None;
+    let mut execution_outcome = None;
+    if let Some(execution) = lease.execution.as_ref() {
+        match execution {
+            StoredReproExecution::Node {
+                status,
+                command,
+                report,
+                result,
+                enrolled_device_public_key,
+            } => {
+                execution_status = Some(status.as_str());
+                checks.command_bound = Some(repro_command_bound(command, &lease, &response.spec));
+                ensure_public_repro_command(command)?;
+                response.result = report
+                    .as_ref()
+                    .and_then(|report| report.result.clone())
+                    .or_else(|| result.clone());
+                if let Some(report) = report {
+                    execution_outcome = Some(&report.outcome);
+                    if final_command_outcome(&report.outcome) {
+                        checks.executor_signature_valid = Some(native_signature_valid(
+                            report,
+                            enrolled_device_public_key.as_deref(),
+                            &lease.node_id,
+                        ));
+                        checks.report_bound = Some(native_report_bound(
+                            report,
+                            command,
+                            &lease,
+                            enrolled_device_public_key.as_deref(),
+                        ));
+                        let signed_report = ReproExecutionReport::Node {
+                            report: report.clone(),
+                        };
+                        attach_repro_evidence(
+                            &mut response,
+                            &mut checks,
+                            &lease,
+                            &capability,
+                            command,
+                            signed_report,
+                        );
+                    }
+                }
+            }
+            StoredReproExecution::Managed {
+                status,
+                command,
+                report,
+            } => {
+                execution_status = Some(status.as_str());
+                checks.command_bound = Some(repro_command_bound(command, &lease, &response.spec));
+                ensure_public_repro_command(command)?;
+                if let Some(report) = report {
+                    execution_outcome = Some(&report.outcome);
+                    response.result = report.result.clone();
+                    if final_command_outcome(&report.outcome) {
+                        checks.executor_signature_valid = Some(report.verify().is_ok());
+                        checks.report_bound = Some(managed_report_bound(
+                            report,
+                            command,
+                            &lease,
+                            &response.spec,
+                        ));
+                        let signed_report = ReproExecutionReport::Managed {
+                            report: report.clone(),
+                        };
+                        attach_repro_evidence(
+                            &mut response,
+                            &mut checks,
+                            &lease,
+                            &capability,
+                            command,
+                            signed_report,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    checks.expected_exit_code = response
+        .result
+        .as_ref()
+        .map(|result| result.exit_code == response.spec.expected_exit_code);
+    response.status = derive_repro_status(&lease.state, execution_status, execution_outcome);
+    response.command_status = execution_status.map(str::to_owned);
+    response.checks = checks;
+    Ok(response)
+}
+
+fn final_command_outcome(outcome: &NodeCommandOutcome) -> bool {
+    matches!(
+        outcome,
+        NodeCommandOutcome::Completed | NodeCommandOutcome::Failed
+    )
+}
+
+fn derive_repro_status(
+    state: &LeaseState,
+    command_status: Option<&str>,
+    outcome: Option<&NodeCommandOutcome>,
+) -> ReproStatus {
+    match state {
+        LeaseState::Finalized => return ReproStatus::Settled,
+        LeaseState::Refunded => return ReproStatus::Refunded,
+        LeaseState::Disputed => return ReproStatus::Disputed,
+        _ => {}
+    }
+    if *state == LeaseState::Failed
+        || command_status == Some("failed")
+        || outcome == Some(&NodeCommandOutcome::Failed)
+    {
+        return ReproStatus::Failed;
+    }
+    if matches!(state, LeaseState::Closing | LeaseState::SettlementPending) {
+        return ReproStatus::Settling;
+    }
+    if outcome == Some(&NodeCommandOutcome::Completed) {
+        return ReproStatus::Completed;
+    }
+    if matches!(command_status, Some("launching" | "running")) {
+        return ReproStatus::Running;
+    }
+    if command_status == Some("ready") || *state == LeaseState::Ready {
+        return ReproStatus::Ready;
+    }
+    if command_status == Some("preparing") || *state == LeaseState::Provisioning {
+        return ReproStatus::Preparing;
+    }
+    if *state == LeaseState::Active {
+        return ReproStatus::Running;
+    }
+    ReproStatus::Funded
+}
+
+fn repro_command_bound(
+    command: &NodeCommand,
+    lease: &StoredReproLease,
+    spec: &GpuReproSpec,
+) -> bool {
+    command.command_id != Uuid::nil()
+        && command.node_id == lease.node_id
+        && command.lease_id == lease.lease_id
+        && command.expires_at > command.issued_at
+        && matches!(
+            &command.kind,
+            NodeCommandKind::Batch {
+                image,
+                command: text,
+                duration_seconds,
+            } if image == &spec.image
+                && text == &spec.command
+                && *duration_seconds == spec.duration_seconds
+        )
+}
+
+fn ensure_public_repro_command(command: &NodeCommand) -> Result<(), StoreError> {
+    if matches!(command.kind, NodeCommandKind::Batch { .. }) {
+        return Ok(());
+    }
+    Err(StoreError::InvalidStoredState(
+        "repro execution contains a credential-bearing command".to_owned(),
+    ))
+}
+
+fn native_signature_valid(
+    report: &NodeCommandReport,
+    enrolled_key: Option<&str>,
+    expected_node_id: &str,
+) -> bool {
+    enrolled_key
+        .and_then(|encoded| verifying_key(encoded).ok())
+        .is_some_and(|key| node_id(&key) == expected_node_id && report.verify(&key).is_ok())
+}
+
+fn native_report_bound(
+    report: &NodeCommandReport,
+    command: &NodeCommand,
+    lease: &StoredReproLease,
+    enrolled_key: Option<&str>,
+) -> bool {
+    let outcome_bound = match report.outcome {
+        NodeCommandOutcome::Completed => report.error.is_none() && report.result.is_some(),
+        NodeCommandOutcome::Failed => {
+            report
+                .error
+                .as_ref()
+                .is_some_and(|error| !error.is_empty() && error.len() <= 512)
+                && report.result.is_none()
+        }
+        NodeCommandOutcome::Ready => false,
+    };
+    report.node_id == lease.node_id
+        && enrolled_key == Some(report.device_public_key.as_str())
+        && report.command_id == command.command_id
+        && !report.request_id.is_nil()
+        && report.observed_at >= command.issued_at
+        && outcome_bound
+        && report
+            .result
+            .as_ref()
+            .is_none_or(|result| result.within_limits() && (-255..=255).contains(&result.exit_code))
+}
+
+fn managed_report_bound(
+    report: &ManagedCommandReport,
+    command: &NodeCommand,
+    lease: &StoredReproLease,
+    spec: &GpuReproSpec,
+) -> bool {
+    let duration = report
+        .finished_at
+        .signed_duration_since(report.started_at)
+        .num_seconds();
+    let outcome_bound = match report.outcome {
+        NodeCommandOutcome::Completed => report.error.is_none() && report.result.is_some(),
+        NodeCommandOutcome::Failed => {
+            report
+                .error
+                .as_ref()
+                .is_some_and(|error| !error.is_empty() && error.len() <= 512)
+                && report.result.is_none()
+        }
+        NodeCommandOutcome::Ready => false,
+    };
+    !report.report_id.is_nil()
+        && report.command_id == command.command_id
+        && report.lease_id == lease.lease_id
+        && report.provider == ManagedProvider::Vast
+        && report.provider_instance_id > 0
+        && !report.gpu_model.trim().is_empty()
+        && report.gpu_model.len() <= 128
+        && report.gpu_vram_mib >= spec.min_vram_mib
+        && report.gpu_vram_mib <= 196_608
+        && is_lower_sha256(&report.transport_host_key_sha256)
+        && report.started_at >= command.issued_at
+        && duration >= 0
+        && duration <= i64::from(spec.duration_seconds)
+        && outcome_bound
+        && report
+            .result
+            .as_ref()
+            .is_none_or(|result| result.within_limits() && (-255..=255).contains(&result.exit_code))
+}
+
+fn attach_repro_evidence(
+    response: &mut ReproStatusResponse,
+    checks: &mut ReproStatusChecks,
+    lease: &StoredReproLease,
+    capability: &prism_protocol::ReproCapability,
+    command: &NodeCommand,
+    report: ReproExecutionReport,
+) {
+    let result = match &report {
+        ReproExecutionReport::Node { report } => report.result.as_ref(),
+        ReproExecutionReport::Managed { report } => report.result.as_ref(),
+    };
+    if let Some(receipt) = lease.receipt.as_ref() {
+        checks.receipt_hash_valid = Some(receipt_hash_matches(receipt).unwrap_or(false));
+        checks.receipt_bound = Some(result.is_some_and(|result| {
+            repro_receipt_bound(
+                receipt,
+                lease,
+                capability,
+                &response.spec,
+                command,
+                &report,
+                result,
+            )
+        }));
+    }
+    response.evidence = Some(ReproStatusEvidence {
+        command: command.clone(),
+        report,
+        receipt: lease.receipt.clone(),
+    });
+}
+
+fn repro_receipt_bound(
+    receipt: &PublicReceipt,
+    lease: &StoredReproLease,
+    capability: &prism_protocol::ReproCapability,
+    spec: &GpuReproSpec,
+    command: &NodeCommand,
+    report: &ReproExecutionReport,
+    result: &CommandResult,
+) -> bool {
+    let Some(repro) = receipt.repro.as_ref() else {
+        return false;
+    };
+    let image_digest = spec.image.rsplit_once('@').map(|(_, digest)| digest);
+    let (executor, report_hash) = match report {
+        ReproExecutionReport::Node { report } => {
+            (ReproExecutor::Node, repro_report_hash(report).ok())
+        }
+        ReproExecutionReport::Managed { report } => (
+            ReproExecutor::Managed,
+            managed_repro_report_hash(report).ok(),
+        ),
+    };
+    receipt.receipt_id != Uuid::nil()
+        && receipt.outcome == ReceiptOutcome::Finalized
+        && receipt.lease_id == lease.chain_lease_id.to_string()
+        && receipt.node_id_hash
+            == format!(
+                "0x{}",
+                hex::encode(Sha256::digest(lease.node_id.as_bytes()))
+            )
+        && is_hash(&receipt.transaction_hash)
+        && repro.executor == executor
+        && repro.token_hash == capability.token_hash
+        && repro.spec_hash == capability.spec_hash
+        && image_digest == Some(repro.image_digest.as_str())
+        && repro_command_hash(command).ok().as_deref() == Some(repro.command_hash.as_str())
+        && repro_result_hash(result).ok().as_deref() == Some(repro.result_hash.as_str())
+        && repro.stdout_hash == repro_stream_hash(&result.stdout)
+        && repro.stderr_hash == repro_stream_hash(&result.stderr)
+        && report_hash.as_deref() == Some(repro.report_hash.as_str())
+        && repro.exit_code == result.exit_code
+        && repro.expected_exit_code == spec.expected_exit_code
+        && repro.succeeded == (result.exit_code == spec.expected_exit_code)
+        && repro.truncated == result.truncated
+}
+
+fn validate_repro_request(request: &LeaseRequest) -> Result<(), &'static str> {
+    let Some(capability) = request.repro.as_ref() else {
+        return Ok(());
+    };
+    let Some(command) = request.command.as_ref() else {
+        return Err("a repro capability requires a batch command");
+    };
+    if !is_lower_sha256(&capability.token_hash) || !is_lower_sha256(&capability.spec_hash) {
+        return Err("repro token and spec commitments must be lowercase SHA-256 hex");
+    }
+    if !(0..=255).contains(&capability.expected_exit_code) {
+        return Err("repro expected exit code must be between 0 and 255");
+    }
+    let spec = GpuReproSpec {
+        image: request.image.clone(),
+        command: command.clone(),
+        duration_seconds: request.duration_seconds,
+        min_vram_mib: request.min_vram_mib,
+        expected_exit_code: capability.expected_exit_code,
+    };
+    if spec.hash().ok().as_deref() != Some(capability.spec_hash.as_str()) {
+        return Err("repro capability does not commit to this exact workload");
+    }
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_sha256_digest(digest: &str) -> bool {
@@ -9066,6 +10265,14 @@ fn store_error(error: StoreError) -> (StatusCode, Json<ApiError>) {
             "command_replay",
             "the signed node command request was already accepted",
         ),
+        StoreError::CommandClaimed => conflict(
+            "command_claimed",
+            "the node command execution was claimed by another signed poll",
+        ),
+        StoreError::AccessCredentialsMissing => bad_request(
+            "missing_access_credentials",
+            "interactive access requires an SSH public key",
+        ),
         StoreError::CertificateReplay => conflict(
             "certificate_replay",
             "the signed node certificate request was already accepted",
@@ -9308,7 +10515,8 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::SigningKey;
     use prism_protocol::{
-        DEFAULT_VAULT_TRUST_FLOOR, GpuSpec, IsolationMode, MAX_STAKE_DISCOUNT_BPS, NodePosture,
+        DEFAULT_VAULT_TRUST_FLOOR, GpuSpec, IsolationMode, MAX_STAKE_DISCOUNT_BPS,
+        NodeCommandReportPayload, NodePosture, ReproCapability, ReproReceiptEvidence,
     };
 
     /// Most scheduler tests are about matching, not pricing, so they ask as a
@@ -9341,6 +10549,7 @@ mod tests {
             trust_class: TrustClass::Open,
             staker_only: false,
             command_channel: false,
+            managed_batch: false,
             updated_at: Utc::now(),
         }
     }
@@ -9561,6 +10770,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class,
             command: command.map(str::to_owned),
+            repro: None,
         }
     }
 
@@ -9783,7 +10993,7 @@ mod tests {
                     escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
                     renter_wallet: format!("0x{}", "33".repeat(20)),
                 },
-                ssh_authorized_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA",
+                ssh_authorized_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA"),
                 jupyter_token: "token",
                 encrypted_jupyter_token: EncryptedSecret {
                     nonce: "bm9uY2U".to_owned(),
@@ -10212,6 +11422,7 @@ mod tests {
                 maximum_escrow: 6_000,
                 trust_class: quoted_class,
                 command: None,
+                repro: None,
                 expires_at: Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES),
             },
         );
@@ -10242,6 +11453,7 @@ mod tests {
                     funding_transaction_hash: format!("0x{}", "cd".repeat(32)),
                     state,
                     command: None,
+                    repro: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
@@ -11278,6 +12490,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: Some("nvidia-smi".to_owned()),
+            repro: None,
         };
 
         assert!(matches!(
@@ -11350,21 +12563,27 @@ mod tests {
             funding_transaction_hash: "0x2".to_owned(),
             state: LeaseState::Funded,
             command: None,
+            repro: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
-        let interactive = launch_command(&base, "ssh-ed25519 AAAA", "token");
+        let interactive = launch_command(&base, Some("ssh-ed25519 AAAA"), "token").unwrap();
         assert!(matches!(interactive.kind, NodeCommandKind::Launch { .. }));
+        assert!(matches!(
+            launch_command(&base, None, "token"),
+            Err(StoreError::AccessCredentialsMissing)
+        ));
 
         let batch = launch_command(
             &LeaseRecord {
                 command: Some("nvidia-smi -L".to_owned()),
                 ..base
             },
-            "ssh-ed25519 AAAA",
+            None,
             "token",
-        );
+        )
+        .unwrap();
         match batch.kind {
             NodeCommandKind::Batch {
                 command,
@@ -11395,6 +12614,7 @@ mod tests {
             funding_transaction_hash: "0x2".to_owned(),
             state,
             command: None,
+            repro: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -11430,6 +12650,7 @@ mod tests {
                 preferred_node_id: None,
                 min_trust_class: TrustClass::Open,
                 command: None,
+                repro: None,
             },
             [&slower, &faster, &expensive],
             &BTreeSet::new(),
@@ -11448,6 +12669,7 @@ mod tests {
         isolated.trust_class = TrustClass::Isolated;
         let request = |min_trust_class| LeaseRequest {
             command: None,
+            repro: None,
             image: "registry.example/runtime@sha256:abc".to_owned(),
             duration_seconds: 60,
             min_vram_mib: 16_000,
@@ -11558,6 +12780,7 @@ mod tests {
                 preferred_node_id: None,
                 min_trust_class: TrustClass::Open,
                 command: None,
+                repro: None,
             },
             [&offer],
             &BTreeSet::new(),
@@ -11580,6 +12803,7 @@ mod tests {
                 preferred_node_id: None,
                 min_trust_class: TrustClass::Open,
                 command: None,
+                repro: None,
             },
             [&reserved, &stale, &available],
             &BTreeSet::from(["reserved".to_owned()]),
@@ -11604,6 +12828,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
 
         assert!(matches!(
@@ -11622,10 +12847,74 @@ mod tests {
             "registry.example/runtime@sha256:{}",
             "a".repeat(64)
         )));
+        assert!(is_pinned_image(&format!(
+            "pytorch/pytorch@sha256:{}",
+            "a".repeat(64)
+        )));
         assert!(!is_pinned_image("registry.example/runtime@sha256:abc"));
-        assert!(!is_pinned_image(
-            "registry.example/../runtime@sha256:aaaaaaaa"
-        ));
+        assert!(!is_pinned_image(&format!(
+            "registry.example/../runtime@sha256:{}",
+            "a".repeat(64)
+        )));
+        for registry in [
+            "localhost:5000",
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "[::1]:5000",
+            "registry.internal",
+        ] {
+            assert!(!is_pinned_image(&format!(
+                "{registry}/runtime@sha256:{}",
+                "a".repeat(64)
+            )));
+        }
+        assert!(!is_pinned_image(&format!(
+            "https://registry.example/runtime@sha256:{}",
+            "a".repeat(64)
+        )));
+    }
+
+    #[test]
+    fn a_repro_capability_must_commit_to_the_exact_request() {
+        let mut request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "a".repeat(64)),
+            duration_seconds: 120,
+            min_vram_mib: 24_576,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: Some("python verify.py".to_owned()),
+            repro: None,
+        };
+        let spec = GpuReproSpec {
+            image: request.image.clone(),
+            command: request.command.clone().unwrap(),
+            duration_seconds: request.duration_seconds,
+            min_vram_mib: request.min_vram_mib,
+            expected_exit_code: 0,
+        };
+        request.repro = Some(prism_protocol::ReproCapability {
+            token_hash: "b".repeat(64),
+            spec_hash: spec.hash().unwrap(),
+            expected_exit_code: 0,
+        });
+        assert_eq!(validate_repro_request(&request), Ok(()));
+
+        let mut missing_command = request.clone();
+        missing_command.command = None;
+        assert!(validate_repro_request(&missing_command).is_err());
+
+        let mut uppercase = request.clone();
+        uppercase.repro.as_mut().unwrap().token_hash = "B".repeat(64);
+        assert!(validate_repro_request(&uppercase).is_err());
+
+        let mut invalid_exit = request.clone();
+        invalid_exit.repro.as_mut().unwrap().expected_exit_code = 256;
+        assert!(validate_repro_request(&invalid_exit).is_err());
+
+        let mut different_duration = request;
+        different_duration.duration_seconds += 1;
+        assert!(validate_repro_request(&different_duration).is_err());
     }
 
     #[test]
@@ -11769,6 +13058,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
         let mut tasks = Vec::new();
         for index in 0..MAX_NETWORK_LEASES {
@@ -11807,6 +13097,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
 
         let first = store.quote("renter", &request, 0).await.unwrap();
@@ -11840,6 +13131,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
 
         let abandoned = store.quote("renter", &request, 0).await.unwrap();
@@ -11901,6 +13193,7 @@ mod tests {
             funding_transaction_hash: format!("0x{:064x}", 27),
             state: LeaseState::Active,
             command: None,
+            repro: None,
             created_at: now,
             updated_at: now,
         };
@@ -11915,6 +13208,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
 
         assert!(matches!(
@@ -11967,14 +13261,16 @@ mod tests {
                 funding_transaction_hash: format!("0x{index:064x}"),
                 state: LeaseState::Funded,
                 command: None,
+                repro: None,
                 created_at: now,
                 updated_at: now,
             };
             let command = launch_command(
                 &lease,
-                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest",
+                Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest"),
                 &"a".repeat(64),
-            );
+            )
+            .unwrap();
             market
                 .leases
                 .insert(lease.lease_id, (format!("subject-{index}"), lease));
@@ -11985,6 +13281,8 @@ mod tests {
                     result: None,
                     status: "queued",
                     lease_until: None,
+                    authorization_request_id: None,
+                    verified_report: None,
                     updated_at: now,
                 },
             );
@@ -12011,6 +13309,7 @@ mod tests {
         let quote_id = Uuid::now_v7();
         let quote = LeaseQuote {
             command: None,
+            repro: None,
             quote_id,
             node_id: format!("0x{}", "ab".repeat(32)),
             image: format!("registry.example/runtime@sha256:{}", "cd".repeat(32)),
@@ -12097,6 +13396,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
         let quote = store.quote("renter", &request, 0).await.unwrap();
 
@@ -12122,7 +13422,7 @@ mod tests {
                     escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
                     renter_wallet: format!("0x{}", "33".repeat(20)),
                 },
-                ssh_authorized_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA",
+                ssh_authorized_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA"),
                 jupyter_token: "token",
                 encrypted_jupyter_token: EncryptedSecret {
                     nonce: "bm9uY2U".to_owned(),
@@ -12165,6 +13465,7 @@ mod tests {
             funding_transaction_hash: format!("0x{}", "cc".repeat(32)),
             state: LeaseState::Refunded,
             command: None,
+            repro: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -12180,6 +13481,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
         let quote = store.quote("renter", &request, 0).await.unwrap();
         let confirmed = store
@@ -12192,7 +13494,7 @@ mod tests {
                     escrow_address: current.to_owned(),
                     renter_wallet: format!("0x{}", "22".repeat(20)),
                 },
-                ssh_authorized_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA",
+                ssh_authorized_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA"),
                 jupyter_token: "token",
                 encrypted_jupyter_token: EncryptedSecret {
                     nonce: "bm9uY2U".to_owned(),
@@ -12242,14 +13544,16 @@ mod tests {
             funding_transaction_hash: format!("0x{}", "cc".repeat(32)),
             state: LeaseState::Funded,
             command: None,
+            repro: None,
             created_at: now,
             updated_at: now,
         };
         let command = launch_command(
             &lease,
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest",
+            Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest"),
             &"a".repeat(64),
-        );
+        )
+        .unwrap();
         let command_id = command.command_id;
         let market = MemoryMarketplace {
             leases: BTreeMap::from([(lease.lease_id, ("subject".to_owned(), lease))]),
@@ -12260,6 +13564,8 @@ mod tests {
                     result: None,
                     status: "queued",
                     lease_until: None,
+                    authorization_request_id: None,
+                    verified_report: None,
                     updated_at: now,
                 },
             )]),
@@ -12302,6 +13608,161 @@ mod tests {
         assert_eq!(market.commands.get(&command_id).unwrap().status, "ready");
     }
 
+    #[tokio::test]
+    async fn a_batch_runs_only_after_active_and_persists_its_signed_result() {
+        let node = format!("0x{}", "ab".repeat(32));
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            lease_id: 17,
+            chain_lease_id: 17,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+            quote_id: Uuid::now_v7(),
+            node_id: node.clone(),
+            renter_wallet: format!("0x{}", "12".repeat(20)),
+            image: format!("registry.example/runtime@sha256:{}", "cd".repeat(32)),
+            duration_seconds: 60,
+            rate_per_second: 100,
+            maximum_escrow: 6_000,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: format!("0x{}", "ef".repeat(32)),
+            state: LeaseState::Funded,
+            command: Some("nvidia-smi -L".to_owned()),
+            repro: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let command = launch_command(&lease, None, "unused").unwrap();
+        let command_id = command.command_id;
+        let market = Arc::new(RwLock::new(MemoryMarketplace {
+            leases: BTreeMap::from([(lease.lease_id, ("subject".to_owned(), lease))]),
+            commands: BTreeMap::from([(
+                command_id,
+                MemoryCommand {
+                    command,
+                    status: "queued",
+                    lease_until: None,
+                    authorization_request_id: None,
+                    result: None,
+                    verified_report: None,
+                    updated_at: now,
+                },
+            )]),
+            ..MemoryMarketplace::default()
+        }));
+        let store = MarketplaceStore::Memory(market.clone());
+        store
+            .claim_command(&node, Uuid::now_v7())
+            .await
+            .unwrap()
+            .unwrap();
+        let ready = NodeCommandReport {
+            node_id: node.clone(),
+            device_public_key: "device-key".to_owned(),
+            request_id: Uuid::now_v7(),
+            command_id,
+            outcome: NodeCommandOutcome::Ready,
+            observed_at: Utc::now(),
+            error: None,
+            result: None,
+            signature: "signature".to_owned(),
+        };
+        store.report_command(&ready).await.unwrap();
+        assert!(
+            !store
+                .authorize_command(&node, command_id, Uuid::now_v7())
+                .await
+                .unwrap(),
+            "a Funded lease cannot authorize execution"
+        );
+
+        market.write().await.leases.get_mut(&17).unwrap().1.state = LeaseState::Active;
+        let execution_claim = Uuid::now_v7();
+        assert!(
+            store
+                .authorize_command(&node, command_id, execution_claim)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .authorize_command(&node, command_id, execution_claim)
+                .await
+                .unwrap(),
+            "a lost response is retryable by the same signed claim"
+        );
+        assert!(matches!(
+            store
+                .authorize_command(&node, command_id, Uuid::now_v7())
+                .await,
+            Err(StoreError::CommandClaimed)
+        ));
+
+        let result = CommandResult::capture(0, "GPU ready\n", "");
+        let completed = NodeCommandReport {
+            node_id: node,
+            device_public_key: "device-key".to_owned(),
+            request_id: Uuid::now_v7(),
+            command_id,
+            outcome: NodeCommandOutcome::Completed,
+            observed_at: Utc::now(),
+            error: None,
+            result: Some(result.clone()),
+            signature: "signature".to_owned(),
+        };
+        store.report_command(&completed).await.unwrap();
+
+        let market = market.read().await;
+        let command = market.commands.get(&command_id).unwrap();
+        assert_eq!(command.status, "completed");
+        assert_eq!(command.result.as_ref(), Some(&result));
+        assert_eq!(command.verified_report.as_ref(), Some(&completed));
+        assert_eq!(market.leases.get(&17).unwrap().1.state, LeaseState::Closing);
+        assert!(market.lifecycle_actions.contains(&(17, "start_access")));
+        assert!(market.lifecycle_actions.contains(&(17, "close_access")));
+    }
+
+    #[test]
+    fn a_prestart_batch_failure_expires_instead_of_closing_access() {
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            lease_id: 19,
+            chain_lease_id: 19,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+            quote_id: Uuid::now_v7(),
+            node_id: "node".to_owned(),
+            renter_wallet: "renter".to_owned(),
+            image: "registry.example/runtime@sha256:abc".to_owned(),
+            duration_seconds: 60,
+            rate_per_second: 100,
+            maximum_escrow: 6_000,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: "0xabc".to_owned(),
+            state: LeaseState::Provisioning,
+            command: Some("false".to_owned()),
+            repro: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let command = launch_command(&lease, None, "unused").unwrap();
+        let report = NodeCommandReport {
+            node_id: "node".to_owned(),
+            device_public_key: "device-key".to_owned(),
+            request_id: Uuid::now_v7(),
+            command_id: command.command_id,
+            outcome: NodeCommandOutcome::Failed,
+            observed_at: now,
+            error: Some("preflight failed".to_owned()),
+            result: None,
+            signature: "signature".to_owned(),
+        };
+        let transition =
+            command_report_transition(&command, "leased", &lease.state, &report).unwrap();
+
+        assert_eq!(transition.status, "failed");
+        assert_eq!(transition.lease_state, Some(LeaseState::Closing));
+        assert_eq!(transition.action, Some("expire_provision"));
+    }
+
     fn envelope(ciphertext: &str) -> VaultEnvelope {
         VaultEnvelope {
             wrapped_key: "d3JhcHBlZA".to_owned(),
@@ -12340,6 +13801,7 @@ mod tests {
                     funding_transaction_hash: "0xabc".to_owned(),
                     state: LeaseState::Active,
                     command: None,
+                    repro: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
@@ -12905,6 +14367,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
 
         // Unstaked renters get the ordinary node and never the pool.
@@ -12928,6 +14391,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
 
         // 190 sits below the floor for an unstaked renter, so it is invisible.
@@ -12963,6 +14427,7 @@ mod tests {
             preferred_node_id: None,
             min_trust_class: TrustClass::Open,
             command: None,
+            repro: None,
         };
 
         for staked in [0, 1_000, 250_000, u64::MAX] {
@@ -13028,6 +14493,289 @@ mod tests {
         assert_eq!(hex::encode(&digest[..4]), ELIGIBLE_STAKE_SELECTOR);
     }
 
+    fn repro_quote(token_hash: String, node_id: &str) -> (LeaseQuote, GpuReproSpec) {
+        let spec = GpuReproSpec {
+            image: format!("registry.example/repro@sha256:{}", "a".repeat(64)),
+            command: "python -c 'print(42)'".to_owned(),
+            duration_seconds: 300,
+            min_vram_mib: 16_000,
+            expected_exit_code: 0,
+        };
+        let quote = LeaseQuote {
+            quote_id: Uuid::now_v7(),
+            node_id: node_id.to_owned(),
+            image: spec.image.clone(),
+            duration_seconds: spec.duration_seconds,
+            min_vram_mib: spec.min_vram_mib,
+            rate_per_second: 222,
+            maximum_escrow: 66_600,
+            trust_class: TrustClass::Open,
+            command: Some(spec.command.clone()),
+            repro: Some(ReproCapability {
+                token_hash,
+                spec_hash: spec.hash().unwrap(),
+                expected_exit_code: spec.expected_exit_code,
+            }),
+            expires_at: Utc::now() + Duration::minutes(5),
+        };
+        (quote, spec)
+    }
+
+    #[test]
+    fn repro_status_accepts_only_canonical_capability_tokens() {
+        let token = URL_SAFE_NO_PAD.encode([9_u8; 32]);
+        assert_eq!(token.len(), 43);
+        assert_eq!(
+            canonical_repro_token_hash(&token),
+            Some(repro_token_hash(&token).unwrap())
+        );
+        for malformed in [
+            "not-a-capability".to_owned(),
+            "a".repeat(64),
+            format!("{token}="),
+            format!(" {}", token),
+        ] {
+            assert_eq!(canonical_repro_token_hash(&malformed), None);
+        }
+        assert!(
+            serde_json::from_value::<ReproStatusRequest>(serde_json::json!({
+                "token": token,
+                "token_hash": "a".repeat(64),
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repro_status_tokens_are_isolated_in_memory() {
+        let first_token = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+        let second_token = URL_SAFE_NO_PAD.encode([2_u8; 32]);
+        let first_hash = repro_token_hash(&first_token).unwrap();
+        let second_hash = repro_token_hash(&second_token).unwrap();
+        let (first, _) = repro_quote(first_hash.clone(), "node-1");
+        let (second, _) = repro_quote(second_hash.clone(), "node-2");
+        let first_id = first.quote_id;
+        let second_id = second.quote_id;
+        let mut market = MemoryMarketplace::default();
+        market.open_quotes.insert(first_id, first);
+        market.open_quotes.insert(second_id, second);
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+
+        assert_eq!(
+            store
+                .repro_status(&first_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .quote
+                .quote_id,
+            first_id
+        );
+        assert_eq!(
+            store
+                .repro_status(&second_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .quote
+                .quote_id,
+            second_id
+        );
+        assert!(store.repro_status(&"f".repeat(64)).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn repro_status_queries_use_only_indexed_public_fields() {
+        for query in [REPRO_STATUS_LEASE_QUERY, REPRO_STATUS_QUOTE_QUERY] {
+            assert!(query.contains("document #>> '{repro,token_hash}' = $1"));
+            assert!(query.contains("ORDER BY"));
+            assert!(query.contains("LIMIT 1"));
+            let lower = query.to_ascii_lowercase();
+            for forbidden in [
+                "subject",
+                "renter_wallet",
+                "funding_transaction_hash",
+                "ssh_authorized_key",
+                "jupyter_token",
+                "runner_private_key",
+                "ssh_host",
+                "ssh_port",
+            ] {
+                assert!(!lower.contains(forbidden), "query exposes {forbidden}");
+            }
+        }
+        let migration = include_str!("../migrations/0022_managed_repros.sql");
+        assert!(
+            migration
+                .matches("((document #>> '{repro,token_hash}'))")
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn repro_status_returns_bound_signed_evidence_without_authority_secrets() {
+        let token = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let token_hash = repro_token_hash(&token).unwrap();
+        let key = SigningKey::from_bytes(&[42_u8; 32]);
+        let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        let node_id = node_id(&key.verifying_key());
+        let (quote, spec) = repro_quote(token_hash.clone(), &node_id);
+        let capability = quote.repro.clone().unwrap();
+        let now = Utc::now();
+        let command = NodeCommand {
+            command_id: Uuid::now_v7(),
+            node_id: node_id.clone(),
+            lease_id: 1_001,
+            issued_at: now,
+            expires_at: now + Duration::minutes(10),
+            kind: NodeCommandKind::Batch {
+                image: spec.image.clone(),
+                command: spec.command.clone(),
+                duration_seconds: spec.duration_seconds,
+            },
+        };
+        let result = CommandResult {
+            exit_code: 0,
+            stdout: "42\n".to_owned(),
+            stderr: String::new(),
+            truncated: false,
+        };
+        let report = NodeCommandReport::sign(
+            NodeCommandReportPayload {
+                node_id: node_id.clone(),
+                device_public_key: public_key.clone(),
+                request_id: Uuid::now_v7(),
+                command_id: command.command_id,
+                outcome: NodeCommandOutcome::Completed,
+                observed_at: now + Duration::seconds(2),
+                error: None,
+                result: Some(result.clone()),
+            },
+            &key,
+        )
+        .unwrap();
+        let mut receipt = PublicReceipt {
+            receipt_id: Uuid::now_v7(),
+            lease_id: "77".to_owned(),
+            node_id_hash: format!("0x{}", hex::encode(Sha256::digest(node_id.as_bytes()))),
+            gpu_model: "NVIDIA L4".to_owned(),
+            runtime_seconds: 2,
+            charged_base_units: 444,
+            refunded_base_units: 66_156,
+            provider_paid_base_units: 400,
+            failure_class: None,
+            outcome: ReceiptOutcome::Finalized,
+            trust_class: Some(TrustClass::Open),
+            attestation: None,
+            credited_seconds: None,
+            repro: Some(ReproReceiptEvidence {
+                executor: ReproExecutor::Node,
+                token_hash: token_hash.clone(),
+                spec_hash: spec.hash().unwrap(),
+                image_digest: format!("sha256:{}", "a".repeat(64)),
+                command_hash: repro_command_hash(&command).unwrap(),
+                result_hash: repro_result_hash(&result).unwrap(),
+                stdout_hash: repro_stream_hash(&result.stdout),
+                stderr_hash: repro_stream_hash(&result.stderr),
+                report_hash: repro_report_hash(&report).unwrap(),
+                exit_code: result.exit_code,
+                expected_exit_code: spec.expected_exit_code,
+                succeeded: true,
+                truncated: false,
+            }),
+            receipt_hash: String::new(),
+            transaction_hash: format!("0x{}", "b".repeat(64)),
+        };
+        receipt.receipt_hash = prism_protocol::receipt_hash(&receipt).unwrap();
+        let response = build_repro_status(
+            &token_hash,
+            StoredReproStatus {
+                quote,
+                lease: Some(StoredReproLease {
+                    lease_id: command.lease_id,
+                    chain_lease_id: 77,
+                    state: LeaseState::Finalized,
+                    node_id,
+                    token_hash: Some(token_hash.clone()),
+                    spec_hash: Some(capability.spec_hash),
+                    execution: Some(StoredReproExecution::Node {
+                        status: "completed".to_owned(),
+                        command,
+                        report: Some(report),
+                        result: Some(result),
+                        enrolled_device_public_key: Some(public_key),
+                    }),
+                    receipt: Some(receipt),
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.status, ReproStatus::Settled);
+        assert!(response.evidence.is_some());
+        assert!(response.checks.token_bound);
+        assert!(response.checks.spec_hash_valid);
+        assert_eq!(response.checks.command_bound, Some(true));
+        assert_eq!(response.checks.executor_signature_valid, Some(true));
+        assert_eq!(response.checks.report_bound, Some(true));
+        assert_eq!(response.checks.receipt_hash_valid, Some(true));
+        assert_eq!(response.checks.receipt_bound, Some(true));
+        assert_eq!(response.checks.expected_exit_code, Some(true));
+
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.len() <= MAX_REPRO_STATUS_RESPONSE_BYTES);
+        assert!(!encoded.contains(&token));
+        for forbidden in [
+            "\"subject\"",
+            "\"renter_wallet\"",
+            "\"funding_transaction_hash\"",
+            "\"ssh_authorized_key\"",
+            "\"jupyter_token\"",
+            "\"runner_private_key\"",
+            "\"ssh_host\"",
+            "\"ssh_port\"",
+        ] {
+            assert!(!encoded.contains(forbidden), "response exposes {forbidden}");
+        }
+    }
+
+    #[test]
+    fn repro_status_mapping_preserves_terminal_and_execution_states() {
+        assert_eq!(
+            derive_repro_status(&LeaseState::Funded, None, None),
+            ReproStatus::Funded
+        );
+        assert_eq!(
+            derive_repro_status(&LeaseState::Provisioning, Some("ready"), None),
+            ReproStatus::Ready
+        );
+        assert_eq!(
+            derive_repro_status(&LeaseState::Active, Some("launching"), None),
+            ReproStatus::Running
+        );
+        assert_eq!(
+            derive_repro_status(
+                &LeaseState::Active,
+                Some("completed"),
+                Some(&NodeCommandOutcome::Completed),
+            ),
+            ReproStatus::Completed
+        );
+        assert_eq!(
+            derive_repro_status(
+                &LeaseState::Closing,
+                Some("completed"),
+                Some(&NodeCommandOutcome::Completed),
+            ),
+            ReproStatus::Settling
+        );
+        assert_eq!(
+            derive_repro_status(&LeaseState::Finalized, Some("failed"), None),
+            ReproStatus::Settled
+        );
+    }
+
     // With no contract deployed, everyone prices at the published rate rather
     // than the quote failing.
     #[tokio::test]
@@ -13067,15 +14815,13 @@ fn every_migration_file_is_registered() {
     );
 }
 
-/// The broker path is provisioned by the lifecycle worker and never polls for
-/// commands, so a batch request that matched one would bill the renter for a
-/// box their command never ran on. The poll decides it rather than the class: a
-/// self-hosted node at `Open` runs the same daemon and takes the same commands.
+/// Native commands require a fresh device poll. A managed host accepts only a
+/// capability-bound repro, never an arbitrary command.
 #[test]
-fn a_batch_request_never_matches_a_broker_node() {
+fn managed_capacity_matches_only_capability_bound_repros() {
     use prism_protocol::GpuSpec;
 
-    let offer = |node_id: &str, trust_class, command_channel| NodeOffer {
+    let offer = |node_id: &str, trust_class, command_channel, managed_batch| NodeOffer {
         node_id: node_id.to_owned(),
         operator_wallet: "0xop".to_owned(),
         payout_wallet: "0xpay".to_owned(),
@@ -13094,11 +14840,12 @@ fn a_batch_request_never_matches_a_broker_node() {
         trust_class,
         staker_only: false,
         command_channel,
+        managed_batch,
         updated_at: Utc::now(),
     };
-    let broker = offer("0xbroker", TrustClass::Open, false);
-    let isolated = offer("0xisolated", TrustClass::Isolated, true);
-    let self_hosted = offer("0xopen", TrustClass::Open, true);
+    let broker = offer("0xbroker", TrustClass::Open, false, true);
+    let isolated = offer("0xisolated", TrustClass::Isolated, true, false);
+    let self_hosted = offer("0xopen", TrustClass::Open, true, false);
     let request = |command: Option<&str>| LeaseRequest {
         image: "docker.io/library/debian@sha256:1".to_owned(),
         duration_seconds: 600,
@@ -13106,6 +14853,7 @@ fn a_batch_request_never_matches_a_broker_node() {
         preferred_node_id: None,
         min_trust_class: TrustClass::Open,
         command: command.map(str::to_owned),
+        repro: None,
     };
     let reserved = BTreeSet::new();
 
@@ -13113,11 +14861,27 @@ fn a_batch_request_never_matches_a_broker_node() {
     let interactive = quote_for_offers(&request(None), [&broker], &reserved, 0).unwrap();
     assert_eq!(interactive.node_id, "0xbroker");
 
-    // A batch lease is not, even though the broker is cheaper and online.
+    // An unrestricted batch lease is not, even though the broker is available.
     assert!(matches!(
         quote_for_offers(&request(Some("nvidia-smi")), [&broker], &reserved, 0),
         Err(StoreError::NoMatch)
     ));
+
+    let mut repro = request(Some("nvidia-smi"));
+    let spec = GpuReproSpec {
+        image: repro.image.clone(),
+        command: repro.command.clone().unwrap(),
+        duration_seconds: repro.duration_seconds,
+        min_vram_mib: repro.min_vram_mib,
+        expected_exit_code: 0,
+    };
+    repro.repro = Some(prism_protocol::ReproCapability {
+        token_hash: "a".repeat(64),
+        spec_hash: spec.hash().unwrap(),
+        expected_exit_code: 0,
+    });
+    let managed = quote_for_offers(&repro, [&broker], &reserved, 0).unwrap();
+    assert_eq!(managed.node_id, "0xbroker");
 
     let batch = quote_for_offers(
         &request(Some("nvidia-smi")),
@@ -13143,7 +14907,7 @@ fn a_batch_request_never_matches_a_broker_node() {
 
     // A node inside a long interactive lease stops polling, and while it does
     // it is out of batch matching whatever class it holds.
-    let quiet = offer("0xquiet", TrustClass::Isolated, false);
+    let quiet = offer("0xquiet", TrustClass::Isolated, false, false);
     assert!(matches!(
         quote_for_offers(&request(Some("nvidia-smi")), [&quiet], &reserved, 0),
         Err(StoreError::NoMatch)

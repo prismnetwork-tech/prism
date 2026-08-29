@@ -74,6 +74,14 @@ describe("isPublicProofIndex", () => {
       expect(isPublicProofIndex(index([{ ...receipt, attestation: broken }]))).toBe(false);
     }
   });
+
+  it("rejects non-canonical uppercase digests", () => {
+    expect(isPublicProofIndex(index([{ ...receipt, receipt_hash: "A".repeat(64) }]))).toBe(false);
+    expect(isPublicProofIndex(index([{ ...receipt, attestation: {
+      ...attestation,
+      verdict_digest: "A".repeat(64),
+    } }]))).toBe(false);
+  });
 });
 
 describe("recomputeReceiptHash with an availability credit", () => {
@@ -130,5 +138,104 @@ describe("recomputeReceiptHash", () => {
     });
     expect(first).not.toBe(second);
     expect(first).not.toBe(published.receipt_hash);
+  });
+
+  it("covers a repro commitment appended to the receipt payload", async () => {
+    const repro = {
+      executor: "node" as const,
+      token_hash: "0".repeat(64),
+      spec_hash: "1".repeat(64),
+      image_digest: `sha256:${"2".repeat(64)}`,
+      command_hash: "3".repeat(64),
+      result_hash: "4".repeat(64),
+      stdout_hash: "5".repeat(64),
+      stderr_hash: "6".repeat(64),
+      report_hash: "7".repeat(64),
+      exit_code: 0,
+      expected_exit_code: 0,
+      succeeded: true,
+      truncated: false,
+    };
+    const withRepro = { ...published, repro };
+
+    expect(isPublicProofIndex(index([withRepro]))).toBe(true);
+    expect(await recomputeReceiptHash(withRepro)).not.toBe(published.receipt_hash);
+    expect(await recomputeReceiptHash({
+      ...withRepro,
+      repro: { ...repro, stdout_hash: "8".repeat(64) },
+    })).not.toBe(await recomputeReceiptHash(withRepro));
+
+    const managed = {
+      ...withRepro,
+      repro: { ...repro, executor: "managed" as const },
+    };
+    expect(isPublicProofIndex(index([managed]))).toBe(true);
+    expect(await recomputeReceiptHash(managed)).not.toBe(await recomputeReceiptHash(withRepro));
+  });
+
+  it("uses the canonical receipt field order for both executor types", async () => {
+    const canonical: PublicProofReceipt = {
+      receipt_id: "019f0000-0000-7000-8000-000000000002",
+      lease_id: "129",
+      node_id_hash: `0x${"b".repeat(64)}`,
+      gpu_model: "NVIDIA L4",
+      runtime_seconds: 60,
+      charged_base_units: 13_320,
+      refunded_base_units: 0,
+      provider_paid_base_units: 11_988,
+      failure_class: null,
+      outcome: "finalized",
+      trust_class: "open",
+      repro: {
+        executor: "node",
+        token_hash: "0".repeat(64),
+        spec_hash: "1".repeat(64),
+        image_digest: `sha256:${"2".repeat(64)}`,
+        command_hash: "3".repeat(64),
+        result_hash: "4".repeat(64),
+        stdout_hash: "5".repeat(64),
+        stderr_hash: "6".repeat(64),
+        report_hash: "7".repeat(64),
+        exit_code: 0,
+        expected_exit_code: 0,
+        succeeded: true,
+        truncated: false,
+      },
+      receipt_hash: "947448674b4c449999cf2106d7cd55f7a3e3041f3f4534086e8e9466fc6d395d",
+      transaction_hash: `0x${"d".repeat(64)}`,
+    };
+    await expect(recomputeReceiptHash(canonical)).resolves.toBe(canonical.receipt_hash);
+
+    const managed: PublicProofReceipt = {
+      ...canonical,
+      repro: { ...canonical.repro!, executor: "managed" },
+      receipt_hash: "01e778a0c8b8f41bcd7fa297bd6a70091399208afe94bd9295f720432a3ea424",
+    };
+    expect(isPublicProofIndex(index([managed]))).toBe(true);
+    await expect(recomputeReceiptHash(managed)).resolves.toBe(managed.receipt_hash);
+  });
+
+  it("rejects unsupported or inconsistent repro commitments", () => {
+    const repro = {
+      executor: "node",
+      token_hash: "0".repeat(64),
+      spec_hash: "1".repeat(64),
+      image_digest: `sha256:${"2".repeat(64)}`,
+      command_hash: "3".repeat(64),
+      result_hash: "4".repeat(64),
+      stdout_hash: "5".repeat(64),
+      stderr_hash: "6".repeat(64),
+      report_hash: "7".repeat(64),
+      exit_code: 1,
+      expected_exit_code: 0,
+      succeeded: false,
+      truncated: false,
+    };
+
+    expect(isPublicProofIndex(index([{ ...published, repro }]))).toBe(true);
+    expect(isPublicProofIndex(index([{ ...published, repro: { ...repro, executor: "managed" } }]))).toBe(true);
+    expect(isPublicProofIndex(index([{ ...published, repro: { ...repro, executor: "browser" } }]))).toBe(false);
+    expect(isPublicProofIndex(index([{ ...published, repro: { ...repro, spec_hash: "A".repeat(64) } }]))).toBe(false);
+    expect(isPublicProofIndex(index([{ ...published, repro: { ...repro, succeeded: true } }]))).toBe(false);
   });
 });

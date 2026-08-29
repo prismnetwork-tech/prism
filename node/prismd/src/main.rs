@@ -42,6 +42,7 @@ const REGISTRATION_WINDOW_SECONDS: u128 = 3_600;
 /// Seven static words precede the signature in register()'s calldata.
 const SIGNATURE_OFFSET: u128 = 7 * 32;
 const CONFIRMATION_ATTEMPTS: u32 = 40;
+const BATCH_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// A verdict outlives this comfortably, so the refresh is about proving the
 /// card is still the one that was verified, not about racing an expiry.
 const ATTESTATION_INTERVAL: Duration = Duration::from_secs(6 * 3_600);
@@ -2013,6 +2014,81 @@ async fn run_batch_command(
         )
         .await;
     };
+    let lease_id = command.lease_id.to_string();
+    let workspace_root = config.workspace_root.clone();
+    let state_root = config.state_root.clone();
+    let limits = config.isolation.limits();
+    let preflight_isolation = isolation.clone();
+    let preflight_image = image.to_owned();
+    let preflight_program = program.to_owned();
+    let preflight_lease_id = lease_id.clone();
+    let preflight = tokio::task::spawn_blocking(move || {
+        runtime::preflight_batch(&runtime::BatchConfig {
+            image: &preflight_image,
+            lease_id: &preflight_lease_id,
+            command: &preflight_program,
+            workspace_root: &workspace_root,
+            state_root: &state_root,
+            isolation: &preflight_isolation,
+            limits,
+            duration_seconds,
+        })
+    })
+    .await?;
+    if let Err(error) = preflight {
+        return report_command(
+            client,
+            &config.control_plane,
+            node,
+            public_key,
+            key,
+            command.command_id,
+            NodeCommandOutcome::Failed,
+            Some(format!("{error:#}").chars().take(512).collect()),
+            None,
+        )
+        .await;
+    }
+    report_command(
+        client,
+        &config.control_plane,
+        node,
+        public_key,
+        key,
+        command.command_id,
+        NodeCommandOutcome::Ready,
+        None,
+        None,
+    )
+    .await?;
+    match wait_for_batch_authorization(
+        client,
+        &config.control_plane,
+        config.poll_seconds,
+        node,
+        public_key,
+        key,
+        command.command_id,
+    )
+    .await?
+    {
+        BatchAuthorization::Authorized => {}
+        BatchAuthorization::ClaimedElsewhere => return Ok(()),
+        BatchAuthorization::TimedOut => {
+            return report_command(
+                client,
+                &config.control_plane,
+                node,
+                public_key,
+                key,
+                command.command_id,
+                NodeCommandOutcome::Failed,
+                Some("lease did not become active before the authorization deadline".to_owned()),
+                None,
+            )
+            .await;
+        }
+    }
     if let Some(reason) = release_gpu_for_lease(idle).await {
         return report_command(
             client,
@@ -2028,7 +2104,6 @@ async fn run_batch_command(
         .await;
     }
 
-    let lease_id = command.lease_id.to_string();
     let workspace_root = config.workspace_root.clone();
     let state_root = config.state_root.clone();
     let limits = config.isolation.limits();
@@ -2072,12 +2147,81 @@ async fn run_batch_command(
                 key,
                 command.command_id,
                 NodeCommandOutcome::Failed,
-                Some(format!("{error:#}")),
+                Some(format!("{error:#}").chars().take(512).collect()),
                 None,
             )
             .await
         }
     }
+}
+
+enum BatchAuthorization {
+    Authorized,
+    ClaimedElsewhere,
+    TimedOut,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_batch_authorization(
+    client: &reqwest::Client,
+    control_plane: &str,
+    poll_seconds: u64,
+    node: &str,
+    public_key: &str,
+    key: &SigningKey,
+    command_id: uuid::Uuid,
+) -> anyhow::Result<BatchAuthorization> {
+    let endpoint = control_plane_endpoint(
+        control_plane,
+        &format!("v1/nodes/{node}/commands/{command_id}/authorize"),
+    )?;
+    let deadline = tokio::time::Instant::now() + BATCH_AUTHORIZATION_TIMEOUT;
+    'poll: while tokio::time::Instant::now() < deadline {
+        let poll = NodeCommandPoll::sign(
+            node.to_owned(),
+            public_key.to_owned(),
+            uuid::Uuid::now_v7(),
+            Utc::now(),
+            key,
+        )?;
+        loop {
+            let result = match client.post(endpoint.clone()).json(&poll).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        response
+                            .json::<bool>()
+                            .await
+                            .context("decode batch authorization")
+                            .map(|authorized| authorized.then_some(BatchAuthorization::Authorized))
+                    } else if matches!(
+                        status,
+                        reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND
+                    ) {
+                        Ok(Some(BatchAuthorization::ClaimedElsewhere))
+                    } else {
+                        require_success(response).await.map(|()| None)
+                    }
+                }
+                Err(error) => Err(error.into()),
+            };
+            match result {
+                Ok(Some(authorization)) => return Ok(authorization),
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
+                    continue 'poll;
+                }
+                Err(error) => {
+                    tracing::warn!(%command_id, %error, "batch authorization poll failed; retrying the same execution claim");
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(BatchAuthorization::TimedOut);
+                    }
+                    tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
+                }
+            }
+        }
+    }
+    Ok(BatchAuthorization::TimedOut)
 }
 
 #[allow(clippy::too_many_arguments)]

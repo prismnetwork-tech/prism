@@ -7,9 +7,12 @@ use prism_chain::{
     word_u128,
 };
 use prism_protocol::{
-    AttestationVerdict, CredentialCipher, ExecutionEvidence, LeaseAttestationVerdict, LeaseRecord,
-    LeaseState, NodeOffer, NodeTelemetry, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptAttestation,
-    ReceiptOutcome, SettlementEvidence, TrustClass, receipt_hash, verdict_digest,
+    AttestationVerdict, CommandResult, CredentialCipher, ExecutionEvidence, GpuReproSpec,
+    LeaseAttestationVerdict, LeaseRecord, LeaseState, ManagedCommandReport, ManagedProvider,
+    NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandReport, NodeOffer, NodeTelemetry,
+    PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptAttestation, ReceiptOutcome, ReproExecutionEvidence,
+    ReproExecutionReport, SettlementEvidence, TrustClass, node_id, receipt_hash, verdict_digest,
+    verifying_key,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -271,6 +274,25 @@ fn boot_budget_exhausted(attached_at: Option<DateTime<Utc>>, now: DateTime<Utc>)
     })
 }
 
+fn managed_runner_is_ready(
+    status: &str,
+    transport_host_key_sha256: Option<&str>,
+) -> anyhow::Result<bool> {
+    match status {
+        "queued" | "preparing" => Ok(false),
+        "ready" if transport_host_key_sha256.is_some_and(is_lower_sha256) => Ok(true),
+        "ready" => {
+            anyhow::bail!("managed repro runner is ready without a valid transport host key")
+        }
+        "failed" => anyhow::bail!("managed repro runner failed before activation"),
+        other => anyhow::bail!("managed repro runner reached invalid pre-activation state {other}"),
+    }
+}
+
+fn should_issue_gateway_access(cloud: bool, batch: bool) -> bool {
+    !cloud && !batch
+}
+
 /// `getLease` returns the struct as fourteen words. `createdAt` is the seventh
 /// and `status` the last, both right aligned in their word.
 fn decode_lease(bytes: &[u8]) -> anyhow::Result<OnchainLease> {
@@ -312,6 +334,7 @@ struct LeaseContext {
     /// about the promise this lease was sold on.
     min_vram_mib: u32,
     connection_id: Option<String>,
+    node_ready_at: Option<DateTime<Utc>>,
     cuda_ready_at: Option<DateTime<Utc>>,
     gateway_ready_at: Option<DateTime<Utc>>,
     access_started_at: Option<DateTime<Utc>>,
@@ -1137,10 +1160,33 @@ impl Worker {
     }
 
     async fn probe(&self, action: &Action) -> anyhow::Result<()> {
+        let context = self.lease_context(action.lease_id).await?;
+        if context.lease.command.is_some() {
+            if self.is_cloud_lease(action.lease_id).await? {
+                if !self.ensure_cloud_ready(action.lease_id).await? {
+                    anyhow::bail!("managed repro lease has no cloud instance");
+                }
+                return Ok(());
+            }
+            if context.lease.state != LeaseState::Ready {
+                anyhow::bail!("batch lease is not ready for activation");
+            }
+            let ready_at = context
+                .node_ready_at
+                .context("batch command has no signed readiness report")?;
+            query(
+                "UPDATE lease_lifecycle SET gateway_ready_at = $2, cuda_ready_at = $2, \
+                     updated_at = NOW() WHERE lease_id = $1",
+            )
+            .bind(action.lease_id as i64)
+            .bind(ready_at)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
         if self.ensure_cloud_ready(action.lease_id).await? {
             return Ok(());
         }
-        let context = self.lease_context(action.lease_id).await?;
         if context.lease.state != LeaseState::Ready {
             anyhow::bail!("lease is not ready for an access probe");
         }
@@ -1172,7 +1218,7 @@ impl Worker {
             (
                 Option<i64>,
                 Option<i64>,
-                String,
+                Option<String>,
                 Option<DateTime<Utc>>,
                 String,
                 Vec<i64>,
@@ -1188,6 +1234,38 @@ impl Worker {
         let Some((stored_instance_id, _, ssh_key, ssh_key_attached_at, status, rejected)) = row
         else {
             return Ok(false);
+        };
+        let managed_job = query_as::<_, (Option<String>, String)>(
+            "SELECT runner_public_key, status FROM managed_repro_jobs WHERE lease_id = $1",
+        )
+        .bind(lease_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        let ssh_key = match managed_job.as_ref() {
+            Some((_, status)) if status == "failed" => {
+                anyhow::bail!("managed repro runner failed before provisioning")
+            }
+            Some((Some(runner_public_key), _)) => {
+                if ssh_key
+                    .as_ref()
+                    .is_some_and(|stored| stored != runner_public_key)
+                {
+                    anyhow::bail!("managed repro runner key changed after it was assigned");
+                }
+                if ssh_key.is_none() {
+                    query(
+                        "UPDATE cloud_instances SET ssh_authorized_key = $2, updated_at = NOW() \
+                         WHERE lease_id = $1 AND ssh_authorized_key IS NULL",
+                    )
+                    .bind(lease_id as i64)
+                    .bind(runner_public_key)
+                    .execute(&self.pool)
+                    .await?;
+                }
+                runner_public_key.clone()
+            }
+            Some((None, _)) => return Err(StillProvisioning.into()),
+            None => ssh_key.context("interactive cloud lease has no SSH authorized key")?,
         };
         let vast = self
             .vast
@@ -1409,11 +1487,13 @@ impl Worker {
             .ssh_port
             .filter(|port| *port > 0)
             .context("Vast instance has no SSH port")?;
-        let ready_at = Utc::now();
+        let gpu_vram_mib = i32::try_from(instance.gpu_ram)?;
         let mut transaction = self.pool.begin().await?;
         query(
             "UPDATE cloud_instances SET hourly_cost_micros = $2, ssh_host = $3, ssh_port = $4, \
                  status = 'running', started_at = COALESCE(started_at, $5), \
+                 gpu_model = COALESCE(gpu_model, $6), \
+                 gpu_vram_mib = COALESCE(gpu_vram_mib, $7), \
                  last_error = NULL, observed_at = NOW(), updated_at = NOW() \
              WHERE lease_id = $1",
         )
@@ -1421,9 +1501,50 @@ impl Worker {
         .bind(i64::try_from(instance.hourly_micros)?)
         .bind(host)
         .bind(i32::from(port))
-        .bind(ready_at)
+        .bind(Utc::now())
+        .bind(&instance.gpu_name)
+        .bind(gpu_vram_mib)
         .execute(&mut *transaction)
         .await?;
+        if managed_job.is_some() {
+            query(
+                "UPDATE managed_repro_jobs \
+                 SET gpu_model = COALESCE(gpu_model, $2), \
+                     gpu_vram_mib = COALESCE(gpu_vram_mib, $3) \
+                 WHERE lease_id = $1",
+            )
+            .bind(lease_id as i64)
+            .bind(&instance.gpu_name)
+            .bind(gpu_vram_mib)
+            .execute(&mut *transaction)
+            .await?;
+            let (job_status, transport_host_key_sha256, runner_ready_at) =
+                query_as::<_, (String, Option<String>, DateTime<Utc>)>(
+                    "SELECT status, transport_host_key_sha256, updated_at \
+                 FROM managed_repro_jobs WHERE lease_id = $1",
+                )
+                .bind(lease_id as i64)
+                .fetch_one(&mut *transaction)
+                .await?;
+            if !managed_runner_is_ready(&job_status, transport_host_key_sha256.as_deref())? {
+                transaction.commit().await?;
+                return Err(StillProvisioning.into());
+            }
+            query(
+                "UPDATE lease_lifecycle SET connection_id = $2, node_ready_at = $3, \
+                     cuda_ready_at = $3, gateway_ready_at = $3, updated_at = NOW() \
+                 WHERE lease_id = $1",
+            )
+            .bind(lease_id as i64)
+            .bind(format!("vast:{instance_id}"))
+            .bind(runner_ready_at)
+            .execute(&mut *transaction)
+            .await?;
+            set_lease_state_in(&mut transaction, lease_id, LeaseState::Ready).await?;
+            transaction.commit().await?;
+            return Ok(true);
+        }
+        let ready_at = Utc::now();
         query(
             "UPDATE lease_lifecycle SET connection_id = $2, cuda_ready_at = $3, \
                  gateway_ready_at = $3, updated_at = NOW() WHERE lease_id = $1",
@@ -1539,7 +1660,10 @@ impl Worker {
         )
         .execute(&self.pool)
         .await?;
-        if !self.is_cloud_lease(action.lease_id).await? {
+        if should_issue_gateway_access(
+            self.is_cloud_lease(action.lease_id).await?,
+            self.is_batch_lease(action.lease_id).await?,
+        ) {
             self.issue_grant(action.lease_id, false).await?;
         }
         self.set_lease_state(action.lease_id, LeaseState::Active)
@@ -1655,6 +1779,7 @@ impl Worker {
             // A machine that never arrived was never billed, so there is
             // nothing to credit back and nothing to say here.
             credited_seconds: None,
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: transaction_hash.clone(),
         };
@@ -1706,7 +1831,11 @@ impl Worker {
     }
 
     async fn refresh_grant(&self, action: &Action) -> anyhow::Result<()> {
-        self.issue_grant(action.lease_id, true).await?;
+        let cloud = self.is_cloud_lease(action.lease_id).await?;
+        let batch = self.is_batch_lease(action.lease_id).await?;
+        if should_issue_gateway_access(cloud, batch) {
+            self.issue_grant(action.lease_id, true).await?;
+        }
         query(
             "UPDATE lifecycle_outbox SET status = 'completed', lease_until = NULL, \
                  last_error = NULL, updated_at = NOW() WHERE action_id = $1",
@@ -1735,6 +1864,12 @@ impl Worker {
     }
 
     async fn issue_grant(&self, lease_id: u64, rotate: bool) -> anyhow::Result<()> {
+        if !should_issue_gateway_access(
+            self.is_cloud_lease(lease_id).await?,
+            self.is_batch_lease(lease_id).await?,
+        ) {
+            anyhow::bail!("gateway access is unavailable for cloud and batch leases");
+        }
         let context = self.lease_context(lease_id).await?;
         let connection_id = context
             .connection_id
@@ -1825,6 +1960,14 @@ impl Worker {
 
     async fn is_cloud_lease(&self, lease_id: u64) -> anyhow::Result<bool> {
         query_scalar("SELECT EXISTS (SELECT 1 FROM cloud_instances WHERE lease_id = $1)")
+            .bind(lease_id as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn is_batch_lease(&self, lease_id: u64) -> anyhow::Result<bool> {
+        query_scalar("SELECT document->>'command' IS NOT NULL FROM leases WHERE lease_id = $1")
             .bind(lease_id as i64)
             .fetch_one(&self.pool)
             .await
@@ -1929,8 +2072,20 @@ impl Worker {
 
     async fn settlement_evidence(&self, lease_id: u64) -> anyhow::Result<SettlementEvidence> {
         let context = self.lease_context(lease_id).await?;
-        let cloud = query_as::<_, (i64, i64, String, Option<DateTime<Utc>>)>(
-            "SELECT provider_instance_id, hourly_cost_micros, status, observed_at \
+        let repro = self.repro_execution_evidence(&context).await?;
+        let cloud = query_as::<
+            _,
+            (
+                i64,
+                i64,
+                String,
+                Option<DateTime<Utc>>,
+                Option<String>,
+                Option<i32>,
+            ),
+        >(
+            "SELECT provider_instance_id, hourly_cost_micros, status, observed_at, \
+                    gpu_model, gpu_vram_mib \
              FROM cloud_instances \
              WHERE lease_id = $1 \
                AND provider_instance_id IS NOT NULL \
@@ -1946,18 +2101,25 @@ impl Worker {
         // machine going away and us noticing.
         let mut last_observed_at = cloud
             .as_ref()
-            .and_then(|(_, _, _, observed_at)| *observed_at);
-        let execution = match cloud {
-            Some((instance_id, hourly_cost_micros, status, _)) => {
+            .and_then(|(_, _, _, observed_at, _, _)| *observed_at);
+        let (execution, gpu_model) = match cloud {
+            Some((instance_id, hourly_cost_micros, status, _, gpu_model, gpu_vram_mib)) => {
                 if status != "destroyed" {
                     anyhow::bail!("cloud instance was not destroyed before settlement");
                 }
-                ExecutionEvidence::Vast {
-                    instance_id: u64::try_from(instance_id)?,
-                    hourly_cost_micros: u64::try_from(hourly_cost_micros)?,
-                }
+                let gpu_model = gpu_model.context("cloud instance has no recorded GPU model")?;
+                let _gpu_vram_mib = gpu_vram_mib
+                    .and_then(|value| u32::try_from(value).ok())
+                    .context("cloud instance has no recorded GPU memory")?;
+                (
+                    ExecutionEvidence::Vast {
+                        instance_id: u64::try_from(instance_id)?,
+                        hourly_cost_micros: u64::try_from(hourly_cost_micros)?,
+                    },
+                    gpu_model,
+                )
             }
-            None => ExecutionEvidence::Physical,
+            None => (ExecutionEvidence::Physical, context.offer.gpu.model.clone()),
         };
         let telemetry = query_scalar::<_, SqlJson<NodeTelemetry>>(
             "SELECT document FROM lease_telemetry WHERE lease_id = $1 ORDER BY sequence",
@@ -1982,7 +2144,7 @@ impl Worker {
             lease_nonce: 1,
             node_id: context.lease.node_id,
             device_public_key: context.offer.device_public_key,
-            gpu_model: context.offer.gpu.model,
+            gpu_model,
             image_digest: context
                 .lease
                 .image
@@ -2005,7 +2167,171 @@ impl Worker {
             trust_class: Some(context.lease.trust_class),
             execution,
             node_telemetry: telemetry,
+            repro,
         })
+    }
+
+    async fn repro_execution_evidence(
+        &self,
+        context: &LeaseContext,
+    ) -> anyhow::Result<Option<ReproExecutionEvidence>> {
+        let Some(capability) = context.lease.repro.clone() else {
+            return Ok(None);
+        };
+        let expected_command = context
+            .lease
+            .command
+            .as_deref()
+            .context("repro lease has no batch command")?;
+        let spec = GpuReproSpec {
+            image: context.lease.image.clone(),
+            command: expected_command.to_owned(),
+            duration_seconds: context.lease.duration_seconds,
+            min_vram_mib: context.min_vram_mib,
+            expected_exit_code: capability.expected_exit_code,
+        };
+        if spec.hash()? != capability.spec_hash {
+            anyhow::bail!("repro capability does not match its lease contract");
+        }
+        let validate_command = |command: &NodeCommand| -> anyhow::Result<()> {
+            if command.node_id != context.lease.node_id
+                || command.lease_id != context.lease.lease_id
+            {
+                anyhow::bail!("repro command does not belong to its lease");
+            }
+            let NodeCommandKind::Batch {
+                image,
+                command: program,
+                duration_seconds,
+            } = &command.kind
+            else {
+                anyhow::bail!("repro lease command is not a batch run");
+            };
+            if image != &context.lease.image
+                || program != expected_command
+                || *duration_seconds != context.lease.duration_seconds
+            {
+                anyhow::bail!("repro command does not match its lease contract");
+            }
+            Ok(())
+        };
+
+        let managed = query_as::<
+            _,
+            (
+                String,
+                SqlJson<NodeCommand>,
+                Option<SqlJson<ManagedCommandReport>>,
+                Option<i64>,
+                Option<String>,
+                Option<i32>,
+                Option<String>,
+            ),
+        >(
+            "SELECT j.status, j.command, j.report, ci.provider_instance_id, ci.gpu_model, \
+                    ci.gpu_vram_mib, j.transport_host_key_sha256 \
+             FROM managed_repro_jobs j \
+             JOIN cloud_instances ci ON ci.lease_id = j.lease_id \
+             WHERE j.lease_id = $1",
+        )
+        .bind(context.lease.lease_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((
+            status,
+            SqlJson(command),
+            report,
+            provider_instance_id,
+            gpu_model,
+            gpu_vram_mib,
+            transport_host_key_sha256,
+        )) = managed
+        {
+            validate_command(&command)?;
+            if reportless_failure(&status, report.is_some()) {
+                return Ok(None);
+            }
+            let report = report
+                .map(|SqlJson(report)| report)
+                .context("managed repro command has no signed final report")?;
+            let provider_instance_id = provider_instance_id
+                .and_then(|value| u64::try_from(value).ok())
+                .context("managed repro has no provider instance")?;
+            let gpu_model = gpu_model.context("managed repro has no recorded GPU model")?;
+            let gpu_vram_mib = gpu_vram_mib
+                .and_then(|value| u32::try_from(value).ok())
+                .context("managed repro has no recorded GPU memory")?;
+            let transport_host_key_sha256 = transport_host_key_sha256
+                .filter(|value| is_lower_sha256(value))
+                .context("managed repro has no valid transport host key commitment")?;
+            if report.command_id != command.command_id
+                || report.lease_id != context.lease.lease_id
+                || report.provider != ManagedProvider::Vast
+                || report.provider_instance_id != provider_instance_id
+                || report.gpu_model != gpu_model
+                || report.gpu_vram_mib != gpu_vram_mib
+                || report.transport_host_key_sha256 != transport_host_key_sha256
+                || report.started_at > report.finished_at
+                || !terminal_report_shape(
+                    &report.outcome,
+                    report.error.as_deref(),
+                    report.result.as_ref(),
+                )
+                || report.verify().is_err()
+            {
+                anyhow::bail!("managed repro has no valid terminal signed report");
+            }
+            return Ok(Some(ReproExecutionEvidence {
+                capability,
+                spec,
+                command,
+                report: ReproExecutionReport::Managed { report },
+            }));
+        }
+        if self.is_cloud_lease(context.lease.lease_id).await? {
+            anyhow::bail!("cloud repro lease has no managed job");
+        }
+
+        let (status, SqlJson(command), report) = query_as::<
+            _,
+            (
+                String,
+                SqlJson<NodeCommand>,
+                Option<SqlJson<NodeCommandReport>>,
+            ),
+        >(
+            "SELECT status, document, verified_report FROM node_commands WHERE lease_id = $1",
+        )
+        .bind(context.lease.lease_id as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        validate_command(&command)?;
+        if reportless_failure(&status, report.is_some()) {
+            return Ok(None);
+        }
+        let report = report
+            .map(|SqlJson(report)| report)
+            .context("repro command has no verified final report")?;
+        let key = verifying_key(&context.offer.device_public_key)?;
+        if node_id(&key) != context.lease.node_id
+            || report.node_id != context.lease.node_id
+            || report.device_public_key != context.offer.device_public_key
+            || report.command_id != command.command_id
+            || !terminal_report_shape(
+                &report.outcome,
+                report.error.as_deref(),
+                report.result.as_ref(),
+            )
+            || report.verify(&key).is_err()
+        {
+            anyhow::bail!("repro command has no valid terminal node report");
+        }
+        Ok(Some(ReproExecutionEvidence {
+            capability,
+            spec,
+            command,
+            report: ReproExecutionReport::Node { report },
+        }))
     }
 
     async fn lease_context(&self, lease_id: u64) -> anyhow::Result<LeaseContext> {
@@ -2020,13 +2346,14 @@ impl Worker {
                 Option<DateTime<Utc>>,
                 Option<DateTime<Utc>>,
                 Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
                 Option<Uuid>,
                 i32,
             ),
         >(
             "SELECT l.document, o.document, lc.connection_id, \
-                    lc.cuda_ready_at, lc.gateway_ready_at, lc.access_started_at, lc.access_ended_at, \
-                    lc.gateway_closed_at, lc.grant_token_id, \
+                    lc.node_ready_at, lc.cuda_ready_at, lc.gateway_ready_at, lc.access_started_at, \
+                    lc.access_ended_at, lc.gateway_closed_at, lc.grant_token_id, \
                     COALESCE((q.document->>'min_vram_mib')::int, 0) \
              FROM leases l \
              JOIN node_offers o ON o.node_id = l.document->>'node_id' \
@@ -2040,14 +2367,15 @@ impl Worker {
         Ok(LeaseContext {
             lease: row.0.0,
             offer: row.1.0,
-            min_vram_mib: u32::try_from(row.9).unwrap_or(0),
+            min_vram_mib: u32::try_from(row.10).unwrap_or(0),
             connection_id: row.2,
-            cuda_ready_at: row.3,
-            gateway_ready_at: row.4,
-            access_started_at: row.5,
-            access_ended_at: row.6,
-            gateway_closed_at: row.7,
-            grant_token_id: row.8,
+            node_ready_at: row.3,
+            cuda_ready_at: row.4,
+            gateway_ready_at: row.5,
+            access_started_at: row.6,
+            access_ended_at: row.7,
+            gateway_closed_at: row.8,
+            grant_token_id: row.9,
         })
     }
 
@@ -2477,7 +2805,37 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
     )
     .fetch_one(pool)
     .await?;
-    if present.is_none() || !rejections {
+    let managed_jobs: Option<String> =
+        query_scalar("SELECT to_regclass('public.managed_repro_jobs')::text")
+            .fetch_one(pool)
+            .await?;
+    let managed_schema: bool = query_scalar(
+        "SELECT \
+             EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'managed_repro_jobs' \
+                   AND column_name = 'runner_public_key' \
+             ) \
+             AND EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'cloud_instances' \
+                   AND column_name = 'ssh_authorized_key' \
+                   AND is_nullable = 'YES' \
+             ) \
+             AND EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'cloud_instances' \
+                   AND column_name = 'gpu_model' \
+             ) \
+             AND EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'cloud_instances' \
+                   AND column_name = 'gpu_vram_mib' \
+             )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if present.is_none() || !rejections || managed_jobs.is_none() || !managed_schema {
         anyhow::bail!("control-plane lifecycle migrations have not been applied");
     }
     Ok(())
@@ -2485,6 +2843,32 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
 
 fn required_env(key: &str) -> anyhow::Result<String> {
     env::var(key).with_context(|| format!("{key} is required"))
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn terminal_report_shape(
+    outcome: &NodeCommandOutcome,
+    error: Option<&str>,
+    result: Option<&CommandResult>,
+) -> bool {
+    match outcome {
+        NodeCommandOutcome::Completed => error.is_none() && result.is_some(),
+        NodeCommandOutcome::Failed => {
+            error.is_some_and(|message| !message.is_empty() && message.len() <= 512)
+                && result.is_none()
+        }
+        NodeCommandOutcome::Ready => false,
+    }
+}
+
+fn reportless_failure(status: &str, has_report: bool) -> bool {
+    status == "failed" && !has_report
 }
 
 /// Recorded on startup so a service running behind the repository shows up in
@@ -2538,6 +2922,23 @@ mod tests {
                 .downcast_ref::<StillProvisioning>()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn managed_start_waits_for_a_transport_bound_runner() {
+        assert!(!managed_runner_is_ready("queued", None).unwrap());
+        assert!(!managed_runner_is_ready("preparing", None).unwrap());
+        assert!(managed_runner_is_ready("ready", Some(&"a".repeat(64))).unwrap());
+        assert!(managed_runner_is_ready("ready", Some(&"A".repeat(64))).is_err());
+        assert!(managed_runner_is_ready("failed", Some(&"a".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn batch_and_cloud_leases_never_receive_gateway_credentials() {
+        assert!(should_issue_gateway_access(false, false));
+        assert!(!should_issue_gateway_access(false, true));
+        assert!(!should_issue_gateway_access(true, false));
+        assert!(!should_issue_gateway_access(true, true));
     }
 
     #[test]
@@ -2760,5 +3161,27 @@ mod tests {
         let truncated = [0_u8; 96];
 
         assert!(truncated.get(128..160).is_none());
+    }
+
+    #[test]
+    fn a_signed_terminal_failure_does_not_need_a_fabricated_result() {
+        assert!(terminal_report_shape(
+            &NodeCommandOutcome::Failed,
+            Some("managed result became unavailable"),
+            None,
+        ));
+        assert!(!terminal_report_shape(
+            &NodeCommandOutcome::Failed,
+            None,
+            None,
+        ));
+        assert!(!terminal_report_shape(
+            &NodeCommandOutcome::Completed,
+            None,
+            None,
+        ));
+        assert!(reportless_failure("failed", false));
+        assert!(!reportless_failure("failed", true));
+        assert!(!reportless_failure("running", false));
     }
 }

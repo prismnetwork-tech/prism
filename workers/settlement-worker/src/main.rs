@@ -9,8 +9,11 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use prism_chain::EthereumSigner;
 use prism_protocol::{
-    ExecutionEvidence, MAX_VERIFIABLE_TRUST_CLASS, PublicReceipt, ROBINHOOD_CHAIN_ID,
-    ReceiptOutcome, SettlementEvidence, TrustClass, node_id, receipt_hash, verifying_key,
+    CommandResult, ExecutionEvidence, MAX_VERIFIABLE_TRUST_CLASS, ManagedProvider, NodeCommandKind,
+    NodeCommandOutcome, PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptOutcome, ReproExecutionReport,
+    ReproExecutor, ReproReceiptEvidence, SettlementEvidence, TrustClass, gpu_repro_spec_hash,
+    managed_repro_report_hash, node_id, receipt_hash, repro_command_hash, repro_report_hash,
+    repro_result_hash, repro_stream_hash, verifying_key,
 };
 use rlp::RlpStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -124,18 +127,19 @@ async fn run_file() -> anyhow::Result<()> {
     if evidence.len() > MAX_EVIDENCE_RECORDS {
         anyhow::bail!("settlement input contains too many evidence records");
     }
-    let mut proposals = evidence
-        .iter()
-        .map(reconcile)
-        .collect::<Result<Vec<_>, _>>()?;
-    proposals.sort_by_key(|proposal| proposal.lease_id);
-
     let rpc_url = secure_url(&required_env("PRISM_RPC_URL")?)?;
     let chain = ChainClient::new(rpc_url)?;
     let chain_id = chain.quantity("eth_chainId", serde_json::json!([])).await?;
     if chain_id != ROBINHOOD_CHAIN_ID {
         anyhow::bail!("RPC chain ID does not match Robinhood Chain mainnet");
     }
+    let gateway = chain.gateway(escrow).await?;
+    let mut proposals = evidence
+        .iter()
+        .map(|evidence| reconcile_with_gateway(evidence, Some(gateway)))
+        .collect::<Result<Vec<_>, _>>()?;
+    proposals.sort_by_key(|proposal| proposal.lease_id);
+
     let signer = EthereumSigner::from_environment("PRISM_ATTESTOR_KMS_KEY_ID").await?;
     let mut outbox = if outbox_path.exists() {
         serde_json::from_slice(&read_bounded(&outbox_path, MAX_EVIDENCE_BYTES)?)?
@@ -374,6 +378,8 @@ async fn prepare_durable_submission(
         .execute(&mut *connection)
         .await?;
     let result = async {
+        let gateway = chain.gateway(escrow).await?;
+        let proposal = reconcile_with_gateway(evidence, Some(gateway))?;
         // Reusing the stored submission is what makes settlement idempotent, but
         // those bytes carry the gas price they were signed at. If the chain has
         // rejected them repeatedly they can never land, and resubmitting until
@@ -393,9 +399,11 @@ async fn prepare_durable_submission(
             && existing.proposal.deadline
                 > (Utc::now().timestamp() as u64) + DEADLINE_MARGIN_SECONDS
         {
+            if existing.proposal.receipt_hash != proposal.receipt_hash {
+                anyhow::bail!("stored settlement proposal no longer matches verified evidence");
+            }
             return Ok(existing);
         }
-        let proposal = reconcile(evidence)?;
         let submission = prepare_submission(chain, signer, escrow, proposal).await?;
         query(
             "UPDATE settlement_jobs SET proposal = $2, raw_transaction = $3, \
@@ -456,7 +464,15 @@ const EARLY_CLOSE_GRACE_SECONDS: u64 = 5;
 /// a lease that finished between two polls is not mistaken for a fault.
 const STALE_OBSERVATION_SECONDS: u64 = 60;
 
+#[cfg(test)]
 fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal> {
+    reconcile_with_gateway(evidence, None)
+}
+
+fn reconcile_with_gateway(
+    evidence: &SettlementEvidence,
+    managed_gateway: Option<[u8; 20]>,
+) -> anyhow::Result<SettlementProposal> {
     if evidence.lease_id == 0
         || evidence.lease_nonce == 0
         || evidence.rate_per_second == 0
@@ -522,6 +538,7 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
     };
     let credited_seconds = interrupted.then(|| closed_at.saturating_sub(end));
     validate_execution_evidence(evidence, start, end)?;
+    let repro = validate_repro_evidence(evidence, managed_gateway)?;
     let trust_class = settled_trust_class(evidence)?;
     let maximum_by_deposit = evidence.deposit_base_units / evidence.rate_per_second;
     let usage_seconds = end
@@ -557,6 +574,7 @@ fn reconcile(evidence: &SettlementEvidence) -> anyhow::Result<SettlementProposal
         trust_class,
         attestation: None,
         credited_seconds,
+        repro,
         receipt_hash: String::new(),
         transaction_hash: String::new(),
     };
@@ -662,6 +680,180 @@ fn validate_execution_evidence(
         );
     }
     Ok(())
+}
+
+fn validate_repro_evidence(
+    evidence: &SettlementEvidence,
+    managed_gateway: Option<[u8; 20]>,
+) -> anyhow::Result<Option<ReproReceiptEvidence>> {
+    let Some(repro) = &evidence.repro else {
+        return Ok(None);
+    };
+    if !is_lower_sha256(&repro.capability.token_hash)
+        || !is_lower_sha256(&repro.capability.spec_hash)
+        || repro.spec.command.trim().is_empty()
+        || repro.spec.command.len() > 8 * 1024
+        || repro.spec.min_vram_mib == 0
+        || repro.spec.duration_seconds != evidence.duration_seconds
+        || repro.spec.expected_exit_code != repro.capability.expected_exit_code
+        || !(0..=255).contains(&repro.spec.expected_exit_code)
+        || gpu_repro_spec_hash(&repro.spec)? != repro.capability.spec_hash
+    {
+        anyhow::bail!(
+            "lease {} has an invalid repro capability or spec",
+            evidence.lease_id
+        );
+    }
+
+    let image_digest = repro
+        .spec
+        .image
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+        .filter(|digest| is_sha256_digest(digest) && is_lower_sha256(&digest[7..]))
+        .context("repro image is not pinned to a sha256 digest")?;
+    if image_digest != evidence.image_digest
+        || repro.command.node_id != evidence.node_id
+        || repro.command.lease_id != evidence.lease_id
+        || repro.command.command_id.is_nil()
+        || repro.command.expires_at <= repro.command.issued_at
+    {
+        anyhow::bail!(
+            "lease {} repro command does not match its lease",
+            evidence.lease_id
+        );
+    }
+    let NodeCommandKind::Batch {
+        image,
+        command,
+        duration_seconds,
+    } = &repro.command.kind
+    else {
+        anyhow::bail!(
+            "lease {} repro command is not a batch run",
+            evidence.lease_id
+        );
+    };
+    if image != &repro.spec.image
+        || command != &repro.spec.command
+        || *duration_seconds != repro.spec.duration_seconds
+    {
+        anyhow::bail!(
+            "lease {} repro command does not match its spec",
+            evidence.lease_id
+        );
+    }
+
+    let (executor, result, report_hash) = match &repro.report {
+        ReproExecutionReport::Node { report } => {
+            let key = verifying_key(&evidence.device_public_key)?;
+            if node_id(&key) != evidence.node_id
+                || report.node_id != evidence.node_id
+                || report.device_public_key != evidence.device_public_key
+                || report.command_id != repro.command.command_id
+                || report.request_id.is_nil()
+                || report.observed_at < repro.command.issued_at
+                || !terminal_report_shape(
+                    &report.outcome,
+                    report.error.as_deref(),
+                    report.result.as_ref(),
+                )
+                || report.verify(&key).is_err()
+            {
+                anyhow::bail!(
+                    "lease {} has an invalid final node repro report",
+                    evidence.lease_id
+                );
+            }
+            (
+                ReproExecutor::Node,
+                report.result.as_ref(),
+                repro_report_hash(report)?,
+            )
+        }
+        ReproExecutionReport::Managed { report } => {
+            let gateway = managed_gateway.context("managed repro gateway was not resolved")?;
+            let ExecutionEvidence::Vast { instance_id, .. } = &evidence.execution else {
+                anyhow::bail!(
+                    "lease {} managed repro report is not backed by managed execution",
+                    evidence.lease_id
+                );
+            };
+            let started_at = u64::try_from(report.started_at.timestamp())
+                .context("managed repro start precedes the Unix epoch")?;
+            let finished_at = u64::try_from(report.finished_at.timestamp())
+                .context("managed repro finish precedes the Unix epoch")?;
+            if report.report_id.is_nil()
+                || report.command_id != repro.command.command_id
+                || report.lease_id != evidence.lease_id
+                || report.provider != ManagedProvider::Vast
+                || report.provider_instance_id != *instance_id
+                || report.gpu_model != evidence.gpu_model
+                || report.gpu_vram_mib < repro.spec.min_vram_mib
+                || report.gpu_vram_mib > 196_608
+                || !is_lower_sha256(&report.transport_host_key_sha256)
+                || report.started_at < repro.command.issued_at
+                || started_at < evidence.access_started_at
+                || finished_at < started_at
+                || finished_at > evidence.access_ended_at
+                || finished_at.saturating_sub(started_at) > u64::from(repro.spec.duration_seconds)
+                || !terminal_report_shape(
+                    &report.outcome,
+                    report.error.as_deref(),
+                    report.result.as_ref(),
+                )
+                || report.verify().is_err()
+                || address(&report.signer)? != gateway
+            {
+                anyhow::bail!(
+                    "lease {} has an invalid final managed repro report",
+                    evidence.lease_id
+                );
+            }
+            (
+                ReproExecutor::Managed,
+                report.result.as_ref(),
+                managed_repro_report_hash(report)?,
+            )
+        }
+    };
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    if !result.within_limits() || !(-255..=255).contains(&result.exit_code) {
+        anyhow::bail!("lease {} repro output exceeds its limit", evidence.lease_id);
+    }
+
+    Ok(Some(ReproReceiptEvidence {
+        executor,
+        token_hash: repro.capability.token_hash.clone(),
+        spec_hash: repro.capability.spec_hash.clone(),
+        image_digest: evidence.image_digest.clone(),
+        command_hash: repro_command_hash(&repro.command)?,
+        result_hash: repro_result_hash(result)?,
+        stdout_hash: repro_stream_hash(&result.stdout),
+        stderr_hash: repro_stream_hash(&result.stderr),
+        report_hash,
+        exit_code: result.exit_code,
+        expected_exit_code: repro.capability.expected_exit_code,
+        succeeded: result.exit_code == repro.capability.expected_exit_code,
+        truncated: result.truncated,
+    }))
+}
+
+fn terminal_report_shape(
+    outcome: &NodeCommandOutcome,
+    error: Option<&str>,
+    result: Option<&CommandResult>,
+) -> bool {
+    match outcome {
+        NodeCommandOutcome::Completed => error.is_none() && result.is_some(),
+        NodeCommandOutcome::Failed => {
+            error.is_some_and(|message| !message.is_empty() && message.len() <= 512)
+                && result.is_none()
+        }
+        NodeCommandOutcome::Ready => false,
+    }
 }
 
 async fn prepare_submission(
@@ -863,6 +1055,23 @@ impl ChainClient {
             .saturating_mul(2))
     }
 
+    async fn gateway(&self, escrow: [u8; 20]) -> anyhow::Result<[u8; 20]> {
+        let selector = Keccak256::digest(b"gateway()");
+        let value: String = self
+            .call(
+                "eth_call",
+                serde_json::json!([
+                    {
+                        "to": format!("0x{}", hex::encode(escrow)),
+                        "data": format!("0x{}", hex::encode(&selector[..4])),
+                    },
+                    "latest"
+                ]),
+            )
+            .await?;
+        decode_abi_address(&value).context("escrow gateway response is invalid")
+    }
+
     /// The escrow decides how long a proposal can be disputed. Reading it beats
     /// assuming: the value is a constant in a non-upgradeable contract, so a
     /// hardcoded guess is wrong for every deployment that does not share it.
@@ -993,6 +1202,24 @@ fn address(value: &str) -> anyhow::Result<[u8; 20]> {
         .map_err(|_| anyhow::anyhow!("address must contain 20 bytes"))
 }
 
+fn decode_abi_address(value: &str) -> anyhow::Result<[u8; 20]> {
+    let bytes = hex::decode(
+        value
+            .strip_prefix("0x")
+            .context("ABI address must start with 0x")?,
+    )?;
+    if bytes.len() != 32 || bytes[..12].iter().any(|byte| *byte != 0) {
+        anyhow::bail!("ABI address must be one zero-padded word");
+    }
+    let address: [u8; 20] = bytes[12..]
+        .try_into()
+        .expect("validated ABI address is 20 bytes");
+    if address == [0_u8; 20] {
+        anyhow::bail!("ABI address must not be zero");
+    }
+    Ok(address)
+}
+
 fn bytes32(value: &str) -> anyhow::Result<[u8; 32]> {
     let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))?;
     bytes
@@ -1004,6 +1231,13 @@ fn is_sha256_digest(value: &str) -> bool {
     value.len() == 71
         && value.starts_with("sha256:")
         && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn secure_url(value: &str) -> anyhow::Result<url::Url> {
@@ -1081,14 +1315,21 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::SigningKey as DeviceSigningKey;
-    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-    use prism_protocol::{NodeTelemetry, UnsignedTelemetry, node_id};
+    use k256::ecdsa::{
+        RecoveryId, Signature, SigningKey as ManagedSigningKey, VerifyingKey,
+        signature::hazmat::PrehashSigner,
+    };
+    use prism_protocol::{
+        CommandResult, GpuReproSpec, ManagedCommandReport, ManagedCommandReportPayload,
+        ManagedProvider, NodeCommand, NodeCommandReport, NodeCommandReportPayload, NodeTelemetry,
+        ReproCapability, ReproExecutionEvidence, ReproExecutionReport, UnsignedTelemetry,
+        gpu_repro_spec_hash, managed_command_report_digest, node_id,
+    };
     use rand::rngs::OsRng;
 
     use super::*;
 
-    fn evidence() -> SettlementEvidence {
-        let key = DeviceSigningKey::generate(&mut OsRng);
+    fn evidence_with_key(key: &DeviceSigningKey) -> SettlementEvidence {
         let node = node_id(&key.verifying_key());
         let image_digest = format!("sha256:{}", "a".repeat(64));
         let telemetry = [1_i64, 70, 120]
@@ -1107,7 +1348,7 @@ mod tests {
                         image_digest: Some(image_digest.clone()),
                         posture: None,
                     },
-                    &key,
+                    key,
                 )
                 .unwrap()
             })
@@ -1132,7 +1373,140 @@ mod tests {
             trust_class: None,
             execution: ExecutionEvidence::Physical,
             node_telemetry: telemetry,
+            repro: None,
         }
+    }
+
+    fn evidence() -> SettlementEvidence {
+        evidence_with_key(&DeviceSigningKey::generate(&mut OsRng))
+    }
+
+    fn repro_evidence(exit_code: i32, expected_exit_code: i32) -> SettlementEvidence {
+        let key = DeviceSigningKey::generate(&mut OsRng);
+        let mut evidence = evidence_with_key(&key);
+        let spec = GpuReproSpec {
+            image: format!("registry.example/runtime@{}", evidence.image_digest),
+            command: "python -c 'print(6 * 7)'".to_owned(),
+            duration_seconds: evidence.duration_seconds,
+            min_vram_mib: 1_024,
+            expected_exit_code,
+        };
+        let capability = ReproCapability {
+            token_hash: "1".repeat(64),
+            spec_hash: gpu_repro_spec_hash(&spec).unwrap(),
+            expected_exit_code,
+        };
+        let command = NodeCommand {
+            command_id: uuid::Uuid::now_v7(),
+            node_id: evidence.node_id.clone(),
+            lease_id: evidence.lease_id,
+            issued_at: Utc.timestamp_opt(1, 0).unwrap(),
+            expires_at: Utc.timestamp_opt(601, 0).unwrap(),
+            kind: NodeCommandKind::Batch {
+                image: spec.image.clone(),
+                command: spec.command.clone(),
+                duration_seconds: spec.duration_seconds,
+            },
+        };
+        let report = NodeCommandReport::sign(
+            NodeCommandReportPayload {
+                node_id: evidence.node_id.clone(),
+                device_public_key: evidence.device_public_key.clone(),
+                request_id: uuid::Uuid::now_v7(),
+                command_id: command.command_id,
+                outcome: NodeCommandOutcome::Completed,
+                observed_at: Utc.timestamp_opt(100, 0).unwrap(),
+                error: None,
+                result: Some(CommandResult {
+                    exit_code,
+                    stdout: "42\n".to_owned(),
+                    stderr: String::new(),
+                    truncated: false,
+                }),
+            },
+            &key,
+        )
+        .unwrap();
+        evidence.repro = Some(ReproExecutionEvidence {
+            capability,
+            spec,
+            command,
+            report: ReproExecutionReport::Node { report },
+        });
+        evidence
+    }
+
+    fn managed_repro_evidence() -> (SettlementEvidence, [u8; 20]) {
+        let mut evidence = repro_evidence(0, 0);
+        evidence.execution = ExecutionEvidence::Vast {
+            instance_id: 42,
+            hourly_cost_micros: 600_000,
+        };
+        evidence.node_telemetry.clear();
+        let repro = evidence.repro.as_mut().unwrap();
+        let payload = ManagedCommandReportPayload {
+            report_id: uuid::Uuid::now_v7(),
+            signer: "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_owned(),
+            command_id: repro.command.command_id,
+            lease_id: evidence.lease_id,
+            provider: ManagedProvider::Vast,
+            provider_instance_id: 42,
+            gpu_model: evidence.gpu_model.clone(),
+            gpu_vram_mib: 24_576,
+            transport_host_key_sha256: "b".repeat(64),
+            started_at: Utc.timestamp_opt(20, 0).unwrap(),
+            finished_at: Utc.timestamp_opt(100, 0).unwrap(),
+            outcome: NodeCommandOutcome::Completed,
+            error: None,
+            result: Some(CommandResult {
+                exit_code: 0,
+                stdout: "42\n".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            }),
+        };
+        let gateway = address(&payload.signer).unwrap();
+        let mut report = ManagedCommandReport {
+            report_id: payload.report_id,
+            signer: payload.signer,
+            command_id: payload.command_id,
+            lease_id: payload.lease_id,
+            provider: payload.provider,
+            provider_instance_id: payload.provider_instance_id,
+            gpu_model: payload.gpu_model,
+            gpu_vram_mib: payload.gpu_vram_mib,
+            transport_host_key_sha256: payload.transport_host_key_sha256,
+            started_at: payload.started_at,
+            finished_at: payload.finished_at,
+            outcome: payload.outcome,
+            error: payload.error,
+            result: payload.result,
+            signature: String::new(),
+        };
+        sign_managed_report(&mut report);
+        repro.report = ReproExecutionReport::Managed { report };
+        (evidence, gateway)
+    }
+
+    fn sign_managed_report(report: &mut ManagedCommandReport) {
+        let digest = managed_command_report_digest(&report.payload()).unwrap();
+        let mut key_bytes = [0_u8; 32];
+        key_bytes[31] = 1;
+        let key = ManagedSigningKey::from_slice(&key_bytes).unwrap();
+        let signature: Signature = key.sign_prehash(&digest).unwrap();
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let recovery_id = [0_u8, 1]
+            .into_iter()
+            .filter_map(RecoveryId::from_byte)
+            .find(|recovery_id| {
+                VerifyingKey::recover_from_prehash(&digest, &signature, *recovery_id)
+                    .is_ok_and(|recovered| recovered == *key.verifying_key())
+            })
+            .unwrap();
+        let mut encoded = [0_u8; 65];
+        encoded[..64].copy_from_slice(&signature.to_bytes());
+        encoded[64] = 27 + recovery_id.to_byte();
+        report.signature = format!("0x{}", hex::encode(encoded));
     }
 
     /// A lease whose machine went away 200s into a 900s window, noticed 150s
@@ -1239,6 +1613,166 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_commits_verified_repro_evidence() {
+        let evidence = repro_evidence(0, 0);
+        let source = evidence.repro.as_ref().unwrap();
+        let ReproExecutionReport::Node { report } = &source.report else {
+            panic!("node report")
+        };
+        let result = report.result.as_ref().unwrap();
+        let proposal = reconcile(&evidence).unwrap();
+        let receipt = proposal.receipt.repro.as_ref().unwrap();
+
+        assert_eq!(receipt.executor, ReproExecutor::Node);
+        assert_eq!(receipt.token_hash, source.capability.token_hash);
+        assert_eq!(receipt.spec_hash, source.capability.spec_hash);
+        assert_eq!(receipt.image_digest, evidence.image_digest);
+        assert_eq!(
+            receipt.command_hash,
+            repro_command_hash(&source.command).unwrap()
+        );
+        assert_eq!(receipt.result_hash, repro_result_hash(result).unwrap());
+        assert_eq!(receipt.report_hash, repro_report_hash(report).unwrap());
+        assert_eq!(receipt.stdout_hash, repro_stream_hash("42\n"));
+        assert_eq!(receipt.stderr_hash, repro_stream_hash(""));
+        assert_eq!(receipt.exit_code, 0);
+        assert_eq!(receipt.expected_exit_code, 0);
+        assert!(receipt.succeeded);
+        assert!(!receipt.truncated);
+        assert!(prism_protocol::receipt_hash_matches(&proposal.receipt).unwrap());
+    }
+
+    #[test]
+    fn a_completed_repro_can_prove_an_expected_failure() {
+        let proposal = reconcile(&repro_evidence(2, 2)).unwrap();
+        assert!(proposal.receipt.repro.unwrap().succeeded);
+
+        let proposal = reconcile(&repro_evidence(2, 0)).unwrap();
+        assert!(!proposal.receipt.repro.unwrap().succeeded);
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_tampered_repro_report() {
+        let mut evidence = repro_evidence(0, 0);
+        let ReproExecutionReport::Node { report } = &mut evidence.repro.as_mut().unwrap().report
+        else {
+            panic!("node report")
+        };
+        report.result.as_mut().unwrap().stdout = "43\n".to_owned();
+
+        assert!(reconcile(&evidence).is_err());
+    }
+
+    #[test]
+    fn reconciliation_accepts_a_gateway_signed_managed_report() {
+        let (evidence, gateway) = managed_repro_evidence();
+        let proposal = reconcile_with_gateway(&evidence, Some(gateway)).unwrap();
+        let receipt = proposal.receipt.repro.unwrap();
+
+        assert_eq!(receipt.executor, ReproExecutor::Managed);
+        assert!(receipt.succeeded);
+        assert_eq!(receipt.stdout_hash, repro_stream_hash("42\n"));
+    }
+
+    #[test]
+    fn a_gateway_signed_infrastructure_failure_can_close_without_a_fake_result() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        let ReproExecutionReport::Managed { report } = &mut evidence.repro.as_mut().unwrap().report
+        else {
+            panic!("managed report")
+        };
+        report.outcome = NodeCommandOutcome::Failed;
+        report.error = Some("managed result became unavailable".to_owned());
+        report.result = None;
+        sign_managed_report(report);
+
+        let proposal = reconcile_with_gateway(&evidence, Some(gateway)).unwrap();
+        assert!(proposal.receipt.repro.is_none());
+        assert!(prism_protocol::receipt_hash_matches(&proposal.receipt).unwrap());
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_managed_report_from_the_wrong_gateway() {
+        let (evidence, _) = managed_repro_evidence();
+
+        assert!(reconcile_with_gateway(&evidence, Some([9_u8; 20])).is_err());
+        assert!(reconcile(&evidence).is_err());
+    }
+
+    #[test]
+    fn reconciliation_rejects_tampered_managed_results() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        let ReproExecutionReport::Managed { report } = &mut evidence.repro.as_mut().unwrap().report
+        else {
+            panic!("managed report")
+        };
+        report.result.as_mut().unwrap().stdout = "43\n".to_owned();
+
+        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+    }
+
+    #[test]
+    fn reconciliation_rejects_managed_execution_outside_the_active_window() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        let ReproExecutionReport::Managed { report } = &mut evidence.repro.as_mut().unwrap().report
+        else {
+            panic!("managed report")
+        };
+        report.finished_at = Utc.timestamp_opt(121, 0).unwrap();
+        sign_managed_report(report);
+
+        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_managed_report_for_another_instance() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        let ReproExecutionReport::Managed { report } = &mut evidence.repro.as_mut().unwrap().report
+        else {
+            panic!("managed report")
+        };
+        report.provider_instance_id += 1;
+        sign_managed_report(report);
+
+        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_managed_report_for_another_gpu() {
+        let (mut evidence, gateway) = managed_repro_evidence();
+        let ReproExecutionReport::Managed { report } = &mut evidence.repro.as_mut().unwrap().report
+        else {
+            panic!("managed report")
+        };
+        report.gpu_model = "NVIDIA H100".to_owned();
+        sign_managed_report(report);
+
+        assert!(reconcile_with_gateway(&evidence, Some(gateway)).is_err());
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_repro_spec_not_bound_to_the_capability() {
+        let mut evidence = repro_evidence(0, 0);
+        evidence.repro.as_mut().unwrap().spec.min_vram_mib += 1;
+
+        assert!(reconcile(&evidence).is_err());
+    }
+
+    #[test]
+    fn reconciliation_rejects_exit_codes_outside_the_capsule_contract() {
+        assert!(reconcile(&repro_evidence(0, 256)).is_err());
+        assert!(reconcile(&repro_evidence(256, 0)).is_err());
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_command_for_another_lease() {
+        let mut evidence = repro_evidence(0, 0);
+        evidence.repro.as_mut().unwrap().command.lease_id += 1;
+
+        assert!(reconcile(&evidence).is_err());
+    }
+
+    #[test]
     fn cloud_reconciliation_uses_explicit_profitable_provider_evidence() {
         let mut evidence = evidence();
         evidence.execution = ExecutionEvidence::Vast {
@@ -1307,6 +1841,22 @@ mod tests {
     fn dispute_window_selector_matches_the_escrow() {
         let selector = Keccak256::digest(b"DISPUTE_WINDOW()");
         assert_eq!(hex::encode(&selector[..4]), "f585dc57");
+    }
+
+    #[test]
+    fn gateway_selector_and_abi_address_match_the_escrow() {
+        let selector = Keccak256::digest(b"gateway()");
+        assert_eq!(hex::encode(&selector[..4]), "116191b6");
+
+        let gateway = [7_u8; 20];
+        let mut word = [0_u8; 32];
+        word[12..].copy_from_slice(&gateway);
+        assert_eq!(
+            decode_abi_address(&format!("0x{}", hex::encode(word))).unwrap(),
+            gateway
+        );
+        assert!(decode_abi_address(&format!("0x{}", "00".repeat(32))).is_err());
+        assert!(decode_abi_address("0x01").is_err());
     }
 
     #[test]

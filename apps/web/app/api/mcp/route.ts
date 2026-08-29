@@ -2,11 +2,17 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import {
   GpuCapabilityError,
+  maxGpuReproCommandBytes,
   prepareGpuLeasePlan,
   summarizeGpuCapacity,
 } from "@/lib/gpu-capability";
 import { loadGpuOffers } from "@/lib/gpu-capability-server";
+import {
+  GpuReproStatusError,
+  loadGpuReproStatus,
+} from "@/lib/gpu-repro-server";
 import { loadPublicProofIndex } from "@/lib/public-proof-server";
+import { createReproIntent } from "@/lib/repro-intent";
 import { requestSubject, takeRateLimit } from "@/lib/server-rate-limit";
 import { siteUrl } from "@/lib/site";
 
@@ -49,38 +55,110 @@ const mcpHandler = createMcpHandler((server) => {
     "prism_prepare_gpu_repro",
     {
       title: "Prepare a bounded GPU repro",
-      description: "Validate a reproducible GPU lease intent and return an approval URL with a live cost ceiling. This tool cannot spend funds, sign a wallet transaction, or create a lease.",
+      description: "Bind an exact command and digest-pinned image into a short-lived approval intent with a live cost ceiling. This tool cannot spend funds, sign a wallet transaction, or create a lease.",
       inputSchema: z.object({
         image: z.string().min(1).max(512).describe("Public OCI image pinned as repository@sha256:<64 hex characters>."),
+        command: z.string().min(1).max(maxGpuReproCommandBytes).describe("Exact command to run on the GPU, up to 2 KiB UTF-8."),
         duration_minutes: z.union([z.literal(30), z.literal(60), z.literal(120), z.literal(360)]),
         min_vram_gib: z.number().int().min(1).max(192),
-        ssh_public_key: z.string().min(1).max(16_384).describe("One Ed25519 public key. Never send the private key."),
+        expected_exit_code: z.number().int().min(0).max(255).default(0),
       }),
       annotations: readOnly,
     },
-    async ({ image, duration_minutes, min_vram_gib, ssh_public_key }) => toolResult(async () => {
+    async ({ image, command, duration_minutes, min_vram_gib, expected_exit_code }) => toolResult(async () => {
       const plan = prepareGpuLeasePlan(
         await loadGpuOffers(),
         {
           image,
+          command,
           durationMinutes: duration_minutes,
           minVramGib: min_vram_gib,
-          sshPublicKey: ssh_public_key,
+          expectedExitCode: expected_exit_code,
         },
-        siteUrl,
       );
+      const intent = createReproIntent(plan, plan.maximumEscrowBaseUnits, siteUrl);
       return {
-        approval_url: plan.approvalUrl,
+        approval_url: intent.approvalUrl,
+        repro_token: intent.reproToken,
+        spec_hash: intent.payload.spec_hash,
         estimated_gpu: {
           model: plan.estimatedGpu.model,
           vram_gib: Math.round(plan.estimatedGpu.vramMib / 1_024),
           cuda_major: plan.estimatedGpu.cudaMajor,
         },
+        estimated_executor: plan.estimatedExecutor,
+        execution_boundary: plan.estimatedExecutor === "managed"
+          ? "Prism centrally orchestrates the digest-pinned job over pinned SSH transport and signs the report with its gateway identity. This is inspectable evidence, not device attestation or proof of faithful computation."
+          : "The enrolled node signs the execution report with its device identity. This binds the report to that node; it does not prove faithful computation by itself.",
         duration_minutes,
+        expected_exit_code,
+        maximum_escrow: intent.payload.maximum_escrow,
         maximum_escrow_usdg: plan.maximumEscrowUsdg,
         lease_created: false,
-        approval_required: "Open the URL, sign in, review the live quote, and approve the wallet transaction.",
+        approval_required: "Open the URL, sign in, verify the locked command and live quote, then approve the wallet transaction.",
+        next: "Keep repro_token private. Use it with the status, evidence, and verify tools after approval.",
         data_boundary: "Use only public images and non-confidential data. Independent providers may operate the assigned GPU.",
+      };
+    }),
+  );
+
+  server.registerTool(
+    "prism_gpu_repro_status",
+    {
+      title: "Read GPU repro status",
+      description: "Read the state and bounded result of one GPU repro using its 256-bit read capability. This cannot create or change a lease.",
+      inputSchema: z.object({
+        repro_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+      }),
+      annotations: readOnly,
+    },
+    async ({ repro_token }) => toolResult(async () => {
+      const { evidence: _evidence, checks: _checks, ...status } = await loadGpuReproStatus(repro_token);
+      return status;
+    }),
+  );
+
+  server.registerTool(
+    "prism_gpu_repro_evidence",
+    {
+      title: "Read GPU repro evidence",
+      description: "Read capability-scoped execution evidence for one GPU repro. A node report is signed by an enrolled device key; a managed report is signed by the Prism gateway for a centrally orchestrated SSH run. Either signature authenticates a report, but neither alone proves faithful computation.",
+      inputSchema: z.object({
+        repro_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+      }),
+      annotations: readOnly,
+    },
+    async ({ repro_token }) => toolResult(async () => {
+      const status = await loadGpuReproStatus(repro_token);
+      if (status.evidence === undefined) throw new GpuReproStatusError("evidence_not_ready");
+      return {
+        status: status.status,
+        spec_hash: status.spec_hash,
+        lease_id: status.lease_id,
+        evidence: status.evidence,
+      };
+    }),
+  );
+
+  server.registerTool(
+    "prism_verify_gpu_repro",
+    {
+      title: "Verify GPU repro evidence",
+      description: "Return the available token, spec, command, report-signature, result, and settlement checks for a GPU repro. Node means an enrolled device-signed report; managed means a Prism gateway-signed report from central SSH orchestration. Neither signature alone proves faithful computation.",
+      inputSchema: z.object({
+        repro_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+      }),
+      annotations: readOnly,
+    },
+    async ({ repro_token }) => toolResult(async () => {
+      const status = await loadGpuReproStatus(repro_token);
+      if (status.checks === undefined) throw new GpuReproStatusError("verification_not_ready");
+      return {
+        status: status.status,
+        spec_hash: status.spec_hash,
+        lease_id: status.lease_id,
+        checks: status.checks,
+        assurance: "For executor=node, an enrolled device key signed the report. For executor=managed, the Prism gateway signed a report from centrally orchestrated SSH execution. Settlement checks the current gateway; this MCP response does not independently query chain state. Neither signature alone proves faithful computation.",
       };
     }),
   );
@@ -94,21 +172,23 @@ const mcpHandler = createMcpHandler((server) => {
         limit: z.number().int().min(1).max(100).default(20),
         receipt_id: z.string().min(1).max(128).optional(),
         transaction_hash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
+        repro_spec_hash: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
       }),
       annotations: readOnly,
     },
-    async ({ limit, receipt_id, transaction_hash }) => toolResult(async () => {
+    async ({ limit, receipt_id, transaction_hash, repro_spec_hash }) => toolResult(async () => {
       const index = await loadPublicProofIndex();
       const receipts = index.receipts
         .filter((receipt) => !receipt_id || receipt.receipt_id === receipt_id)
         .filter((receipt) => !transaction_hash || receipt.transaction_hash.toLowerCase() === transaction_hash.toLowerCase())
+        .filter((receipt) => !repro_spec_hash || receipt.repro?.spec_hash.toLowerCase() === repro_spec_hash.toLowerCase())
         .slice(0, limit);
       return { generated_at: index.generated_at, receipts };
     }),
   );
 }, {
-  serverInfo: { name: "prism-network", version: "0.1.0" },
-  instructions: "Expose read-only Prism GPU availability, bounded launch preparation, and public settlement receipts. Wallet signing and lease creation always require a separate human approval in the Prism web application.",
+  serverInfo: { name: "prism-network", version: "0.2.0" },
+  instructions: "Expose read-only Prism GPU availability, bounded repro preparation, capability-scoped status and evidence, verification checks, and public settlement receipts. Wallet signing and lease creation always require a separate human approval in the Prism web application.",
   maxSubscriptions: 0,
 });
 
@@ -168,7 +248,7 @@ async function toolResult(load: () => Promise<unknown>) {
     const payload = await load();
     return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
   } catch (error) {
-    const message = error instanceof GpuCapabilityError
+    const message = error instanceof GpuCapabilityError || error instanceof GpuReproStatusError
       ? error.message
       : "Prism is temporarily unavailable.";
     return {

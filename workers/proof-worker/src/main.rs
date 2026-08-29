@@ -467,6 +467,23 @@ fn validate_receipts(receipts: &[PublicReceipt]) -> anyhow::Result<()> {
         }) {
             anyhow::bail!("public receipt contains a malformed attestation");
         }
+        if let Some(repro) = &receipt.repro {
+            if receipt.outcome != ReceiptOutcome::Finalized
+                || !is_lower_digest(&repro.token_hash)
+                || !is_lower_digest(&repro.spec_hash)
+                || !is_lower_image_digest(&repro.image_digest)
+                || !is_lower_digest(&repro.command_hash)
+                || !is_lower_digest(&repro.result_hash)
+                || !is_lower_digest(&repro.stdout_hash)
+                || !is_lower_digest(&repro.stderr_hash)
+                || !is_lower_digest(&repro.report_hash)
+                || !(-255..=255).contains(&repro.exit_code)
+                || !(0..=255).contains(&repro.expected_exit_code)
+                || repro.succeeded != (repro.exit_code == repro.expected_exit_code)
+            {
+                anyhow::bail!("public receipt contains malformed repro evidence");
+            }
+        }
         if receipt.failure_class.as_ref().is_some_and(|class| {
             class.is_empty()
                 || class.len() > 64
@@ -714,8 +731,10 @@ fn publish_artifacts(directory: &Path, receipts: &[PublicReceipt]) -> anyhow::Re
     let page_directory = directory.join("pages");
     fs::create_dir_all(&page_directory)?;
     let pages = proof_pages(receipts);
-    let expected_pages: HashSet<String> =
-        pages.iter().map(|(key, _)| key["pages/".len()..].to_owned()).collect();
+    let expected_pages: HashSet<String> = pages
+        .iter()
+        .map(|(key, _)| key["pages/".len()..].to_owned())
+        .collect();
     for entry in fs::read_dir(&page_directory)? {
         let entry = entry?;
         if entry.file_type()?.is_file()
@@ -803,6 +822,17 @@ fn is_hash(value: &str) -> bool {
 
 fn is_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_lower_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_lower_image_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(is_lower_digest)
 }
 
 async fn post_to_x(text: &str) -> anyhow::Result<String> {
@@ -953,7 +983,8 @@ fn parse_https_url(value: &str) -> anyhow::Result<url::Url> {
 mod tests {
     use super::*;
     use prism_protocol::{
-        AttestationKind, PublicReceipt, ReceiptAttestation, ReceiptOutcome, receipt_hash,
+        AttestationKind, PublicReceipt, ReceiptAttestation, ReceiptOutcome, ReproExecutor,
+        ReproReceiptEvidence, receipt_hash,
     };
     use uuid::Uuid;
 
@@ -974,6 +1005,7 @@ mod tests {
                 outcome: ReceiptOutcome::Finalized,
                 trust_class: None,
                 attestation: None,
+                repro: None,
                 receipt_hash: String::new(),
                 transaction_hash: format!("0x{}", "a".repeat(64)),
             },
@@ -991,6 +1023,7 @@ mod tests {
                 outcome: ReceiptOutcome::Refunded,
                 trust_class: None,
                 attestation: None,
+                repro: None,
                 receipt_hash: String::new(),
                 transaction_hash: format!("0x{}", "b".repeat(64)),
             },
@@ -1023,6 +1056,7 @@ mod tests {
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: format!("0x{}", "b".repeat(64)),
         };
@@ -1094,6 +1128,51 @@ mod tests {
         });
         receipt.receipt_hash = receipt_hash(&receipt).unwrap();
         assert!(validate_receipts(&[receipt]).is_err());
+    }
+
+    #[test]
+    fn receipt_validation_accepts_anchored_node_repro_commitments() {
+        let mut receipt = valid_receipt("1", 'a');
+        receipt.repro = Some(repro());
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        validate_receipts(&[receipt]).unwrap();
+    }
+
+    #[test]
+    fn receipt_validation_rejects_inconsistent_repro_outcomes() {
+        let mut receipt = valid_receipt("1", 'a');
+        receipt.repro = Some(ReproReceiptEvidence {
+            succeeded: false,
+            ..repro()
+        });
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        assert!(validate_receipts(&[receipt]).is_err());
+    }
+
+    #[test]
+    fn receipt_validation_rejects_noncanonical_repro_hashes() {
+        let mut receipt = valid_receipt("1", 'a');
+        receipt.repro = Some(ReproReceiptEvidence {
+            report_hash: "A".repeat(64),
+            ..repro()
+        });
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        assert!(validate_receipts(&[receipt]).is_err());
+    }
+
+    #[test]
+    fn receipt_validation_accepts_gateway_verified_managed_repro() {
+        let mut receipt = valid_receipt("1", 'a');
+        receipt.repro = Some(ReproReceiptEvidence {
+            executor: ReproExecutor::Managed,
+            ..repro()
+        });
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        validate_receipts(&[receipt]).unwrap();
     }
 
     #[test]
@@ -1225,6 +1304,24 @@ mod tests {
         }
     }
 
+    fn repro() -> ReproReceiptEvidence {
+        ReproReceiptEvidence {
+            executor: ReproExecutor::Node,
+            token_hash: "0".repeat(64),
+            spec_hash: "1".repeat(64),
+            image_digest: format!("sha256:{}", "2".repeat(64)),
+            command_hash: "3".repeat(64),
+            result_hash: "4".repeat(64),
+            stdout_hash: "5".repeat(64),
+            stderr_hash: "6".repeat(64),
+            report_hash: "7".repeat(64),
+            exit_code: 0,
+            expected_exit_code: 0,
+            succeeded: true,
+            truncated: false,
+        }
+    }
+
     fn valid_receipt(lease_id: &str, transaction: char) -> PublicReceipt {
         PublicReceipt {
             receipt_id: Uuid::now_v7(),
@@ -1240,6 +1337,7 @@ mod tests {
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: format!("0x{}", transaction.to_string().repeat(64)),
         }

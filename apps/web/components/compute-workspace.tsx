@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { createPublicClient, encodeFunctionData, http, keccak256, toBytes, type Address, type Hex } from "viem";
 import { usePrismAuth, useSmartWallet } from "@/components/providers";
 import { escrowAbi, escrowAddress, robinhoodChain, usdgAbi, usdgAddress } from "@/lib/chain";
-import { isPinnedPublicImage, isSshPublicKey, parseGpuLaunchIntent } from "@/lib/gpu-capability";
+import { isGpuReproCommand, isPinnedPublicImage, isSshPublicKey } from "@/lib/gpu-capability";
 
 type TrustClass = "open" | "isolated" | "attested" | "confidential";
 
@@ -44,7 +44,41 @@ type LeaseQuote = {
   node_id: `0x${string}`;
   image: string;
   duration_seconds: number;
+  min_vram_mib: number;
   rate_per_second: number;
+  maximum_escrow: number;
+  command?: string;
+  repro?: {
+    token_hash: string;
+    spec_hash: string;
+    expected_exit_code: number;
+  };
+};
+
+type ReproIntent = {
+  version: "prism.gpu-repro.intent.v1";
+  image: string;
+  command: string;
+  duration_seconds: number;
+  min_vram_mib: number;
+  expected_exit_code: number;
+  maximum_escrow: string;
+  token_hash: string;
+  spec_hash: string;
+  issued_at: number;
+  expires_at: number;
+};
+
+type CommandResult = {
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+};
+
+type ReproProgress = {
+  leaseState: string;
+  result: CommandResult | null;
 };
 
 const apps = [
@@ -66,8 +100,11 @@ export function ComputeWorkspace() {
   const [customImage, setCustomImage] = useState("");
   const [sshKey, setSshKey] = useState("");
   const [generatedKey, setGeneratedKey] = useState(false);
-  const [confirmed, setConfirmed] = useState<{ model: string; vram: number; escrow: string; hash: string } | null>(null);
-  const image = (advanced ? customImage.trim() : apps.find((app) => app.id === appId)?.image) ?? "";
+  const [confirmed, setConfirmed] = useState<{ model: string; vram: number; escrow: string; hash: string; leaseId: number; repro: boolean } | null>(null);
+  const [reproIntent, setReproIntent] = useState<ReproIntent | null>(null);
+  const [reproLoad, setReproLoad] = useState<"none" | "loading" | "ready" | "invalid">("none");
+  const [reproProgress, setReproProgress] = useState<ReproProgress | null>(null);
+  const image = reproIntent?.image ?? ((advanced ? customImage.trim() : apps.find((app) => app.id === appId)?.image) ?? "");
   const [offers, setOffers] = useState<MarketplaceOffer[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [fundingAddress, setFundingAddress] = useState<Address | null>(null);
@@ -83,11 +120,15 @@ export function ComputeWorkspace() {
     () => offer ? formatUsd(BigInt(offer.rate_per_second) * BigInt(duration)) : "—",
     [duration, offer],
   );
-  let launchLabel = mode === "auto" ? "Match and fund escrow" : "Approve USDG and fund escrow";
+  let launchLabel = reproIntent
+    ? "Approve and run repro"
+    : mode === "auto" ? "Match and fund escrow" : "Approve USDG and fund escrow";
   if (!auth.authenticated) launchLabel = "Sign in to launch";
   if (!auth.configured) launchLabel = "Account access unavailable";
   if (!offer) launchLabel = "No GPUs available";
   if (loadingOffers) launchLabel = "Loading live offers…";
+  if (reproLoad === "loading") launchLabel = "Verifying repro…";
+  if (reproLoad === "invalid") launchLabel = "Invalid repro link";
 
   useEffect(() => {
     const controller = new AbortController();
@@ -104,21 +145,51 @@ export function ComputeWorkspace() {
   }, []);
 
   useEffect(() => {
-    try {
-      const intent = parseGpuLaunchIntent(new URLSearchParams(window.location.search));
-      if (!intent) return;
-      setAdvanced(true);
-      setCustomImage(intent.image);
-      setDuration(intent.durationSeconds);
-      setMinVramMib(intent.minVramMib);
-      setSshKey(intent.sshPublicKey);
-      setGeneratedKey(false);
-      setMode("auto");
-      setNotice("GPU repro intent loaded. Review the live quote before approving your wallet.");
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "This GPU launch link is invalid.");
-    }
+    const envelope = new URLSearchParams(window.location.hash.slice(1)).get("repro");
+    if (!envelope) return;
+    const controller = new AbortController();
+    setReproLoad("loading");
+    void loadReproIntent(envelope, controller.signal)
+      .then((intent) => {
+        setReproIntent(intent);
+        setDuration(intent.duration_seconds);
+        setMinVramMib(intent.min_vram_mib);
+        setMode("auto");
+        setReproLoad("ready");
+        setNotice("GPU repro loaded. Verify the locked command and live quote before approving your wallet.");
+      })
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setReproLoad("invalid");
+        setNotice(error instanceof Error ? error.message : "This GPU repro approval link is invalid.");
+      });
+    return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    if (!confirmed?.repro) {
+      setReproProgress(null);
+      return;
+    }
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const progress = await loadReproProgress(confirmed.leaseId);
+        if (stopped) return;
+        setReproProgress(progress);
+        if (progress.result || isTerminalLeaseState(progress.leaseState)) return;
+      } catch {
+        if (stopped) return;
+      }
+      timer = setTimeout(() => void poll(), 5_000);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [confirmed?.leaseId, confirmed?.repro]);
 
   useEffect(() => {
     setSelected((current) => (
@@ -161,8 +232,16 @@ export function ComputeWorkspace() {
       setNotice("Use a public OCI image pinned to an immutable sha256 digest.");
       return;
     }
-    if (!isSshPublicKey(sshKey)) {
+    if (!reproIntent && !isSshPublicKey(sshKey)) {
       setNotice("Add one Ed25519 SSH public key for workspace access.");
+      return;
+    }
+    if (reproLoad === "loading") {
+      setNotice("The GPU repro is still being verified.");
+      return;
+    }
+    if (reproLoad === "invalid") {
+      setNotice("This GPU repro approval link is invalid or expired.");
       return;
     }
 
@@ -172,8 +251,10 @@ export function ComputeWorkspace() {
         duration,
         mode === "auto" ? minVramMib : offer.gpu.vram_mib,
         mode === "manual" ? offer.node_id : null,
+        reproIntent,
       );
-      const maximumBaseUnits = BigInt(lease.rate_per_second) * BigInt(duration);
+      const maximumBaseUnits = BigInt(lease.maximum_escrow);
+      if (reproIntent) assertReproQuote(lease, reproIntent);
       const clientReference = keccak256(toBytes(lease.quote_id));
       const calls = [
         {
@@ -185,7 +266,7 @@ export function ComputeWorkspace() {
           data: encodeFunctionData({
             abi: escrowAbi,
             functionName: "createLease",
-            args: [lease.node_id, duration, clientReference],
+            args: [lease.node_id, lease.duration_seconds, clientReference],
           }),
         },
       ] as const;
@@ -205,9 +286,21 @@ export function ComputeWorkspace() {
         return;
       }
       const result = await smartWallet.executeCalls([...calls], fundingAddress);
-      await confirmLease(lease.quote_id, result.transactionHash, sshKey.trim());
+      const record = await confirmLease(
+        lease.quote_id,
+        result.transactionHash,
+        reproIntent ? undefined : sshKey.trim(),
+      );
+      const matchedOffer = offers.find((candidate) => candidate.node_id === lease.node_id) ?? offer;
       setNotice(null);
-      setConfirmed({ model: offer.gpu.model, vram: offer.gpu.vram_mib, escrow: maximum, hash: result.transactionHash });
+      setConfirmed({
+        model: matchedOffer.gpu.model,
+        vram: matchedOffer.gpu.vram_mib,
+        escrow: formatUsd(maximumBaseUnits),
+        hash: result.transactionHash,
+        leaseId: record.lease_id,
+        repro: Boolean(reproIntent),
+      });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Wallet transaction was not completed.");
     }
@@ -225,6 +318,22 @@ export function ComputeWorkspace() {
     }
   }
 
+  if (reproLoad === "loading" || reproLoad === "invalid") {
+    return (
+      <section className="page-stack">
+        <div className="page-heading">
+          <div><p className="eyebrow">GPU repro</p><h1>Review GPU repro</h1></div>
+          <span className="chip">Signed intent</span>
+        </div>
+        <article className="panel empty-state" role="status">
+          <span className="empty-icon">◇</span>
+          <h2>{reproLoad === "loading" ? "Verifying approval intent" : "Approval link unavailable"}</h2>
+          <p>{reproLoad === "loading" ? "Checking the exact workload and cost ceiling…" : notice}</p>
+        </article>
+      </section>
+    );
+  }
+
   return (
     <section className="page-stack">
       <div className="page-heading">
@@ -238,13 +347,32 @@ export function ComputeWorkspace() {
       {confirmed ? (
         <div className="panel lease-confirmed" role="status">
           <span className="lease-confirmed-check" aria-hidden="true">✓</span>
-          <h2>Lease confirmed</h2>
-          <p>Your {confirmed.model} workspace is provisioning. It will be ready to connect in about a minute.</p>
+          <h2>{confirmed.repro ? "GPU repro funded" : "Lease confirmed"}</h2>
+          <p>
+            {confirmed.repro
+              ? reproProgress?.result
+                ? `The command finished with exit code ${reproProgress.result.exit_code}.`
+                : `Lease #${confirmed.leaseId} is ${reproProgress?.leaseState.replaceAll("_", " ") ?? "preparing"}. The result will appear here.`
+              : `Your ${confirmed.model} workspace is provisioning. It will be ready to connect in about a minute.`}
+          </p>
           <dl className="lease-confirmed-facts">
+            <div><dt>Lease</dt><dd>#{confirmed.leaseId}</dd></div>
             <div><dt>GPU</dt><dd>{confirmed.model} · {formatVram(confirmed.vram)}</dd></div>
             <div><dt>Escrow held</dt><dd>{confirmed.escrow}</dd></div>
             <div><dt>Funding tx</dt><dd>{confirmed.hash.slice(0, 10)}…{confirmed.hash.slice(-6)}</dd></div>
           </dl>
+          {confirmed.repro && reproProgress?.result && reproIntent && (
+            <section className="access-panel" aria-label="GPU repro result">
+              <p className="eyebrow">
+                {reproProgress.result.exit_code === reproIntent.expected_exit_code ? "Expected result" : "Unexpected exit code"}
+              </p>
+              <h3>Command output</h3>
+              {reproProgress.result.stdout && <pre>{reproProgress.result.stdout}</pre>}
+              {reproProgress.result.stderr && <pre>{reproProgress.result.stderr}</pre>}
+              {reproProgress.result.truncated && <p className="muted">Output exceeded the capture limit; only its tail is shown.</p>}
+              <p className="muted">Grok can retrieve the signed evidence and settlement checks with the read token returned when this repro was prepared.</p>
+            </section>
+          )}
           <button type="button" className="button primary full" onClick={() => router.push("/leases")}>
             View your leases
           </button>
@@ -252,7 +380,25 @@ export function ComputeWorkspace() {
       ) : (
       <div className="compute-layout">
         <form className="panel launch-form" onSubmit={(event) => { event.preventDefault(); void fundEscrow(); }}>
-          <fieldset className="form-fieldset">
+          {reproIntent ? (
+            <fieldset className="form-fieldset">
+              <legend>Locked repro specification</legend>
+              <dl className="lease-confirmed-facts">
+                <div><dt>Image</dt><dd className="mono">{shortImageDigest(reproIntent.image)}</dd></div>
+                <div><dt>Runtime</dt><dd>{formatDuration(reproIntent.duration_seconds)}</dd></div>
+                <div><dt>Minimum VRAM</dt><dd>{formatVram(reproIntent.min_vram_mib)}</dd></div>
+                <div><dt>Expected exit</dt><dd>{reproIntent.expected_exit_code}</dd></div>
+                <div><dt>Cost ceiling</dt><dd>{formatUsd(BigInt(reproIntent.maximum_escrow))}</dd></div>
+                <div><dt>Spec hash</dt><dd className="mono">{shortDigest(reproIntent.spec_hash)}</dd></div>
+              </dl>
+              <label>
+                Exact command
+                <textarea value={reproIntent.command} readOnly rows={5} spellCheck="false" />
+              </label>
+              <small>This signed specification cannot be edited. Reject it if the command is not exactly what you expected.</small>
+              <small>Execution may use a Prism-managed GPU. Managed evidence is gateway-signed central SSH orchestration; node evidence is device-signed. Neither signature alone proves faithful computation.</small>
+            </fieldset>
+          ) : <fieldset className="form-fieldset">
             <legend>What do you want to run?</legend>
             <div className="app-picker">
               {apps.map((app) => (
@@ -289,8 +435,8 @@ export function ComputeWorkspace() {
                 <small>Public, immutable, sha256-pinned and CUDA-compatible.</small>
               </label>
             )}
-          </fieldset>
-          <fieldset className="form-fieldset">
+          </fieldset>}
+          {!reproIntent && <fieldset className="form-fieldset">
             <legend>Workspace access</legend>
             <div className="keygen-row">
               <input
@@ -309,8 +455,8 @@ export function ComputeWorkspace() {
                 ? "Key created and public key filled. Your private key downloaded as \"prism_key\" — keep it to connect."
                 : "No SSH key? Let us make one. Only the public key ever reaches the workspace."}
             </small>
-          </fieldset>
-          <fieldset className="form-fieldset">
+          </fieldset>}
+          {!reproIntent && <fieldset className="form-fieldset">
             <legend>Runtime</legend>
             <div className="duration-picker">
               {[30, 60, 120, 360].map((minutes) => (
@@ -319,8 +465,8 @@ export function ComputeWorkspace() {
                 </button>
               ))}
             </div>
-          </fieldset>
-          <fieldset className="form-fieldset">
+          </fieldset>}
+          {!reproIntent && <fieldset className="form-fieldset">
             <legend>Minimum GPU memory</legend>
             <div className="duration-picker">
               {[16, 24, 40, 44].map((gib) => (
@@ -334,12 +480,12 @@ export function ComputeWorkspace() {
                 </button>
               ))}
             </div>
-          </fieldset>
-          <div className="segmented" role="group" aria-label="Offer selection mode">
+          </fieldset>}
+          {!reproIntent && <div className="segmented" role="group" aria-label="Offer selection mode">
             <button type="button" className={mode === "auto" ? "active" : ""} onClick={() => setMode("auto")}>Auto-match</button>
             <button type="button" className={mode === "manual" ? "active" : ""} onClick={() => setMode("manual")}>Choose offer</button>
-          </div>
-          {mode === "manual" && (
+          </div>}
+          {!reproIntent && mode === "manual" && (
             <label>
               GPU offer
               <select value={selected ?? ""} onChange={(event) => setSelected(event.target.value)} disabled={!eligibleOffers.length}>
@@ -390,7 +536,8 @@ export function ComputeWorkspace() {
           <div className="quote-line"><span>Rate</span><strong>{offer ? formatUsdPerHour(offer.rate_per_second) : "—"}</strong></div>
           <div className="quote-line"><span>Trust class</span><strong>{offer ? trustCopy[offer.trust_class]?.label ?? offer.trust_class : "—"}</strong></div>
           <div className="quote-total"><span>Max escrow · USDG</span><strong>{maximum}</strong></div>
-          <p className="muted">Charges begin after GPU and access readiness are confirmed. Unused escrow is returned after settlement.</p>
+          {reproIntent && <div className="quote-line"><span>Signed ceiling</span><strong>{formatUsd(BigInt(reproIntent.maximum_escrow))}</strong></div>}
+          <p className="muted">Charges begin after GPU readiness is confirmed. Unused escrow is returned after settlement.</p>
         </aside>
       </div>
       )}
@@ -425,11 +572,26 @@ async function requestMatch(
   duration_seconds: number,
   min_vram_mib: number,
   preferred_node_id: string | null,
+  repro: ReproIntent | null,
 ): Promise<LeaseQuote> {
+  const request = {
+    image,
+    duration_seconds,
+    min_vram_mib,
+    preferred_node_id,
+    ...(repro ? {
+      command: repro.command,
+      repro: {
+        token_hash: repro.token_hash,
+        spec_hash: repro.spec_hash,
+        expected_exit_code: repro.expected_exit_code,
+      },
+    } : {}),
+  };
   const response = await fetch("/api/app/leases/match", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request: { image, duration_seconds, min_vram_mib, preferred_node_id } }),
+    body: JSON.stringify({ request }),
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null) as { error?: unknown; message?: unknown } | null;
@@ -473,10 +635,25 @@ function isLeaseQuote(value: unknown): value is LeaseQuote {
     && isBytes32(quote.node_id)
     && typeof quote.image === "string"
     && isPositiveInteger(quote.duration_seconds)
-    && isPositiveInteger(quote.rate_per_second);
+    && isPositiveInteger(quote.min_vram_mib)
+    && isPositiveInteger(quote.rate_per_second)
+    && isPositiveInteger(quote.maximum_escrow);
 }
 
-async function confirmLease(quoteId: string, transactionHash: Hex, sshAuthorizedKey: string) {
+function assertReproQuote(quote: LeaseQuote, intent: ReproIntent) {
+  if (quote.image !== intent.image
+    || quote.command !== intent.command
+    || quote.duration_seconds !== intent.duration_seconds
+    || quote.min_vram_mib !== intent.min_vram_mib
+    || BigInt(quote.maximum_escrow) > BigInt(intent.maximum_escrow)
+    || quote.repro?.token_hash !== intent.token_hash
+    || quote.repro?.spec_hash !== intent.spec_hash
+    || quote.repro?.expected_exit_code !== intent.expected_exit_code) {
+    throw new Error("The live quote does not match the signed GPU repro or exceeds its cost ceiling.");
+  }
+}
+
+async function confirmLease(quoteId: string, transactionHash: Hex, sshAuthorizedKey?: string) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const response = await fetch("/api/app/leases/confirm", {
       method: "POST",
@@ -484,10 +661,14 @@ async function confirmLease(quoteId: string, transactionHash: Hex, sshAuthorized
       body: JSON.stringify({
         quote_id: quoteId,
         transaction_hash: transactionHash,
-        ssh_authorized_key: sshAuthorizedKey,
+        ...(sshAuthorizedKey ? { ssh_authorized_key: sshAuthorizedKey } : {}),
       }),
     });
-    if (response.ok) return;
+    if (response.ok) {
+      const record: unknown = await response.json();
+      if (!isLeaseConfirmation(record)) throw new Error("The lease confirmation response was invalid.");
+      return record;
+    }
     const payload = await response.json().catch(() => null) as { code?: unknown; error?: unknown; message?: unknown } | null;
     const code = typeof payload?.code === "string"
       ? payload.code
@@ -501,6 +682,85 @@ async function confirmLease(quoteId: string, transactionHash: Hex, sshAuthorized
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }
   throw new Error("Funding confirmation timed out. Check the Leases page for the latest transaction status.");
+}
+
+async function loadReproIntent(envelope: string, signal: AbortSignal): Promise<ReproIntent> {
+  const response = await fetch("/api/repro/intent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ envelope }),
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) {
+    if (response.status === 410) throw new Error("This GPU repro approval link has expired. Ask Grok to prepare a new one.");
+    throw new Error("This GPU repro approval link is invalid.");
+  }
+  const payload: unknown = await response.json();
+  if (!isReproIntent(payload)) throw new Error("This GPU repro approval payload is invalid.");
+  return payload;
+}
+
+async function loadReproProgress(leaseId: number): Promise<ReproProgress> {
+  const leasesResponse = await fetch("/api/app/leases", { cache: "no-store" });
+  if (!leasesResponse.ok) throw new Error("lease status unavailable");
+  const leases: unknown = await leasesResponse.json();
+  if (!Array.isArray(leases)) throw new Error("invalid lease status");
+  const lease = leases.find((value) => (
+    value && typeof value === "object" && (value as { lease_id?: unknown }).lease_id === leaseId
+  ));
+  if (!lease || typeof (lease as { state?: unknown }).state !== "string") {
+    throw new Error("lease status unavailable");
+  }
+
+  const resultResponse = await fetch(`/api/app/leases/${leaseId}/result`, { cache: "no-store" });
+  let result: CommandResult | null = null;
+  if (resultResponse.ok) {
+    const payload: unknown = await resultResponse.json();
+    if (!isCommandResult(payload)) throw new Error("invalid repro result");
+    result = payload;
+  } else if (resultResponse.status !== 404) {
+    throw new Error("repro result unavailable");
+  }
+  return { leaseState: (lease as { state: string }).state, result };
+}
+
+function isReproIntent(value: unknown): value is ReproIntent {
+  if (!value || typeof value !== "object") return false;
+  const intent = value as Partial<ReproIntent>;
+  return intent.version === "prism.gpu-repro.intent.v1"
+    && isPinnedPublicImage(intent.image ?? "")
+    && isGpuReproCommand(intent.command ?? "")
+    && isPositiveInteger(intent.duration_seconds)
+    && isPositiveInteger(intent.min_vram_mib)
+    && Number.isSafeInteger(intent.expected_exit_code)
+    && Number(intent.expected_exit_code) >= 0
+    && Number(intent.expected_exit_code) <= 255
+    && typeof intent.maximum_escrow === "string"
+    && /^[1-9][0-9]{0,19}$/.test(intent.maximum_escrow)
+    && isDigest(intent.token_hash)
+    && isDigest(intent.spec_hash)
+    && Number.isSafeInteger(intent.issued_at)
+    && Number.isSafeInteger(intent.expires_at);
+}
+
+function isCommandResult(value: unknown): value is CommandResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<CommandResult>;
+  return Number.isSafeInteger(result.exit_code)
+    && typeof result.stdout === "string"
+    && typeof result.stderr === "string"
+    && typeof result.truncated === "boolean";
+}
+
+function isLeaseConfirmation(value: unknown): value is { lease_id: number } {
+  return Boolean(value)
+    && typeof value === "object"
+    && isPositiveInteger((value as { lease_id?: unknown }).lease_id);
+}
+
+function isTerminalLeaseState(state: string) {
+  return ["closing", "settlement_pending", "disputed", "finalized", "refunded", "failed"].includes(state);
 }
 
 function isBytes32(value: unknown): value is `0x${string}` {
@@ -573,6 +833,24 @@ function downloadText(name: string, text: string) {
 
 function formatVram(vramMib: number) {
   return `${Math.round(vramMib / 1_024)} GB`;
+}
+
+function formatDuration(seconds: number) {
+  const minutes = seconds / 60;
+  return minutes < 60 ? `${minutes} minutes` : `${minutes / 60} hours`;
+}
+
+function shortImageDigest(image: string) {
+  const [repository, digest] = image.split("@sha256:");
+  return `${repository}@sha256:${digest?.slice(0, 12)}…`;
+}
+
+function shortDigest(value: string) {
+  return `${value.slice(0, 12)}…${value.slice(-8)}`;
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
 function isPositiveInteger(value: unknown): value is number {

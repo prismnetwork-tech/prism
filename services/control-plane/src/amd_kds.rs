@@ -160,7 +160,9 @@ impl AmdKds {
         {
             return Ok(entry.chain.clone());
         }
-        let body = self.get(&format!("{}/vcek/v1/Genoa/cert_chain", self.base)).await?;
+        let body = self
+            .get(&format!("{}/vcek/v1/Genoa/cert_chain", self.base))
+            .await?;
         let chain = pem_certificates(&body)?;
         if chain.len() != 2 {
             anyhow::bail!(
@@ -267,18 +269,39 @@ mod tests {
                 let mut chip_id = [0_u8; 64];
                 chip_id[..8].copy_from_slice(&(index as u64).to_le_bytes());
                 cache.insert(
-                    ChipTcb { chip_id, bootloader: 0, tee: 0, snp: 0, microcode: 0 },
-                    Cached { chain: vec![vec![0x30]], fetched_at: Instant::now() },
+                    ChipTcb {
+                        chip_id,
+                        bootloader: 0,
+                        tee: 0,
+                        snp: 0,
+                        microcode: 0,
+                    },
+                    Cached {
+                        chain: vec![vec![0x30]],
+                        fetched_at: Instant::now(),
+                    },
                 );
             }
         }
         // Nothing evicts a live entry, so a full cache simply stops taking new
         // ones rather than throwing out the chip that is serving.
         let cache = kds.vcek.lock().await;
-        assert!(cache.len() > MAX_CACHED_CHIPS, "the test filled it directly");
+        assert!(
+            cache.len() > MAX_CACHED_CHIPS,
+            "the test filled it directly"
+        );
         drop(cache);
 
-        let key = ChipTcb { chip_id: [9_u8; 64], bootloader: 1, tee: 0, snp: 1, microcode: 1 };
-        assert!(kds.cached_vcek(&key).await.is_none(), "an unfetched chip is not served from cache");
+        let key = ChipTcb {
+            chip_id: [9_u8; 64],
+            bootloader: 1,
+            tee: 0,
+            snp: 1,
+            microcode: 1,
+        };
+        assert!(
+            kds.cached_vcek(&key).await.is_none(),
+            "an unfetched chip is not served from cache"
+        );
     }
 }

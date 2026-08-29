@@ -67,12 +67,29 @@ PAYLOAD_FIELDS = (
     "outcome",
     "trust_class",
     "attestation",
+    "credited_seconds",
+    "repro",
 )
-OMITTED_WHEN_NULL = ("trust_class", "attestation")
+OMITTED_WHEN_NULL = ("trust_class", "attestation", "credited_seconds", "repro")
 ATTESTATION_FIELDS = ("kind", "verdict_digest", "verifier_version")
+REPRO_FIELDS = (
+    "executor",
+    "token_hash",
+    "spec_hash",
+    "image_digest",
+    "command_hash",
+    "result_hash",
+    "stdout_hash",
+    "stderr_hash",
+    "report_hash",
+    "exit_code",
+    "expected_exit_code",
+    "succeeded",
+    "truncated",
+)
 
 TRUST_CLASSES = ("open", "isolated", "attested", "confidential")
-MAX_VERIFIABLE_TRUST_CLASS = "isolated"
+MAX_VERIFIABLE_TRUST_CLASS = "attested"
 
 
 def fetch(container: str) -> list:
@@ -93,6 +110,8 @@ def receipt_hash(receipt: dict) -> str:
             continue
         if field == "attestation":
             value = {key: value.get(key) for key in ATTESTATION_FIELDS}
+        if field == "repro":
+            value = {key: value.get(key) for key in REPRO_FIELDS}
         payload[field] = value
     canonical = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode()).hexdigest()
@@ -121,11 +140,50 @@ def check(receipts: list) -> None:
                 raise SystemExit(
                     f"receipt {receipt['receipt_id']} claims {trust}, which the network does not verify"
                 )
+        repro = receipt.get("repro")
+        if repro is not None:
+            digests = (
+                repro.get("token_hash"),
+                repro.get("spec_hash"),
+                repro.get("command_hash"),
+                repro.get("result_hash"),
+                repro.get("stdout_hash"),
+                repro.get("stderr_hash"),
+                repro.get("report_hash"),
+            )
+            image_digest = repro.get("image_digest")
+            if (
+                receipt["outcome"] != "finalized"
+                or repro.get("executor") not in ("node", "managed")
+                or not all(is_lower_digest(value) for value in digests)
+                or not isinstance(image_digest, str)
+                or not image_digest.startswith("sha256:")
+                or not is_lower_digest(image_digest[7:])
+                or type(repro.get("exit_code")) is not int
+                or type(repro.get("expected_exit_code")) is not int
+                or not -255 <= repro["exit_code"] <= 255
+                or not 0 <= repro["expected_exit_code"] <= 255
+                or not isinstance(repro.get("succeeded"), bool)
+                or not isinstance(repro.get("truncated"), bool)
+                or repro["succeeded"]
+                != (repro["exit_code"] == repro["expected_exit_code"])
+            ):
+                raise SystemExit(
+                    f"receipt {receipt['receipt_id']} contains malformed repro evidence"
+                )
         recomputed = receipt_hash(receipt)
         if recomputed != receipt["receipt_hash"]:
             raise SystemExit(
                 f"receipt {receipt['receipt_id']} does not hash to {receipt['receipt_hash']}"
             )
+
+
+def is_lower_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 # Two rows exactly as the index published them, one from each era of the
@@ -179,6 +237,28 @@ def rejects(receipt: dict, reason: str) -> None:
 def self_test() -> int:
     check(PUBLISHED_RECEIPTS)
 
+    credited = {
+        "receipt_id": "019f0000-0000-7000-8000-000000000001",
+        "lease_id": "128",
+        "node_id_hash": "0x" + "a" * 64,
+        "gpu_model": "NVIDIA L40S",
+        "runtime_seconds": 200,
+        "charged_base_units": 44400,
+        "refunded_base_units": 155400,
+        "provider_paid_base_units": 39960,
+        "failure_class": "interrupted",
+        "outcome": "finalized",
+        "trust_class": "open",
+        "credited_seconds": 150,
+        "receipt_hash": "c63e4690f2e6be23ecf474e2f5e813b3eecce5b36a3d4a2b39b3c6e87e7de135",
+        "transaction_hash": "0x" + "c" * 64,
+        "escrow_address": "0x" + "e" * 40,
+    }
+    assert receipt_hash(credited) == credited["receipt_hash"], (
+        "the Python publisher and Rust credited receipt hash disagree"
+    )
+    check([credited])
+
     for field in ("charged_base_units", "runtime_seconds", "provider_paid_base_units"):
         rejects(dict(PUBLISHED_RECEIPTS[0], **{field: 1}), "does not hash to")
     rejects(dict(PUBLISHED_RECEIPTS[0], trust_class="isolated"), "does not hash to")
@@ -201,6 +281,54 @@ def self_test() -> int:
     assert receipt_hash(dict(attested, attestation=dict(attestation, verdict_digest="e" * 64))) != attested[
         "receipt_hash"
     ], "the attestation is outside the hash"
+
+    repro = {
+        "executor": "node",
+        "token_hash": "0" * 64,
+        "spec_hash": "1" * 64,
+        "image_digest": "sha256:" + "2" * 64,
+        "command_hash": "3" * 64,
+        "result_hash": "4" * 64,
+        "stdout_hash": "5" * 64,
+        "stderr_hash": "6" * 64,
+        "report_hash": "7" * 64,
+        "exit_code": 0,
+        "expected_exit_code": 0,
+        "succeeded": True,
+        "truncated": False,
+    }
+    reproduced = {
+        "receipt_id": "019f0000-0000-7000-8000-000000000002",
+        "lease_id": "129",
+        "node_id_hash": "0x" + "b" * 64,
+        "gpu_model": "NVIDIA L4",
+        "runtime_seconds": 60,
+        "charged_base_units": 13320,
+        "refunded_base_units": 0,
+        "provider_paid_base_units": 11988,
+        "failure_class": None,
+        "outcome": "finalized",
+        "trust_class": "open",
+        "repro": repro,
+        "transaction_hash": "0x" + "d" * 64,
+        "escrow_address": "0x" + "e" * 40,
+    }
+    reproduced["receipt_hash"] = (
+        "947448674b4c449999cf2106d7cd55f7a3e3041f3f4534086e8e9466fc6d395d"
+    )
+    assert receipt_hash(reproduced) == reproduced["receipt_hash"], (
+        "the Python publisher and Rust repro receipt hash disagree"
+    )
+    check([reproduced])
+    managed = dict(reproduced, repro=dict(repro, executor="managed"))
+    managed["receipt_hash"] = receipt_hash(managed)
+    check([managed])
+    unsupported = dict(reproduced, repro=dict(repro, executor="browser"))
+    unsupported["receipt_hash"] = receipt_hash(unsupported)
+    rejects(unsupported, "malformed repro evidence")
+    inconsistent = dict(reproduced, repro=dict(repro, succeeded=False))
+    inconsistent["receipt_hash"] = receipt_hash(inconsistent)
+    rejects(inconsistent, "malformed repro evidence")
 
     print(f"hash recomputation and trust rules agree with {len(PUBLISHED_RECEIPTS)} published receipt(s)")
     return 0

@@ -1569,17 +1569,38 @@ pub fn batch_command(config: &BatchConfig<'_>) -> anyhow::Result<Command> {
     Ok(command)
 }
 
+/// Establish everything that can be known without starting renter code. The
+/// device lock is deliberately taken by `run_batch`, after authorization: a
+/// preflight must not evict or block the operator's idle workload while the
+/// escrow is still Funded.
+pub fn preflight_batch(config: &BatchConfig<'_>) -> anyhow::Result<()> {
+    validate_batch_config(config)?;
+    let isolation = resolve_batch_isolation(config.isolation)?;
+    if let Isolation::Shared { gpu } = &isolation {
+        crate::gpu::usage(&gpu.uuid).context("query the batch GPU")?;
+    }
+    let resolved = BatchConfig {
+        image: config.image,
+        lease_id: config.lease_id,
+        command: config.command,
+        workspace_root: config.workspace_root,
+        state_root: config.state_root,
+        isolation: &isolation,
+        limits: config.limits,
+        duration_seconds: config.duration_seconds,
+    };
+    batch_command(&resolved)?;
+    fs::create_dir_all(config.workspace_root)?;
+    fs::create_dir_all(config.state_root)?;
+    pull_image(config.image)
+}
+
 /// Run the command to completion, or kill it when its paid duration runs out.
 /// Returns what it printed and the code it exited with; a command that fails is
 /// a result, not an error, because the renter still paid for the attempt.
 pub fn run_batch(config: BatchConfig<'_>) -> anyhow::Result<prism_protocol::CommandResult> {
     validate_batch_config(&config)?;
-    let isolation = match config.isolation {
-        Isolation::KataVfio { group } => Isolation::KataVfio {
-            group: VfioGroup::from_system(group.id)?,
-        },
-        Isolation::Shared { .. } => config.isolation.clone(),
-    };
+    let isolation = resolve_batch_isolation(config.isolation)?;
     let _reservation = DeviceReservation::acquire_slot(
         Path::new(SYSTEM_LOCK_ROOT),
         &isolation.reservation_slot(),
@@ -1587,9 +1608,7 @@ pub fn run_batch(config: BatchConfig<'_>) -> anyhow::Result<prism_protocol::Comm
     )?;
     fs::create_dir_all(config.workspace_root)?;
     fs::create_dir_all(config.state_root)?;
-    if config.isolation.is_shared() {
-        pull_image(config.image)?;
-    }
+    pull_image(config.image)?;
 
     let mut command = batch_command(&config)?;
     install_startup_policy(&isolation)?;
@@ -1675,6 +1694,15 @@ pub fn run_batch(config: BatchConfig<'_>) -> anyhow::Result<prism_protocol::Comm
     Ok(prism_protocol::CommandResult::capture(
         exit_code, &stdout, &stderr,
     ))
+}
+
+fn resolve_batch_isolation(isolation: &Isolation) -> anyhow::Result<Isolation> {
+    match isolation {
+        Isolation::KataVfio { group } => Ok(Isolation::KataVfio {
+            group: VfioGroup::from_system(group.id)?,
+        }),
+        Isolation::Shared { .. } => Ok(isolation.clone()),
+    }
 }
 
 fn validate_batch_config(config: &BatchConfig<'_>) -> anyhow::Result<()> {

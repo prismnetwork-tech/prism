@@ -21,6 +21,25 @@ export type PublicProofReceipt = {
   /// that ran to its end, and on every receipt settled before the availability
   /// commitment existed.
   credited_seconds?: number;
+  /// Present for a completed GPU repro. Node reports are signed by an enrolled
+  /// device key; managed reports are signed by the Prism gateway after a
+  /// centrally orchestrated SSH run. Both bind claims to the settlement, but
+  /// neither signature alone proves faithful computation.
+  repro?: {
+    executor: "node" | "managed";
+    token_hash: string;
+    spec_hash: string;
+    image_digest: string;
+    command_hash: string;
+    result_hash: string;
+    stdout_hash: string;
+    stderr_hash: string;
+    report_hash: string;
+    exit_code: number;
+    expected_exit_code: number;
+    succeeded: boolean;
+    truncated: boolean;
+  };
   receipt_hash: string;
   transaction_hash: string;
   /// The escrow that issued this lease id. Ids count from one inside a single
@@ -63,15 +82,39 @@ function isPublicProofReceipt(value: unknown): value is PublicProofReceipt {
     && (receipt.trust_class === undefined || trustClasses.includes(receipt.trust_class))
     && (receipt.attestation === undefined || isAttestation(receipt.attestation))
     && (receipt.credited_seconds === undefined || isBaseUnits(receipt.credited_seconds, 21_600))
-    && /^[0-9a-f]{64}$/i.test(receipt.receipt_hash ?? "")
+    && (receipt.repro === undefined || isReproReceipt(receipt.repro))
+    && /^[0-9a-f]{64}$/.test(receipt.receipt_hash ?? "")
     && isHash(receipt.transaction_hash);
+}
+
+function isReproReceipt(value: unknown): value is NonNullable<PublicProofReceipt["repro"]> {
+  if (!value || typeof value !== "object") return false;
+  const repro = value as Partial<NonNullable<PublicProofReceipt["repro"]>>;
+  return (repro.executor === "node" || repro.executor === "managed")
+    && isDigest(repro.token_hash)
+    && isDigest(repro.spec_hash)
+    && typeof repro.image_digest === "string"
+    && /^sha256:[0-9a-f]{64}$/.test(repro.image_digest)
+    && isDigest(repro.command_hash)
+    && isDigest(repro.result_hash)
+    && isDigest(repro.stdout_hash)
+    && isDigest(repro.stderr_hash)
+    && isDigest(repro.report_hash)
+    && Number.isSafeInteger(repro.exit_code)
+    && Number(repro.exit_code) >= -255
+    && Number(repro.exit_code) <= 255
+    && Number.isSafeInteger(repro.expected_exit_code)
+    && Number(repro.expected_exit_code) >= 0
+    && Number(repro.expected_exit_code) <= 255
+    && repro.succeeded === (repro.exit_code === repro.expected_exit_code)
+    && typeof repro.truncated === "boolean";
 }
 
 function isAttestation(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const attestation = value as Partial<NonNullable<PublicProofReceipt["attestation"]>>;
   return isBoundedText(attestation.kind, 1, 32)
-    && /^[0-9a-f]{64}$/i.test(attestation.verdict_digest ?? "")
+    && /^[0-9a-f]{64}$/.test(attestation.verdict_digest ?? "")
     && isBoundedText(attestation.verifier_version, 1, 64);
 }
 
@@ -105,6 +148,23 @@ export async function recomputeReceiptHash(receipt: PublicProofReceipt): Promise
   // Zero is a real credit, so this asks whether the field is there rather than
   // whether it is truthy.
   if (receipt.credited_seconds !== undefined) payload.credited_seconds = receipt.credited_seconds;
+  if (receipt.repro) {
+    payload.repro = {
+      executor: receipt.repro.executor,
+      token_hash: receipt.repro.token_hash,
+      spec_hash: receipt.repro.spec_hash,
+      image_digest: receipt.repro.image_digest,
+      command_hash: receipt.repro.command_hash,
+      result_hash: receipt.repro.result_hash,
+      stdout_hash: receipt.repro.stdout_hash,
+      stderr_hash: receipt.repro.stderr_hash,
+      report_hash: receipt.repro.report_hash,
+      exit_code: receipt.repro.exit_code,
+      expected_exit_code: receipt.repro.expected_exit_code,
+      succeeded: receipt.repro.succeeded,
+      truncated: receipt.repro.truncated,
+    };
+  }
   const bytes = new TextEncoder().encode(JSON.stringify(payload));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -120,4 +180,8 @@ function isBoundedText(value: unknown, minimum: number, maximum: number): value 
 
 function isHash(value: unknown): value is `0x${string}` {
   return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value);
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }

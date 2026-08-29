@@ -56,6 +56,9 @@ The environment must provide the image references, domain and ACME email,
 database and service secrets, operator subjects, deployed registry and escrow
 addresses, RPC URL, KMS key identifiers and the comma-separated
 `PRISM_VAST_NODE_IDS` the broker rents against, all required by `compose.yml`.
+Managed batch execution also requires `PRISM_REPRO_WORKER_IMAGE`; the worker
+reuses the access-credential encryption key and gateway KMS key already used by
+the control and lifecycle services.
 The gateway additionally needs `PRISM_ACCESS_GATEWAY_IMAGE`,
 `PRISM_GATEWAY_HMAC_KEY`, `PRISM_GATEWAY_CONTROL_TOKEN` and
 `PRISM_REDIS_PASSWORD`. Every one of these belongs in the env file. Passing a
@@ -73,8 +76,10 @@ deployment needs a second native runner in that workflow, not a `--platform`
 flag.
 
 ```sh
-PRISM_LIFECYCLE_WORKER_IMAGE=ghcr.io/winter0x/prism/prism-lifecycle-worker:main
-docker compose pull lifecycle-worker && docker compose up -d lifecycle-worker
+PRISM_LIFECYCLE_WORKER_IMAGE=ghcr.io/winter0x/prism/prism-lifecycle-worker:<git-sha>
+PRISM_REPRO_WORKER_IMAGE=ghcr.io/winter0x/prism/prism-repro-worker:<git-sha>
+docker compose pull lifecycle-worker repro-worker
+docker compose up -d lifecycle-worker repro-worker
 ```
 
 ### Alerts

@@ -117,6 +117,7 @@ after, money moves. See [integrity monitoring](#integrity-monitoring).
 | `services/operations-monitor` | Operational health metrics (tunnels, certs, queues) | — (reads PostgreSQL) |
 | `services/reconciliation-monitor` | Chain ↔ database integrity invariants | — (reads PostgreSQL + chain) |
 | `workers/lifecycle-worker` | Provisioning, access, teardown, settlement evidence | PostgreSQL + chain |
+| `workers/repro-worker` | Per-lease managed SSH keys, pinned transport, bounded batch execution, gateway-signed reports | PostgreSQL + KMS |
 | `workers/settlement-worker` | EIP-712 metering proposal and finalization | Chain (KMS-signed) |
 | `workers/proof-worker` | Terminal-event verification and public proof publication | Proof artifacts |
 | `node/prismd` | Supplier daemon: Kata/VFIO runtime, tunnels | Node host |
@@ -128,6 +129,7 @@ after, money moves. See [integrity monitoring](#integrity-monitoring).
 - `POST /v1/nodes/{node_id}/heartbeat` accepts a device-signed, monotonic status
   update.
 - `GET /v1/offers` returns bonded, online, compatible public-image offers.
+- `POST /v1/repros/status` resolves one 256-bit read capability to its bounded status, signed report, verification checks, and eventual public receipt without exposing account or SSH data.
 - `POST /v1/leases/match` returns a five-minute quote; the wallet creates the
   actual escrow directly onchain with a quote-derived client reference.
 - `POST /v1/leases/confirm` verifies the finalized quote-bound funding event,

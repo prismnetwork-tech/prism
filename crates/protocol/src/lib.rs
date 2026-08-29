@@ -5,8 +5,12 @@ use aes_gcm::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use k256::ecdsa::{
+    RecoveryId, Signature as EthereumSignature, VerifyingKey as EthereumVerifyingKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
+use sha3::Keccak256;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -69,6 +73,11 @@ const ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.node-attestation.v1\0";
 const GUEST_ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.guest-attestation.v1\0";
 const TDX_LEASE_ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.tdx-lease-attestation.v1\0";
 const GPU_CC_ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"prism.gpu-cc-attestation.v1\0";
+const GPU_REPRO_SPEC_HASH_DOMAIN: &[u8] = b"prism-gpu-repro-spec-v1\0";
+const GPU_REPRO_COMMAND_HASH_DOMAIN: &[u8] = b"prism-gpu-repro-command-v1\0";
+const GPU_REPRO_RESULT_HASH_DOMAIN: &[u8] = b"prism-gpu-repro-result-v1\0";
+const GPU_REPRO_REPORT_HASH_DOMAIN: &[u8] = b"prism-gpu-repro-report-v1\0";
+const MANAGED_COMMAND_REPORT_SIGNATURE_DOMAIN: &[u8] = b"prism-managed-command-report-v1\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -1058,6 +1067,11 @@ pub struct NodeOffer {
     /// with, so a node that goes quiet stops taking batch work on its own.
     #[serde(default)]
     pub command_channel: bool,
+    /// Whether this offer currently has brokered capacity behind the managed
+    /// repro runner. Like `command_channel`, callers must treat this as a
+    /// short-lived observation rather than an enrollment claim.
+    #[serde(default)]
+    pub managed_batch: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1299,6 +1313,32 @@ impl NodeCertificateRequest {
     }
 }
 
+/// The exact workload a repro capability authorizes. Its field order is part
+/// of the v1 hash contract and must not change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuReproSpec {
+    pub image: String,
+    pub command: String,
+    pub duration_seconds: u32,
+    pub min_vram_mib: u32,
+    pub expected_exit_code: i32,
+}
+
+impl GpuReproSpec {
+    pub fn hash(&self) -> Result<String, ProtocolError> {
+        gpu_repro_spec_hash(self)
+    }
+}
+
+/// A bearer capability reduced to public commitments. The token itself never
+/// enters a quote, lease record, settlement artifact or proof feed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReproCapability {
+    pub token_hash: String,
+    pub spec_hash: String,
+    pub expected_exit_code: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeaseRequest {
     pub image: String,
@@ -1312,6 +1352,8 @@ pub struct LeaseRequest {
     /// interactive one; only what happens on the node differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repro: Option<ReproCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1329,6 +1371,8 @@ pub struct LeaseQuote {
     /// command that actually runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repro: Option<ReproCapability>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -1383,6 +1427,8 @@ pub struct LeaseRecord {
     pub state: LeaseState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repro: Option<ReproCapability>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1603,6 +1649,135 @@ impl NodeCommandReport {
     }
 }
 
+/// Private settlement input for a capability-scoped batch run. The signed
+/// report is retained in full so an independent verifier can check the node's
+/// assertion instead of trusting a result copied out of it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReproExecutionEvidence {
+    pub capability: ReproCapability,
+    pub spec: GpuReproSpec,
+    pub command: NodeCommand,
+    pub report: ReproExecutionReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "executor", rename_all = "snake_case")]
+pub enum ReproExecutionReport {
+    Node { report: NodeCommandReport },
+    Managed { report: ManagedCommandReport },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReproExecutor {
+    Node,
+    Managed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedProvider {
+    Vast,
+}
+
+/// The signed portion of a centrally orchestrated execution report. Field
+/// order is part of the v1 signature contract and must not change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedCommandReportPayload {
+    pub report_id: Uuid,
+    pub signer: String,
+    pub command_id: Uuid,
+    pub lease_id: u64,
+    pub provider: ManagedProvider,
+    pub provider_instance_id: u64,
+    pub gpu_model: String,
+    pub gpu_vram_mib: u32,
+    pub transport_host_key_sha256: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub outcome: NodeCommandOutcome,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CommandResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedCommandReport {
+    pub report_id: Uuid,
+    pub signer: String,
+    pub command_id: Uuid,
+    pub lease_id: u64,
+    pub provider: ManagedProvider,
+    pub provider_instance_id: u64,
+    pub gpu_model: String,
+    pub gpu_vram_mib: u32,
+    pub transport_host_key_sha256: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub outcome: NodeCommandOutcome,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CommandResult>,
+    pub signature: String,
+}
+
+impl ManagedCommandReport {
+    pub fn payload(&self) -> ManagedCommandReportPayload {
+        ManagedCommandReportPayload {
+            report_id: self.report_id,
+            signer: self.signer.clone(),
+            command_id: self.command_id,
+            lease_id: self.lease_id,
+            provider: self.provider,
+            provider_instance_id: self.provider_instance_id,
+            gpu_model: self.gpu_model.clone(),
+            gpu_vram_mib: self.gpu_vram_mib,
+            transport_host_key_sha256: self.transport_host_key_sha256.clone(),
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            outcome: self.outcome.clone(),
+            error: self.error.clone(),
+            result: self.result.clone(),
+        }
+    }
+
+    pub fn digest(&self) -> Result<[u8; 32], ProtocolError> {
+        managed_command_report_digest(&self.payload())
+    }
+
+    pub fn recover_signer(&self) -> Result<String, ProtocolError> {
+        recover_managed_command_report_signer(&self.payload(), &self.signature)
+    }
+
+    pub fn verify(&self) -> Result<(), ProtocolError> {
+        let recovered = self.recover_signer()?;
+        if recovered != self.signer || !is_lower_ethereum_address(&self.signer) {
+            return Err(ProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+}
+
+/// Public commitments extracted from verified repro evidence. These establish
+/// what an enrolled node or the onchain gateway signed and what settlement
+/// anchored, not that the result was computed faithfully.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReproReceiptEvidence {
+    pub executor: ReproExecutor,
+    pub token_hash: String,
+    pub spec_hash: String,
+    pub image_digest: String,
+    pub command_hash: String,
+    pub result_hash: String,
+    pub stdout_hash: String,
+    pub stderr_hash: String,
+    pub report_hash: String,
+    pub exit_code: i32,
+    pub expected_exit_code: i32,
+    pub succeeded: bool,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublicReceipt {
     pub receipt_id: Uuid,
@@ -1625,6 +1800,8 @@ pub struct PublicReceipt {
     /// was still responding at the moment access closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credited_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repro: Option<ReproReceiptEvidence>,
     pub receipt_hash: String,
     pub transaction_hash: String,
 }
@@ -1670,6 +1847,8 @@ pub struct SettlementEvidence {
     #[serde(default)]
     pub execution: ExecutionEvidence,
     pub node_telemetry: Vec<NodeTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repro: Option<ReproExecutionEvidence>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1701,6 +1880,8 @@ struct ReceiptPayload {
     attestation: Option<ReceiptAttestation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credited_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repro: Option<ReproReceiptEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2031,6 +2212,7 @@ pub fn receipt_hash(receipt: &PublicReceipt) -> Result<String, ProtocolError> {
         trust_class: receipt.trust_class,
         attestation: receipt.attestation.clone(),
         credited_seconds: receipt.credited_seconds,
+        repro: receipt.repro.clone(),
     };
     Ok(hex::encode(Sha256::digest(canonical_json(&payload)?)))
 }
@@ -2039,8 +2221,108 @@ pub fn receipt_hash_matches(receipt: &PublicReceipt) -> Result<bool, ProtocolErr
     Ok(receipt.receipt_hash == receipt_hash(receipt)?)
 }
 
+/// Hashes the exact v1 workload contract. This is deliberately domain
+/// separated from every other JSON hash in the protocol.
+pub fn gpu_repro_spec_hash(spec: &GpuReproSpec) -> Result<String, ProtocolError> {
+    canonical_domain_hash(GPU_REPRO_SPEC_HASH_DOMAIN, spec)
+}
+
+/// Turns a 256-bit, unpadded base64url bearer token into the commitment carried
+/// by the capability. The token bytes, not their textual encoding, are hashed.
+pub fn repro_token_hash(token: &str) -> Result<String, ProtocolError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| ProtocolError::InvalidReproToken)?;
+    if decoded.len() != 32 {
+        return Err(ProtocolError::InvalidReproToken);
+    }
+    Ok(hex::encode(Sha256::digest(decoded)))
+}
+
+pub fn repro_command_hash(command: &NodeCommand) -> Result<String, ProtocolError> {
+    canonical_domain_hash(GPU_REPRO_COMMAND_HASH_DOMAIN, command)
+}
+
+pub fn repro_result_hash(result: &CommandResult) -> Result<String, ProtocolError> {
+    canonical_domain_hash(GPU_REPRO_RESULT_HASH_DOMAIN, result)
+}
+
+pub fn repro_report_hash(report: &NodeCommandReport) -> Result<String, ProtocolError> {
+    canonical_domain_hash(GPU_REPRO_REPORT_HASH_DOMAIN, report)
+}
+
+pub fn managed_repro_report_hash(report: &ManagedCommandReport) -> Result<String, ProtocolError> {
+    canonical_domain_hash(GPU_REPRO_REPORT_HASH_DOMAIN, report)
+}
+
+pub fn managed_command_report_digest(
+    payload: &ManagedCommandReportPayload,
+) -> Result<[u8; 32], ProtocolError> {
+    let encoded = canonical_json(payload)?;
+    let mut input =
+        Vec::with_capacity(MANAGED_COMMAND_REPORT_SIGNATURE_DOMAIN.len() + encoded.len());
+    input.extend_from_slice(MANAGED_COMMAND_REPORT_SIGNATURE_DOMAIN);
+    input.extend_from_slice(encoded.as_bytes());
+    Ok(Keccak256::digest(input).into())
+}
+
+pub fn recover_managed_command_report_signer(
+    payload: &ManagedCommandReportPayload,
+    encoded_signature: &str,
+) -> Result<String, ProtocolError> {
+    let encoded = encoded_signature
+        .strip_prefix("0x")
+        .filter(|value| {
+            value.len() == 130
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or(ProtocolError::InvalidSignature)?;
+    let bytes = hex::decode(encoded).map_err(|_| ProtocolError::InvalidSignature)?;
+    let signature =
+        EthereumSignature::from_slice(&bytes[..64]).map_err(|_| ProtocolError::InvalidSignature)?;
+    if signature.normalize_s().is_some() {
+        return Err(ProtocolError::InvalidSignature);
+    }
+    let recovery_id = match bytes[64] {
+        value @ 0..=1 => RecoveryId::from_byte(value),
+        value @ 27..=28 => RecoveryId::from_byte(value - 27),
+        _ => None,
+    }
+    .ok_or(ProtocolError::InvalidSignature)?;
+    let key = EthereumVerifyingKey::recover_from_prehash(
+        &managed_command_report_digest(payload)?,
+        &signature,
+        recovery_id,
+    )
+    .map_err(|_| ProtocolError::InvalidSignature)?;
+    let point = key.to_encoded_point(false);
+    let digest = Keccak256::digest(&point.as_bytes()[1..]);
+    Ok(format!("0x{}", hex::encode(&digest[12..])))
+}
+
+pub fn repro_stream_hash(stream: &str) -> String {
+    hex::encode(Sha256::digest(stream.as_bytes()))
+}
+
 fn canonical_json<T: Serialize>(value: &T) -> Result<String, ProtocolError> {
     serde_json::to_string(value).map_err(ProtocolError::Serialization)
+}
+
+fn canonical_domain_hash<T: Serialize>(domain: &[u8], value: &T) -> Result<String, ProtocolError> {
+    Ok(hex::encode(Sha256::digest(signature_payload(
+        domain, value,
+    )?)))
+}
+
+fn is_lower_ethereum_address(value: &str) -> bool {
+    value.strip_prefix("0x").is_some_and(|address| {
+        address.len() == 40
+            && address
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn signature_payload<T: Serialize>(domain: &[u8], value: &T) -> Result<Vec<u8>, ProtocolError> {
@@ -2073,6 +2355,8 @@ pub enum ProtocolError {
     InvalidSignature,
     #[error("invalid public key")]
     InvalidPublicKey,
+    #[error("invalid repro capability token")]
+    InvalidReproToken,
     #[error("serialization failed")]
     Serialization(#[source] serde_json::Error),
     #[error("credential encryption key is invalid")]
@@ -2088,6 +2372,69 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::{SigningKey as ManagedSigningKey, signature::hazmat::PrehashSigner};
+
+    fn signed_managed_report() -> ManagedCommandReport {
+        let mut key_bytes = [0_u8; 32];
+        key_bytes[31] = 1;
+        let key = ManagedSigningKey::from_slice(&key_bytes).unwrap();
+        let payload = ManagedCommandReportPayload {
+            report_id: Uuid::parse_str("019f0000-0000-7000-8000-000000000003").unwrap(),
+            signer: "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_owned(),
+            command_id: Uuid::parse_str("019f0000-0000-7000-8000-000000000004").unwrap(),
+            lease_id: 129,
+            provider: ManagedProvider::Vast,
+            provider_instance_id: 42,
+            gpu_model: "NVIDIA L40S".to_owned(),
+            gpu_vram_mib: 46_068,
+            transport_host_key_sha256: "a".repeat(64),
+            started_at: DateTime::parse_from_rfc3339("2026-08-29T20:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            finished_at: DateTime::parse_from_rfc3339("2026-08-29T20:01:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            outcome: NodeCommandOutcome::Completed,
+            error: None,
+            result: Some(CommandResult {
+                exit_code: 0,
+                stdout: "42\n".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            }),
+        };
+        let digest = managed_command_report_digest(&payload).unwrap();
+        let signature: EthereumSignature = key.sign_prehash(&digest).unwrap();
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let recovery_id = [0_u8, 1]
+            .into_iter()
+            .filter_map(RecoveryId::from_byte)
+            .find(|recovery_id| {
+                EthereumVerifyingKey::recover_from_prehash(&digest, &signature, *recovery_id)
+                    .is_ok_and(|recovered| recovered == *key.verifying_key())
+            })
+            .unwrap();
+        let mut encoded = [0_u8; 65];
+        encoded[..64].copy_from_slice(&signature.to_bytes());
+        encoded[64] = 27 + recovery_id.to_byte();
+        ManagedCommandReport {
+            report_id: payload.report_id,
+            signer: payload.signer,
+            command_id: payload.command_id,
+            lease_id: payload.lease_id,
+            provider: payload.provider,
+            provider_instance_id: payload.provider_instance_id,
+            gpu_model: payload.gpu_model,
+            gpu_vram_mib: payload.gpu_vram_mib,
+            transport_host_key_sha256: payload.transport_host_key_sha256,
+            started_at: payload.started_at,
+            finished_at: payload.finished_at,
+            outcome: payload.outcome,
+            error: payload.error,
+            result: payload.result,
+            signature: format!("0x{}", hex::encode(encoded)),
+        }
+    }
 
     #[test]
     fn telemetry_round_trip_verifies() {
@@ -2205,6 +2552,7 @@ mod tests {
         let offer: NodeOffer = serde_json::from_value(document).unwrap();
 
         assert!(!offer.command_channel);
+        assert!(!offer.managed_batch);
     }
 
     #[test]
@@ -2285,6 +2633,7 @@ mod tests {
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: "0x5678".to_owned(),
         };
@@ -2318,6 +2667,7 @@ mod tests {
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: "0x3669fa89".to_owned(),
         };
@@ -2347,6 +2697,7 @@ mod tests {
             outcome: ReceiptOutcome::Finalized,
             trust_class: Some(TrustClass::Open),
             attestation: None,
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: "0x3669fa89".to_owned(),
         };
@@ -2372,6 +2723,7 @@ mod tests {
             outcome: ReceiptOutcome::Finalized,
             trust_class: Some(TrustClass::Isolated),
             attestation: None,
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: "0x3669fa89".to_owned(),
         }
@@ -2429,6 +2781,153 @@ mod tests {
         });
         let serialized = serde_json::to_string(&with_log).expect("canonical form");
         assert!(serialized.contains("tdx_event_log"));
+    }
+
+    #[test]
+    fn repro_spec_hash_matches_the_v1_reference_vector() {
+        let spec = GpuReproSpec {
+            image: format!("registry.example/runtime@sha256:{}", "a".repeat(64)),
+            command: "python -c 'print(6 * 7)'".to_owned(),
+            duration_seconds: 120,
+            min_vram_mib: 1_024,
+            expected_exit_code: 0,
+        };
+
+        assert_eq!(
+            gpu_repro_spec_hash(&spec).unwrap(),
+            "23979781f1379272e8d5c6b036708792e060ac88b3cb78fbd2f8e62bed7a79ed"
+        );
+        assert_eq!(spec.hash().unwrap(), gpu_repro_spec_hash(&spec).unwrap());
+    }
+
+    #[test]
+    fn repro_token_hashes_the_decoded_256_bit_secret() {
+        assert_eq!(
+            repro_token_hash("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc").unwrap(),
+            "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0"
+        );
+        assert!(repro_token_hash("too-short").is_err());
+        assert!(repro_token_hash("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=").is_err());
+    }
+
+    #[test]
+    fn managed_report_recovers_and_verifies_its_gateway_signer() {
+        let mut report = signed_managed_report();
+
+        assert_eq!(report.recover_signer().unwrap(), report.signer);
+        assert!(report.verify().is_ok());
+        report.result.as_mut().unwrap().stdout = "43\n".to_owned();
+        assert!(report.verify().is_err());
+    }
+
+    #[test]
+    fn managed_report_digest_matches_the_v1_reference_vector() {
+        let report = signed_managed_report();
+
+        assert_eq!(
+            hex::encode(report.digest().unwrap()),
+            "9177afcd30525f8328cff37aabc5acd9769a954ac4ad4ee45b8e55db0082985d"
+        );
+    }
+
+    #[test]
+    fn managed_report_rejects_noncanonical_signatures_and_claimed_signers() {
+        let mut report = signed_managed_report();
+        report.signature = report.signature.to_ascii_uppercase();
+        assert!(report.verify().is_err());
+
+        let mut report = signed_managed_report();
+        report.signer = "0x0000000000000000000000000000000000000001".to_owned();
+        assert!(report.verify().is_err());
+    }
+
+    #[test]
+    fn managed_repro_hash_commits_to_the_recoverable_signature() {
+        let mut report = signed_managed_report();
+        let original = managed_repro_report_hash(&report).unwrap();
+        report.signature.push('0');
+
+        assert_ne!(managed_repro_report_hash(&report).unwrap(), original);
+    }
+
+    #[test]
+    fn receipt_hashes_cover_repro_commitments() {
+        let mut receipt = receipt_at("15", Uuid::now_v7());
+        receipt.repro = Some(ReproReceiptEvidence {
+            executor: ReproExecutor::Node,
+            token_hash: "0".repeat(64),
+            spec_hash: "1".repeat(64),
+            image_digest: format!("sha256:{}", "2".repeat(64)),
+            command_hash: "3".repeat(64),
+            result_hash: "4".repeat(64),
+            stdout_hash: "5".repeat(64),
+            stderr_hash: "6".repeat(64),
+            report_hash: "7".repeat(64),
+            exit_code: 0,
+            expected_exit_code: 0,
+            succeeded: true,
+            truncated: false,
+        });
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+
+        assert!(receipt_hash_matches(&receipt).unwrap());
+        receipt.repro.as_mut().unwrap().stdout_hash = "8".repeat(64);
+        assert!(!receipt_hash_matches(&receipt).unwrap());
+    }
+
+    #[test]
+    fn repro_receipt_hash_matches_the_publisher_reference_vector() {
+        let receipt = PublicReceipt {
+            receipt_id: Uuid::parse_str("019f0000-0000-7000-8000-000000000002").unwrap(),
+            lease_id: "129".to_owned(),
+            node_id_hash: format!("0x{}", "b".repeat(64)),
+            gpu_model: "NVIDIA L4".to_owned(),
+            runtime_seconds: 60,
+            charged_base_units: 13_320,
+            refunded_base_units: 0,
+            provider_paid_base_units: 11_988,
+            failure_class: None,
+            outcome: ReceiptOutcome::Finalized,
+            trust_class: Some(TrustClass::Open),
+            attestation: None,
+            credited_seconds: None,
+            repro: Some(ReproReceiptEvidence {
+                executor: ReproExecutor::Node,
+                token_hash: "0".repeat(64),
+                spec_hash: "1".repeat(64),
+                image_digest: format!("sha256:{}", "2".repeat(64)),
+                command_hash: "3".repeat(64),
+                result_hash: "4".repeat(64),
+                stdout_hash: "5".repeat(64),
+                stderr_hash: "6".repeat(64),
+                report_hash: "7".repeat(64),
+                exit_code: 0,
+                expected_exit_code: 0,
+                succeeded: true,
+                truncated: false,
+            }),
+            receipt_hash: String::new(),
+            transaction_hash: format!("0x{}", "d".repeat(64)),
+        };
+
+        assert_eq!(
+            receipt_hash(&receipt).unwrap(),
+            "947448674b4c449999cf2106d7cd55f7a3e3041f3f4534086e8e9466fc6d395d"
+        );
+    }
+
+    #[test]
+    fn legacy_lease_requests_have_no_repro_capability() {
+        let request: LeaseRequest = serde_json::from_value(serde_json::json!({
+            "image": format!("registry.example/runtime@sha256:{}", "a".repeat(64)),
+            "duration_seconds": 120,
+            "min_vram_mib": 1024,
+            "preferred_node_id": null,
+            "command": "nvidia-smi"
+        }))
+        .unwrap();
+
+        assert!(request.repro.is_none());
     }
 
     fn unsigned_attestation(node_id: &str) -> UnsignedNodeAttestation {
@@ -3675,6 +4174,7 @@ mod tests {
             trust_class: Some(TrustClass::Open),
             attestation: None,
             credited_seconds: Some(150),
+            repro: None,
             receipt_hash: String::new(),
             transaction_hash: format!("0x{}", "c".repeat(64)),
         };

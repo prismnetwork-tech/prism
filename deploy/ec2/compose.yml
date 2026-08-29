@@ -20,6 +20,11 @@ services:
       - caddy_config:/config
     depends_on:
       inference:
+        condition: service_started
+      control-plane:
+        condition: service_healthy
+
+  inference:
     image: node:22-alpine@sha256:9fcc1a6da2b9eba3037dc0d6e0a1a1fbc0f7d047b90aa9d3193b16f04b515821
     restart: unless-stopped
     working_dir: /app
@@ -32,9 +37,6 @@ services:
       - inference_state:/state
     environment:
       INFERENCE_PAYMENTS_FILE: /state/inference-consumed.log
-
-  control-plane:
-        condition: service_healthy
 
   control-plane:
     image: ${PRISM_CONTROL_PLANE_IMAGE:?set PRISM_CONTROL_PLANE_IMAGE}
@@ -210,6 +212,22 @@ services:
       PRISM_VAST_NODE_IDS: ${PRISM_VAST_NODE_IDS:-}
     secrets:
       - vast_api_key
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+  repro-worker:
+    image: ${PRISM_REPRO_WORKER_IMAGE:?set PRISM_REPRO_WORKER_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    environment:
+      AWS_REGION: ${AWS_REGION:-eu-central-1}
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_ACCESS_CREDENTIAL_KEY: ${PRISM_ACCESS_CREDENTIAL_KEY:?set PRISM_ACCESS_CREDENTIAL_KEY}
+      PRISM_GATEWAY_KMS_KEY_ID: ${PRISM_GATEWAY_KMS_KEY_ID:?set PRISM_GATEWAY_KMS_KEY_ID}
     depends_on:
       control-plane:
         condition: service_healthy

@@ -17,11 +17,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp "/workspace/target/release/${BINARY}" /workspace/prism-service
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG BINARY
 RUN useradd --system --create-home --uid 10001 prism \
     && apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && if [ "$BINARY" = "prism-repro-worker" ]; then \
+         apt-get install --yes --no-install-recommends openssh-client; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
-ARG BINARY
 RUN test -n "${BINARY}"
 # The commit this image was built from. Services record it so a deployment that
 # has fallen behind the repository is visible without inspecting image digests

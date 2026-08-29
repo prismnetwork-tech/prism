@@ -1,4 +1,5 @@
 export const gpuLeaseDurations = [30, 60, 120, 360] as const;
+export const maxGpuReproCommandBytes = 2 * 1_024;
 
 export type MarketplaceOffer = {
   node_id: `0x${string}`;
@@ -11,24 +12,27 @@ export type MarketplaceOffer = {
   reliability_bps: number;
   benchmark_score?: number;
   staker_only?: boolean;
+  command_channel?: boolean;
+  managed_batch?: boolean;
 };
 
-export type GpuLaunchIntent = {
+export type GpuReproSpec = {
   image: string;
-  durationSeconds: number;
-  minVramMib: number;
-  sshPublicKey: string;
+  command: string;
+  duration_seconds: number;
+  min_vram_mib: number;
+  expected_exit_code: number;
 };
 
-export type GpuLeasePlan = GpuLaunchIntent & {
+export type GpuLeasePlan = GpuReproSpec & {
   estimatedGpu: {
     model: string;
     vramMib: number;
     cudaMajor: number;
   };
+  estimatedExecutor: "node" | "managed";
   maximumEscrowBaseUnits: bigint;
   maximumEscrowUsdg: string;
-  approvalUrl: string;
 };
 
 export class GpuCapabilityError extends Error {
@@ -44,11 +48,11 @@ export function prepareGpuLeasePlan(
   offers: MarketplaceOffer[],
   input: {
     image: string;
+    command: string;
     durationMinutes: number;
     minVramGib: number;
-    sshPublicKey: string;
+    expectedExitCode: number;
   },
-  origin: URL,
 ): GpuLeasePlan {
   if (!isPinnedPublicImage(input.image)) {
     throw new GpuCapabilityError(
@@ -65,76 +69,48 @@ export function prepareGpuLeasePlan(
   if (!Number.isSafeInteger(input.minVramGib) || input.minVramGib < 1 || input.minVramGib > 192) {
     throw new GpuCapabilityError("invalid_vram", "Minimum GPU memory must be between 1 and 192 GiB.");
   }
-  const sshPublicKey = canonicalSshPublicKey(input.sshPublicKey);
-  if (!sshPublicKey) {
-    throw new GpuCapabilityError("invalid_ssh_key", "Use one Ed25519 SSH public key.");
+  if (!isGpuReproCommand(input.command)) {
+    throw new GpuCapabilityError(
+      "invalid_command",
+      `Command must be non-empty and at most ${maxGpuReproCommandBytes / 1_024} KiB.`,
+    );
+  }
+  if (!Number.isSafeInteger(input.expectedExitCode) || input.expectedExitCode < 0 || input.expectedExitCode > 255) {
+    throw new GpuCapabilityError("invalid_exit_code", "Expected exit code must be between 0 and 255.");
   }
 
   const minVramMib = input.minVramGib * 1_024;
   const eligible = offers
     .filter(isGenerallyAvailableOffer)
+    .filter(canRunRepro)
     .filter((offer) => offer.gpu.vram_mib >= minVramMib)
     .sort(compareOffers);
   const offer = eligible[0];
   if (!offer) {
     throw new GpuCapabilityError(
       "capacity_unavailable",
-      `No live GPU offer meets the ${input.minVramGib} GiB minimum.`,
+      `No live repro-capable GPU offer meets the ${input.minVramGib} GiB minimum.`,
     );
   }
 
   const durationSeconds = input.durationMinutes * 60;
   const maximumEscrowBaseUnits = BigInt(offer.rate_per_second) * BigInt(durationSeconds);
-  const approvalUrl = new URL("/compute", origin);
-  approvalUrl.searchParams.set("intent", "prism-gpu-repro-v1");
-  approvalUrl.searchParams.set("image", input.image);
-  approvalUrl.searchParams.set("duration", String(durationSeconds));
-  approvalUrl.searchParams.set("min_vram_mib", String(minVramMib));
-  approvalUrl.searchParams.set("ssh_key", sshPublicKey);
 
   return {
     image: input.image,
-    durationSeconds,
-    minVramMib,
-    sshPublicKey,
+    command: input.command,
+    duration_seconds: durationSeconds,
+    min_vram_mib: minVramMib,
+    expected_exit_code: input.expectedExitCode,
     estimatedGpu: {
       model: offer.gpu.model,
       vramMib: offer.gpu.vram_mib,
       cudaMajor: offer.gpu.cuda_major,
     },
+    estimatedExecutor: offer.managed_batch === true ? "managed" : "node",
     maximumEscrowBaseUnits,
     maximumEscrowUsdg: formatUsdg(maximumEscrowBaseUnits),
-    approvalUrl: approvalUrl.toString(),
   };
-}
-
-export function parseGpuLaunchIntent(params: URLSearchParams): GpuLaunchIntent | null {
-  if (!params.has("intent")) return null;
-  if (params.get("intent") !== "prism-gpu-repro-v1") {
-    throw new GpuCapabilityError("invalid_intent", "This GPU launch link uses an unsupported intent version.");
-  }
-
-  const image = params.get("image") ?? "";
-  const durationSeconds = Number(params.get("duration"));
-  const minVramMib = Number(params.get("min_vram_mib"));
-  const sshPublicKey = params.get("ssh_key") ?? "";
-  if (!isPinnedPublicImage(image)) {
-    throw new GpuCapabilityError("invalid_image", "The GPU launch link contains an invalid OCI image.");
-  }
-  if (
-    !Number.isSafeInteger(durationSeconds)
-    || !gpuLeaseDurations.includes((durationSeconds / 60) as (typeof gpuLeaseDurations)[number])
-  ) {
-    throw new GpuCapabilityError("invalid_duration", "The GPU launch link contains an invalid duration.");
-  }
-  if (!Number.isSafeInteger(minVramMib) || minVramMib < 1_024 || minVramMib > 196_608) {
-    throw new GpuCapabilityError("invalid_vram", "The GPU launch link contains an invalid memory requirement.");
-  }
-  const canonicalKey = canonicalSshPublicKey(sshPublicKey);
-  if (!canonicalKey) {
-    throw new GpuCapabilityError("invalid_ssh_key", "The GPU launch link contains an invalid SSH key.");
-  }
-  return { image, durationSeconds, minVramMib, sshPublicKey: canonicalKey };
 }
 
 export function summarizeGpuCapacity(offers: MarketplaceOffer[]) {
@@ -145,6 +121,8 @@ export function summarizeGpuCapacity(offers: MarketplaceOffer[]) {
     available: number;
     minimumRatePerSecond: number;
     maximumReliabilityBps: number;
+    managedRepro: boolean;
+    deviceRepro: boolean;
   }>();
   for (const offer of offers) {
     if (!isGenerallyAvailableOffer(offer)) continue;
@@ -154,6 +132,8 @@ export function summarizeGpuCapacity(offers: MarketplaceOffer[]) {
       current.available += 1;
       current.minimumRatePerSecond = Math.min(current.minimumRatePerSecond, offer.rate_per_second);
       current.maximumReliabilityBps = Math.max(current.maximumReliabilityBps, offer.reliability_bps);
+      current.managedRepro ||= offer.managed_batch === true;
+      current.deviceRepro ||= offer.command_channel === true;
       continue;
     }
     groups.set(key, {
@@ -163,6 +143,8 @@ export function summarizeGpuCapacity(offers: MarketplaceOffer[]) {
       available: 1,
       minimumRatePerSecond: offer.rate_per_second,
       maximumReliabilityBps: offer.reliability_bps,
+      managedRepro: offer.managed_batch === true,
+      deviceRepro: offer.command_channel === true,
     });
   }
   return [...groups.values()]
@@ -190,7 +172,9 @@ export function isMarketplaceOffer(value: unknown): value is MarketplaceOffer {
       offer.benchmark_score === undefined
       || (Number.isSafeInteger(offer.benchmark_score) && offer.benchmark_score >= 0)
     )
-    && (offer.staker_only === undefined || typeof offer.staker_only === "boolean");
+    && (offer.staker_only === undefined || typeof offer.staker_only === "boolean")
+    && (offer.command_channel === undefined || typeof offer.command_channel === "boolean")
+    && (offer.managed_batch === undefined || typeof offer.managed_batch === "boolean");
 }
 
 export function isPinnedPublicImage(image: string) {
@@ -212,6 +196,13 @@ export function isSshPublicKey(value: string) {
   return canonicalSshPublicKey(value) !== null;
 }
 
+export function isGpuReproCommand(value: string) {
+  return typeof value === "string"
+    && value.trim().length > 0
+    && !value.includes("\0")
+    && new TextEncoder().encode(value).byteLength <= maxGpuReproCommandBytes;
+}
+
 export function formatUsdg(baseUnits: number | bigint) {
   const value = BigInt(baseUnits);
   const whole = value / 1_000_000n;
@@ -227,6 +218,10 @@ function compareOffers(left: MarketplaceOffer, right: MarketplaceOffer) {
 
 function isGenerallyAvailableOffer(offer: MarketplaceOffer) {
   return offer.staker_only !== true;
+}
+
+function canRunRepro(offer: MarketplaceOffer) {
+  return offer.command_channel === true || offer.managed_batch === true;
 }
 
 function canonicalSshPublicKey(value: string) {

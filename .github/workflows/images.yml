@@ -35,6 +35,7 @@ jobs:
           - prism-control-plane
           - prism-access-gateway
           - prism-lifecycle-worker
+          - prism-repro-worker
           - prism-settlement-worker
           - prism-reconciliation-monitor
     steps:

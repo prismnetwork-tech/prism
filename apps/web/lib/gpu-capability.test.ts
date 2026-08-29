@@ -1,16 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   GpuCapabilityError,
+  isGpuReproCommand,
   isPinnedPublicImage,
-  parseGpuLaunchIntent,
   prepareGpuLeasePlan,
   summarizeGpuCapacity,
   type MarketplaceOffer,
 } from "./gpu-capability";
 
 const image = `ghcr.io/prism-network/gpu-repro@sha256:${"a".repeat(64)}`;
-const sshPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFgcqV9bxjW5lu0s9eN0589FiHY0vZpg7Yi+mlw73P9h prism-repro";
-const canonicalSshPublicKey = sshPublicKey.slice(0, sshPublicKey.lastIndexOf(" "));
+const command = "python -c 'import torch; assert torch.cuda.is_available()'";
 const offers: MarketplaceOffer[] = [
   {
     node_id: `0x${"1".repeat(64)}`,
@@ -18,6 +17,7 @@ const offers: MarketplaceOffer[] = [
     rate_per_second: 120,
     reliability_bps: 9_900,
     benchmark_score: 8_000,
+    managed_batch: true,
   },
   {
     node_id: `0x${"2".repeat(64)}`,
@@ -25,6 +25,7 @@ const offers: MarketplaceOffer[] = [
     rate_per_second: 222,
     reliability_bps: 9_800,
     benchmark_score: 10_000,
+    managed_batch: true,
   },
   {
     node_id: `0x${"3".repeat(64)}`,
@@ -33,35 +34,54 @@ const offers: MarketplaceOffer[] = [
     reliability_bps: 9_900,
     benchmark_score: 10_100,
     staker_only: true,
+    managed_batch: true,
   },
 ];
 
 describe("GPU capability planning", () => {
-  it("prepares a bounded approval URL without creating a lease", () => {
+  it("prepares a bounded immutable repro specification", () => {
     const plan = prepareGpuLeasePlan(offers, {
       image,
+      command,
       durationMinutes: 30,
       minVramGib: 40,
-      sshPublicKey,
-    }, new URL("https://prism.example"));
+      expectedExitCode: 0,
+    });
 
     expect(plan.estimatedGpu.model).toBe("L40S");
     expect(plan.maximumEscrowUsdg).toBe("0.3996");
-    expect(parseGpuLaunchIntent(new URL(plan.approvalUrl).searchParams)).toEqual({
+    expect(plan).toMatchObject({
       image,
-      durationSeconds: 1_800,
-      minVramMib: 40_960,
-      sshPublicKey: canonicalSshPublicKey,
+      command,
+      duration_seconds: 1_800,
+      min_vram_mib: 40_960,
+      expected_exit_code: 0,
     });
   });
 
   it("fails explicitly when matching capacity is unavailable", () => {
     expect(() => prepareGpuLeasePlan(offers, {
       image,
+      command,
       durationMinutes: 30,
       minVramGib: 80,
-      sshPublicKey,
-    }, new URL("https://prism.example"))).toThrowError(GpuCapabilityError);
+      expectedExitCode: 0,
+    })).toThrowError(GpuCapabilityError);
+  });
+
+  it("does not quote an offer with no executable batch path", () => {
+    const interactiveOnly = {
+      ...offers[0],
+      command_channel: false,
+      managed_batch: false,
+    };
+    expect(() => prepareGpuLeasePlan([interactiveOnly], {
+      image,
+      command,
+      durationMinutes: 30,
+      minVramGib: 1,
+      expectedExitCode: 0,
+    })).toThrowError(/repro-capable/);
   });
 
   it("rejects mutable and private-registry images", () => {
@@ -71,22 +91,19 @@ describe("GPU capability planning", () => {
     expect(isPinnedPublicImage(image)).toBe(true);
   });
 
-  it("rejects malformed SSH keys and removes key comments from launch URLs", () => {
+  it("rejects empty, null-containing, and oversized commands", () => {
+    expect(isGpuReproCommand(command)).toBe(true);
+    expect(isGpuReproCommand("  ")).toBe(false);
+    expect(isGpuReproCommand("echo\0oops")).toBe(false);
+    expect(isGpuReproCommand("é".repeat(1_025))).toBe(false);
+
     expect(() => prepareGpuLeasePlan(offers, {
       image,
+      command: " ",
       durationMinutes: 30,
       minVramGib: 40,
-      sshPublicKey: "ssh-ed25519 AAAA not-a-key",
-    }, new URL("https://prism.example"))).toThrowError(GpuCapabilityError);
-
-    const plan = prepareGpuLeasePlan(offers, {
-      image,
-      durationMinutes: 30,
-      minVramGib: 40,
-      sshPublicKey,
-    }, new URL("https://prism.example"));
-    expect(plan.sshPublicKey).toBe(canonicalSshPublicKey);
-    expect(plan.approvalUrl).not.toContain("prism-repro");
+      expectedExitCode: 0,
+    })).toThrowError(GpuCapabilityError);
   });
 
   it("summarizes capacity without operational node identifiers", () => {
@@ -97,6 +114,8 @@ describe("GPU capability planning", () => {
     expect(summary.find((item) => item.model === "L40S")).toMatchObject({
       available: 1,
       fromUsdgPerHour: "0.7992",
+      managedRepro: true,
+      deviceRepro: false,
     });
   });
 });
