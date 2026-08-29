@@ -76,6 +76,41 @@ describe("isPublicProofIndex", () => {
   });
 });
 
+describe("recomputeReceiptHash with an availability credit", () => {
+  // The hash is pinned in the Rust that mints it (crates/protocol receipt_hash
+  // tests), so this checks the two implementations agree rather than checking
+  // this one against itself.
+  const credited: PublicProofReceipt = {
+    receipt_id: "019f0000-0000-7000-8000-000000000001",
+    lease_id: "128",
+    node_id_hash: `0x${"a".repeat(64)}`,
+    gpu_model: "NVIDIA L40S",
+    runtime_seconds: 200,
+    charged_base_units: 44_400,
+    refunded_base_units: 155_400,
+    provider_paid_base_units: 39_960,
+    failure_class: "interrupted",
+    outcome: "finalized",
+    trust_class: "open",
+    credited_seconds: 150,
+    receipt_hash: "c63e4690f2e6be23ecf474e2f5e813b3eecce5b36a3d4a2b39b3c6e87e7de135",
+    transaction_hash: `0x${"c".repeat(64)}`,
+  };
+
+  it("agrees with the Rust that minted it", async () => {
+    await expect(recomputeReceiptHash(credited)).resolves.toBe(credited.receipt_hash);
+  });
+
+  it("accepts a credited receipt into the feed", () => {
+    expect(isPublicProofIndex({ generated_at: new Date().toISOString(), receipts: [credited] })).toBe(true);
+  });
+
+  it("leaves a receipt settled before the commitment hashing exactly as it did", async () => {
+    expect(Object.hasOwn(published, "credited_seconds")).toBe(false);
+    await expect(recomputeReceiptHash(published)).resolves.toBe(published.receipt_hash);
+  });
+});
+
 describe("recomputeReceiptHash", () => {
   it("reproduces the hash a settled receipt was published with", async () => {
     await expect(recomputeReceiptHash(published)).resolves.toBe(published.receipt_hash);

@@ -52,11 +52,8 @@ export default function AboutPage() {
           documented alongside the source for independent technical review.
         </p>
         <p>
-          Review the{" "}
-          <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">
-            Prism source repository
-          </a>{" "}
-          or read the <a href="https://docs.prismnetwork.tech">developer documentation</a>.
+          Read the <a href="https://docs.prismnetwork.tech">developer documentation</a> for the
+          architecture, the operational contracts and the API reference.
         </p>
       </InformationSection>
     </InformationPage>

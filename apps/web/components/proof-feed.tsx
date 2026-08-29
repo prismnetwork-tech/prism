@@ -62,7 +62,7 @@ function Receipt({ receipt }: { receipt: PublicProofReceipt }) {
   return (
     <div className="receipt">
       <div><p className="eyebrow">{formatOutcome(receipt)}</p><h2>{receipt.gpu_model}</h2><span className="mono">{shortHash(receipt.receipt_hash)}</span></div>
-      <div className="receipt-values"><span>{formatRuntime(receipt.runtime_seconds)} confirmed</span><span>{formatUsdg(receipt.charged_base_units)} USDG charged</span><span>{formatUsdg(receipt.provider_paid_base_units)} USDG paid</span><span>{formatUsdg(receipt.refunded_base_units)} USDG refunded</span>{receipt.trust_class && <span>{receipt.trust_class} class</span>}{receipt.attestation && <span className="mono">device verdict {shortHash(receipt.attestation.verdict_digest)}</span>}{recomputed !== "unchecked" && <span>{hashLabel(recomputed)}</span>}</div>
+      <div className="receipt-values"><span>{formatRuntime(receipt.runtime_seconds)} confirmed</span><span>{formatUsdg(receipt.charged_base_units)} USDG charged</span><span>{formatUsdg(receipt.provider_paid_base_units)} USDG paid</span><span>{formatUsdg(receipt.refunded_base_units)} USDG refunded</span>{receipt.credited_seconds !== undefined && <span>{formatRuntime(receipt.credited_seconds)} not charged</span>}{receipt.trust_class && <span>{receipt.trust_class} class</span>}{receipt.attestation && <span className="mono">device verdict {shortHash(receipt.attestation.verdict_digest)}</span>}{recomputed !== "unchecked" && <span>{hashLabel(recomputed)}</span>}</div>
       <a href={`https://robinhoodchain.blockscout.com/tx/${receipt.transaction_hash}`} target="_blank" rel="noreferrer">View settlement</a>
     </div>
   );

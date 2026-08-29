@@ -1,7 +1,12 @@
+import type { AttestationResult, VerifyConfidentialOptions, WorkloadPin } from "./attest.d.mts";
+
 export declare const robinhoodChain: unknown;
 export declare const USDG: string;
 export declare const DEFAULT_IMAGE: string;
 export declare const TRUST_CLASSES: readonly ["open", "isolated", "attested", "confidential"];
+
+export { DEFAULT_CONFIDENTIAL_BASE, EXPECTED_WORKLOAD, renderChecks, verifyConfidential } from "./attest.d.mts";
+export type { AttestationCheck, AttestationResult, WorkloadPin } from "./attest.d.mts";
 
 /// `mode` says which of the two shapes arrived. Brokered capacity fills in
 /// `ssh_host` and `ssh_port`; a node that accepts nothing inbound fills in the
@@ -54,6 +59,35 @@ export interface RunResult {
   timedOut: boolean;
 }
 
+export interface PaidResponse {
+  status: number;
+  headers: Headers;
+  /// The response bytes exactly as they arrived, which is what a signed receipt
+  /// over the exchange commits to.
+  bytes: Buffer;
+  tx: string;
+  /// The request as the attempt that was served built it. Under E2EE each
+  /// attempt seals its own envelope, so this is the one the receipt covers.
+  sent: { bytes: Buffer; headers?: Record<string, string>; [key: string]: unknown };
+}
+
+/// One confidential generation, with everything needed to check it afterwards.
+export interface ConfidentialRun {
+  model: string;
+  content: string | null;
+  usage: Record<string, unknown> | null;
+  receiptId: string | null;
+  receipt: Record<string, unknown> | null;
+  /// The key set the prompt was encrypted to, when e2ee was on.
+  keysetDigest: string | null;
+  e2ee: boolean;
+  priceMicros: string;
+  priceUsdg: string;
+  tx: string;
+  bytes: { request: Buffer; response: Buffer; restoredRequest?: Buffer };
+  verify(options?: Partial<VerifyConfidentialOptions>): Promise<AttestationResult>;
+}
+
 export declare class PrismAgent {
   constructor(options: { privateKey: string; escrow: string; apiBase?: string; rpcUrl?: string });
   readonly address: string;
@@ -96,6 +130,35 @@ export declare class PrismAgent {
   /// not a one-shot command: scp, a notebook client, an interactive shell.
   forward(lease: LeaseHandle, options?: { service?: "ssh" | "jupyter" }): Promise<RelayForwarder>;
   endLease(lease: LeaseHandle): void;
+  /// Pay for one call to a metered endpoint, keeping the payment until the
+  /// endpoint serves. Bytes are sent verbatim. Pass `seal` instead of `body` for
+  /// a request that has to be rebuilt per attempt, with `fingerprint` so the
+  /// kept payment still recognises the two attempts as the same request.
+  payAndPost(options: {
+    base: string;
+    path: string;
+    price: bigint | number | string;
+    payTo: string;
+    body?: Uint8Array | string | Record<string, unknown> | null;
+    headers?: Record<string, string>;
+    seal?: (() => { bytes: Uint8Array; headers?: Record<string, string> }) | null;
+    fingerprint?: Uint8Array | string | null;
+    retryDelayMs?: number;
+    caller?: string;
+  }): Promise<PaidResponse>;
+  /// One generation from the confidential tier, end-to-end encrypted by default
+  /// to a key the serving enclave's attestation quote commits to, from an
+  /// enclave running the code `expectedWorkload` pins.
+  confidentialInfer(options: {
+    prompt?: string;
+    messages?: Array<{ role: string; content: string }>;
+    model?: string | null;
+    maxUsdg?: number;
+    maxTokens?: number;
+    e2ee?: boolean;
+    expectedWorkload?: WorkloadPin | null;
+    endpoint?: string;
+  }): Promise<ConfidentialRun>;
 }
 
 export declare class PrismError extends Error {

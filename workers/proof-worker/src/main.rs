@@ -41,7 +41,59 @@ enum ArtifactStore {
 #[derive(Serialize)]
 struct ProofIndex<'a> {
     generated_at: chrono::DateTime<Utc>,
+    /// Every receipt the index carries, newest first. Kept whole so existing
+    /// readers do not have to change.
     receipts: &'a [PublicReceipt],
+    /// How many receipts exist, which is not always how many are listed above.
+    /// A reader that finds `total` larger than `receipts` is looking at a
+    /// truncated window and should walk `pages` instead of assuming the feed
+    /// stopped.
+    total: usize,
+    page_size: usize,
+    pages: usize,
+    /// First page of the complete set, newest first. `null` when there is
+    /// nothing published yet.
+    first_page: Option<String>,
+}
+
+/// One page of the complete set. `next` is the path to the following page, or
+/// `null` on the last one, so a verifier can walk to the end without guessing
+/// how many pages exist.
+#[derive(Serialize)]
+struct ProofPage<'a> {
+    generated_at: chrono::DateTime<Utc>,
+    page: usize,
+    page_size: usize,
+    pages: usize,
+    total: usize,
+    next: Option<String>,
+    receipts: &'a [PublicReceipt],
+}
+
+/// Small enough that a page is cheap to fetch, large enough that the common
+/// case is one request.
+const PROOF_PAGE_SIZE: usize = 500;
+
+fn proof_pages(receipts: &[PublicReceipt]) -> Vec<(String, Vec<u8>)> {
+    let total = receipts.len();
+    let pages = total.div_ceil(PROOF_PAGE_SIZE).max(1);
+    let mut out = Vec::new();
+    for (i, chunk) in receipts.chunks(PROOF_PAGE_SIZE).enumerate() {
+        let page = i + 1;
+        let body = ProofPage {
+            generated_at: Utc::now(),
+            page,
+            page_size: PROOF_PAGE_SIZE,
+            pages,
+            total,
+            next: (page < pages).then(|| format!("pages/{}.json", page + 1)),
+            receipts: chunk,
+        };
+        if let Ok(bytes) = serde_json::to_vec_pretty(&body) {
+            out.push((format!("pages/{page}.json"), bytes));
+        }
+    }
+    out
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -185,12 +237,20 @@ async fn publish_pending_receipts(pool: &PgPool, store: &ArtifactStore) -> anyho
     .map(|SqlJson(receipt)| receipt)
     .collect::<Vec<_>>();
     validate_receipts(&all)?;
+    let pages = proof_pages(&all);
+    for (key, body) in &pages {
+        store.put(key, body.clone(), "application/json").await?;
+    }
     store
         .put(
             "index.json",
             serde_json::to_vec_pretty(&ProofIndex {
                 generated_at: Utc::now(),
                 receipts: &all,
+                total: all.len(),
+                page_size: PROOF_PAGE_SIZE,
+                pages: pages.len(),
+                first_page: (!all.is_empty()).then(|| "pages/1.json".to_owned()),
             })?,
             "application/json",
         )
@@ -651,9 +711,29 @@ fn publish_artifacts(directory: &Path, receipts: &[PublicReceipt]) -> anyhow::Re
         let path = receipt_directory.join(format!("{}.json", receipt.receipt_id));
         atomic_write(&path, &serde_json::to_vec_pretty(receipt)?)?;
     }
+    let page_directory = directory.join("pages");
+    fs::create_dir_all(&page_directory)?;
+    let pages = proof_pages(receipts);
+    let expected_pages: HashSet<String> =
+        pages.iter().map(|(key, _)| key["pages/".len()..].to_owned()).collect();
+    for entry in fs::read_dir(&page_directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && !expected_pages.contains(&entry.file_name().to_string_lossy().into_owned())
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    for (key, body) in &pages {
+        atomic_write(&directory.join(key), body)?;
+    }
     let index = ProofIndex {
         generated_at: Utc::now(),
         receipts,
+        total: receipts.len(),
+        page_size: PROOF_PAGE_SIZE,
+        pages: pages.len(),
+        first_page: (!receipts.is_empty()).then(|| "pages/1.json".to_owned()),
     };
     atomic_write(
         &directory.join("index.json"),
@@ -890,6 +970,7 @@ mod tests {
                 refunded_base_units: 250_000,
                 provider_paid_base_units: 1_125_000,
                 failure_class: None,
+                credited_seconds: None,
                 outcome: ReceiptOutcome::Finalized,
                 trust_class: None,
                 attestation: None,
@@ -906,6 +987,7 @@ mod tests {
                 refunded_base_units: 500_000,
                 provider_paid_base_units: 0,
                 failure_class: Some("provisioning_timeout".to_owned()),
+                credited_seconds: None,
                 outcome: ReceiptOutcome::Refunded,
                 trust_class: None,
                 attestation: None,
@@ -937,6 +1019,7 @@ mod tests {
             refunded_base_units: 0,
             provider_paid_base_units: 1,
             failure_class: None,
+            credited_seconds: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,
@@ -1153,6 +1236,7 @@ mod tests {
             refunded_base_units: 0,
             provider_paid_base_units: 900_000,
             failure_class: None,
+            credited_seconds: None,
             outcome: ReceiptOutcome::Finalized,
             trust_class: None,
             attestation: None,

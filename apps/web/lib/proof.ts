@@ -16,6 +16,11 @@ export type PublicProofReceipt = {
   /// signed device report, not the report. Absent on every receipt settled
   /// before device attestation existed.
   attestation?: { kind: string; verdict_digest: string; verifier_version: string };
+  /// Seconds the renter held but was not charged for, because the machine had
+  /// already stopped answering when the lease was cut short. Absent on a lease
+  /// that ran to its end, and on every receipt settled before the availability
+  /// commitment existed.
+  credited_seconds?: number;
   receipt_hash: string;
   transaction_hash: string;
   /// The escrow that issued this lease id. Ids count from one inside a single
@@ -57,6 +62,7 @@ function isPublicProofReceipt(value: unknown): value is PublicProofReceipt {
     && (receipt.outcome === "finalized" || receipt.outcome === "refunded" || receipt.outcome === "disputed")
     && (receipt.trust_class === undefined || trustClasses.includes(receipt.trust_class))
     && (receipt.attestation === undefined || isAttestation(receipt.attestation))
+    && (receipt.credited_seconds === undefined || isBaseUnits(receipt.credited_seconds, 21_600))
     && /^[0-9a-f]{64}$/i.test(receipt.receipt_hash ?? "")
     && isHash(receipt.transaction_hash);
 }
@@ -96,6 +102,9 @@ export async function recomputeReceiptHash(receipt: PublicProofReceipt): Promise
       verifier_version: receipt.attestation.verifier_version,
     };
   }
+  // Zero is a real credit, so this asks whether the field is there rather than
+  // whether it is truthy.
+  if (receipt.credited_seconds !== undefined) payload.credited_seconds = receipt.credited_seconds;
   const bytes = new TextEncoder().encode(JSON.stringify(payload));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");

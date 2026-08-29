@@ -8,6 +8,18 @@ The project follows semantic versioning after its first stable release.
 
 ### Changed
 
+- The repository moved to `winter0x`, and every link across the site, the
+  packages and the docs points there. The previous two homes are abandoned
+  rather than mirrored: one is hidden from the public by an account
+  restriction, and the other cannot run CI for the same reason.
+
+  Two published names move with it, which the earlier move deliberately avoided.
+  The MCP registry namespace becomes `io.github.winter0x/mcp` and the container
+  image path becomes `ghcr.io/winter0x/prism`. A registry namespace is verified
+  by proving ownership of the account that owns it, so leaving it on an account
+  that can no longer be used would mean never publishing an update again. The
+  existing registry entry stays where it is and stops being maintained.
+
 - Managed inference is repriced against what a generation costs to serve.
   `llama3.2:3b` is 3000 micros plus 3 a token and `llama3.1:8b` is 6000 plus 6,
   which halves the price of a short answer and cuts a full 1024-token one by

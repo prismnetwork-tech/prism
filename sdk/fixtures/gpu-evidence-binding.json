@@ -1,0 +1,8 @@
+{
+  "captured_at": "2026-08-25",
+  "endpoint": "https://api.redpill.ai/v1/attestation/report?model=phala/gemma-4-26b-a4b-uncensored",
+  "workload_keyset_digest": "sha256:fa47ae4c27d5df35d063dd6e0cbd258b8cff1a83b3b974b66ca7cb9fea2d1ec9",
+  "signing_address": "0x79a5061efe5a46b0d1f33b11cf1c5adbedae6b79",
+  "quote_report_data": "79a5061efe5a46b0d1f33b11cf1c5adbedae6b79000000000000000000000000bae90a941e72817cc7c2a18c100f0e8fe8f5dd53d27f2af20578bf857fa1fa95",
+  "nvidia_nonce": "bae90a941e72817cc7c2a18c100f0e8fe8f5dd53d27f2af20578bf857fa1fa95"
+}

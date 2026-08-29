@@ -1,7 +1,7 @@
 # Prism Network
 
-[![Validate](https://github.com/prismnetwork-tech/prism/actions/workflows/validate.yml/badge.svg)](https://github.com/prismnetwork-tech/prism/actions/workflows/validate.yml)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/prismnetwork-tech/prism/badge)](https://securityscorecards.dev/viewer/?uri=github.com/prismnetwork-tech/prism)
+[![Validate](https://github.com/winter0x/prism/actions/workflows/validate.yml/badge.svg)](https://github.com/winter0x/prism/actions/workflows/validate.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/winter0x/prism/badge)](https://securityscorecards.dev/viewer/?uri=github.com/winter0x/prism)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ccff00)](LICENSE)
 [![Headless agent SDK](https://img.shields.io/badge/agents-headless%20SDK-ccff00)](sdk/README.md)
 [![MCP + x402](https://img.shields.io/badge/agents-MCP%20%2B%20x402-ccff00)](mcp/README.md)
@@ -155,6 +155,7 @@ The repository contains:
 - `inference`: managed inference, a warm ollama lease behind an x402-paid endpoint.
 - `integrations`: LangChain, CrewAI, AG2/AutoGen, elizaOS and Virtuals GAME adapters.
 - `examples/trading`: agents that rent a GPU for research, then trade on what it finds.
+- `examples/confidential`: an agent pays for TEE-served inference and verifies the attestation itself.
 - `deploy/ec2`: lean Vast launch topology with the web application on Render.
 - `deploy/lightsail`: full single-host reference topology.
 - `deploy/node`: Ubuntu node service units and configuration.

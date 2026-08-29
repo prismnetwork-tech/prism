@@ -16,6 +16,7 @@
     "receipt.mjs",
     "server.mjs",
     "openapi.mjs",
+    "provider.mjs",
     "README.md"
   ],
   "engines": {
@@ -35,14 +36,6 @@
     "ollama"
   ],
   "homepage": "https://prismnetwork.tech",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/prismnetwork-tech/prism.git",
-    "directory": "inference"
-  },
-  "bugs": {
-    "url": "https://github.com/prismnetwork-tech/prism/issues"
-  },
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"

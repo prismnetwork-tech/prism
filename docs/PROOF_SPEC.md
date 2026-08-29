@@ -6,7 +6,7 @@ matching settlement event. It is intentionally pseudonymous.
 ```json
 {
   "receipt_id": "uuid",
-  "lease_id": "opaque lease identifier",
+  "lease_id": "onchain escrow lease id, as a decimal string",
   "node_id_hash": "sha256-derived identifier",
   "gpu_model": "NVIDIA model",
   "runtime_seconds": 0,
@@ -36,6 +36,11 @@ byte-identical. The verdict digest is all that is published. Raw attestation
 reports are not, because a report carries the GPU's device serial and would
 deanonymize the host.
 
+`lease_id` is the lease id the escrow contract assigned onchain, rendered as a
+decimal string. It is the value the settlement event carries, so a verifier can
+match a receipt to its transaction. It is not the identifier the HTTP API uses
+for the same lease; those are separate counters and they do not agree.
+
 `receipt_hash` is the SHA-256 hash of the canonical payload with the
 `receipt_hash` and `transaction_hash` fields omitted. The transaction hash
 cannot be part of the receipt committed by the settlement transaction that
@@ -50,6 +55,54 @@ event. Disputed receipts are not published as final proof. It removes stale
 receipt artifacts from the generated directory. The public site does not
 expose wallet addresses, precise geography, image digests, files, terminal
 output or private telemetry.
+
+## Walking the whole set
+
+`index.json` carries `total`, `page_size`, `pages` and `first_page`. `receipts`
+is the window the index itself lists; `total` is how many exist. When `total`
+is larger than that window, the index is truncated and the complete set is read
+by following `first_page` and then each page's `next` until it is `null`. Pages
+are newest first and each one repeats `total` and `pages`, so a verifier can
+tell mid-walk that the feed moved under it.
+
+## Reproducing the hashes
+
+Everything below is SHA-256 over UTF-8, written as lowercase hex. Three rules
+decide whether an independent verifier reproduces a published hash, and all
+three are easy to get wrong:
+
+- **Field order is declaration order, not sorted.** The canonical form is the
+  struct's own order, listed below. A verifier that sorts keys alphabetically
+  computes a different hash.
+- **Separators are compact.** No spaces after `:` or `,`.
+- **Absent optional fields are omitted, never null.** `trust_class`,
+  `attestation` and `credited_seconds` disappear from the payload when unset,
+  which is what keeps older receipts byte-identical as fields are added.
+
+`receipt_hash` is taken over exactly these fields, in this order:
+
+```
+receipt_id, lease_id, node_id_hash, gpu_model, runtime_seconds,
+charged_base_units, refunded_base_units, provider_paid_base_units,
+failure_class, outcome, trust_class, attestation, credited_seconds
+```
+
+`receipt_hash` and `transaction_hash` are not part of it. `failure_class` is
+serialized as `null` when absent; the three optional fields above are omitted.
+Numeric fields are JSON numbers, and `lease_id` is a JSON string.
+
+`receipt_set_id` covers a window's receipts. Collect each `receipt_hash`, sort
+them ascending as strings, drop duplicates, and hash the resulting compact JSON
+array of hex strings.
+
+`digest_id` covers the daily digest document. Serialize the document compactly
+with `digest_id` set to the empty string, hash that, then write the result into
+the field.
+
+Confidential inference is a different product from a confidential lease, and a
+receipt does not blur them. Receipts here cover GPU leases, whose ceiling is
+`isolated`. The confidential inference tier runs in a relayed enclave and is
+attested through its own endpoint, not through this feed.
 
 Proof establishes an onchain payment event paired with a platform-attested
 usage record, under a stated trust class. It does not establish that a supplier

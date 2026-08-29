@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/agent-sdk",
-  "version": "0.6.3",
+  "version": "0.7.2",
   "description": "Headless GPU leasing and renter-encrypted storage on Prism Network for wallet-holding agents.",
   "type": "module",
   "main": "prism.mjs",
@@ -8,6 +8,14 @@
     ".": {
       "types": "./prism.d.mts",
       "default": "./prism.mjs"
+    },
+    "./attest": {
+      "types": "./attest.d.mts",
+      "default": "./attest.mjs"
+    },
+    "./e2ee": {
+      "types": "./e2ee.d.mts",
+      "default": "./e2ee.mjs"
     },
     "./toolset": {
       "types": "./toolset.d.mts",
@@ -24,15 +32,22 @@
   },
   "files": [
     "prism.mjs",
-    "relay.mjs",
-    "toolset.d.mts",
     "prism.d.mts",
+    "attest.mjs",
+    "attest.d.mts",
+    "e2ee.mjs",
+    "e2ee.d.mts",
+    "relay.mjs",
     "toolset.mjs",
+    "toolset.d.mts",
     "vault.mjs",
     "vault.d.ts",
     "workspace.mjs",
     "workspace.d.ts",
-    "README.md"
+    "vendor/aci-verifier/*.mjs",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=20"
@@ -47,20 +62,18 @@
     "web3",
     "usdg",
     "compute",
-    "llm"
+    "llm",
+    "tee",
+    "attestation"
   ],
   "homepage": "https://prismnetwork.tech",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/prismnetwork-tech/prism.git",
-    "directory": "sdk"
-  },
-  "bugs": {
-    "url": "https://github.com/prismnetwork-tech/prism/issues"
-  },
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"
   },
-  "types": "prism.d.mts"
+  "types": "prism.d.mts",
+  "dependencies": {
+    "@phala/dcap-qvl": "^0.6.1",
+    "jose": "^6.0.0"
+  }
 }

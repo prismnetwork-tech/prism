@@ -1,11 +1,22 @@
 name: deploy web
 
-# Render is configured to deploy this repository automatically, but the
-# integration that delivers push events disappeared: the repository has no
-# webhooks at all, so autoDeploy sat enabled and idle while the site served a
-# four-day-old build. Nothing reported it, because a deploy that is never
-# requested has no failure to report. Requesting it here means a broken deploy
-# is a red check instead of silence.
+# The site is published as a container image, not built from this repository:
+# the Render service pulls a pinned tag and `autoDeploy` is off. So a deploy is
+# three things, not one, and asking Render to deploy without doing the first two
+# redeploys whatever tag is already pinned while reporting success. That is a
+# green check over an unchanged site, which is worse than a red one.
+#
+# The image goes to ghcr rather than the self-hosted registry. That registry
+# exists to keep the site publishable while this project had no usable GitHub
+# account, and it serves reads anonymously so that Render can pull without a
+# credential. The same anonymous read is what stops anything pushing to it from
+# here: a client picks its auth scheme from the registry ping, the ping answers
+# 200 with no challenge, and from then on it writes as nobody. docker and
+# skopeo both refuse, while the credential itself authenticates a write fine.
+# The account works now, so the workaround can go.
+#
+# The runner builds amd64 natively, which is what Render runs and what an arm64
+# laptop can only reach through emulation.
 
 on:
   workflow_dispatch:
@@ -18,12 +29,79 @@ concurrency:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      # NEXT_PUBLIC_* values are inlined at build time, so the image is only
+      # correct if they match what the service runs with. They are read from the
+      # service itself rather than duplicated into secrets, because a second
+      # copy is a second thing to forget.
+      - name: Read the public build settings off the service
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            "https://api.render.com/v1/services/$SERVICE_ID/env-vars?limit=100" \
+            | jq -r '.[].envVar | select(.key | startswith("NEXT_PUBLIC_")) | "\(.key)=\(.value)"' \
+            > public-build-args.env
+          if [ ! -s public-build-args.env ]; then
+            printf 'the service reports no NEXT_PUBLIC_* settings\n' >&2
+            exit 1
+          fi
+          # The values are not secret, the file is only a build input, but the
+          # log is public so only the names are printed.
+          cut -d= -f1 public-build-args.env
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish the site image
+        id: image
+        run: |
+          set -euo pipefail
+          tag="ghcr.io/${GITHUB_REPOSITORY}/web:${GITHUB_SHA::7}"
+          args=()
+          while IFS= read -r line; do args+=(--build-arg "$line"); done < public-build-args.env
+          docker build --platform linux/amd64 -f deploy/Dockerfile.web "${args[@]}" -t "$tag" .
+          docker push "$tag"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+      # Pinning the tag is what makes the deploy carry this commit. Without it
+      # the request below redeploys the previous image.
+      - name: Pin the service to it
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
+          OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          pinned=$(curl --fail --silent --show-error -X PATCH \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg owner "$OWNER_ID" --arg path "$TAG" \
+                  '{image: {ownerId: $owner, imagePath: $path}}')" \
+            "https://api.render.com/v1/services/$SERVICE_ID" | jq -r '.imagePath')
+          if [ "$pinned" != "$TAG" ]; then
+            printf 'the service is pinned to %s, not %s\n' "$pinned" "$TAG" >&2
+            exit 1
+          fi
+          printf 'pinned %s\n' "$pinned"
+
       - name: Request a deploy of this commit
         id: request
         env:

@@ -131,7 +131,6 @@ export function DeveloperDocs() {
           <span>prism.</span>
         </Link>
         <nav aria-label="Documentation header">
-          <a href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
           <Link href={new URL("/activity", siteUrl).href}>Activity</Link>
           <Link href={new URL("/proof", siteUrl).href}>Receipts</Link>
           <Link className="docs-console-link" href={new URL("/compute", siteUrl).href}>Open console ↗</Link>
@@ -164,7 +163,7 @@ export function DeveloperDocs() {
             </p>
             <div className="docs-hero-actions">
               <a className="landing-button primary" href="#quickstart">Start integration <span>↓</span></a>
-              <a className="landing-button secondary" href="https://github.com/prismnetwork-tech/prism" target="_blank" rel="noopener noreferrer">Read source <span>↗</span></a>
+              <a className="landing-button secondary" href="#architecture">Read the architecture <span>↓</span></a>
             </div>
             <dl className="docs-facts">
               <div><dt>Execution</dt><dd>L40S cloud</dd></div>
@@ -312,8 +311,8 @@ export function DeveloperDocs() {
 
           <DocsSection id="runtime" index="07" eyebrow="Execution environments" title="Runtime modes">
             <div className="runtime-table">
-              <div className="runtime-head"><span>Property</span><span>Managed L40S</span><span>Operator-owned infrastructure</span></div>
-              <RuntimeRow label="Capacity" cloud="Managed NVIDIA L40S capacity" physical="Bonded operator-owned NVIDIA host" />
+              <div className="runtime-head"><span>Property</span><span>Managed cloud capacity</span><span>Operator-owned infrastructure</span></div>
+              <RuntimeRow label="Capacity" cloud="Managed NVIDIA capacity: RTX 6000 Ada, RTX 5880 Ada, RTX A6000, A40, L40S as stock allows" physical="Bonded operator-owned NVIDIA host" />
               <RuntimeRow label="Isolation" cloud="Disposable provider container" physical="Kata sandbox with VFIO GPU assignment" />
               <RuntimeRow label="Access" cloud="Temporary direct root SSH" physical="Revocable SSH/Jupyter grant via mTLS gateway" />
               <RuntimeRow label="Readiness" cloud="Provider state, GPU, VRAM, cost, SSH endpoint" physical="Signed telemetry plus independent active gateway probes" />
@@ -399,7 +398,7 @@ export function DeveloperDocs() {
               </InfoCard>
               <InfoCard title="Excluded protections">
                 <ul>
-                  <li>Host confidentiality or trusted execution.</li>
+                  <li>Host confidentiality or trusted execution on a GPU lease. Confidential inference is a separate tier, served from a relayed enclave with its own attestation endpoint, and does not run on leased Prism GPUs.</li>
                   <li>Protection from a malicious provider operator.</li>
                   <li>Durable workspace storage.</li>
                   <li>Uninterrupted infrastructure-provider availability.</li>

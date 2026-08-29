@@ -29,7 +29,7 @@ export function publicPageRewrite(hostname: string, pathname: string) {
 /// `structured-data.test.ts` recomputes this from the rendered string and fails
 /// if they drift, because a stale hash silently drops the markup.
 export const STRUCTURED_DATA_HASHES = [
-  "sha256-jVGYQAc+tNEHWR50wru54Z/ENBpv0mX6gqRil1B94js=",
+  "sha256-X0tJmqBWy2c3p35NmEyLzHOmoQf1DZ1oE1C+rD0rFSs=",
   "sha256-dHbYlUj0AgSutpV8NARzDW7bvn32OViL3zzave8JVco=",
 ] as const;
 

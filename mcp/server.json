@@ -1,11 +1,11 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.prismnetwork-tech/mcp",
+  "name": "io.github.winter0x/mcp",
   "description": "Rent real NVIDIA GPUs from your agent. Browse with no wallet; pay per second onchain.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "websiteUrl": "https://prismnetwork.tech",
   "repository": {
-    "url": "https://github.com/prismnetwork-tech/prism",
+    "url": "https://github.com/winter0x/prism",
     "source": "github",
     "subfolder": "mcp"
   },
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@prismnetwork/mcp",
-      "version": "0.8.0",
+      "version": "0.9.0",
       "transport": {
         "type": "stdio"
       },
