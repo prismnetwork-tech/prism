@@ -242,7 +242,7 @@ test("a failed generation does not consume the payment", async () => {
   const gateway = build(deps);
   const first = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
   assert.equal(first.status, 503);
-  assert.match(first.body.retry, /not consumed/);
+  assert.match(first.body.retry, /nothing was charged/);
 
   // The same tx works on retry once the backend recovers.
   deps.fetchOllama = fakeDeps().fetchOllama;
@@ -255,14 +255,18 @@ test("a failed warmup releases the lease and cools down instead of chain-leasing
   const deps = fakeDeps();
   deps.agent.run = async () => ({ code: 1, stdout: "", stderr: "no space left" });
   const gateway = build(deps);
+  // A GPU was leased and could not be used, which is this pool being down
+  // rather than busy, and the status has to say so or the outage is invisible.
   const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
   assert.equal(out.status, 503);
+  assert.match(out.body.detail, /no space left/);
   assert.deepEqual(deps.calls.ended, [1]);
 
-  // Retries inside the cooldown window must not fund another lease.
+  // Retries inside the cooldown window must not fund another lease, and are
+  // still answered with the fault that is holding the pool down.
   const retry = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
   assert.equal(retry.status, 503);
-  assert.match(retry.body.detail, /cooling down/);
+  assert.match(retry.body.detail, /cooling down after model pull exit 1/);
   assert.equal(deps.calls.leases, 1);
 
   // After the window, and with the fault fixed, warmup runs again.
@@ -281,7 +285,7 @@ test("a failed match resets to cold and cools down", async () => {
   };
   const gateway = build(deps);
   const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
-  assert.equal(out.status, 503);
+  assert.equal(out.status, 429);
   assert.equal(gateway.state().phase, "cold");
   const retry = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
   assert.match(retry.body.detail, /cooling down/);
@@ -584,11 +588,45 @@ test("a cold box answers immediately with when to retry instead of holding the c
   const started = Date.now();
   const out = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
   assert.ok(Date.now() - started < 2_000, "the caller must not wait on a GPU");
-  assert.equal(out.status, 503);
+  assert.equal(out.status, 429);
   assert.equal(out.body.error, "warming_up");
   assert.equal(out.body.retry_after_seconds, 300);
   assert.equal(out.headers["retry-after"], "300");
   release?.({ leaseId: 1, access: {} });
+});
+
+test("a queue is not a fault: no GPU to run on answers 429, a GPU that fails answers 5xx", async () => {
+  const cold = fakeDeps();
+  cold.agent.lease = () => new Promise(() => {});
+  const queued = await build(cold, { readyWaitMs: 30, retryAfterMs: 300_000 })
+    .handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
+  assert.equal(queued.status, 429);
+  assert.equal(queued.headers["retry-after"], "300");
+  assert.equal(queued.body.state, "warming");
+  // The fields a client reads off a cold answer are the fields it always read.
+  assert.deepEqual(Object.keys(queued.body), ["error", "detail", "state", "retry_after_seconds", "retry"]);
+
+  // A lease that never lands leaves the pool cooling down, which is still the
+  // pool being unable to take work rather than anything having gone wrong here.
+  const refused = fakeDeps();
+  refused.agent.lease = async () => {
+    refused.calls.leases += 1;
+    throw new Error("prism 409: capacity_reserved");
+  };
+  const cooling = build(refused, { coldRetryAfterMs: 600_000 });
+  await cooling.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
+  const out = await cooling.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
+  assert.equal(out.status, 429);
+  assert.equal(out.body.error, "inference_unavailable");
+  assert.equal(out.body.retry_after_seconds, 600);
+
+  const broken = fakeDeps({
+    fetchOllama: async (_slot, path) =>
+      path === "/api/tags" ? { ok: true, json: async () => ({ models: [] }) } : { ok: false, status: 500 },
+  });
+  const failed = await build(broken).handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
+  assert.equal(failed.status, 503, "a box that took the work and could not do it is a fault");
+  assert.equal(failed.body.error, "inference_unavailable");
 });
 
 test("nothing is charged while warming, so the same authorization still works", async () => {
@@ -598,7 +636,7 @@ test("nothing is charged while warming, so the same authorization still works", 
   const exact = fakeExact();
   const gateway = build(deps, { basePayTo: BASE_PAY_TO, exact, readyWaitMs: 30 });
   const first = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, authorization(), 2);
-  assert.equal(first.status, 503);
+  assert.equal(first.status, 429);
   assert.equal(exact.calls.settled, 0, "a warming box must not take money");
 
   // Same authorization again once the box is up: not a replay, because the

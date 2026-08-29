@@ -51,20 +51,32 @@ export default function TrustClassesPage() {
         <p>
           It does not stop the operator watching. Work on its way to the GPU leaves the protected
           part of memory, so this grade tells you what ran. Who could see it is the next grade up.
-          No capacity is served at this grade yet.{" "}
-          <a
-            href="https://github.com/winter0x/prism/blob/main/docs/ATTESTATION.md"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            How the proof is checked
+          No rented machine is served at this grade yet. The{" "}
+          <a href="https://docs.prismnetwork.tech" target="_blank" rel="noopener noreferrer">
+            documentation
           </a>{" "}
-          covers the mechanism and what it leaves open.
+          covers how the proof is checked and what it leaves open.
         </p>
         <h3>Confidential</h3>
         <p>
           Guest memory and GPU memory are encrypted against the host. Here the operator genuinely
           cannot read the workload, and reaching this grade takes particular silicon.
+        </p>
+        <p>
+          Inference is served at this grade today. Nine models run inside an Intel TDX enclave in
+          front of a GPU that NVIDIA attests directly, among them DeepSeek, Llama 3.3 70B, GPT-OSS,
+          Qwen and GLM. The prompt is encrypted to a key the enclave&apos;s attestation quote
+          commits to, and the quote is checked before the prompt is sent. Every generation returns
+          a signed receipt over the exact request and response bytes, and an answer whose
+          attestation does not verify is withheld rather than returned. The{" "}
+          <a
+            href="https://api.prismnetwork.tech/inference/v1/models"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            live model list
+          </a>{" "}
+          carries the current prices.
         </p>
       </InformationSection>
 

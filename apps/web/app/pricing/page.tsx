@@ -53,7 +53,34 @@ export default function PricingPage() {
         </ul>
       </InformationSection>
 
-      <InformationSection index="04" title="Provider economics">
+      <InformationSection index="04" title="Confidential inference">
+        <p>
+          Renting a machine by the hour is one way to buy compute here. The other is a single
+          generation, priced per call and paid from a wallet with no account and no API key.
+          Nine models run at the confidential grade, among them DeepSeek, Llama 3.3 70B, GPT-OSS,
+          Qwen and GLM.
+        </p>
+        <p>
+          A call costs a fixed charge plus a rate over the output cap it asks for, quoted in full
+          before payment and settled in USDG. Today that lands between 0.011 and 0.025 USDG for a
+          full 1,024-token answer, depending on the model. The{" "}
+          <a
+            href="https://api.prismnetwork.tech/inference/v1/models"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            live model list
+          </a>{" "}
+          carries the current rate for each one.
+        </p>
+        <p>
+          You pay for the cap you request rather than the tokens produced, so a request that asks
+          for less costs less. An answer whose attestation does not verify is withheld, and that
+          call is still charged.
+        </p>
+      </InformationSection>
+
+      <InformationSection index="05" title="Provider economics">
         <p>
           Finalized usage allocates 90% of the confirmed charge to the provider and 10% to the
           Prism as the service fee. The funded maximum is not the final charge; settlement is

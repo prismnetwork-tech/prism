@@ -9,6 +9,8 @@
 // leases settle with the same public receipts.
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { createPublicClient, getAddress, http, recoverMessageAddress } from "viem";
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
 import { createExactEvm } from "@prismnetwork/x402/exact-evm";
@@ -33,6 +35,7 @@ import {
   inferenceOutput,
   openApiDocument,
 } from "./openapi.mjs";
+import { providerModels } from "./provider.mjs";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
@@ -252,6 +255,12 @@ const confidentialSchemas = config.confidential
               "Output token cap; the price scales with it. Required, because the body is forwarded unchanged.",
           },
           temperature: { type: "number" },
+          stream: {
+            type: "boolean",
+            description:
+              "Return the answer as server-sent events, relayed frame by frame. The receipt covers " +
+              "the whole stream, framing included.",
+          },
         },
       },
       output: {
@@ -363,6 +372,16 @@ const server = createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/v1/stats") {
     return json(res, 200, gateway.stats());
+  }
+  // The confidential tier as an aggregator's provider monitor reads a
+  // catalogue. Free, and assembled from live pricing and the live spend cap so
+  // it says the same thing the 402 does.
+  if (req.method === "GET" && url.pathname === "/v1/provider/models") {
+    const catalogue = providerModels({
+      confidential: gateway.confidential(),
+      dailyUsd: gateway.stats().confidential_daily_cap_usd,
+    });
+    return json(res, 200, catalogue, { "cache-control": "public, max-age=300" });
   }
   // The canonical discovery contract. Built from live pricing for the same
   // reason as the manifest below: a document that disagrees with the endpoint
@@ -507,7 +526,7 @@ const server = createServer(async (req, res) => {
     return relayed(res, await gateway.attestation(url.searchParams.get("nonce")));
   }
   if (req.method === "GET" && url.pathname === "/v1/gpu-evidence") {
-    return relayed(res, await gateway.gpuEvidence(url.searchParams.get("model")));
+    return relayed(res, await gateway.gpuEvidence(url.searchParams.get("model"), url.searchParams.get("keyset_digest")));
   }
   if (req.method === "GET" && url.pathname === "/v1/sessions") {
     return relayed(res, await gateway.sessions({
@@ -554,8 +573,11 @@ function confidentialEndpoints(confidential) {
         "unchanged and returns the upstream bytes unchanged, so the receipt the enclave signs over " +
         "both covers exactly what you sent and exactly what you received; the id to fetch it comes " +
         "back in X-Receipt-Id. Send the five X-E2EE-* headers to encrypt message content to the " +
-        "enclave's key, in which case the relay carries ciphertext. A payment is consumed only when " +
-        "a response is served.",
+        "enclave's key, in which case the relay carries ciphertext. Set stream to true for " +
+        "server-sent events: frames are relayed as the enclave produces them, the receipt covers " +
+        "the whole stream including its framing, and the payment settles after the final frame, so " +
+        "a streamed answer carries no PAYMENT-RESPONSE header. A payment is consumed only when a " +
+        "complete response is served.",
       price: `up to ${(Number(confidential.price_micros) / 1e6).toFixed(6)} USDC or USDG per generation, quoted per request`,
       accepts: gateway.confidentialRequirements().accepts,
       inputSchema: confidentialSchemas.input,
@@ -608,9 +630,10 @@ function json(res, status, obj, extra = {}) {
   res.end(payload);
 }
 
-/// A relay answer is either bytes the gateway must not touch or a refusal it
-/// wrote itself.
+/// A relay answer is frames arriving from the enclave, bytes the gateway must
+/// not touch, or a refusal it wrote itself.
 function relayed(res, out) {
+  if (out.stream) return streamed(res, out);
   if (!out.bytes) return json(res, out.status, out.body, out.headers);
   res.writeHead(out.status, {
     "content-type": "application/json",
@@ -618,6 +641,28 @@ function relayed(res, out) {
     "content-length": out.bytes.length,
   });
   res.end(out.bytes);
+}
+
+/// Frames go out as they arrive. Nothing here holds one back: no length to
+/// buffer towards, and the header that stops the proxy in front of this one
+/// collecting the answer and delivering it as a single late chunk. What the
+/// caller is timed on is the first token, not the last.
+async function streamed(res, out) {
+  res.writeHead(out.status, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    "x-accel-buffering": "no",
+    ...out.headers,
+  });
+  try {
+    await pipeline(Readable.from(out.stream), res);
+  } catch (err) {
+    // The caller already holds a 200 and whatever frames landed, so the only
+    // thing left to say is that the body is not all there. Ending the
+    // connection without its terminating chunk is how HTTP says it.
+    console.error(`confidential stream ended early: ${err.message}`);
+    res.destroy();
+  }
 }
 
 function segment(pathname, prefix) {

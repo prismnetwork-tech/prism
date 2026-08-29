@@ -1,14 +1,18 @@
 {
   "name": "@prismnetwork/agentkit",
-  "version": "0.1.0",
-  "description": "Prism GPU leasing as Coinbase AgentKit actions, usable from Vercel AI SDK and LangChain.",
+  "version": "0.2.1",
+  "description": "Prism GPU compute as Coinbase AgentKit actions. Pay per call from the agent's own wallet in USDC on Base over x402, or lease a whole GPU in USDG.",
   "type": "module",
-  "main": "provider.mjs",
+  "main": "index.mjs",
   "exports": {
-    ".": "./provider.mjs"
+    ".": "./index.mjs",
+    "./x402": "./x402-provider.mjs",
+    "./leasing": "./provider.mjs"
   },
   "files": [
+    "index.mjs",
     "provider.mjs",
+    "x402-provider.mjs",
     "README.md"
   ],
   "engines": {
@@ -18,7 +22,9 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@prismnetwork/agent-sdk": "^0.2.0"
+    "@prismnetwork/agent-sdk": "^0.7.0",
+    "@x402/evm": "^2.7.0",
+    "@x402/fetch": "^2.7.0"
   },
   "peerDependencies": {
     "@coinbase/agentkit": ">=0.10",
@@ -28,21 +34,17 @@
   "keywords": [
     "prism",
     "agentkit",
+    "coinbase",
+    "x402",
     "gpu",
     "agent",
-    "vercel-ai",
+    "base",
+    "usdc",
+    "compute",
     "langchain",
-    "compute"
+    "vercel-ai"
   ],
   "homepage": "https://prismnetwork.tech",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/winter0x/prism.git",
-    "directory": "agentkit-ts"
-  },
-  "bugs": {
-    "url": "https://github.com/winter0x/prism/issues"
-  },
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"

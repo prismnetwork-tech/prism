@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/agent-sdk",
-  "version": "0.7.0",
+  "version": "0.7.2",
   "description": "Headless GPU leasing and renter-encrypted storage on Prism Network for wallet-holding agents.",
   "type": "module",
   "main": "prism.mjs",
@@ -67,14 +67,6 @@
     "attestation"
   ],
   "homepage": "https://prismnetwork.tech",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/winter0x/prism.git",
-    "directory": "sdk"
-  },
-  "bugs": {
-    "url": "https://github.com/winter0x/prism/issues"
-  },
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"

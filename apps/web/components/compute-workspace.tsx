@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { createPublicClient, encodeFunctionData, http, keccak256, toBytes, type Address, type Hex } from "viem";
 import { usePrismAuth, useSmartWallet } from "@/components/providers";
 import { escrowAbi, escrowAddress, robinhoodChain, usdgAbi, usdgAddress } from "@/lib/chain";
+import { isPinnedPublicImage, isSshPublicKey, parseGpuLaunchIntent } from "@/lib/gpu-capability";
 
 type TrustClass = "open" | "isolated" | "attested" | "confidential";
 
@@ -14,6 +15,7 @@ type MarketplaceOffer = {
   rate_per_second: number;
   reliability_bps: number;
   trust_class: TrustClass;
+  staker_only?: boolean;
 };
 
 // What the renter can actually rely on, stated per offer rather than as one
@@ -57,6 +59,7 @@ export function ComputeWorkspace() {
   const smartWallet = useSmartWallet();
   const router = useRouter();
   const [duration, setDuration] = useState(3_600);
+  const [minVramMib, setMinVramMib] = useState(24 * 1_024);
   const [mode, setMode] = useState<"auto" | "manual">("auto");
   const [appId, setAppId] = useState<string>(apps[0].id);
   const [advanced, setAdvanced] = useState(false);
@@ -71,7 +74,11 @@ export function ComputeWorkspace() {
   const [loadingOffers, setLoadingOffers] = useState(true);
   const [offerError, setOfferError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const offer = offers.find((item) => item.node_id === selected) ?? offers[0];
+  const eligibleOffers = useMemo(
+    () => offers.filter((item) => item.gpu.vram_mib >= minVramMib && item.staker_only !== true),
+    [minVramMib, offers],
+  );
+  const offer = eligibleOffers.find((item) => item.node_id === selected) ?? eligibleOffers[0];
   const maximum = useMemo(
     () => offer ? formatUsd(BigInt(offer.rate_per_second) * BigInt(duration)) : "—",
     [duration, offer],
@@ -87,7 +94,6 @@ export function ComputeWorkspace() {
     void loadOffers(controller.signal)
       .then((nextOffers) => {
         setOffers(nextOffers);
-        setSelected((current) => nextOffers.some((item) => item.node_id === current) ? current : nextOffers[0]?.node_id ?? null);
       })
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === "AbortError") return;
@@ -96,6 +102,31 @@ export function ComputeWorkspace() {
       .finally(() => setLoadingOffers(false));
     return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    try {
+      const intent = parseGpuLaunchIntent(new URLSearchParams(window.location.search));
+      if (!intent) return;
+      setAdvanced(true);
+      setCustomImage(intent.image);
+      setDuration(intent.durationSeconds);
+      setMinVramMib(intent.minVramMib);
+      setSshKey(intent.sshPublicKey);
+      setGeneratedKey(false);
+      setMode("auto");
+      setNotice("GPU repro intent loaded. Review the live quote before approving your wallet.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "This GPU launch link is invalid.");
+    }
+  }, []);
+
+  useEffect(() => {
+    setSelected((current) => (
+      eligibleOffers.some((item) => item.node_id === current)
+        ? current
+        : eligibleOffers[0]?.node_id ?? null
+    ));
+  }, [eligibleOffers]);
 
   useEffect(() => {
     if (!auth.authenticated) {
@@ -126,11 +157,11 @@ export function ComputeWorkspace() {
       setNotice("No compatible GPU offers are currently available.");
       return;
     }
-    if (!image.includes("@sha256:")) {
+    if (!isPinnedPublicImage(image)) {
       setNotice("Use a public OCI image pinned to an immutable sha256 digest.");
       return;
     }
-    if (!/^ssh-ed25519 [A-Za-z0-9+/=]+(?: .*)?$/.test(sshKey.trim())) {
+    if (!isSshPublicKey(sshKey)) {
       setNotice("Add one Ed25519 SSH public key for workspace access.");
       return;
     }
@@ -139,7 +170,7 @@ export function ComputeWorkspace() {
       const lease = await requestMatch(
         image,
         duration,
-        offer.gpu.vram_mib,
+        mode === "auto" ? minVramMib : offer.gpu.vram_mib,
         mode === "manual" ? offer.node_id : null,
       );
       const maximumBaseUnits = BigInt(lease.rate_per_second) * BigInt(duration);
@@ -289,6 +320,21 @@ export function ComputeWorkspace() {
               ))}
             </div>
           </fieldset>
+          <fieldset className="form-fieldset">
+            <legend>Minimum GPU memory</legend>
+            <div className="duration-picker">
+              {[16, 24, 40, 44].map((gib) => (
+                <button
+                  className={minVramMib === gib * 1_024 ? "duration active" : "duration"}
+                  type="button"
+                  onClick={() => setMinVramMib(gib * 1_024)}
+                  key={gib}
+                >
+                  {gib} GB
+                </button>
+              ))}
+            </div>
+          </fieldset>
           <div className="segmented" role="group" aria-label="Offer selection mode">
             <button type="button" className={mode === "auto" ? "active" : ""} onClick={() => setMode("auto")}>Auto-match</button>
             <button type="button" className={mode === "manual" ? "active" : ""} onClick={() => setMode("manual")}>Choose offer</button>
@@ -296,9 +342,9 @@ export function ComputeWorkspace() {
           {mode === "manual" && (
             <label>
               GPU offer
-              <select value={selected ?? ""} onChange={(event) => setSelected(event.target.value)} disabled={!offers.length}>
-                {!offers.length && <option value="">No schedulable offers</option>}
-                {offers.map((item) => <option value={item.node_id} key={item.node_id}>{item.gpu.model} · {formatVram(item.gpu.vram_mib)} · {formatUsdPerHour(item.rate_per_second)} · {trustCopy[item.trust_class]?.label ?? item.trust_class}</option>)}
+              <select value={selected ?? ""} onChange={(event) => setSelected(event.target.value)} disabled={!eligibleOffers.length}>
+                {!eligibleOffers.length && <option value="">No schedulable offers</option>}
+                {eligibleOffers.map((item) => <option value={item.node_id} key={item.node_id}>{item.gpu.model} · {formatVram(item.gpu.vram_mib)} · {formatUsdPerHour(item.rate_per_second)} · {trustCopy[item.trust_class]?.label ?? item.trust_class}</option>)}
               </select>
             </label>
           )}
@@ -415,7 +461,8 @@ function isMarketplaceOffer(value: unknown): value is MarketplaceOffer {
     && typeof offer.reliability_bps === "number"
     && Number.isInteger(offer.reliability_bps)
     && offer.reliability_bps >= 0
-    && offer.reliability_bps <= 10_000;
+    && offer.reliability_bps <= 10_000
+    && (offer.staker_only === undefined || typeof offer.staker_only === "boolean");
 }
 
 function isLeaseQuote(value: unknown): value is LeaseQuote {

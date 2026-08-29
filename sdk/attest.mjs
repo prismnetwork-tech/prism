@@ -683,7 +683,13 @@ async function sessionChecks(t, { root, fetchImpl, sessionId, servedAt }) {
 async function gpuChecks(t, { root, fetchImpl, model, digest, quote, collateralUrl, now }) {
   let fetched;
   try {
-    const query = model ? `?model=${encodeURIComponent(model)}` : "";
+    // Name the instance we need. The model runs on several, and the endpoint
+    // answers from whichever the upstream picks, so asking blind returns a
+    // sibling most of the time: same image, same compose, different RTMR3.
+    const params = new URLSearchParams();
+    if (model) params.set("model", model);
+    if (digest) params.set("keyset_digest", digest);
+    const query = params.size ? `?${params}` : "";
     fetched = await getJson(fetchImpl, `${root}/v1/gpu-evidence${query}`, "the GPU evidence endpoint");
   } catch (err) {
     fetched = { ok: false, detail: err?.message ?? String(err) };
@@ -719,11 +725,13 @@ async function gpuChecks(t, { root, fetchImpl, model, digest, quote, collateralU
   // verified. Its own quote is verified here, the report-data slot is read out
   // of that verified structure, and the TD it came from is held against the TD
   // whose quote carried our nonce. The plaintext key-set field the same
-  // response supplies is a label, not a binding.
-  if (report.workload_keyset_digest !== digest) {
-    const named = report.workload_keyset_digest;
-    return t.fail("gpu-binding", `the GPU evidence names key set ${named}, not the one that served us`);
-  }
+  // response supplies is a label, not a binding, so a label that disagrees is
+  // reported and then ignored: the evidence endpoint is served by one replica
+  // and completions by another, so the label routinely names a sibling even
+  // when the quotes below prove the evidence came from the TD that served us.
+  // Failing on it here would reject evidence that binds cryptographically.
+  const labelled = report.workload_keyset_digest;
+  const mislabelled = labelled !== digest;
   if (typeof report.intel_quote !== "string") {
     return t.fail("gpu-binding", "the GPU evidence carries no CPU quote to bind against");
   }
@@ -744,10 +752,11 @@ async function gpuChecks(t, { root, fetchImpl, model, digest, quote, collateralU
     signingAddress: report.signing_address,
     nonce,
   });
+  const aside = mislabelled ? `; the evidence labels itself key set ${labelled}, which the quotes above override` : "";
   t.add(
     "gpu-binding",
     gate.ok ? "pass" : "fail",
-    gate.ok ? `${gate.detail}, quoted by the TD that carried our nonce` : gate.detail,
+    gate.ok ? `${gate.detail}, quoted by the TD that carried our nonce${aside}` : gate.detail,
   );
 }
 
