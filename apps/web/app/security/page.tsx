@@ -34,17 +34,33 @@ export default function SecurityPage() {
         </p>
         <p>
           Do not place private keys, production credentials, regulated data, proprietary model
-          weights, or other confidential material in a workspace. Prism does not currently
-          provide a hardware-backed trusted execution environment, confidential GPU memory,
-          durable storage, or a service-level agreement.
+          weights, or other confidential material in a rented workspace. A workspace has no durable
+          storage and carries no service-level agreement.
+        </p>
+        <p>
+          Confidential inference is the exception, and it is a different service. Those models run
+          inside an Intel TDX enclave in front of a GPU that NVIDIA attests, the prompt is encrypted
+          to a key the enclave&apos;s attestation quote commits to, and the quote is checked before the
+          prompt is sent. That protection covers the inference endpoint. It does not extend to a
+          rented workspace, where the infrastructure provider still controls the physical host.
+        </p>
+        <p>
+          Clients pin the SSH host key of the machine they rent for the life of the lease. Where a
+          node publishes its host key under its own device key, the session terminates on the key
+          that machine named. Where capacity is brokered through a third-party cloud that generates
+          the key and never publishes it, no honest pin exists: the lease is reported as unverified
+          rather than presented as checked, and a client can refuse it.
         </p>
       </InformationSection>
 
       <InformationSection index="03" title="Contracts and governance">
         <p>
-          Lease funding and settlement execute through deployed Robinhood Chain contracts.
-          Configuration changes pass through a 48-hour timelock, while the governance Safe holds
-          emergency and dispute authority. The initial contracts are unaudited software.
+          Lease funding and settlement execute through deployed Robinhood Chain contracts, which are
+          unaudited software. The contracts carrying live leases today are governed directly by a
+          two-of-two Safe, so an administrative change takes effect as soon as both signers agree.
+          A second set is deployed that places routine changes behind a 48-hour timelock and leaves
+          only pausing, bond freezes and dispute resolution outside it. Migration details will be
+          published before those contracts start carrying leases.
         </p>
         <p>
           Contract addresses, roles, state transitions, settlement calculations, and operational
