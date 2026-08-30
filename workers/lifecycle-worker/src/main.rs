@@ -535,6 +535,47 @@ fn cloud_write_fence_matches(
         && current_status == expected_status
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedRefusal {
+    machine_id: i64,
+    reason: String,
+}
+
+impl StagedRefusal {
+    fn note(&self) -> String {
+        format!("machine {} refused: {}", self.machine_id, self.reason)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusedCleanupOutcome {
+    Replace,
+    Exhausted,
+}
+
+fn staged_refusal(last_error: Option<&str>, rejected: &[i64]) -> Option<StagedRefusal> {
+    let (machine, reason) = last_error?
+        .strip_prefix("machine ")?
+        .split_once(" refused: ")?;
+    let machine_id = machine.parse().ok()?;
+    if reason.is_empty() || !rejected.contains(&machine_id) {
+        return None;
+    }
+    Some(StagedRefusal {
+        machine_id,
+        reason: reason.to_owned(),
+    })
+}
+
+#[cfg(test)]
+fn refused_cleanup_outcome(recorded_rejections: usize) -> RefusedCleanupOutcome {
+    if recorded_rejections >= MAX_REJECTED_MACHINES {
+        RefusedCleanupOutcome::Exhausted
+    } else {
+        RefusedCleanupOutcome::Replace
+    }
+}
+
 fn cloud_lease_lock_key(lease_id: u64) -> anyhow::Result<i64> {
     Ok(!i64::try_from(lease_id)?)
 }
@@ -2117,6 +2158,139 @@ impl Worker {
         result
     }
 
+    async fn stage_refused_cloud_instance(
+        &self,
+        action: &Action,
+        instance_id: u64,
+        expected_status: &str,
+        machine_id: u64,
+        reason: &str,
+    ) -> anyhow::Result<StagedRefusal> {
+        let machine_id = i64::try_from(machine_id)?;
+        if machine_id <= 0 {
+            anyhow::bail!("Vast refused instance has no valid machine ID");
+        }
+        let refusal = StagedRefusal {
+            machine_id,
+            reason: reason.chars().take(900).collect(),
+        };
+        let note = refusal.note();
+        let mut transaction = self.pool.begin().await?;
+        let staged = query(
+            "UPDATE cloud_instances \
+             SET status = 'destroying', \
+                 rejected_machines = CASE WHEN $3 = ANY(rejected_machines) \
+                     THEN rejected_machines ELSE array_append(rejected_machines, $3) END, \
+                 last_error = $4, updated_at = NOW() \
+             WHERE lease_id = $1 AND provider_instance_id = $2 AND status = $5 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM managed_repro_jobs j \
+                   WHERE j.lease_id = $1 AND j.prepared_provider_instance_id = $2 \
+               ) \
+               AND EXISTS ( \
+                   SELECT 1 FROM leases l \
+                   JOIN lifecycle_outbox o ON o.lease_id = l.lease_id \
+                   WHERE l.lease_id = $1 \
+                     AND l.state IN ('funded', 'provisioning', 'ready') \
+                     AND o.action_id = $6 AND o.kind = 'start_access' \
+                     AND o.status = 'processing' \
+                     AND o.claim_generation = $7 \
+                     AND o.lease_until > NOW() \
+               )",
+        )
+        .bind(action.lease_id as i64)
+        .bind(i64::try_from(instance_id)?)
+        .bind(machine_id)
+        .bind(&note)
+        .bind(expected_status)
+        .bind(action.action_id)
+        .bind(action.claim_generation)
+        .execute(&mut *transaction)
+        .await?;
+        if staged.rows_affected() != 1 {
+            return Err(StillProvisioning.into());
+        }
+        query(
+            "INSERT INTO cloud_machine_rejections (machine_id, reason) VALUES ($1, $2) \
+             ON CONFLICT (machine_id) DO UPDATE \
+             SET reason = EXCLUDED.reason, \
+                 rejections = cloud_machine_rejections.rejections + 1, \
+                 last_rejected_at = NOW()",
+        )
+        .bind(machine_id)
+        .bind(&refusal.reason)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(refusal)
+    }
+
+    async fn finish_refused_cloud_instance(
+        &self,
+        action: &Action,
+        instance_id: u64,
+        refusal: Option<&StagedRefusal>,
+    ) -> anyhow::Result<RefusedCleanupOutcome> {
+        let unrecorded = i32::from(refusal.is_none());
+        let note = refusal.map_or_else(
+            || "provider instance destroyed while recovering an unstaged refusal".to_owned(),
+            StagedRefusal::note,
+        );
+        let reason = refusal.map_or("unrecorded provider refusal", |value| value.reason.as_str());
+        let status = query_scalar::<_, String>(
+            "UPDATE cloud_instances ci \
+             SET status = CASE \
+                     WHEN cardinality(rejected_machines) + $3 >= $4 THEN 'failed' \
+                     ELSE 'provisioning' END, \
+                 provider_instance_id = CASE \
+                     WHEN cardinality(rejected_machines) + $3 >= $4 \
+                     THEN provider_instance_id ELSE NULL END, \
+                 provider_offer_id = CASE \
+                     WHEN cardinality(rejected_machines) + $3 >= $4 \
+                     THEN provider_offer_id ELSE NULL END, \
+                 ssh_key_attached_at = CASE \
+                     WHEN cardinality(rejected_machines) + $3 >= $4 \
+                     THEN ssh_key_attached_at ELSE NULL END, \
+                 destroyed_at = CASE \
+                     WHEN cardinality(rejected_machines) + $3 >= $4 \
+                     THEN COALESCE(destroyed_at, NOW()) ELSE destroyed_at END, \
+                 last_error = CASE \
+                     WHEN cardinality(rejected_machines) + $3 >= $4 THEN $5 ELSE $6 END, \
+                 updated_at = NOW() \
+             WHERE ci.lease_id = $1 AND ci.provider_instance_id = $2 \
+               AND ci.status = 'destroying' \
+               AND ($7::text IS NULL OR ci.last_error = $7) \
+               AND EXISTS ( \
+                   SELECT 1 FROM leases l \
+                   JOIN lifecycle_outbox o ON o.lease_id = l.lease_id \
+                   WHERE l.lease_id = ci.lease_id \
+                     AND l.state IN ('funded', 'provisioning', 'ready') \
+                     AND o.action_id = $8 AND o.kind = 'start_access' \
+                     AND o.status = 'processing' \
+                     AND o.claim_generation = $9 \
+                     AND o.lease_until > NOW() \
+               ) \
+             RETURNING status",
+        )
+        .bind(action.lease_id as i64)
+        .bind(i64::try_from(instance_id)?)
+        .bind(unrecorded)
+        .bind(i32::try_from(MAX_REJECTED_MACHINES)?)
+        .bind(format!("every candidate host was refused, last: {reason}"))
+        .bind(note)
+        .bind(refusal.map(StagedRefusal::note))
+        .bind(action.action_id)
+        .bind(action.claim_generation)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StillProvisioning)?;
+        match status.as_str() {
+            "provisioning" => Ok(RefusedCleanupOutcome::Replace),
+            "failed" => Ok(RefusedCleanupOutcome::Exhausted),
+            _ => anyhow::bail!("refused cloud instance reached invalid state {status}"),
+        }
+    }
+
     async fn ensure_cloud_ready_locked(&self, action: &Action) -> anyhow::Result<bool> {
         let lease_id = action.lease_id;
         let row = query_as::<
@@ -2128,16 +2302,25 @@ impl Worker {
                 Option<DateTime<Utc>>,
                 String,
                 Vec<i64>,
+                Option<String>,
             ),
         >(
             "SELECT provider_instance_id, provider_offer_id, ssh_authorized_key, \
-                    ssh_key_attached_at, status, rejected_machines \
+                    ssh_key_attached_at, status, rejected_machines, last_error \
              FROM cloud_instances WHERE lease_id = $1",
         )
         .bind(lease_id as i64)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((stored_instance_id, _, ssh_key, ssh_key_attached_at, status, rejected)) = row
+        let Some((
+            stored_instance_id,
+            _,
+            ssh_key,
+            ssh_key_attached_at,
+            status,
+            rejected,
+            last_error,
+        )) = row
         else {
             return Ok(false);
         };
@@ -2148,7 +2331,7 @@ impl Worker {
         .fetch_optional(&self.pool)
         .await?;
         let ssh_key = match managed_job.as_ref() {
-            Some((_, status)) if status == "failed" => {
+            Some((_, managed_status)) if managed_status == "failed" && status != "destroying" => {
                 anyhow::bail!("managed repro runner failed before provisioning")
             }
             Some((Some(runner_public_key), _)) => {
@@ -2199,6 +2382,83 @@ impl Worker {
         if !vast.owns(&context.lease.node_id) {
             anyhow::bail!("cloud lease node is not brokered by this worker");
         }
+        let retail = retail_hourly(context.lease.rate_per_second);
+        if matches!(status.as_str(), "destroyed" | "failed") {
+            anyhow::bail!("cloud instance is in terminal state {status}");
+        }
+        // The reservation is committed before the provider call. A rate-limited
+        // DELETE must resume the same instance, not strand a billing machine or
+        // let a replacement race it.
+        if status == "destroying" {
+            let instance_id = stored_instance_id
+                .and_then(|value| u64::try_from(value).ok())
+                .context("destroying cloud instance has no provider instance ID")?;
+            let refusal = match staged_refusal(last_error.as_deref(), &rejected) {
+                Some(refusal) => Some(refusal),
+                None => match vast.instance(instance_id).await {
+                    Ok(instance) => {
+                        let stalled = boot_budget_exhausted(ssh_key_attached_at, Utc::now());
+                        let reason = candidate_refusal(
+                            &instance,
+                            vast.admits(&instance.gpu_name, instance.gpu_ram),
+                            context.min_vram_mib,
+                            vast.ceiling(retail),
+                            &rejected,
+                            stalled,
+                        )
+                        .context("destroying cloud instance has no recoverable refusal")?;
+                        Some(
+                            self.stage_refused_cloud_instance(
+                                action,
+                                instance_id,
+                                "destroying",
+                                instance.machine_id,
+                                &reason,
+                            )
+                            .await?,
+                        )
+                    }
+                    Err(error)
+                        if matches!(
+                            vast::failure_scope(&error),
+                            Some(vast::FailureScope::Resource | vast::FailureScope::Permanent)
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => {
+                        return Err(error.context(CloudCleanupPending(format!(
+                            "Vast instance {instance_id} refusal recovery is pending"
+                        ))));
+                    }
+                },
+            };
+            vast.destroy(instance_id).await.with_context(|| {
+                CloudCleanupPending(format!(
+                    "Vast instance {instance_id} refusal cleanup is pending"
+                ))
+            })?;
+            let outcome = self
+                .finish_refused_cloud_instance(action, instance_id, refusal.as_ref())
+                .await?;
+            match outcome {
+                RefusedCleanupOutcome::Replace => {
+                    let detail = refusal
+                        .as_ref()
+                        .map_or("provider instance was already absent".to_owned(), |value| {
+                            format!("machine {} refused: {}", value.machine_id, value.reason)
+                        });
+                    anyhow::bail!("Vast {detail}")
+                }
+                RefusedCleanupOutcome::Exhausted => {
+                    let reason = refusal
+                        .as_ref()
+                        .map_or("unrecorded provider refusal", |value| value.reason.as_str());
+                    anyhow::bail!("every candidate Vast host was refused, last: {reason}")
+                }
+            }
+        }
+
         // The escrow measures this window from the block that funded the lease.
         // This row is written later, after the funding reaches its confirmation
         // depth and the client gets around to calling confirm, so measuring from
@@ -2220,11 +2480,6 @@ impl Worker {
         if Utc::now() >= opened_at + chrono::Duration::seconds(PROVISION_TIMEOUT_SECONDS as i64) {
             anyhow::bail!("the provisioning window for this lease has closed");
         }
-        let retail = retail_hourly(context.lease.rate_per_second);
-        if matches!(status.as_str(), "destroying" | "destroyed" | "failed") {
-            anyhow::bail!("cloud instance is in terminal state {status}");
-        }
-
         let label = format!("prism-lease-{lease_id}");
         let (instance_id, selected_offer, launched_here) = match stored_instance_id {
             Some(instance_id) => (u64::try_from(instance_id)?, None, false),
@@ -2461,103 +2716,34 @@ impl Worker {
             stalled,
         );
         if let Some(refusal) = refusal {
-            let reserved = query(
-                "UPDATE cloud_instances SET status = 'destroying', updated_at = NOW() \
-                 WHERE lease_id = $1 AND provider_instance_id = $2 AND status = $3 \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM managed_repro_jobs j \
-                       WHERE j.lease_id = $1 \
-                         AND j.prepared_provider_instance_id = $2 \
-                   ) \
-                   AND EXISTS ( \
-                       SELECT 1 FROM leases l \
-                       JOIN lifecycle_outbox o ON o.lease_id = l.lease_id \
-                       WHERE l.lease_id = $1 \
-                         AND l.state IN ('funded', 'provisioning', 'ready') \
-                         AND o.action_id = $4 AND o.kind = 'start_access' \
-                         AND o.status = 'processing' \
-                         AND o.claim_generation = $5 \
-                         AND o.lease_until > NOW() \
-                   )",
-            )
-            .bind(lease_id as i64)
-            .bind(i64::try_from(instance_id)?)
-            .bind(assigned_status)
-            .bind(action.action_id)
-            .bind(action.claim_generation)
-            .execute(&self.pool)
-            .await?;
-            if reserved.rows_affected() != 1 {
-                return Err(StillProvisioning.into());
-            }
-            vast.destroy(instance_id).await?;
-            if rejected.len() + 1 >= MAX_REJECTED_MACHINES {
-                let failed = query(
-                    "UPDATE cloud_instances SET status = 'failed', destroyed_at = NOW(), \
-                         last_error = $2, updated_at = NOW() \
-                     WHERE lease_id = $1 AND provider_instance_id = $3 \
-                       AND status = 'destroying' \
-                       AND EXISTS ( \
-                           SELECT 1 FROM leases l \
-                           JOIN lifecycle_outbox o ON o.lease_id = l.lease_id \
-                           WHERE l.lease_id = $1 \
-                             AND l.state IN ('funded', 'provisioning', 'ready') \
-                             AND o.action_id = $4 AND o.kind = 'start_access' \
-                             AND o.status = 'processing' \
-                             AND o.claim_generation = $5 \
-                             AND o.lease_until > NOW() \
-                       )",
+            let refusal = self
+                .stage_refused_cloud_instance(
+                    action,
+                    instance_id,
+                    assigned_status,
+                    instance.machine_id,
+                    &refusal,
                 )
-                .bind(lease_id as i64)
-                .bind(format!("every candidate host was refused, last: {refusal}"))
-                .bind(i64::try_from(instance_id)?)
-                .bind(action.action_id)
-                .bind(action.claim_generation)
-                .execute(&self.pool)
                 .await?;
-                if failed.rows_affected() != 1 {
-                    return Err(StillProvisioning.into());
-                }
-                anyhow::bail!("every candidate Vast host was refused, last: {refusal}");
-            }
-            self.remember_rejected_machine(instance.machine_id as i64, &refusal)
+            vast.destroy(instance_id).await.with_context(|| {
+                CloudCleanupPending(format!(
+                    "Vast instance {instance_id} refusal cleanup is pending"
+                ))
+            })?;
+            let outcome = self
+                .finish_refused_cloud_instance(action, instance_id, Some(&refusal))
                 .await?;
-            let released = query(
-                "UPDATE cloud_instances SET provider_instance_id = NULL, \
-                     provider_offer_id = NULL, ssh_key_attached_at = NULL, \
-                     rejected_machines = CASE WHEN $2 = ANY(rejected_machines) \
-                         THEN rejected_machines ELSE array_append(rejected_machines, $2) END, \
-                     status = 'provisioning', \
-                     last_error = $3, \
-                     updated_at = NOW() \
-                 WHERE lease_id = $1 AND provider_instance_id = $4 \
-                   AND status = 'destroying' \
-                   AND EXISTS ( \
-                       SELECT 1 FROM leases l \
-                       JOIN lifecycle_outbox o ON o.lease_id = l.lease_id \
-                       WHERE l.lease_id = $1 \
-                         AND l.state IN ('funded', 'provisioning', 'ready') \
-                         AND o.action_id = $5 AND o.kind = 'start_access' \
-                         AND o.status = 'processing' \
-                         AND o.claim_generation = $6 \
-                         AND o.lease_until > NOW() \
-                   )",
-            )
-            .bind(lease_id as i64)
-            .bind(instance.machine_id as i64)
-            .bind(format!(
-                "machine {} refused: {refusal}",
-                instance.machine_id
-            ))
-            .bind(i64::try_from(instance_id)?)
-            .bind(action.action_id)
-            .bind(action.claim_generation)
-            .execute(&self.pool)
-            .await?;
-            if released.rows_affected() != 1 {
-                return Err(StillProvisioning.into());
+            match outcome {
+                RefusedCleanupOutcome::Replace => anyhow::bail!(
+                    "Vast machine {} refused: {}",
+                    refusal.machine_id,
+                    refusal.reason
+                ),
+                RefusedCleanupOutcome::Exhausted => anyhow::bail!(
+                    "every candidate Vast host was refused, last: {}",
+                    refusal.reason
+                ),
             }
-            anyhow::bail!("Vast machine {} refused: {refusal}", instance.machine_id);
         }
         // Not refused, but not usable yet either. A host reports its forwarded
         // port some seconds after it starts reporting itself as running, and
@@ -4307,21 +4493,6 @@ impl Worker {
         .await?)
     }
 
-    async fn remember_rejected_machine(&self, machine_id: i64, reason: &str) -> anyhow::Result<()> {
-        query(
-            "INSERT INTO cloud_machine_rejections (machine_id, reason) VALUES ($1, $2) \
-             ON CONFLICT (machine_id) DO UPDATE \
-             SET reason = EXCLUDED.reason, \
-                 rejections = cloud_machine_rejections.rejections + 1, \
-                 last_rejected_at = NOW()",
-        )
-        .bind(machine_id)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     async fn remember_failed_provider_offer(
         &self,
         action: &Action,
@@ -5447,6 +5618,35 @@ mod tests {
                 .downcast_ref::<StillProvisioning>()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_failed_provider_delete_leaves_a_resumable_refusal() {
+        let refusal = StagedRefusal {
+            machine_id: 24_733,
+            reason: "host was still loading after 300s of boot budget".to_owned(),
+        };
+        let note = refusal.note();
+
+        assert_eq!(
+            staged_refusal(Some(&note), &[11_111, refusal.machine_id]),
+            Some(refusal)
+        );
+        assert_eq!(staged_refusal(Some(&note), &[11_111]), None);
+        assert_eq!(
+            refused_cleanup_outcome(MAX_REJECTED_MACHINES - 1),
+            RefusedCleanupOutcome::Replace
+        );
+        assert_eq!(
+            refused_cleanup_outcome(MAX_REJECTED_MACHINES),
+            RefusedCleanupOutcome::Exhausted
+        );
+
+        let error = anyhow::Error::from(StillProvisioning).context(CloudCleanupPending(
+            "provider rate limited cleanup".to_owned(),
+        ));
+        assert!(error.downcast_ref::<CloudCleanupPending>().is_some());
+        assert!(error.downcast_ref::<StillProvisioning>().is_some());
     }
 
     #[test]
