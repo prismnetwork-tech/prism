@@ -1764,7 +1764,24 @@ async fn run_ssh(
             Ok(status) => status?,
             Err(_) => {
                 let _ = child.kill().await;
-                anyhow::bail!("managed SSH timed out");
+                // Killing the child closes the pipes, so the readers finish and
+                // can say how far the session got. A hang before the banner and
+                // a hang inside the remote script look identical without this.
+                let stderr = stderr_task
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let stdout = stdout_task
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "managed SSH timed out after {SSH_TIMEOUT_SECONDS}s: {} (stdout {} bytes)",
+                    ssh_failure_detail(&stderr),
+                    stdout.len()
+                );
             }
         };
     let stdout = stdout_task.await??;
