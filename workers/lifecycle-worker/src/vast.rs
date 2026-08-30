@@ -77,7 +77,12 @@ struct OfferResponse {
 
 #[derive(Deserialize)]
 struct AccountResponse {
+    #[serde(default)]
     balance: f64,
+    #[serde(default)]
+    credit: f64,
+    #[serde(default)]
+    can_pay: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -301,7 +306,7 @@ impl VastBroker {
             .json::<AccountResponse>()
             .await
             .map_err(|error| response_decode_failure("account lookup", &error))?;
-        balance_micros(account.balance).map_err(|_| {
+        spendable_balance_micros(&account).map_err(|_| {
             provider_failure(
                 "account lookup",
                 FailureScope::Permanent,
@@ -690,6 +695,13 @@ fn balance_micros(value: f64) -> anyhow::Result<i64> {
         anyhow::bail!("Vast account balance is out of range");
     }
     Ok(micros as i64)
+}
+
+fn spendable_balance_micros(account: &AccountResponse) -> anyhow::Result<i64> {
+    if account.can_pay == Some(false) {
+        anyhow::bail!("Vast reports that the account cannot pay");
+    }
+    balance_micros(account.balance + account.credit)
 }
 
 fn funded_slots(balance_micros: i64, reserve_micros: u64, committed: usize) -> usize {
@@ -1205,6 +1217,29 @@ mod tests {
         assert_eq!(balance_micros(0.000_001_9).unwrap(), 1);
         assert_eq!(balance_micros(-0.003_681_309).unwrap(), -3_682);
         assert!(balance_micros(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn account_credit_counts_toward_spendable_balance() {
+        let funded: AccountResponse = serde_json::from_str(
+            r#"{"balance":0,"credit":25,"billing_creditonly":1,"can_pay":true}"#,
+        )
+        .unwrap();
+        assert_eq!(spendable_balance_micros(&funded).unwrap(), 25_000_000);
+
+        let partially_used: AccountResponse =
+            serde_json::from_str(r#"{"balance":-0.125,"credit":25,"can_pay":true}"#).unwrap();
+        assert_eq!(
+            spendable_balance_micros(&partially_used).unwrap(),
+            24_875_000
+        );
+    }
+
+    #[test]
+    fn an_account_that_cannot_pay_fails_closed() {
+        let account: AccountResponse =
+            serde_json::from_str(r#"{"balance":0,"credit":25,"can_pay":false}"#).unwrap();
+        assert!(spendable_balance_micros(&account).is_err());
     }
 
     #[test]
