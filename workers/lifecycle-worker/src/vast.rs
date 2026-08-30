@@ -185,6 +185,8 @@ struct RawInstance {
     ssh_host: Option<String>,
     #[serde(default)]
     ssh_port: Option<u16>,
+    #[serde(default)]
+    public_ipaddr: Option<String>,
     /// Vast reports -1 when the host could not reserve a forwarded port range,
     /// and nothing at all until it has tried.
     #[serde(default)]
@@ -646,8 +648,12 @@ fn instance_from_response(body: &str) -> anyhow::Result<Instance> {
     let raw = serde_json::from_str::<InstanceResponse>(body)
         .with_context(|| format!("decode Vast instance: {}", truncate(body, 300)))?
         .instances;
-    if raw
-        .ssh_host
+    // These instances are created `ssh_direct`. `ssh_host`/`ssh_port` describe
+    // Vast's relay, which accepts the connection and then never speaks SSH for
+    // a direct instance, so a renter waiting on it only ever sees a timeout.
+    // The machine itself answers on its own address and forwarded port.
+    let (ssh_host, ssh_port) = direct_ssh_target(&raw);
+    if ssh_host
         .as_deref()
         .is_some_and(|host| !valid_ssh_host(host))
     {
@@ -670,11 +676,30 @@ fn instance_from_response(body: &str) -> anyhow::Result<Instance> {
         gpu_ram: raw.gpu_ram.unwrap_or_default(),
         verification: raw.verification.unwrap_or_default(),
         hourly_micros: raw.dph_total.map(hourly_micros).transpose()?.unwrap_or(0),
-        ssh_host: raw.ssh_host,
-        ssh_port: raw.ssh_port,
+        ssh_host,
+        ssh_port,
         direct_port_start: raw.direct_port_start.unwrap_or_default(),
         machine_id: raw.machine_id.unwrap_or_default(),
     })
+}
+
+/// The address a renter actually reaches sshd on. Both halves have to be real
+/// before this is worth handing out; a port without a host, or Vast's -1
+/// placeholder, means the host has not finished reserving one yet.
+fn direct_ssh_target(raw: &RawInstance) -> (Option<String>, Option<u16>) {
+    let host = raw
+        .public_ipaddr
+        .as_deref()
+        .map(str::trim)
+        .filter(|address| !address.is_empty());
+    let port = raw
+        .direct_port_start
+        .filter(|port| *port > 0)
+        .and_then(|port| u16::try_from(port).ok());
+    match (host, port) {
+        (Some(host), Some(port)) => (Some(host.to_owned()), Some(port)),
+        _ => (None, None),
+    }
 }
 
 fn truncate(value: &str, limit: usize) -> &str {
@@ -1293,6 +1318,36 @@ mod tests {
     /// The A40 in this test is the real one prod picked on 2026-08-30: cheapest
     /// of eighteen offers, 180 Mbit down, and it lost the lease waiting for a
     /// 1.4 GB image. The Delaware host is what should win instead.
+    /// Instance 49314298 on 2026-08-30: the relay accepted TCP and never spoke
+    /// SSH, so every attempt read as a timeout, while the machine's own address
+    /// answered on the first try and ran the workload.
+    #[test]
+    fn ssh_targets_the_machine_rather_than_the_vast_relay() {
+        let instance = instance_from_response(
+            r#"{"instances":{"actual_status":"running","gpu_name":"RTX A6000","gpu_ram":49140,
+                "verification":"verified","dph_total":0.4044,"machine_id":26608,
+                "ssh_host":"ssh2.vast.ai","ssh_port":34298,
+                "public_ipaddr":"38.29.145.24","direct_port_start":40549}}"#,
+        )
+        .unwrap();
+        assert_eq!(instance.ssh_host.as_deref(), Some("38.29.145.24"));
+        assert_eq!(instance.ssh_port, Some(40549));
+    }
+
+    #[test]
+    fn a_host_with_no_forwarded_port_yet_offers_no_ssh_target() {
+        for body in [
+            r#"{"instances":{"actual_status":"running","ssh_host":"ssh2.vast.ai","ssh_port":34298,
+                "public_ipaddr":"38.29.145.24","direct_port_start":-1}}"#,
+            r#"{"instances":{"actual_status":"running","ssh_host":"ssh2.vast.ai","ssh_port":34298,
+                "direct_port_start":40549}}"#,
+        ] {
+            let instance = instance_from_response(body).unwrap();
+            assert_eq!(instance.ssh_host, None);
+            assert_eq!(instance.ssh_port, None);
+        }
+    }
+
     #[test]
     fn a_host_too_slow_for_the_image_is_not_the_cheapest_host() {
         let vietnam = slow_offer(1, 0.3356, 180.5, 844.7);
