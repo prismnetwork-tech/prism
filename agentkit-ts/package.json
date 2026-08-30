@@ -45,14 +45,6 @@
     "vercel-ai"
   ],
   "homepage": "https://prismnetwork.tech",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/winter0x/prism.git",
-    "directory": "agentkit-ts"
-  },
-  "bugs": {
-    "url": "https://github.com/winter0x/prism/issues"
-  },
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"

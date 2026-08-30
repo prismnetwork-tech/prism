@@ -37,14 +37,6 @@
     "ollama"
   ],
   "homepage": "https://prismnetwork.tech",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/winter0x/prism.git",
-    "directory": "inference"
-  },
-  "bugs": {
-    "url": "https://github.com/winter0x/prism/issues"
-  },
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"
