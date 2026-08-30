@@ -1773,12 +1773,46 @@ async fn run_ssh(
         anyhow::bail!("managed SSH response exceeded its limit");
     }
     if !status.success() {
-        anyhow::bail!("managed SSH command exited unsuccessfully");
+        // Without the transport's own words every failure here reads the same,
+        // and "exited unsuccessfully" covers a refused key, a dead port and a
+        // broken script alike.
+        anyhow::bail!(
+            "managed SSH command exited unsuccessfully: {}",
+            ssh_failure_detail(&stderr)
+        );
     }
     Ok(SshOutput {
         stdout,
         known_hosts: fs::read_to_string(&known_hosts_path)?,
     })
+}
+
+/// Vast greets every session with a two-line banner, so the useful part is the
+/// tail. Anything that looks like a key or a token is dropped rather than
+/// carried into a log line.
+fn ssh_failure_detail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let detail = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("Welcome to vast.ai")
+                && !line.starts_with("Have fun!")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detail.is_empty() {
+        return "no diagnostic output".to_owned();
+    }
+    detail
+        .split_whitespace()
+        .filter(|word| word.len() < 40)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(reader: R) -> anyhow::Result<Vec<u8>> {
@@ -2420,6 +2454,25 @@ mod tests {
             MAX_GPU_VRAM_MIB + 1
         );
         assert!(parse_gpu(output.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn ssh_failures_carry_the_transport_reason() {
+        let denied = b"Welcome to vast.ai. If authentication fails, try again after a few seconds.\nHave fun!\nroot@38.29.145.28: Permission denied (publickey).\n";
+        assert_eq!(
+            ssh_failure_detail(denied),
+            "root@38.29.145.28: Permission denied (publickey)."
+        );
+        assert_eq!(
+            ssh_failure_detail(b"ssh: connect to host 1.2.3.4 port 40632: Connection refused\n"),
+            "ssh: connect to host 1.2.3.4 port 40632: Connection refused"
+        );
+        assert_eq!(ssh_failure_detail(b"Have fun!\n"), "no diagnostic output");
+        // A long opaque blob is the shape a leaked key would have.
+        assert_eq!(
+            ssh_failure_detail(format!("key {}", "a".repeat(64)).as_bytes()),
+            "key"
+        );
     }
 
     #[test]
