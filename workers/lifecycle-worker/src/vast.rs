@@ -8,6 +8,13 @@ use url::Url;
 const DEFAULT_API_URL: &str = "https://console.vast.ai/api/v0/";
 const DEFAULT_MAX_HOURLY_MICROS: u64 = 640_000;
 const DEFAULT_CREDIT_PER_SLOT_MICROS: u64 = 5_000_000;
+/// Vast runs the renter image under `while [ ! -e /.launch ]; do sleep 1; done;
+/// bash /.launch`, so PID 1 leaves as soon as the launch script returns and the
+/// instance goes to `exited`. Without something to hold it open a measured box
+/// answered ssh at t+39s and was gone by t+64s, which is why leases reached a
+/// running GPU and still died in provisioning. The renter's own work arrives
+/// over ssh, so this only has to outlive the lease.
+const HOLD_OPEN_ONSTART: &str = "sleep infinity";
 /// A renter's image has to land and unpack inside HOST_BOOT_BUDGET_SECONDS or
 /// the lease is refused, and PROVISION_TIMEOUT leaves room for barely one
 /// attempt. Cheapest-first ranking used to hand a 1.4 GB image to a 180 Mbit
@@ -207,6 +214,7 @@ struct CreateRequest<'a> {
     label: String,
     disk: u32,
     runtype: &'static str,
+    onstart: &'static str,
     cancel_unavail: bool,
 }
 
@@ -486,6 +494,7 @@ impl VastBroker {
                 label: format!("prism-lease-{lease_id}"),
                 disk: self.disk_gb,
                 runtype: "ssh_direct",
+                onstart: HOLD_OPEN_ONSTART,
                 cancel_unavail: true,
             })
             .send()
@@ -1321,6 +1330,24 @@ mod tests {
     /// Instance 49314298 on 2026-08-30: the relay accepted TCP and never spoke
     /// SSH, so every attempt read as a timeout, while the machine's own address
     /// answered on the first try and ran the workload.
+    /// A measured box with no onstart answered ssh at t+39s and reported
+    /// `exited` by t+64s; the same box with one stayed up past four minutes and
+    /// ran the workload.
+    #[test]
+    fn creation_holds_the_container_open_past_the_handshake() {
+        let request = CreateRequest {
+            image: "registry.example/image@sha256:abc",
+            label: "prism-lease-1".to_owned(),
+            disk: 16,
+            runtype: "ssh_direct",
+            onstart: HOLD_OPEN_ONSTART,
+            cancel_unavail: true,
+        };
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["runtype"], "ssh_direct");
+        assert_eq!(body["onstart"], "sleep infinity");
+    }
+
     #[test]
     fn ssh_targets_the_machine_rather_than_the_vast_relay() {
         let instance = instance_from_response(
