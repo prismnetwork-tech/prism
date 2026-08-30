@@ -45,6 +45,15 @@ install -m 0400 "$control/authorized_keys" /run/prism/authorized_keys
 chown workspace:workspace /run/prism/authorized_keys
 ssh-keygen -q -t ed25519 -N "" -f /run/prism/ssh_host_key
 
+# The renter has no way to recognise the box they were handed unless somebody
+# names the key it answers on. Nothing here can attest to it, so the node says
+# what it started and signs for it, and the control plane passes that on marked
+# as the operator's word. Printed before sshd binds, so the key is published
+# before there is anything to connect to. The encoding avoids `base64 -w0`
+# because the image is the renter's and busybox has no such flag.
+printf 'prism-evidence channel-key.pub %s\n' \
+    "$(base64 < /run/prism/ssh_host_key.pub | tr -d '\n')"
+
 cat >/run/prism/sshd_config <<'EOF'
 Port 2222
 ListenAddress 0.0.0.0

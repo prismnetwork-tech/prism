@@ -12,19 +12,22 @@ POST /run  { "command": "nvidia-smi" }
                       { network: "eip155:4663", asset: USDG, payTo, maxAmountRequired } ] }
 ```
 
-Pick an entry, pay `maxAmountRequired` of its `asset` to its `payTo`. Then sign the tx hash (`personal_sign`) with the paying wallet and send it as the payment header:
+Pick an entry, pay `maxAmountRequired` of its `asset` to its `payTo`. Then `personal_sign` the payment with the paying wallet and send it as the payment header. What you sign is the transfer and the request it buys together:
 
 ```
-X-PAYMENT: base64(JSON({ txHash, signature, network }))
+message   = "prism-x402:v2\n" + txHash.toLowerCase() + "\n" + sha256hex(request body bytes)
+X-PAYMENT = base64(JSON({ txHash, signature, network }))
 
 POST /run  { "command": "nvidia-smi" }   header X-PAYMENT: <base64 envelope>
   -> 202 { job_id, token, poll: "/jobs/<id>" }
 
-GET /jobs/<id>   header Authorization: Bearer <token>
+GET /jobs/<id>?token=<token>
   -> { status: "completed", exit_code, stdout, stderr }
 ```
 
-The signature binds the payment to you, so a third party who sees your tx hash cannot claim the job. The server verifies the on-chain USDG `Transfer` to `payTo` (amount >= price, 12 confirmations, sent by the signer, not already used), then leases a GPU with its own wallet, runs the command, returns the output, and releases the lease. If the lease or run fails, it refunds the payment.
+`@prismnetwork/agent-sdk/x402` exports `boundMessage` and `hashRequest`, and the Python SDK exports `bound_message` and `hash_request`, so a client does not have to spell the message out. The job token is also accepted as `Authorization: Bearer <token>` when the listener has no token of its own.
+
+The signature binds the payment to you and to the command it buys. Someone who reads your header off the wire can neither claim the job nor spend the transfer on a command of their own. The server recomputes the digest over the exact bytes that arrived, so sign the body you are about to send rather than one built again for the signature. It then verifies the on-chain `Transfer` to `payTo` (amount >= price, 12 confirmations, sent by the signer, not already used), leases a GPU with its own wallet, runs the command, returns the output, and releases the lease. If the lease or run fails, it refunds the payment.
 
 ## Run
 
@@ -51,3 +54,16 @@ with the address, amount and network rather than losing it to a log line.
 Install with `npm install @prismnetwork/x402`, or run it directly with `npx @prismnetwork/x402`.
 
 Other env: `X402_PORT` (8402), `X402_DURATION_SECONDS` (300), `X402_MIN_VRAM_MIB` (16000), `X402_PAYMENTS_FILE`, `PRISM_API_BASE`, `PRISM_RPC_URL`. The consumed-payments file makes replay protection survive a restart; a multi-instance deployment needs a shared store instead.
+
+`PRISM_X402_ALLOW_UNBOUND_PAYMENT=1` also accepts the older signature over the bare tx hash, for the length of a migration. That is the replay the binding closes, so turn it off again.
+
+## Reaching it from another machine
+
+The server holds a wallet that funds leases, settles for callers, and hands back the output of jobs, and none of that sits behind an account. So it listens on `127.0.0.1` and refuses to start on a wider address unless you give it a credential:
+
+```
+X402_HOST=0.0.0.0
+X402_TOKEN=<at least 16 random characters>
+```
+
+Callers then send `Authorization: Bearer <token>` on every route, `/healthz` and `/jobs` included, so a liveness probe needs the header too and a job is polled with `?token=<job token>`. Behind a reverse proxy, the proxy holds the credential and adds the header.

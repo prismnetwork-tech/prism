@@ -36,10 +36,20 @@ curl -s -X POST http://localhost:8500/v1/inference \
 ```
 
 With no payment this answers `402` with the x402 requirements: the USDG price,
-the `payTo` address, and the chain (`eip155:4663`). Pay it, sign the tx hash
-with the paying wallet (`personal_sign`), and retry with
-`X-PAYMENT: base64({txHash, signature})`. The response carries the generation,
-token usage, and the id of the lease that served it.
+the `payTo` address, and the chain (`eip155:4663`). Pay it, then `personal_sign`
+the transfer together with the request it buys and retry with
+`X-PAYMENT: base64({txHash, signature})`:
+
+```
+message = "prism-x402:v2\n" + txHash.toLowerCase() + "\n" + sha256hex(request body)
+```
+
+The response carries the generation, token usage, and the id of the lease that
+served it. Binding the payment to the body is what stops anyone who reads the
+header in flight from redeeming it against a prompt of their own; the gateway
+hashes the bytes that arrived and checks them against what was signed.
+`@prismnetwork/agent-sdk` does this for you, and so does the Python SDK's
+`payment_header`.
 
 The price scales with the request: each model has a base price plus a
 per-token rate over the output cap you ask for (`options.num_predict`, up to
@@ -330,6 +340,7 @@ lost connection costs you nothing.
 | `INFERENCE_BATCH_MAX_ITEMS` | Prompts allowed in one batch (default 64). |
 | `INFERENCE_BATCH_ITEMS_PER_BOX` | Prompts a batch must carry before it is worth another GPU (default 25). |
 | `INFERENCE_PORT` / `INFERENCE_TUNNEL_PORT` | HTTP port (8500) and local ollama tunnel port (11435). |
+| `INFERENCE_HOST` / `INFERENCE_TOKEN` | Listen address (default `127.0.0.1`) and the credential any wider address requires. See below. |
 | `INFERENCE_PAYMENTS_FILE` | Consumed-payment ledger (default `./inference-consumed.log`). |
 | `INFERENCE_CONFIDENTIAL` | Turns the confidential class on. JSON, see below. Unset leaves those routes answering 404. |
 | `INFERENCE_CONFIDENTIAL_DAILY_USD` | Upstream spend the confidential relay may commit in a UTC day, in-flight requests included (default 1.0). Set it above one call's full-cap price. |
@@ -355,14 +366,42 @@ free ones are rate limited so the gateway does not become an open proxy for a
 key it pays for.
 
 Generations are capped at 1024 output tokens and prompts at 32 KiB, so the
-price bounds what one request can spend of the warm window. `ssh` must be on
-`PATH`; each box's ollama is reachable only through its own tunnel, on
-`INFERENCE_TUNNEL_PORT` plus the slot number.
+price bounds what one request can spend of the warm window. `ssh` and
+`ssh-keyscan` must be on `PATH`; each box's ollama is reachable only through its
+own tunnel, on `INFERENCE_TUNNEL_PORT` plus the slot number. Every prompt crosses
+that tunnel, so the box on the far end is checked against the SSH host key the
+lease publishes before it carries anything. Where the lease publishes none, which
+is every box brokered from a public cloud, the key is taken on first sight and
+held for the rest of the lease.
 
 Every GPU in the pool is a separate prepaid lease running whether or not
 anything asks for it, which is why the default pool is one. Raise
 `INFERENCE_POOL_MAX` when there is batch traffic to pay for it; a batch small
 enough to run on the GPUs already warm never leases another.
+
+## Reaching it from another machine
+
+The gateway holds the operator's own funded wallet: warming leases a GPU against
+it, and the free routes name the leases and the takings. None of that sits behind
+an account, so it listens on `127.0.0.1` and refuses to start on a wider address
+unless you give it a credential:
+
+```
+INFERENCE_HOST=0.0.0.0
+INFERENCE_TOKEN=<at least 16 random characters>
+```
+
+Callers then send `Authorization: Bearer <token>` on every route, `/healthz`
+included, so a liveness probe needs the header too. A public deployment puts a
+reverse proxy in front and has the proxy hold the credential, which leaves the
+front door as the only way in while the paid endpoints stay open to anyone who
+pays. In Caddy that is one line on the route:
+
+```
+reverse_proxy inference:8500 {
+	header_up Authorization "Bearer {$PRISM_INFERENCE_TOKEN}"
+}
+```
 
 Prism is pre-production and unaudited. The gateway wallet should hold only
 what you are prepared to lose.

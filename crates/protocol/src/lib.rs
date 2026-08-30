@@ -2,7 +2,10 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, OsRng, rand_core::RngCore},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -435,6 +438,31 @@ pub fn snp_report_data(challenge_nonce: &[u8], lease_id: u64, guest_channel_key:
 /// An SNP report is 1184 bytes, so base64 of one lands near 1.6 KiB. The cap is
 /// well clear of that and nowhere near the request body limit.
 pub const MAX_SNP_REPORT_BYTES: usize = 4 * 1_024;
+
+/// An ed25519 host key line is about 100 bytes and an RSA one about 750. The cap
+/// is clear of both and stops a node spending a command report on a blob.
+pub const MAX_CHANNEL_KEY_BYTES: usize = 2 * 1_024;
+
+/// The fingerprint `ssh-keygen -lf` prints for an OpenSSH public key line.
+///
+/// Every path that publishes a host key to a renter publishes it in this form,
+/// whether the key came from a guest report or from the node's own account of
+/// the workspace it started, so a client has one comparison to make and one
+/// separate field to read for where the claim came from.
+pub fn channel_key_fingerprint(key_line: &str) -> Result<String, ProtocolError> {
+    if key_line.len() > MAX_CHANNEL_KEY_BYTES {
+        return Err(ProtocolError::InvalidChannelKey);
+    }
+    let blob = key_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|encoded| STANDARD.decode(encoded).ok())
+        .ok_or(ProtocolError::InvalidChannelKey)?;
+    Ok(format!(
+        "SHA256:{}",
+        STANDARD_NO_PAD.encode(Sha256::digest(&blob))
+    ))
+}
 
 /// A report the guest running a lease took of itself, carried to the control
 /// plane by the host. The envelope is signed by the node's device key rather
@@ -1133,6 +1161,8 @@ pub struct NodeCommandReport {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<CommandResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_key: Option<String>,
     pub signature: String,
 }
 
@@ -1149,6 +1179,16 @@ pub struct NodeCommandReportPayload {
     /// it signed before batch existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<CommandResult>,
+    /// The OpenSSH public key line the workspace serving this lease listens on,
+    /// carried on the ready report so the renter can be told which key their
+    /// session should terminate on. Inside the signature because the whole
+    /// value of it is that the operator's bonded device key stands behind it: a
+    /// relay between the node and the renter cannot substitute a key it holds
+    /// without breaking a signature the dispute queue can check. A guest that
+    /// takes its own report supersedes this, and a node that cannot read one
+    /// leaves it absent rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_key: Option<String>,
 }
 
 impl NodeCommandReport {
@@ -1169,6 +1209,7 @@ impl NodeCommandReport {
             observed_at: unsigned.observed_at,
             error: unsigned.error,
             result: unsigned.result,
+            channel_key: unsigned.channel_key,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         })
     }
@@ -1184,6 +1225,7 @@ impl NodeCommandReport {
                 observed_at: self.observed_at,
                 error: self.error.clone(),
                 result: self.result.clone(),
+                channel_key: self.channel_key.clone(),
             },
             &self.signature,
             key,
@@ -1671,6 +1713,8 @@ pub enum ProtocolError {
     AttestationTooLarge,
     #[error("attestation is malformed")]
     InvalidAttestation,
+    #[error("channel key is not an OpenSSH public key line")]
+    InvalidChannelKey,
 }
 
 #[cfg(test)]
@@ -2617,10 +2661,34 @@ mod tests {
                 observed_at: Utc::now(),
                 error: None,
                 result,
+                channel_key: None,
             },
             key,
         )
         .unwrap()
+    }
+
+    /// The renter is told to pin whatever this key hashes to, so a node that
+    /// could name one key and serve another would be handing out a pin for a
+    /// box nobody checked.
+    #[test]
+    fn a_reported_host_key_cannot_be_edited_after_signing() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut report = signed_report(&key, None);
+        report.channel_key = Some(GUEST_CHANNEL_KEY.to_owned());
+        assert!(report.verify(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn a_channel_key_fingerprint_matches_the_openssh_form() {
+        assert_eq!(
+            channel_key_fingerprint(GUEST_CHANNEL_KEY).unwrap(),
+            "SHA256:5/gdC8tsZ+1R7UnoiM4pMal9U3M82idPVzt95oIw3hQ"
+        );
+        assert!(channel_key_fingerprint("ssh-ed25519").is_err());
+        assert!(channel_key_fingerprint("ssh-ed25519 not base64!!").is_err());
+        let oversized = format!("ssh-rsa {}", "A".repeat(MAX_CHANNEL_KEY_BYTES));
+        assert!(channel_key_fingerprint(&oversized).is_err());
     }
 
     /// A node that can edit the exit code after signing could bill a failure as
@@ -2651,9 +2719,11 @@ mod tests {
             observed_at: report.observed_at,
             error: None,
             result: None,
+            channel_key: None,
         })
         .unwrap();
         assert!(!encoded.contains("result"), "{encoded}");
+        assert!(!encoded.contains("channel_key"), "{encoded}");
         assert!(report.verify(&key.verifying_key()).is_ok());
     }
 
@@ -2695,6 +2765,7 @@ mod tests {
                 observed_at: Utc::now(),
                 error: None,
                 result: None,
+                channel_key: None,
             },
             &key,
         )

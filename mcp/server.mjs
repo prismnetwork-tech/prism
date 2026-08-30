@@ -9,10 +9,14 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import {
   DEFAULT_IMAGE,
   DEFAULT_TRUST_FLOOR,
+  hostKeyPolicy,
   PrismAgent,
   TRUST_CLASSES,
   verifyConfidential,
 } from "@prismnetwork/agent-sdk";
+import { BudgetError, SpendLedger, callCeiling, readBudget, recordSpend, stripUnexpanded } from "./budget.mjs";
+
+stripUnexpanded(process.env);
 
 const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 
@@ -48,6 +52,18 @@ if (!agent) {
   );
 }
 
+// A budget the operator got wrong must stop spending, not fall back to none.
+// Reading capacity and prices is unaffected, so a typo is discoverable rather
+// than fatal.
+let ledger = null;
+let budgetProblem = null;
+try {
+  ledger = new SpendLedger(readBudget());
+} catch (err) {
+  budgetProblem = err?.message ?? String(err);
+  console.error(`prism mcp: ${budgetProblem}`);
+}
+
 function requireWallet(tool, reason = "spends money") {
   if (!agent) {
     throw new Error(
@@ -56,6 +72,17 @@ function requireWallet(tool, reason = "spends money") {
   }
   return agent;
 }
+
+function requireLedger(tool) {
+  if (!ledger) {
+    throw new Error(`${tool} needs the spend limits, and they are unusable: ${budgetProblem}`);
+  }
+  return ledger;
+}
+
+// The ledger has to be usable before anything is spent, and the refusal names
+// the tool that asked.
+const spending = (tool, micros, run) => recordSpend(requireLedger(tool), tool, micros, run);
 
 function requireCommand(value) {
   if (typeof value !== "string" || value.trim() === "") {
@@ -67,12 +94,29 @@ function requireCommand(value) {
   return value;
 }
 
-function maxDeposit(args) {
-  const cap = args.max_usdg ?? 1;
-  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
-    throw new Error("max_usdg must be a positive number of USDG.");
-  }
-  return Math.round(cap * 1e6);
+// What the caller can check the machine against if they open their own session.
+// A lease that publishes nothing says so, rather than leaving the field out and
+// letting its absence read as "fine".
+function hostKey(access) {
+  const policy = hostKeyPolicy(access);
+  return policy.fingerprint === null
+    ? { host_key: "unpublished: this lease cannot tell you which machine answers" }
+    : { host_key_fingerprint: policy.fingerprint, host_key_claim: policy.mode };
+}
+
+// What the escrow actually holds, which is what the day's budget should count.
+// Booking the caller's ceiling instead charged a 0.2 USDG lease against a 0.5
+// USDG cap, so a 5 USDG day bought ten leases where it could afford twenty-five.
+function escrowed(quote) {
+  const held = Number(quote?.maximum_escrow);
+  return Number.isFinite(held) && held > 0 ? held : undefined;
+}
+
+// The per-call ceiling is the operator's, not the model's: an omitted max_usdg
+// takes PRISM_MAX_USDG rather than a hardcoded number, and a stated one above it
+// is clamped back down to it.
+function maxDeposit(tool, args) {
+  return callCeiling(args.max_usdg, requireLedger(tool).maxPerCallMicros);
 }
 
 const PROOF_FEED = process.env.PRISM_PROOF_URL ?? "https://prismnetwork.tech/api/proof";
@@ -129,13 +173,14 @@ async function inferenceOffer(base, requested) {
   return { offer, model, unit: BigInt(offer.price_micros ?? 0) };
 }
 
-function withinCap(price, maxUsdg, fallback, what) {
-  const cap = maxUsdg ?? fallback;
-  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
-    throw new Error("max_usdg must be a positive number of USDG.");
-  }
-  if (price <= 0n || price > BigInt(Math.round(cap * 1e6))) {
-    throw new Error(`the endpoint quotes ${usdg(price)} ${what}, past the ${cap} USDG cap.`);
+// The quoted price against the lower of what this call asked for and what the
+// operator allows, so the refusal names whichever ceiling stopped it.
+function withinCap(tool, price, maxUsdg, fallback, what) {
+  const operator = requireLedger(tool).maxPerCallMicros;
+  const cap = callCeiling(maxUsdg ?? fallback, operator);
+  if (price <= 0n || price > BigInt(cap)) {
+    const named = cap === operator ? "PRISM_MAX_USDG" : "max_usdg";
+    throw new Error(`the endpoint quotes ${usdg(price)} ${what}, past the ${named} cap of ${usdg(cap)}.`);
   }
 }
 
@@ -156,11 +201,28 @@ function leaseId(value) {
   return id;
 }
 
+// Hints a client uses to decide what it may run unattended. `reads` is anything
+// that cannot change state or move money; `spends` is anything that can, and it
+// carries the Claude Code marker that forces a confirmation prompt on every call
+// even in modes that otherwise auto-approve.
+const reads = { readOnlyHint: true, openWorldHint: true };
+const spends = {
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  _meta: { "anthropic/requiresUserInteraction": true },
+};
+
 const TOOLS = [
+  {
+    name: "prism_budget",
+    description: "Show the spending limits this server enforces and what it has already spent in the last 24 hours, with the recent charges. Needs no wallet. Check this before a long job; a lease refused for budget says the same numbers.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Spending limits", readOnlyHint: true, openWorldHint: false },
+  },
   {
     name: "prism_wallet",
     description: "Show the agent's wallet address and on-chain balances (USDG and ETH for gas) on Robinhood Chain. Check this before leasing to confirm the wallet can pay.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Wallet balances", ...reads },
   },
   {
     name: "prism_list_gpus",
@@ -175,11 +237,13 @@ const TOOLS = [
         },
       },
     },
+    annotations: { title: "Available GPUs", ...reads },
   },
   {
     name: "prism_price_index",
     description: "Current GPU pricing on Prism Network by model: sourced low/median/high and settled mean, in USDG per hour. Needs no wallet. Use it to estimate what an analysis job will cost before leasing.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { title: "GPU price index", ...reads },
   },
   {
     name: "prism_receipts",
@@ -190,11 +254,13 @@ const TOOLS = [
         limit: { type: "integer", description: "Max receipts to return (default 10, max 50)." },
       },
     },
+    annotations: { title: "Settled receipts", ...reads },
   },
   {
     name: "prism_leases",
     description: "List this wallet's leases on Prism Network with their current state.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Your leases", ...reads },
   },
   {
     name: "prism_batch_run",
@@ -205,10 +271,12 @@ const TOOLS = [
         command: { type: "string", description: "Shell command to run (max 8 KiB)." },
         duration_seconds: { type: "integer", description: "Paid window in seconds (default 900, max 21600). A command still running at the end is killed and reported exit 124." },
         min_vram_mib: { type: "integer", description: "Minimum GPU memory in MiB (default 16000)." },
-        max_usdg: { type: "number", description: "Hard cap on the USDG this lease may cost (default 1). Raise it deliberately for longer leases." },
+        max_usdg: { type: "number", description: "Cost ceiling for this lease in USDG. It lowers the operator's PRISM_MAX_USDG and cannot raise it; omitted, that ceiling applies. See prism_budget." },
       },
       required: ["command"],
     },
+    ...spends,
+    annotations: { title: "Rent a GPU for one command", ...spends.annotations },
   },
   {
     name: "prism_batch_result",
@@ -220,6 +288,7 @@ const TOOLS = [
       },
       required: ["lease_id"],
     },
+    annotations: { title: "Batch result", ...reads },
   },
   {
     name: "prism_infer",
@@ -229,10 +298,12 @@ const TOOLS = [
       properties: {
         prompt: { type: "string", description: "The prompt to generate from (max 32 KiB)." },
         model: { type: "string", description: "Model to use; defaults to the endpoint's first offered model." },
-        max_usdg: { type: "number", description: "Refuse if the quoted price exceeds this (default 0.05)." },
+        max_usdg: { type: "number", description: "Refuse if the quoted price exceeds this (default 0.05). The operator's PRISM_MAX_USDG binds it either way." },
       },
       required: ["prompt"],
     },
+    ...spends,
+    annotations: { title: "Buy one LLM generation", ...spends.annotations },
   },
   {
     name: "prism_infer_batch",
@@ -248,10 +319,12 @@ const TOOLS = [
           description: "Independent prompts, answered in the order given (each max 32 KiB).",
         },
         model: { type: "string", description: "Model to use; defaults to the endpoint's first offered model." },
-        max_usdg: { type: "number", description: "Refuse if the quoted total exceeds this (default 0.5)." },
+        max_usdg: { type: "number", description: "Refuse if the quoted total exceeds this (default 0.5). The operator's PRISM_MAX_USDG binds it either way." },
       },
       required: ["prompts"],
     },
+    ...spends,
+    annotations: { title: "Buy many LLM generations", ...spends.annotations },
   },
   {
     name: "prism_confidential_infer",
@@ -262,11 +335,13 @@ const TOOLS = [
         prompt: { type: "string", description: "The prompt to generate from." },
         model: { type: "string", description: "Confidential model to use; defaults to the endpoint's first." },
         max_tokens: { type: "integer", description: "Cap on generated tokens (default 512). The price is quoted against this cap." },
-        max_usdg: { type: "number", description: "Refuse if the quoted price exceeds this (default 0.25)." },
+        max_usdg: { type: "number", description: "Refuse if the quoted price exceeds this (default 0.25). The operator's PRISM_MAX_USDG binds it either way." },
         e2ee: { type: "boolean", description: "Encrypt message contents to the attested enclave key (default true). Turn it off only when the relay is allowed to read the prompt." },
       },
       required: ["prompt"],
     },
+    ...spends,
+    annotations: { title: "Buy one confidential LLM generation", ...spends.annotations },
   },
   {
     name: "prism_verify_attestation",
@@ -279,6 +354,7 @@ const TOOLS = [
       },
       required: ["receipt_id"],
     },
+    annotations: { title: "Check a confidential generation", ...reads },
   },
   {
     name: "prism_lease_and_run",
@@ -294,10 +370,12 @@ const TOOLS = [
           enum: TRUST_CLASSES,
           description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
         },
-        max_usdg: { type: "number", description: "Hard cap on the USDG this lease may cost (default 1). Raise it deliberately for longer leases." },
+        max_usdg: { type: "number", description: "Cost ceiling for this lease in USDG. It lowers the operator's PRISM_MAX_USDG and cannot raise it; omitted, that ceiling applies. See prism_budget." },
       },
       required: ["command"],
     },
+    ...spends,
+    annotations: { title: "Rent a GPU and run a command", ...spends.annotations },
   },
   {
     name: "prism_lease",
@@ -312,9 +390,11 @@ const TOOLS = [
           enum: TRUST_CLASSES,
           description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
         },
-        max_usdg: { type: "number", description: "Hard cap on the USDG this lease may cost (default 1). Raise it deliberately for longer leases." },
+        max_usdg: { type: "number", description: "Cost ceiling for this lease in USDG. It lowers the operator's PRISM_MAX_USDG and cannot raise it; omitted, that ceiling applies. See prism_budget." },
       },
     },
+    ...spends,
+    annotations: { title: "Rent a GPU", ...spends.annotations },
   },
   {
     name: "prism_run",
@@ -328,6 +408,7 @@ const TOOLS = [
       },
       required: ["lease_id", "command"],
     },
+    annotations: { title: "Run a command on a lease", readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "prism_end_lease",
@@ -337,6 +418,7 @@ const TOOLS = [
       properties: { lease_id: { type: "integer" } },
       required: ["lease_id"],
     },
+    annotations: { title: "Release a lease", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   {
     name: "prism_vault_store",
@@ -354,11 +436,13 @@ const TOOLS = [
       },
       required: ["value"],
     },
+    annotations: { title: "Seal a secret", readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   },
   {
     name: "prism_vault_list",
     description: "List the agent's sealed vault items: item_id, label, version and trust floor. Values are not returned and are not readable by Prism.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { title: "List sealed items", ...reads },
   },
   {
     name: "prism_vault_read",
@@ -368,6 +452,8 @@ const TOOLS = [
       properties: { item_id: { type: "string", description: "The item_id from prism_vault_store or prism_vault_list." } },
       required: ["item_id"],
     },
+    _meta: { "anthropic/requiresUserInteraction": true },
+    annotations: { title: "Decrypt one sealed item", readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "prism_vault_delete",
@@ -377,6 +463,8 @@ const TOOLS = [
       properties: { item_id: { type: "string" } },
       required: ["item_id"],
     },
+    ...spends,
+    annotations: { title: "Delete a sealed item", ...spends.annotations },
   },
   {
     name: "prism_vault_release",
@@ -389,10 +477,13 @@ const TOOLS = [
       },
       required: ["item_id", "lease_id"],
     },
+    ...spends,
+    annotations: { title: "Release a secret into a lease", ...spends.annotations },
   },
 ];
 
 async function handle(name, args) {
+  if (name === "prism_budget") return requireLedger(name).status();
   if (name === "prism_wallet") {
     const b = await requireWallet("prism_wallet").balances();
     return { address: b.address, usdg: usdg(b.usdg), eth_wei: b.eth };
@@ -483,22 +574,28 @@ async function handle(name, args) {
   if (name === "prism_batch_run") {
     requireCommand(args.command);
     requireWallet(name);
-    const cap = maxDeposit(args);
-    const batch = await agent.lease({
-      image: IMAGE,
-      durationSeconds: args.duration_seconds ?? 900,
-      minVramMib: args.min_vram_mib ?? 16000,
-      maxDeposit: cap,
-      command: args.command,
+    const cap = maxDeposit(name, args);
+    return spending(name, cap, async () => {
+      const batch = await agent.lease({
+        image: IMAGE,
+        durationSeconds: args.duration_seconds ?? 900,
+        minVramMib: args.min_vram_mib ?? 16000,
+        maxDeposit: cap,
+        command: args.command,
+      });
+      return {
+        reference: batch.fundingHash,
+        settledMicros: escrowed(batch.quote),
+        value: {
+          lease_id: batch.leaseId,
+          funding_tx: batch.fundingHash,
+          exit_code: batch.result?.exit_code,
+          stdout: batch.result?.stdout,
+          stderr: batch.result?.stderr,
+          truncated: batch.result?.truncated ?? false,
+        },
+      };
     });
-    return {
-      lease_id: batch.leaseId,
-      funding_tx: batch.fundingHash,
-      exit_code: batch.result?.exit_code,
-      stdout: batch.result?.stdout,
-      stderr: batch.result?.stderr,
-      truncated: batch.result?.truncated ?? false,
-    };
   }
   if (name === "prism_batch_result") {
     requireWallet(name, "reads this wallet's leases");
@@ -512,14 +609,17 @@ async function handle(name, args) {
     requireWallet(name);
     const base = inferenceBase();
     const { offer, model, unit } = await inferenceOffer(base, args.model);
-    withinCap(unit, args.max_usdg, 0.05, "per generation");
-    return payAndPost({
-      base,
-      path: "/v1/inference",
-      price: unit,
-      payTo: offer.pay_to,
-      body: { model, prompt: args.prompt },
-      tool: "prism_infer",
+    withinCap(name, unit, args.max_usdg, 0.05, "per generation");
+    return spending(name, Number(unit), async () => {
+      const value = await payAndPost({
+        base,
+        path: "/v1/inference",
+        price: unit,
+        payTo: offer.pay_to,
+        body: { model, prompt: args.prompt },
+        tool: "prism_infer",
+      });
+      return { value, settledMicros: Number(unit), reference: value.payment_tx };
     });
   }
   if (name === "prism_infer_batch") {
@@ -537,14 +637,17 @@ async function handle(name, args) {
     const base = inferenceBase();
     const { offer, model, unit } = await inferenceOffer(base, args.model);
     const price = unit * BigInt(prompts.length);
-    withinCap(price, args.max_usdg, 0.5, `for ${prompts.length} generations`);
-    return payAndPost({
-      base,
-      path: "/v1/batch",
-      price,
-      payTo: offer.pay_to,
-      body: { model, prompts },
-      tool: "prism_infer_batch",
+    withinCap(name, price, args.max_usdg, 0.5, `for ${prompts.length} generations`);
+    return spending(name, Number(price), async () => {
+      const value = await payAndPost({
+        base,
+        path: "/v1/batch",
+        price,
+        payTo: offer.pay_to,
+        body: { model, prompts },
+        tool: "prism_infer_batch",
+      });
+      return { value, settledMicros: Number(price), reference: value.payment_tx };
     });
   }
   if (name === "prism_confidential_infer") {
@@ -553,13 +656,19 @@ async function handle(name, args) {
     }
     requireWallet(name);
     const base = inferenceBase();
-    const run = await agent.confidentialInfer({
-      prompt: args.prompt,
-      model: args.model,
-      maxTokens: args.max_tokens ?? 512,
-      maxUsdg: args.max_usdg ?? 0.25,
-      e2ee: args.e2ee ?? true,
-      endpoint: base,
+    // The endpoint quotes inside the SDK, so the day is charged the ceiling up
+    // front and corrected to the quoted price once the call has been served.
+    const cap = callCeiling(args.max_usdg ?? 0.25, requireLedger(name).maxPerCallMicros);
+    const run = await spending(name, cap, async () => {
+      const served = await agent.confidentialInfer({
+        prompt: args.prompt,
+        model: args.model,
+        maxTokens: args.max_tokens ?? 512,
+        maxUsdg: cap / 1e6,
+        e2ee: args.e2ee ?? true,
+        endpoint: base,
+      });
+      return { value: served, settledMicros: Number(served.priceMicros), reference: served.tx };
     });
     rememberConfidentialCall(run.receiptId, {
       base,
@@ -622,20 +731,32 @@ async function handle(name, args) {
   if (name === "prism_lease_and_run" || name === "prism_lease") {
     if (name === "prism_lease_and_run") requireCommand(args.command);
     requireWallet(name);
-    const cap = maxDeposit(args);
+    const cap = maxDeposit(name, args);
     sweepExpiredLeases();
-    const lease = await agent.lease({
-      image: IMAGE,
-      durationSeconds: args.duration_seconds ?? 900,
-      minVramMib: args.min_vram_mib ?? 16000,
-      maxDeposit: cap,
-      minTrustClass: args.min_trust_class ?? "open",
+    const lease = await spending(name, cap, async () => {
+      const funded = await agent.lease({
+        image: IMAGE,
+        durationSeconds: args.duration_seconds ?? 900,
+        minVramMib: args.min_vram_mib ?? 16000,
+        maxDeposit: cap,
+        minTrustClass: args.min_trust_class ?? "open",
+      });
+      return { value: funded, reference: funded.fundingHash, settledMicros: escrowed(funded.quote) };
     });
     leases.set(lease.leaseId, lease);
     const summary = {
       lease_id: lease.leaseId,
       funding_tx: lease.fundingHash,
-      ssh: { host: lease.access.ssh_host, port: lease.access.ssh_port, user: lease.access.ssh_user },
+      // `prism_run` checks this itself. It is in the summary because the
+      // caller is being handed an address they may connect to by hand, and an
+      // address with no key to check is an invitation to accept whatever
+      // answers.
+      ssh: {
+        host: lease.access.ssh_host,
+        port: lease.access.ssh_port,
+        user: lease.access.ssh_user,
+        ...hostKey(lease.access),
+      },
       trust: lease.quote?.trust_class ?? "open",
       expires_at: lease.access.expires_at,
     };
@@ -734,6 +855,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const result = await handle(request.params.name, request.params.arguments ?? {});
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
+    if (err instanceof BudgetError) {
+      return { isError: true, content: [{ type: "text", text: `${err.message} See prism_budget.` }] };
+    }
     const body = err?.body ?? {};
     const detail = [
       body.cause,

@@ -7,7 +7,14 @@
 // `spawnTunnel` (ssh -L to the box's ollama), `fetchOllama`, and `verify`
 // (on-chain payment verification).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import { parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "@prismnetwork/x402/codec";
+import {
+  hashRequest,
+  parsePayment,
+  paymentRequired,
+  paymentResponse,
+  requirementsFor,
+  sameNetwork,
+} from "@prismnetwork/x402/codec";
 import { batchReceipt, digest } from "./receipt.mjs";
 
 // The shipped rate card, in USDG micros, derived from what a generation costs
@@ -401,7 +408,10 @@ export function createGateway({
 
   const consumed = loadConsumed(paymentsFile);
   // A client that paid and then lost the connection must be able to fetch what
-  // it paid for: a consumed tx hash answers with its own result, not a refusal.
+  // it paid for: a consumed payment answers with its own result, not a refusal.
+  // Keyed by the request as well as the payment, because the payment half is
+  // public the moment the transfer or the authorization lands on chain, and a
+  // key anyone can reconstruct must not on its own name someone else's answer.
   const served = new Map();
   const SERVED_CAP = 200;
   // One slot per box the gateway is allowed to hold at once. A slot owns its
@@ -424,6 +434,11 @@ export function createGateway({
   }
   function releasePayment(key) {
     consumed.delete(key);
+  }
+  const servedKey = (key, requestHash) => `${key}:${requestHash ?? ""}`;
+  function rememberServed(key, requestHash, result) {
+    served.set(servedKey(key, requestHash), result);
+    if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
   }
   // Append-only and rebuilt on restart; the line is reassembled from validated
   // parts rather than trusting a string built elsewhere.
@@ -710,7 +725,8 @@ export function createGateway({
         `${route.unit} ${route.where}, paid in USDG on Robinhood Chain${route.rail ?? ""}. ` +
         "Sign an EIP-3009 transferWithAuthorization for the quoted amount " +
         "and send it as the payment header; you need no gas, because the authorization is " +
-        "broadcast for you. The older flow, a direct transfer plus a signed tx hash, still works.",
+        "broadcast for you. The older flow still works: transfer the amount, then sign three lines, " +
+        "prism-x402:v2, the lowercased tx hash and the sha256 hex of your request body.",
       mimeType: "application/json",
       maxTimeoutSeconds: 60,
       ...(shape ? { outputSchema: shape } : {}),
@@ -759,7 +775,7 @@ export function createGateway({
   /// yet, so verification is read-only and the broadcast happens only once a
   /// generation exists to pay for. A failed generation therefore costs the
   /// payer nothing and needs no refund, which the legacy scheme cannot offer.
-  async function checkAuthorization(parsed, quotedMicros, route) {
+  async function checkAuthorization(parsed, quotedMicros, route, requestHash) {
     const authorization = parsed.payload?.authorization;
     const from = authorization?.from;
     const nonce = authorization?.nonce;
@@ -779,15 +795,15 @@ export function createGateway({
     );
     if (!want) return { ok: false, reason: "invalid_network" };
 
-    if (!reservePayment(key)) {
-      const replay = served.get(key);
-      return { ok: false, reason: "payment_reused", ...(replay ? { replay } : {}) };
-    }
-
+    // Checked before the spent-payment cache is consulted. The authorization
+    // and its signature are broadcast on chain to settle, so a payer and nonce
+    // read off a block would otherwise redeem the answer they bought.
     const verdict = await exact.verify(parsed, want);
-    if (!verdict.isValid) {
-      releasePayment(key);
-      return { ok: false, reason: verdict.invalidReason };
+    if (!verdict.isValid) return { ok: false, reason: verdict.invalidReason };
+
+    if (!reservePayment(key)) {
+      const replay = served.get(servedKey(key, requestHash));
+      return { ok: false, reason: "payment_reused", ...(replay ? { replay } : {}) };
     }
 
     return {
@@ -796,36 +812,37 @@ export function createGateway({
       settle: async () => exact.settle(parsed, want),
       commit: (result) => {
         commitPayment(key);
-        served.set(key, result);
-        if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
+        rememberServed(key, requestHash, result);
       },
       release: () => releasePayment(key),
     };
   }
 
-  async function checkPayment(header, quotedMicros, route = ROUTES.single) {
+  /// `requestHash` is the digest of the bytes the caller sent. On the legacy
+  /// scheme the payer signs it with the transaction, so a header read off the
+  /// wire cannot be redeemed against a different prompt.
+  async function checkPayment(header, quotedMicros, route, requestHash) {
     const parsed = parsePayment(header);
     if (!parsed) return { ok: false, reason: "invalid_payload" };
     // An authorization means the exact scheme; a bare tx hash is the legacy
     // one, kept working for a release so anything already integrated survives.
     if (parsed.payload?.authorization) {
       if (!exact) return { ok: false, reason: "invalid_scheme" };
-      return checkAuthorization(parsed, quotedMicros, route);
+      return checkAuthorization(parsed, quotedMicros, route, requestHash);
     }
     const { txHash, signature } = parsed.raw ?? {};
     if (!TX_HASH.test(txHash ?? "") || typeof signature !== "string") {
       return { ok: false, reason: "malformed_payment" };
     }
     const key = txHash.toLowerCase();
+    // The signature is checked before the spent-payment cache is read. The tx
+    // hash is public on chain, so answering a reused one on the hash alone
+    // hands the payer's generation to anyone watching transfers to `payTo`.
+    const outcome = await verify(txHash, signature, quotedMicros, requestHash);
+    if (!outcome.ok) return outcome;
     if (!reservePayment(key)) {
-      const replay = served.get(key);
-      if (replay) return { ok: false, reason: "payment_reused", replay };
-      return { ok: false, reason: "payment_reused" };
-    }
-    const outcome = await verify(txHash, signature, quotedMicros);
-    if (!outcome.ok) {
-      releasePayment(key);
-      return outcome;
+      const replay = served.get(servedKey(key, requestHash));
+      return { ok: false, reason: "payment_reused", ...(replay ? { replay } : {}) };
     }
     return {
       ok: true,
@@ -834,8 +851,7 @@ export function createGateway({
       // leaves the tx valid for the retry.
       commit: (result) => {
         commitPayment(key);
-        served.set(key, result);
-        if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
+        rememberServed(key, requestHash, result);
       },
       release: () => releasePayment(key),
     };
@@ -911,7 +927,7 @@ export function createGateway({
     return settlement;
   }
 
-  async function handleInference(body, paymentHeader, paymentVersion = null) {
+  async function handleInference(body, paymentHeader, paymentVersion = null, requestHash = null) {
     // v2 unless the caller showed us they speak v1. The scanners and the
     // agent tooling read v2 only, and an unpaid probe tells us nothing about
     // itself, so the newer shape is the right thing to volunteer.
@@ -945,7 +961,7 @@ export function createGateway({
     }
     const { cap, micros } = priceFor(pricing, body.model, Number(body.options?.num_predict));
     const quote = { model: body.model, cap, micros };
-    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.single);
+    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.single, requestHash);
     if (!payment.ok) {
       // A payment already spent on the confidential relay replays there, as
       // raw bytes, and has no JSON result to hand back here.
@@ -1079,7 +1095,7 @@ export function createGateway({
     return results;
   }
 
-  async function handleBatch(body, paymentHeader, paymentVersion = null) {
+  async function handleBatch(body, paymentHeader, paymentVersion = null, requestHash = null) {
     const version = paymentVersion ?? 2;
     const known = typeof body?.model === "string" && models.includes(body.model);
     const prompts = Array.isArray(body?.prompts) ? body.prompts : null;
@@ -1111,7 +1127,7 @@ export function createGateway({
     const { cap, micros: unit } = priceFor(pricing, body.model, Number(body.options?.num_predict));
     const micros = unit * BigInt(prompts.length);
     const quote = { model: body.model, cap, micros, count: prompts.length };
-    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.batch);
+    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.batch, requestHash);
     if (!payment.ok) {
       if (payment.replay && !payment.replay.relay) {
         return { status: 200, body: { ...payment.replay, replayed: true } };
@@ -1635,7 +1651,7 @@ export function createGateway({
       };
     }
 
-    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.confidential);
+    const payment = await checkPayment(String(paymentHeader), micros, ROUTES.confidential, hashRequest(bytes));
     if (!payment.ok) {
       settleSpend(modelled);
       const replay = payment.replay?.relay;

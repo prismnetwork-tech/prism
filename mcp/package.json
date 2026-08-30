@@ -8,6 +8,7 @@
     "prism-mcp": "server.mjs"
   },
   "files": [
+    "budget.mjs",
     "server.mjs",
     "README.md"
   ],
@@ -17,7 +18,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@phala/dcap-qvl": "^0.6.1",
-    "@prismnetwork/agent-sdk": "^0.7.0",
+    "@prismnetwork/agent-sdk": "^0.7.3",
     "jose": "^6",
     "viem": "^2"
   },
@@ -41,5 +42,8 @@
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"
+  },
+  "scripts": {
+    "test": "node --test"
   }
 }

@@ -88,6 +88,14 @@ if [ -f "$control/attestation_challenge" ]; then
                 "$artifact" "$(base64 -w0 < "/run/prism/evidence/$artifact")"
         fi
     done
+else
+    # No report covers this key, so the node says which one it started and
+    # signs for it. The renter gets a name to check the box against, backed by
+    # the operator's bond rather than by the processor. Never printed alongside
+    # a report: the report is the stronger statement about the same key and two
+    # claims invite the weaker one being read as the answer.
+    printf 'prism-evidence channel-key.pub %s\n' \
+        "$(base64 -w0 < /run/prism/ssh_host_key.pub)"
 fi
 
 cat >/run/prism/sshd_config <<'EOF'

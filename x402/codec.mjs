@@ -210,3 +210,11 @@ export function paymentResponse(version, settlement) {
     },
   };
 }
+
+/// What the payer signs: the transaction and the exact request it buys. Older
+/// clients signed the transaction alone; PRISM_X402_ALLOW_UNBOUND_PAYMENT=1
+/// keeps those working through a migration and is not safe to leave on.
+///
+/// Defined in the client SDK, which this package depends on, so the payer and
+/// the verifier cannot drift apart.
+export { boundMessage, hashRequest } from "@prismnetwork/agent-sdk/x402";

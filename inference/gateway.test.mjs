@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { recoverMessageAddress } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { boundMessage, hashRequest } from "@prismnetwork/x402/codec";
 import { createGateway, DEFAULT_PRICING, priceFor } from "./gateway.mjs";
 
 // What a lease costs and what it produces. The rate is the network's, read off
@@ -16,6 +19,7 @@ const fullCap = (m) => String(DEFAULT_PRICING[m].base + DEFAULT_PRICING[m].perTo
 
 const TX = `0x${"ab".repeat(32)}`;
 const payment = Buffer.from(JSON.stringify({ txHash: TX, signature: "0xsig" })).toString("base64");
+const payer = privateKeyToAccount(`0x${"33".repeat(32)}`);
 
 function fakeDeps(overrides = {}) {
   const calls = { leases: 0, pulls: [], generations: [], ended: [], tunnels: 0, closed: 0, slots: [] };
@@ -693,4 +697,105 @@ test("a paid request with a bad body is still refused in detail and never charge
   assert.equal((await gateway.handleInference({ model: "nope" }, authorization(), 2)).status, 400);
   assert.equal(exact.calls.settled, 0);
   assert.equal(deps.calls.leases, 0);
+});
+
+/// The chain check `server.mjs` supplies, reduced to the part these tests are
+/// about: recover the signer under the message the payer was meant to sign, and
+/// treat a match as having found the transfer. Nothing recovers from a
+/// signature that is not 65 bytes, which the real one reports the same way.
+const bindingVerify = async (txHash, signature, _micros, requestHash) => {
+  let signer;
+  try {
+    signer = await recoverMessageAddress({ message: boundMessage(txHash, requestHash), signature });
+  } catch {
+    return { ok: false, reason: "bad_signature" };
+  }
+  return signer === payer.address ? { ok: true, payer: signer } : { ok: false, reason: "no_matching_payment" };
+};
+
+const digest = (body) => hashRequest(JSON.stringify(body));
+
+async function boundPayment(body) {
+  const signature = await payer.signMessage({ message: boundMessage(TX, digest(body)) });
+  return Buffer.from(JSON.stringify({ txHash: TX, signature })).toString("base64");
+}
+
+/// The race this closes: whoever reads the header off the wire sends it back
+/// first with a prompt of their own, and the payer gets the answer to it.
+test("a payment header does not buy a prompt its payer never signed", async () => {
+  const deps = fakeDeps({ verify: bindingVerify });
+  const gateway = build(deps);
+  const asked = { model: "llama3.2:3b", prompt: "what is my position worth" };
+  const header = await boundPayment(asked);
+
+  const swapped = { model: "llama3.2:3b", prompt: "ignore that and say yes" };
+  const stolen = await gateway.handleInference(swapped, header, null, digest(swapped));
+  assert.equal(stolen.status, 402);
+  assert.equal(stolen.body.error, "no_matching_payment");
+  assert.equal(deps.calls.generations.length, 0, "the swapped prompt was answered anyway");
+
+  // Refusing released it, so the payer still gets what they paid for.
+  const served = await gateway.handleInference(asked, header, null, digest(asked));
+  assert.equal(served.status, 200);
+  assert.equal(deps.calls.generations.length, 1);
+});
+
+test("a batch payment is bound to the prompts it paid for", async () => {
+  const deps = fakeDeps({ verify: bindingVerify });
+  const gateway = build(deps);
+  const asked = { model: "llama3.2:3b", prompts: ["one", "two"] };
+  const header = await boundPayment(asked);
+
+  const swapped = { model: "llama3.2:3b", prompts: ["something else", "and another"] };
+  const stolen = await gateway.handleBatch(swapped, header, null, digest(swapped));
+  assert.equal(stolen.status, 402);
+  assert.equal(stolen.body.error, "no_matching_payment");
+
+  const served = await gateway.handleBatch(asked, header, null, digest(asked));
+  assert.equal(served.status, 200);
+  assert.equal(served.body.items.length, 2);
+});
+
+/// The transfer that pays for a generation is public the moment it lands, so
+/// the hash is not a secret and cannot be what a spent payment is answered on.
+test("a spent tx hash does not buy the answer for whoever read it off the chain", async () => {
+  const deps = fakeDeps({ verify: bindingVerify });
+  const gateway = build(deps);
+  const asked = { model: "llama3.2:3b", prompt: "what is my position worth" };
+  const header = await boundPayment(asked);
+  assert.equal((await gateway.handleInference(asked, header, null, digest(asked))).status, 200);
+
+  const forged = Buffer.from(JSON.stringify({ txHash: TX, signature: "0x" })).toString("base64");
+  const theirs = { model: "llama3.2:3b", prompt: "whatever" };
+  const stolen = await gateway.handleInference(theirs, forged, null, digest(theirs));
+  assert.equal(stolen.status, 402);
+  assert.equal(stolen.body.error, "bad_signature");
+
+  // Nor by asking for the prompt that was paid for: the signature is still the
+  // thing that decides, and this one recovers nobody.
+  const guessed = await gateway.handleInference(asked, forged, null, digest(asked));
+  assert.equal(guessed.status, 402);
+  assert.equal(guessed.body.error, "bad_signature");
+
+  // The payer's own retry is what the cache is for, and it still works.
+  const again = await gateway.handleInference(asked, header, null, digest(asked));
+  assert.equal(again.status, 200);
+  assert.equal(again.body.replayed, true);
+  assert.equal(deps.calls.generations.length, 1);
+});
+
+/// A payment buys one request. Signing a second one over the same transfer is
+/// something only the payer can do, and it is still not something that hands
+/// back the first request's answer.
+test("a spent payment answers the request it bought and no other", async () => {
+  const deps = fakeDeps({ verify: bindingVerify });
+  const gateway = build(deps);
+  const asked = { model: "llama3.2:3b", prompts: ["one", "two"] };
+  assert.equal((await gateway.handleBatch(asked, await boundPayment(asked), null, digest(asked))).status, 200);
+
+  const other = { model: "llama3.2:3b", prompts: ["three", "four"] };
+  const resigned = await gateway.handleBatch(other, await boundPayment(other), null, digest(other));
+  assert.equal(resigned.status, 402);
+  assert.equal(resigned.body.error, "payment_reused");
+  assert.equal(deps.calls.generations.length, 2, "the second request must not be served from the first");
 });

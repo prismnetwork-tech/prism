@@ -21,7 +21,18 @@ import { jobExample, jobInput, jobInputExample, jobOutput } from "./schemas.mjs"
 import { createExactEvm } from "./exact-evm.mjs";
 import { createCdpFacilitator, routeByNetwork } from "./cdp-facilitator.mjs";
 import { createFacilitator, createBudget } from "./facilitator.mjs";
-import { bazaar, detect, parsePayment, paymentRequired, paymentResponse, requirementsFor, sameNetwork } from "./codec.mjs";
+import { authorized, listener } from "./listen.mjs";
+import {
+  bazaar,
+  boundMessage,
+  detect,
+  hashRequest,
+  parsePayment,
+  paymentRequired,
+  paymentResponse,
+  requirementsFor,
+  sameNetwork,
+} from "./codec.mjs";
 
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 // Base USDC reports this as its EIP-712 domain. The published spec example
@@ -68,6 +79,16 @@ function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`${name} is required`);
   return v;
+}
+
+// Resolved before anything else: a listener that came up on the wrong address
+// has already been reachable by the time a later line of config fails.
+let listen;
+try {
+  listen = listener(process.env, "X402");
+} catch (err) {
+  console.error(`x402 config error: ${err.message}`);
+  process.exit(1);
 }
 
 let agent;
@@ -274,8 +295,9 @@ function accepted(resource) {
         "immediately and the payment is only taken once it has succeeded, so a failed job " +
         `costs nothing. Sign it valid for at least ${JOB_TIMEOUT_SECONDS()} seconds.`
       : `One GPU job, paid in ${network.label}. Pay the amount to payTo, then retry with ` +
-        "header X-PAYMENT: base64({txHash, signature}) where signature is a personal_sign of " +
-        "the tx hash.",
+        "header X-PAYMENT: base64({txHash, signature}), where signature is a personal_sign over " +
+        "three lines: prism-x402:v2, the lowercased tx hash, and the sha256 hex of the command " +
+        "you are sending. A payment buys the one command it names and nothing else.",
     mimeType: "application/json",
     maxTimeoutSeconds: JOB_TIMEOUT_SECONDS(),
     ...(network.domain ? { extra: { ...network.domain, assetTransferMethod: "eip3009" } } : {}),
@@ -336,10 +358,16 @@ async function verifyAuthorization(parsed, resource) {
   };
 }
 
+// A migration escape hatch: older clients signed the transaction alone, which
+// is the replay the binding below closes. Not safe to leave on.
+const ALLOW_UNBOUND = process.env.PRISM_X402_ALLOW_UNBOUND_PAYMENT === "1";
+
 // Verify an on-chain USDG payment bound to the caller: the caller signs the tx
-// hash, and the Transfer's `from` must match that signer. This stops a front-runner
-// from claiming someone else's payment tx hash.
-async function verifyPayment(header) {
+// hash together with the request it buys, and the Transfer's `from` must match
+// that signer. The hash stops a front-runner from claiming someone else's
+// payment; the request stops anyone who read the header from spending it on a
+// command of their own.
+async function verifyPayment(header, requestHash) {
   let txHash;
   let signature;
   let declared;
@@ -354,21 +382,29 @@ async function verifyPayment(header) {
   const candidates = declared ? networks.filter((n) => n.id === declared) : networks;
   if (!candidates.length) return { ok: false, reason: "unsupported_network" };
 
-  let signer;
-  try {
-    signer = await recoverMessageAddress({ message: txHash, signature });
-  } catch {
-    return { ok: false, reason: "bad_signature" };
+  // One signature recovers a different address under each message, so which
+  // form the payer used is decided by the transfer on chain rather than here.
+  const messages = ALLOW_UNBOUND
+    ? [boundMessage(txHash, requestHash), txHash]
+    : [boundMessage(txHash, requestHash)];
+  const signers = [];
+  for (const message of messages) {
+    try {
+      signers.push(await recoverMessageAddress({ message, signature }));
+    } catch {
+      // Nothing recovers from a signature that is not 65 bytes, under any message.
+    }
   }
+  if (!signers.length) return { ok: false, reason: "bad_signature" };
 
   let reason = "tx_not_found";
   for (const network of candidates) {
     const key = paymentKey(network.id, txHash);
     if (!reservePayment(key)) return { ok: false, reason: "payment_reused" };
-    const outcome = await settleOn(network, txHash, signer);
+    const outcome = await settleOn(network, txHash, signers);
     if (outcome.ok) {
       commitPayment(network.id, txHash);
-      return { ok: true, payer: getAddress(signer), network: network.id };
+      return { ok: true, payer: getAddress(outcome.payer), network: network.id };
     }
     releasePayment(key);
     if (outcome.reason !== "tx_not_found") reason = outcome.reason;
@@ -377,8 +413,8 @@ async function verifyPayment(header) {
 }
 
 // A payment counts when the transaction is final on that network and moved at
-// least the price in that network's asset, from the signer, to its payee.
-async function settleOn(network, txHash, signer) {
+// least the price in that network's asset, from one of the signers, to its payee.
+async function settleOn(network, txHash, signers) {
   try {
     let receipt;
     try {
@@ -391,17 +427,19 @@ async function settleOn(network, txHash, signer) {
     if (head - receipt.blockNumber < BigInt(network.confirmations)) {
       return { ok: false, reason: "insufficient_confirmations" };
     }
-    const paid = receipt.logs.some((log) => {
-      if (log.address.toLowerCase() !== network.asset.toLowerCase()) return false;
-      const t = decodeTransfer(log);
-      return (
-        t &&
-        t.to.toLowerCase() === network.payTo.toLowerCase() &&
-        t.from.toLowerCase() === signer.toLowerCase() &&
-        t.value >= config.priceMicros
-      );
-    });
-    return paid ? { ok: true } : { ok: false, reason: "no_matching_payment" };
+    const payer = signers.find((signer) =>
+      receipt.logs.some((log) => {
+        if (log.address.toLowerCase() !== network.asset.toLowerCase()) return false;
+        const t = decodeTransfer(log);
+        return (
+          t &&
+          t.to.toLowerCase() === network.payTo.toLowerCase() &&
+          t.from.toLowerCase() === signer.toLowerCase() &&
+          t.value >= config.priceMicros
+        );
+      }),
+    );
+    return payer ? { ok: true, payer } : { ok: false, reason: "no_matching_payment" };
   } catch (err) {
     console.error(`payment verification error on ${network.id}: ${err.message}`);
     return { ok: false, reason: "verification_error" };
@@ -494,6 +532,19 @@ function evictExpiredJobs() {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${config.port}`);
+  // Only off loopback, and then on every route including /healthz: the
+  // facilitator broadcasts transactions and a job carries its own output, so
+  // there is no route here worth answering for a stranger who found the port.
+  const auth = authorized(req, listen.token);
+  if (auth !== "ok") {
+    return json(res, 401, {
+      error: "unauthorized",
+      detail:
+        auth === "missing"
+          ? "this listener is not on loopback, so every request needs an Authorization: Bearer header"
+          : "the bearer token does not match",
+    });
+  }
   if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, { status: "ok" });
 
   // The facilitator interface, for endpoints that are not ours.
@@ -501,7 +552,7 @@ const server = createServer(async (req, res) => {
     let body = null;
     if (req.method === "POST") {
       try {
-        body = await readJson(req);
+        ({ body } = await readJson(req));
       } catch (err) {
         return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
       }
@@ -514,7 +565,9 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname.startsWith("/jobs/")) {
     const job = jobs.get(url.pathname.slice(6));
     if (!job) return json(res, 404, { error: "job_not_found" });
-    const token = bearer(req) ?? url.searchParams.get("token");
+    // The query string first, because a listener token has already claimed the
+    // Authorization header.
+    const token = url.searchParams.get("token") ?? bearer(req);
     if (token !== job.token) return json(res, 401, { error: "invalid_job_token" });
     const { token: _t, ...view } = job;
     return json(res, 200, view);
@@ -529,9 +582,9 @@ const server = createServer(async (req, res) => {
     return json(res, 402, required.body, required.headers);
   }
   if (req.method === "POST" && url.pathname === "/run") {
-    let body;
+    let read;
     try {
-      body = await readJson(req);
+      read = await readJson(req);
     } catch (err) {
       return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
     }
@@ -545,11 +598,18 @@ const server = createServer(async (req, res) => {
       const required = paymentRequirements("/run", version);
       return json(res, 402, required.body, required.headers);
     }
-    if (!body?.command || typeof body.command !== "string") return json(res, 400, { error: "command_required" });
+    if (!read.body?.command || typeof read.body.command !== "string") {
+      return json(res, 400, { error: "command_required" });
+    }
     const parsed = parsePayment(payment.header);
+    // The bytes that arrived, not the command read out of them. Every client
+    // signs what it is about to send, and a digest taken over a field the
+    // server picked out would leave the two computing different hashes of the
+    // same request.
+    const requestHash = hashRequest(read.bytes);
     const check = parsed?.payload?.authorization
       ? await verifyAuthorization(parsed, "/run")
-      : await verifyPayment(String(payment.header));
+      : await verifyPayment(String(payment.header), requestHash);
     if (!check.ok) {
       const refused = paymentRequirements("/run", version, check.reason);
       return json(res, 402, refused.body, refused.headers);
@@ -559,7 +619,7 @@ const server = createServer(async (req, res) => {
     const jobId = randomUUID();
     const token = randomUUID();
     jobs.set(jobId, { job_id: jobId, status: "queued", token, payer: check.payer, network: check.network });
-    runJob(jobId, body.command, check.payer, check.network, check);
+    runJob(jobId, read.body.command, check.payer, check.network, check);
     return json(res, 202, { job_id: jobId, status: "queued", token, poll: `/jobs/${jobId}` });
   }
 
@@ -581,6 +641,8 @@ function json(res, status, obj, extra = {}) {
   res.end(payload);
 }
 
+// The bytes come back with the parsed body because the payment is signed over
+// them: re-serializing here would hash something the caller never sent.
 async function readJson(req) {
   if (Number(req.headers["content-length"] ?? "0") > MAX_BODY_BYTES) {
     throw Object.assign(new Error("body too large"), { code: "too_large" });
@@ -595,17 +657,23 @@ async function readJson(req) {
     }
     chunks.push(chunk);
   }
-  if (!chunks.length) return {};
+  const bytes = Buffer.concat(chunks);
+  if (!bytes.length) return { body: {}, bytes };
   try {
-    return JSON.parse(Buffer.concat(chunks).toString());
+    return { body: JSON.parse(bytes.toString()), bytes };
   } catch {
     throw Object.assign(new Error("invalid json"), { code: "invalid_json" });
   }
 }
 
-server.listen(config.port, () =>
+server.listen(config.port, listen.host, () => {
   console.error(
-    `prism x402 server on :${config.port}, price ${config.priceMicros} micros, accepting ` +
+    `prism x402 server on ${listen.host}:${config.port}, price ${config.priceMicros} micros, accepting ` +
       networks.map((network) => `${network.label} -> ${network.payTo}`).join(", "),
-  ),
-);
+  );
+  console.error(
+    listen.token
+      ? "callers must send a bearer token, /healthz included"
+      : "no token: any local caller can spend and read jobs",
+  );
+});

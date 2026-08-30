@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use p384::elliptic_curve::subtle::ConstantTimeEq;
 use prism_protocol::{
@@ -332,16 +332,11 @@ pub fn verify_sev_snp_attestation(
 
 /// The fingerprint `ssh-keygen -lf` prints for the same key, so a renter can
 /// compare what the grant names against what their client is about to trust.
+/// Derived the same way as a node-reported host key, because the renter reads
+/// one field and should not have to know which path filled it.
 fn channel_key_fingerprint(key_line: &str) -> Result<String, VerificationError> {
-    let blob = key_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|encoded| STANDARD.decode(encoded).ok())
-        .ok_or(VerificationError::SnpChannelKeyMalformed)?;
-    Ok(format!(
-        "SHA256:{}",
-        STANDARD_NO_PAD.encode(Sha256::digest(&blob))
-    ))
+    prism_protocol::channel_key_fingerprint(key_line)
+        .map_err(|_| VerificationError::SnpChannelKeyMalformed)
 }
 
 /// Every reported measurement has to match the reference set by name and
@@ -400,6 +395,8 @@ fn decode_base64(encoded: &str) -> Result<Vec<u8>, VerificationError> {
 
 #[cfg(test)]
 mod tests {
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+
     use super::*;
 
     #[test]

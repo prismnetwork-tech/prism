@@ -276,7 +276,11 @@ genuine and the workload image is unverified, and the class must not be claimed.
 **Client enforcement.** The access grant carries the SSH host key fingerprint
 from the report, and the renter's client has to pin it. A client that
 auto-accepts the host key makes the binding decorative. Exposing the fingerprint
-is Prism's job; enforcing it is the client's.
+is Prism's job; enforcing it is the client's, and the clients Prism ships do it:
+`@prismnetwork/agent-sdk`, `prismnetwork`, `@prismnetwork/mcp` and the inference
+gateway read the key off the wire, compare it to the fingerprint on the grant,
+and refuse the session if it differs. Anything else you connect with has to make
+the same comparison, or the report covers a machine you are not talking to.
 
 **Our verifier.** The chain walk runs in the control plane, so `attested` means
 we checked it, not that the renter did. [SECURITY_MODEL.md](SECURITY_MODEL.md)

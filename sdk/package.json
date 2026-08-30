@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/agent-sdk",
-  "version": "0.7.2",
+  "version": "0.7.4",
   "description": "Headless GPU leasing and renter-encrypted storage on Prism Network for wallet-holding agents.",
   "type": "module",
   "main": "prism.mjs",
@@ -28,6 +28,10 @@
     "./workspace": {
       "types": "./workspace.d.ts",
       "default": "./workspace.mjs"
+    },
+    "./x402": {
+      "types": "./x402.d.mts",
+      "default": "./x402.mjs"
     }
   },
   "files": [
@@ -37,6 +41,7 @@
     "attest.d.mts",
     "e2ee.mjs",
     "e2ee.d.mts",
+    "hostkey.mjs",
     "relay.mjs",
     "toolset.mjs",
     "toolset.d.mts",
@@ -44,6 +49,8 @@
     "vault.d.ts",
     "workspace.mjs",
     "workspace.d.ts",
+    "x402.mjs",
+    "x402.d.mts",
     "vendor/aci-verifier/*.mjs",
     "README.md",
     "LICENSE",

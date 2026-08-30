@@ -30,6 +30,18 @@
           "description": "Prism LeaseEscrow contract address",
           "isRequired": false,
           "default": "0x62C042265991bEa17B07229322A01850974626dA"
+        },
+        {
+          "name": "PRISM_DAILY_BUDGET_USDG",
+          "description": "Most this wallet may spend through Prism in any 24 hours. Defaults to 5. Set 0 to remove the ceiling",
+          "isRequired": false,
+          "default": "5"
+        },
+        {
+          "name": "PRISM_MAX_USDG",
+          "description": "Most any single lease or generation may cost. Defaults to 1. A max_usdg argument can lower it and cannot raise it",
+          "isRequired": false,
+          "default": "1"
         }
       ]
     }
