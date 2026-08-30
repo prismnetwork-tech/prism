@@ -62,9 +62,10 @@ broker identity.
 
 ## Vast credentials
 
-Use a scoped Vast key with only `misc`, `instance_read` and `instance_write`.
+Use a scoped Vast key with only `misc`, `user_read`, `instance_read` and `instance_write`.
 The worker needs offer search, instance list/show/create/destroy and SSH-key
-attachment. It does not need billing or account-write permissions.
+attachment, plus the read-only current balance used for admission. It does not
+need billing or account-write permissions.
 
 Write the key to the ignored Compose secret:
 
@@ -76,24 +77,68 @@ install -m 0600 /dev/null deploy/lightsail/secrets/vast-api-key
 Paste the key into that file without adding it to `.env` or the repository.
 Set the broker node ID in `deploy/lightsail/.env`. Keep
 `PRISM_VAST_MAX_HOURLY_MICROS=640000` unless the retail rate changes.
+Keep `PRISM_VAST_CREDIT_PER_SLOT_MICROS=5000000` unless the maximum provider
+rate or six-hour lease ceiling changes.
 
 ## Runtime behavior
 
 The lifecycle worker:
 
-1. searches verified, rentable, single-GPU L40S offers every 30 seconds;
-2. removes the broker offer when nothing meets the hard cost ceiling;
-3. reconciles instance creation by the unique lease label before creating;
-4. creates an `ssh_direct` instance from the renter's pinned OCI image;
-5. attaches only the renter's submitted public SSH key;
-6. validates the running GPU, VRAM, provider verification, actual hourly cost
+1. reserves fresh account balance for every committed and advertised slot;
+2. searches verified, rentable, single-GPU L40S offers every 30 seconds;
+3. removes the broker offer when funding or supply does not meet policy;
+4. reconciles instance creation by the unique lease label before creating;
+5. creates an `ssh_direct` instance from the renter's pinned OCI image;
+6. attaches only the renter's submitted public SSH key;
+7. validates the running GPU, VRAM, provider verification, actual hourly cost
    and SSH endpoint before starting paid access onchain;
-7. destroys the instance before closing or refunding the lease;
-8. settles from explicit Vast execution evidence instead of fabricating signed
+8. destroys an active instance when access closes and queues independent,
+   retrying cleanup after a refund so provider downtime cannot block fund release;
+9. settles from explicit Vast execution evidence instead of fabricating signed
    physical-node telemetry.
 
 Instance and offer IDs, costs and lifecycle state are durable in PostgreSQL.
 The Vast key remains worker-side and is never returned by the control plane.
+
+## Reset a latched provider breaker
+
+`auth_blocked` and `permanent_blocked` are fail-closed states. A successful
+balance read does not clear them, including during an overlapping rollout.
+Inspect the state first:
+
+```sql
+SELECT provider, state, failure_class, balance_micros, blocked_at,
+       observed_at, consecutive_failures
+FROM cloud_provider_state
+WHERE provider = 'vast';
+```
+
+For `auth_blocked`, rotate or correct the scoped key and verify account lookup,
+offer search and instance-list access outside the worker. For
+`permanent_blocked`, correct the request, endpoint, response-schema or policy
+error shown in the worker logs. Do not reset while the cause is unknown, and
+never set the row to `healthy` manually.
+
+After the provider checks succeed, keep capacity closed and remove only the
+latched observation under the same lock used by matching and confirmation:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(4663);
+UPDATE cloud_capacity
+SET available = FALSE, updated_at = NOW()
+WHERE provider = 'vast';
+DELETE FROM cloud_provider_state
+WHERE provider = 'vast'
+  AND state IN ('auth_blocked', 'permanent_blocked');
+COMMIT;
+```
+
+Within 30 seconds the lifecycle worker must recreate the row from a fresh
+provider observation. Reopen service only when the state is `healthy`, its
+`observed_at` is less than 90 seconds old, and the number of available rows is
+no greater than the funded-slot calculation. If the row latches again, leave
+capacity closed and fix the new failure rather than repeating the reset.
 
 ## Launch limitations
 

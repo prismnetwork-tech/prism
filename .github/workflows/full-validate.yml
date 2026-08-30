@@ -57,7 +57,8 @@ jobs:
       - name: Validate deployment manifests
         run: |
           docker compose --env-file deploy/lightsail/.env.example -f deploy/lightsail/compose.yml config --quiet
-          docker compose --env-file deploy/lightsail/.env.example -f deploy/ec2/compose.yml config --quiet
+          PRISM_INFERENCE_ENV_FILE=/dev/null \
+            docker compose --env-file deploy/lightsail/.env.example -f deploy/ec2/compose.yml config --quiet
           ./scripts/test-compose-env.sh
           ./scripts/test-web-build-env.sh
       - name: Build service images

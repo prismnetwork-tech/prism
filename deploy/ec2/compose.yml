@@ -31,7 +31,7 @@ services:
     # The gateway shells out to ssh for the ollama tunnel; the base image does
     # not carry a client.
     entrypoint: ["/bin/sh", "-c", "apk add --no-cache openssh-client >/dev/null && exec node server.mjs"]
-    env_file: ./inference.env
+    env_file: ${PRISM_INFERENCE_ENV_FILE:-./inference.env}
     volumes:
       - ./inference:/app:ro
       - inference_state:/state
@@ -205,6 +205,7 @@ services:
       PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
       PRISM_VAST_API_KEY_FILE: /run/secrets/vast_api_key
       PRISM_VAST_DISK_GB: ${PRISM_VAST_DISK_GB:-16}
+      PRISM_VAST_CREDIT_PER_SLOT_MICROS: ${PRISM_VAST_CREDIT_PER_SLOT_MICROS:-5000000}
       PRISM_VAST_MAX_HOURLY_MICROS: ${PRISM_VAST_MAX_HOURLY_MICROS:-640000}
       PRISM_VAST_GPU_MODELS: ${PRISM_VAST_GPU_MODELS:-L40S}
       PRISM_VAST_MIN_GPU_RAM_MIB: ${PRISM_VAST_MIN_GPU_RAM_MIB:-45000}

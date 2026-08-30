@@ -43,6 +43,7 @@ Create these untracked files:
 
 ```text
 deploy/ec2/.env
+deploy/ec2/inference.env
 deploy/ec2/secrets/vast-api-key
 deploy/ec2/secrets/tls/ca.crt
 deploy/ec2/secrets/tls/ca.key
@@ -190,9 +191,13 @@ its own onchain registration and a `MIN_BOND` deposit. `PRISM_VAST_NODE_ID` is
 still read as a single-node shorthand.
 
 The broker's supply policy comes from `PRISM_VAST_GPU_MODELS` and
-`PRISM_VAST_MIN_GPU_RAM_MIB`. A variable set in `.env` but absent from the
-host's `compose.yml` never reaches the container, and the effect is an empty
-marketplace with a healthy stack, so check the container rather than the file:
+`PRISM_VAST_MIN_GPU_RAM_MIB`. `PRISM_VAST_CREDIT_PER_SLOT_MICROS` reserves
+provider balance for the longest lease plus a cost margin before each slot is
+advertised; its default is 5 USD per concurrent slot.
+
+A variable set in `.env` but absent from the host's `compose.yml` never reaches
+the container, and the effect is an empty marketplace with a healthy stack, so
+check the container rather than the file:
 
 ```sh
 docker compose --env-file deploy/ec2/.env -f deploy/ec2/compose.yml \

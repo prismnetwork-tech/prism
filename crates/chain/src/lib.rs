@@ -1,4 +1,4 @@
-use std::{env, net::IpAddr};
+use std::{env, net::IpAddr, time::Duration};
 
 use anyhow::Context;
 use aws_sdk_kms::{
@@ -15,10 +15,67 @@ use rlp::RlpStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha3::{Digest, Keccak256};
 
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_MAX_ATTEMPTS: usize = 4;
+const RPC_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const RPC_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const RPC_RETRY_AFTER_LIMIT: Duration = Duration::from_secs(10);
+const RPC_ERROR_BODY_LIMIT: usize = 1_024;
+
 #[derive(Clone)]
 pub struct RpcClient {
     client: reqwest::Client,
     url: url::Url,
+    retry: RetryPolicy,
+}
+
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+    retry_after_limit: Duration,
+    error_body_limit: usize,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: RPC_MAX_ATTEMPTS,
+            base_delay: RPC_RETRY_BASE_DELAY,
+            max_delay: RPC_RETRY_MAX_DELAY,
+            retry_after_limit: RPC_RETRY_AFTER_LIMIT,
+            error_body_limit: RPC_ERROR_BODY_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TransientRpcError {
+    message: String,
+    source: Option<reqwest::Error>,
+}
+
+impl std::fmt::Display for TransientRpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TransientRpcError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Whether an RPC call exhausted retries on a transport or retryable HTTP failure.
+pub fn is_transient_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<TransientRpcError>().is_some())
 }
 
 pub enum EthereumSigner {
@@ -100,12 +157,33 @@ struct BlockHeader {
 
 impl RpcClient {
     pub fn new(value: &str) -> anyhow::Result<Self> {
+        Self::with_policy(
+            value,
+            RPC_REQUEST_TIMEOUT,
+            RPC_CONNECT_TIMEOUT,
+            RetryPolicy::default(),
+        )
+    }
+
+    fn with_policy(
+        value: &str,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+        retry: RetryPolicy,
+    ) -> anyhow::Result<Self> {
+        if retry.max_attempts == 0 {
+            anyhow::bail!("RPC retry policy must allow at least one attempt");
+        }
         let url = secure_rpc_url(value)?;
         Ok(Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
+                .timeout(request_timeout)
+                .connect_timeout(connect_timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .build()?,
             url,
+            retry,
         })
     }
 
@@ -114,20 +192,13 @@ impl RpcClient {
         method: &'static str,
         params: serde_json::Value,
     ) -> anyhow::Result<T> {
-        let response = self
-            .client
-            .post(self.url.clone())
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": method,
-                "params": params,
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<RpcResponse>()
-            .await?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }))?;
+        let response = self.send(method, &body, rand::random()).await?;
         if let Some(error) = response.error {
             match error.data {
                 Some(data) => anyhow::bail!(
@@ -139,6 +210,149 @@ impl RpcClient {
             }
         }
         serde_json::from_value(response.result).context("RPC response contains an invalid result")
+    }
+
+    async fn send(
+        &self,
+        method: &'static str,
+        body: &[u8],
+        retry_seed: u64,
+    ) -> anyhow::Result<RpcResponse> {
+        for attempt in 1..=self.retry.max_attempts {
+            let sent = self
+                .client
+                .post(self.url.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_vec())
+                .send()
+                .await;
+            let mut response = match sent {
+                Ok(response) => response,
+                Err(error) if retryable_transport(&error) => {
+                    if attempt < self.retry.max_attempts {
+                        self.wait_before_retry(body, attempt, retry_seed, None)
+                            .await;
+                        continue;
+                    }
+                    return Err(TransientRpcError {
+                        message: format!(
+                            "RPC {method} transport failed after {attempt} {}",
+                            attempt_word(attempt)
+                        ),
+                        source: Some(error.without_url()),
+                    }
+                    .into());
+                }
+                Err(error) => {
+                    let error = error.without_url();
+                    return Err(anyhow::Error::new(error)).with_context(|| {
+                        format!(
+                            "RPC {method} transport failed after {attempt} {}",
+                            attempt_word(attempt)
+                        )
+                    });
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let retry_after = numeric_retry_after(
+                    response.headers().get(reqwest::header::RETRY_AFTER),
+                    self.retry.retry_after_limit,
+                );
+                if retryable_status(status) && attempt < self.retry.max_attempts {
+                    self.wait_before_retry(body, attempt, retry_seed, retry_after)
+                        .await;
+                    continue;
+                }
+
+                let detail = bounded_error_body(&mut response, self.retry.error_body_limit).await;
+                let message = match detail {
+                    Some(detail) => format!(
+                        "RPC {method} returned HTTP {status} after {attempt} {}: {detail}",
+                        attempt_word(attempt)
+                    ),
+                    None => format!(
+                        "RPC {method} returned HTTP {status} after {attempt} {}",
+                        attempt_word(attempt)
+                    ),
+                };
+                if retryable_status(status) {
+                    return Err(TransientRpcError {
+                        message,
+                        source: None,
+                    }
+                    .into());
+                }
+                anyhow::bail!(message);
+            }
+
+            match response.json::<RpcResponse>().await {
+                Ok(response) => {
+                    if let Some(error) = response
+                        .error
+                        .as_ref()
+                        .filter(|error| retryable_rpc_application_error(error))
+                    {
+                        if attempt < self.retry.max_attempts {
+                            self.wait_before_retry(body, attempt, retry_seed, None)
+                                .await;
+                            continue;
+                        }
+                        return Err(TransientRpcError {
+                            message: format!(
+                                "RPC {method} was rate-limited after {attempt} {}: {} ({})",
+                                attempt_word(attempt),
+                                sanitised_rpc_message(&error.message),
+                                error.code
+                            ),
+                            source: None,
+                        }
+                        .into());
+                    }
+                    return Ok(response);
+                }
+                Err(error) if retryable_transport(&error) => {
+                    if attempt < self.retry.max_attempts {
+                        self.wait_before_retry(body, attempt, retry_seed, None)
+                            .await;
+                        continue;
+                    }
+                    return Err(TransientRpcError {
+                        message: format!(
+                            "RPC {method} response failed after {attempt} {}",
+                            attempt_word(attempt)
+                        ),
+                        source: Some(error.without_url()),
+                    }
+                    .into());
+                }
+                Err(error) => {
+                    let error = error.without_url();
+                    return Err(anyhow::Error::new(error)).with_context(|| {
+                        format!(
+                            "RPC {method} response failed after {attempt} {}",
+                            attempt_word(attempt)
+                        )
+                    });
+                }
+            }
+        }
+
+        unreachable!("RPC retry loop always returns on its final attempt")
+    }
+
+    async fn wait_before_retry(
+        &self,
+        body: &[u8],
+        attempt: usize,
+        retry_seed: u64,
+        retry_after: Option<Duration>,
+    ) {
+        let delay = retry_delay(body, attempt, retry_seed, self.retry, retry_after);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
     }
 
     pub async fn quantity(
@@ -420,6 +634,156 @@ pub fn parse_quantity(value: &str) -> anyhow::Result<u64> {
     .context("RPC quantity exceeds uint64")
 }
 
+fn retryable_transport(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn retryable_rpc_application_error(error: &RpcError) -> bool {
+    if error.code == 429 {
+        return true;
+    }
+    if !(-32_099..=-32_000).contains(&error.code) {
+        return false;
+    }
+    let message = error.message.to_ascii_lowercase();
+    [
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        "request limit",
+        "throughput limit",
+        "capacity exceeded",
+        "temporarily unavailable",
+        "try again later",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn sanitised_rpc_message(value: &str) -> String {
+    let message: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(160)
+        .collect();
+    let message = message.trim();
+    if message.is_empty() {
+        "provider rate limit".to_owned()
+    } else {
+        message.to_owned()
+    }
+}
+
+fn numeric_retry_after(
+    value: Option<&reqwest::header::HeaderValue>,
+    limit: Duration,
+) -> Option<Duration> {
+    let value = value?.to_str().ok()?.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = value.bytes().fold(0_u64, |seconds, byte| {
+        seconds
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'))
+    });
+    Some(Duration::from_secs(seconds).min(limit))
+}
+
+fn retry_delay(
+    body: &[u8],
+    attempt: usize,
+    seed: u64,
+    policy: RetryPolicy,
+    retry_after: Option<Duration>,
+) -> Duration {
+    let retry_after = retry_after.map(|delay| delay.min(policy.retry_after_limit));
+    let base_ms = u64::try_from(policy.base_delay.as_millis()).unwrap_or(u64::MAX);
+    let max_ms = u64::try_from(policy.max_delay.as_millis()).unwrap_or(u64::MAX);
+    if base_ms == 0 || max_ms == 0 {
+        return retry_after.unwrap_or(Duration::ZERO);
+    }
+
+    let shift = u32::try_from(attempt.saturating_sub(1).min(63)).unwrap_or(63);
+    let ceiling = base_ms.saturating_mul(1_u64 << shift).min(max_ms);
+    let floor = ceiling / 2;
+    let width = ceiling.saturating_sub(floor).saturating_add(1);
+    let mut hasher = Keccak256::new();
+    hasher.update(body);
+    hasher.update(attempt.to_le_bytes());
+    hasher.update(seed.to_le_bytes());
+    let digest = hasher.finalize();
+    let sample = u64::from_le_bytes(digest[..8].try_into().expect("digest contains eight bytes"));
+    let spread = Duration::from_millis(floor.saturating_add(sample % width));
+    retry_after.map_or(spread, |delay| spread.max(delay))
+}
+
+async fn bounded_error_body(response: &mut reqwest::Response, limit: usize) -> Option<String> {
+    if limit == 0 {
+        return None;
+    }
+
+    let mut body = Vec::with_capacity(limit.min(256));
+    let mut truncated = false;
+    while body.len() < limit {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => return sanitise_error_body(&body, truncated),
+        };
+        let remaining = limit - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    sanitise_error_body(&body, truncated)
+}
+
+fn sanitise_error_body(body: &[u8], truncated: bool) -> Option<String> {
+    let mut detail: String = String::from_utf8_lossy(body)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    detail = detail.trim().to_owned();
+    if detail.is_empty() {
+        return None;
+    }
+    if truncated {
+        detail.push('…');
+    }
+    Some(detail)
+}
+
+fn attempt_word(attempt: usize) -> &'static str {
+    if attempt == 1 { "attempt" } else { "attempts" }
+}
+
 fn ethereum_address(public_key: &VerifyingKey) -> [u8; 20] {
     let encoded = public_key.to_encoded_point(false);
     let digest = Keccak256::digest(&encoded.as_bytes()[1..]);
@@ -519,6 +883,424 @@ fn secure_rpc_url(value: &str) -> anyhow::Result<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        task::JoinHandle,
+    };
+
+    struct MockResponse {
+        status: &'static str,
+        headers: Vec<(&'static str, &'static str)>,
+        body: Vec<u8>,
+        delay: Duration,
+    }
+
+    struct MockServer {
+        url: String,
+        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl MockResponse {
+        fn json(status: &'static str, body: &str) -> Self {
+            Self {
+                status,
+                headers: vec![("Content-Type", "application/json")],
+                body: body.as_bytes().to_vec(),
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    async fn mock_server(responses: Vec<MockResponse>) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bodies);
+        let task = tokio::spawn(async move {
+            let mut handlers = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = Arc::clone(&captured);
+                handlers.push(tokio::spawn(async move {
+                    serve_response(stream, response, captured).await;
+                }));
+            }
+            for handler in handlers {
+                handler.await.unwrap();
+            }
+        });
+        MockServer { url, bodies, task }
+    }
+
+    async fn serve_response(
+        mut stream: TcpStream,
+        response: MockResponse,
+        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let body = read_request_body(&mut stream).await;
+        bodies.lock().unwrap().push(body);
+        tokio::time::sleep(response.delay).await;
+        let headers = response
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let head = format!(
+            "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+            response.status,
+            response.body.len(),
+            headers
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream.write_all(&response.body).await;
+    }
+
+    async fn read_request_body(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1_024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "client closed before sending HTTP headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "client closed before sending the HTTP body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        request[header_end..header_end + content_length].to_vec()
+    }
+
+    fn test_policy(max_attempts: usize) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            retry_after_limit: Duration::from_secs(30),
+            error_body_limit: 64,
+        }
+    }
+
+    fn rpc_client(url: &str, max_attempts: usize) -> RpcClient {
+        RpcClient::with_policy(
+            url,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            test_policy(max_attempts),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retries_only_selected_http_statuses_with_identical_payloads() {
+        let mut responses = [
+            "408 Request Timeout",
+            "429 Too Many Requests",
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
+        ]
+        .into_iter()
+        .map(|status| {
+            let mut response = MockResponse::json(status, "retry");
+            if status.starts_with("429") {
+                response.headers.push(("Retry-After", "0"));
+            }
+            response
+        })
+        .collect::<Vec<_>>();
+        responses.push(MockResponse::json(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#,
+        ));
+        let server = mock_server(responses).await;
+        let result: String = rpc_client(&server.url, 6)
+            .call("eth_test", serde_json::json!([7]))
+            .await
+            .unwrap();
+        assert_eq!(result, "0x2a");
+        server.task.await.unwrap();
+        let bodies = server.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 6);
+        assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[tokio::test]
+    async fn json_rpc_application_errors_are_not_retried() {
+        let server = mock_server(vec![MockResponse::json(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution reverted","data":"0xdead"}}"#,
+        )])
+        .await;
+        let error = rpc_client(&server.url, 4)
+            .call::<String>("eth_call", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("execution reverted (0xdead)"));
+        assert!(!is_transient_error(&error));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_explicit_json_rpc_rate_limits_with_identical_payloads() {
+        let server = mock_server(vec![
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"rate limit exceeded"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"too many requests"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#,
+            ),
+        ])
+        .await;
+        let result: String = rpc_client(&server.url, 3)
+            .call("eth_test", serde_json::json!([7]))
+            .await
+            .unwrap();
+        assert_eq!(result, "0x2a");
+        server.task.await.unwrap();
+        let bodies = server.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[tokio::test]
+    async fn exhausted_json_rpc_rate_limits_are_transient() {
+        let server = mock_server(vec![
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"rate limit\nexceeded"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"rate limit\nexceeded"}}"#,
+            ),
+        ])
+        .await;
+        let error = rpc_client(&server.url, 2)
+            .call::<String>("eth_test", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(is_transient_error(&error));
+        assert!(error.to_string().contains("after 2 attempts"));
+        assert!(!error.to_string().contains('\n'));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_retryable_http_errors_are_transient_through_context() {
+        let statuses = [
+            "408 Request Timeout",
+            "429 Too Many Requests",
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
+        ];
+        let responses = statuses
+            .iter()
+            .flat_map(|status| {
+                [
+                    MockResponse::json(status, "first"),
+                    MockResponse::json(status, "exhausted"),
+                ]
+            })
+            .collect();
+        let server = mock_server(responses).await;
+        let client = rpc_client(&server.url, 2);
+        for status in statuses {
+            let error = client
+                .call::<String>("eth_test", serde_json::json!([]))
+                .await
+                .unwrap_err();
+            assert!(is_transient_error(&error));
+            assert!(error.to_string().contains(status));
+            assert!(error.to_string().contains("exhausted"));
+            let wrapped = error.context("caller context");
+            assert!(is_transient_error(&wrapped));
+        }
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn retries_timeouts_with_the_same_payload() {
+        let mut delayed =
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"stale"}"#);
+        delayed.delay = Duration::from_millis(50);
+        let server = mock_server(vec![
+            delayed,
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"fresh"}"#),
+        ])
+        .await;
+        let client = RpcClient::with_policy(
+            &server.url,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            test_policy(2),
+        )
+        .unwrap();
+        let result: String = client
+            .call("eth_test", serde_json::json!([1, 2, 3]))
+            .await
+            .unwrap();
+        assert_eq!(result, "fresh");
+        server.task.await.unwrap();
+        let bodies = server.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn retries_connection_failures_up_to_the_attempt_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = RpcClient::with_policy(
+            &url,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            test_policy(3),
+        )
+        .unwrap()
+        .call::<String>("eth_test", serde_json::json!([]))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("after 3 attempts"));
+        assert!(is_transient_error(&error));
+    }
+
+    #[tokio::test]
+    async fn exhausted_response_timeouts_are_transient() {
+        let mut first =
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"first"}"#);
+        first.delay = Duration::from_millis(50);
+        let mut second =
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"second"}"#);
+        second.delay = Duration::from_millis(50);
+        let server = mock_server(vec![first, second]).await;
+        let client = RpcClient::with_policy(
+            &server.url,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            test_policy(2),
+        )
+        .unwrap();
+        let error = client
+            .call::<String>("eth_test", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(is_transient_error(&error));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_errors_keep_bounded_sanitised_context() {
+        let server = mock_server(vec![MockResponse {
+            status: "400 Bad Request",
+            headers: Vec::new(),
+            body: b"unsafe\nbody\x1b[31m-secret-tail".to_vec(),
+            delay: Duration::ZERO,
+        }])
+        .await;
+        let mut policy = test_policy(4);
+        policy.error_body_limit = 16;
+        let client = RpcClient::with_policy(
+            &server.url,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            policy,
+        )
+        .unwrap();
+        let error = client
+            .call::<String>("eth_test", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(!is_transient_error(&error));
+        let rendered = error.to_string();
+        assert!(rendered.contains("HTTP 400 Bad Request after 1 attempt"));
+        assert!(rendered.contains("unsafe body [31m"));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains("secret-tail"));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_successful_responses_are_not_transient() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", "{"),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":42}"#),
+        ])
+        .await;
+        let client = rpc_client(&server.url, 4);
+        let malformed = client
+            .call::<String>("eth_test", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(!is_transient_error(&malformed));
+        let wrong_result = client
+            .call::<String>("eth_test", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(!is_transient_error(&wrong_result));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn numeric_retry_after_is_bounded_and_dates_are_ignored() {
+        let limit = Duration::from_secs(30);
+        let huge =
+            reqwest::header::HeaderValue::from_static("999999999999999999999999999999999999999999");
+        let date = reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(numeric_retry_after(Some(&huge), limit), Some(limit));
+        assert_eq!(numeric_retry_after(Some(&date), limit), None);
+
+        let mut policy = test_policy(2);
+        policy.base_delay = Duration::from_millis(10);
+        policy.max_delay = Duration::from_millis(10);
+        assert_eq!(
+            retry_delay(b"request", 1, 0, policy, Some(Duration::from_secs(300))),
+            limit
+        );
+    }
+
+    #[test]
+    fn retry_status_allowlist_is_narrow() {
+        for status in [408, 429, 502, 503, 504] {
+            assert!(retryable_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+        for status in [400, 401, 403, 404, 409, 500, 501] {
+            assert!(!retryable_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+    }
 
     #[test]
     fn local_signer_produces_recoverable_low_s_signatures() {

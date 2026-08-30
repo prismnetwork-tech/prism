@@ -330,7 +330,7 @@ export function ComputeWorkspace() {
         <article className="panel empty-state" role="status">
           <span className="empty-icon">◇</span>
           <h2>{reproLoad === "loading" ? "Verifying approval intent" : "Approval link unavailable"}</h2>
-          <p>{reproLoad === "loading" ? "Checking the exact workload and cost ceiling…" : notice}</p>
+          <p>{reproLoad === "loading" ? "Checking the workload and maximum spend…" : notice}</p>
         </article>
       </section>
     );
@@ -391,7 +391,7 @@ export function ComputeWorkspace() {
                 <div><dt>Minimum VRAM</dt><dd>{formatVram(reproIntent.min_vram_mib)}</dd></div>
                 <div><dt>Expected exit</dt><dd>{reproIntent.expected_exit_code}</dd></div>
                 <div><dt>Executor</dt><dd>{reproIntent.executor === "managed" ? "Prism-managed GPU" : "Provider node"}</dd></div>
-                <div><dt>Cost ceiling</dt><dd>{formatUsd(BigInt(reproIntent.maximum_escrow))}</dd></div>
+                <div><dt>Maximum spend</dt><dd>{formatUsd(BigInt(reproIntent.maximum_escrow))}</dd></div>
                 <div><dt>Spec hash</dt><dd className="mono">{shortDigest(reproIntent.spec_hash)}</dd></div>
               </dl>
               <label>
@@ -654,7 +654,7 @@ function assertReproQuote(quote: LeaseQuote, intent: ReproIntent) {
     || quote.repro?.spec_hash !== intent.spec_hash
     || quote.repro?.expected_exit_code !== intent.expected_exit_code
     || quote.repro?.executor !== intent.executor) {
-    throw new Error("The live quote does not match the signed GPU repro or exceeds its cost ceiling.");
+    throw new Error("The live quote does not match the approved GPU repro or costs more than approved.");
   }
 }
 

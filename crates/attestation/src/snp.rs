@@ -50,6 +50,7 @@ const SIGNED_LEN: usize = 0x2A0;
 /// nothing here depends on them. Genoa platforms in the field emit 3, so
 /// refusing it rejects genuine current hardware.
 const REPORT_VERSIONS: [u32; 2] = [2, 3];
+#[cfg(any(test, feature = "test-vectors"))]
 const REPORT_VERSION_EMITTED: u32 = 2;
 const SIGNATURE_ALGO_ECDSA_P384_SHA384: u32 = 1;
 

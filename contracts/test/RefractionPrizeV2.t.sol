@@ -52,8 +52,7 @@ contract RefractionPrizeV2Test {
         returns (bool)
     {
         VM.prank(solver);
-        (bool ok,) =
-            address(prize).call(abi.encodeCall(RefractionPrizeV2.reveal, (answer, salt)));
+        (bool ok,) = address(prize).call(abi.encodeCall(RefractionPrizeV2.reveal, (answer, salt)));
         return !ok;
     }
 
@@ -137,9 +136,10 @@ contract RefractionPrizeV2Test {
         _solve(BOB, bytes32("b"));
         _solve(CAROL, bytes32("c"));
         VM.prank(DAN);
-        (bool ok,) = address(prize).call(
-            abi.encodeCall(RefractionPrizeV2.commit, (_commitment(ANSWER, DAN, bytes32("d"))))
-        );
+        (bool ok,) = address(prize)
+            .call(
+                abi.encodeCall(RefractionPrizeV2.commit, (_commitment(ANSWER, DAN, bytes32("d"))))
+            );
         require(!ok, "committing after the last place is refused");
         require(DAN.balance == 0, "and pays nothing");
     }
@@ -188,7 +188,8 @@ contract RefractionPrizeV2Test {
     function test_only_the_treasury_can_take_it_back() public {
         VM.warp(OPENS - 1 days);
         VM.prank(BOT);
-        (bool ok,) = address(prize).call(abi.encodeCall(RefractionPrizeV2.withdrawBeforeOpening, ()));
+        (bool ok,) =
+            address(prize).call(abi.encodeCall(RefractionPrizeV2.withdrawBeforeOpening, ()));
         require(!ok, "a stranger cannot empty the pool");
     }
 
@@ -197,7 +198,8 @@ contract RefractionPrizeV2Test {
     function test_the_pool_is_untouchable_once_it_opens() public {
         VM.warp(OPENS + 1);
         VM.prank(TREASURY);
-        (bool ok,) = address(prize).call(abi.encodeCall(RefractionPrizeV2.withdrawBeforeOpening, ()));
+        (bool ok,) =
+            address(prize).call(abi.encodeCall(RefractionPrizeV2.withdrawBeforeOpening, ()));
         require(!ok, "not once the puzzle is open");
         require(address(prize).balance == 0.1 ether, "the pool is intact");
     }
@@ -205,13 +207,13 @@ contract RefractionPrizeV2Test {
     function test_nobody_can_play_before_it_opens() public {
         VM.warp(OPENS - 1 days);
         VM.prank(ALICE);
-        (bool ok,) = address(prize).call(
-            abi.encodeCall(RefractionPrizeV2.commit, (_commitment(ANSWER, ALICE, bytes32("a"))))
-        );
+        (bool ok,) = address(prize)
+            .call(
+                abi.encodeCall(RefractionPrizeV2.commit, (_commitment(ANSWER, ALICE, bytes32("a"))))
+            );
         require(!ok, "committing before opening is refused");
     }
 }
-
 
 interface Vm {
     function deal(address who, uint256 amount) external;

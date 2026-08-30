@@ -15,6 +15,7 @@ import { loadPublicProofIndex } from "@/lib/public-proof-server";
 import { createReproIntent } from "@/lib/repro-intent";
 import { requestSubject, takeRateLimit } from "@/lib/server-rate-limit";
 import { siteUrl } from "@/lib/site";
+import { robinhoodChain, usdgAddress } from "@/lib/chain";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -100,6 +101,13 @@ const mcpHandler = createMcpHandler((server) => {
         expected_exit_code,
         maximum_escrow: intent.payload.maximum_escrow,
         maximum_escrow_usdg: plan.maximumEscrowUsdg,
+        settlement: {
+          network: robinhoodChain.name,
+          chain_id: robinhoodChain.id,
+          asset: "USDG",
+          asset_contract: usdgAddress,
+          asset_decimals: 6,
+        },
         lease_created: false,
         approval_required: "Open the URL, sign in, verify the locked command and live quote, then approve the wallet transaction.",
         next: "Keep repro_token private. Use it with the status, evidence, and verify tools after approval.",

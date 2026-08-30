@@ -388,13 +388,9 @@ contract LeaseEscrowV1Test {
 
         require(address(staked.bondToken()) == address(bondToken), "bond token is the staked asset");
         require(staked.requiredBond(222) == stake, "bond scales with the advertised rate");
-        require(
-            staked.requiredBond(444) == stake * 2, "twice the rate stakes twice as much"
-        );
+        require(staked.requiredBond(444) == stake * 2, "twice the rate stakes twice as much");
         require(staked.requiredBond(0) == 1e18, "the floor applies when nothing scales");
-        require(
-            staked.requiredBond(type(uint128).max) == 1_000_000e18, "the ceiling caps the bond"
-        );
+        require(staked.requiredBond(type(uint128).max) == 1_000_000e18, "the ceiling caps the bond");
 
         bondToken.mint(PROVIDER, perRateUnit * 3_000);
         VM.prank(PROVIDER);
@@ -404,8 +400,14 @@ contract LeaseEscrowV1Test {
         bytes32 nodeId = keccak256("staked-device");
         uint256 deadline = block.timestamp + 1 hours;
         bytes32 digest = staked.enrollmentDigest(
-            nodeId, nodeId, PROVIDER, PROVIDER, 3_000, keccak256("offer"),
-            staked.enrollmentNonces(PROVIDER), deadline
+            nodeId,
+            nodeId,
+            PROVIDER,
+            PROVIDER,
+            3_000,
+            keccak256("offer"),
+            staked.enrollmentNonces(PROVIDER),
+            deadline
         );
         (uint8 v, bytes32 r, bytes32 s) = VM.sign(PROVIDER_KEY, digest);
         VM.prank(PROVIDER);

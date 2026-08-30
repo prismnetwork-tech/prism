@@ -45,6 +45,7 @@ contract PrismStakeV1 {
     event Withdrawn(address indexed account, uint256 amount);
 
     error AmountZero();
+    error AmountTooLarge();
     error InsufficientStake();
     error NothingUnbonding();
     error CooldownActive();
@@ -57,13 +58,13 @@ contract PrismStakeV1 {
 
     function stake(uint256 amount) external {
         if (amount == 0) revert AmountZero();
+        if (amount > type(uint128).max) revert AmountTooLarge();
         Position storage position = positions[msg.sender];
-
-        token.pull(msg.sender, amount);
-
         position.staked += uint128(amount);
         position.maturesAt = uint64(block.timestamp) + MATURITY;
         totalStaked += amount;
+
+        token.pull(msg.sender, amount);
 
         emit Staked(msg.sender, amount, position.maturesAt);
     }

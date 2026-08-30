@@ -467,8 +467,8 @@ fn validate_receipts(receipts: &[PublicReceipt]) -> anyhow::Result<()> {
         }) {
             anyhow::bail!("public receipt contains a malformed attestation");
         }
-        if let Some(repro) = &receipt.repro {
-            if receipt.outcome != ReceiptOutcome::Finalized
+        if receipt.repro.as_ref().is_some_and(|repro| {
+            receipt.outcome != ReceiptOutcome::Finalized
                 || !is_lower_digest(&repro.token_hash)
                 || !is_lower_digest(&repro.spec_hash)
                 || !is_lower_image_digest(&repro.image_digest)
@@ -480,9 +480,8 @@ fn validate_receipts(receipts: &[PublicReceipt]) -> anyhow::Result<()> {
                 || !(-255..=255).contains(&repro.exit_code)
                 || !(0..=255).contains(&repro.expected_exit_code)
                 || repro.succeeded != (repro.exit_code == repro.expected_exit_code)
-            {
-                anyhow::bail!("public receipt contains malformed repro evidence");
-            }
+        }) {
+            anyhow::bail!("public receipt contains malformed repro evidence");
         }
         if receipt.failure_class.as_ref().is_some_and(|class| {
             class.is_empty()

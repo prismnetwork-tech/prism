@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -29,6 +34,7 @@ mod vast;
 use vast::VastBroker;
 
 const SIGNER_LOCK: i64 = 4_663_001;
+const SCHEDULER_LOCK: i64 = 4_663;
 /// How many Vast hosts a single lease may burn through before the provisioning
 /// attempt is abandoned and the escrow refunded.
 const MAX_REJECTED_MACHINES: usize = 4;
@@ -63,6 +69,10 @@ const ORPHAN_SCAN_INTERVAL_SECONDS: u64 = 300;
 /// window that closes a lease, leaving room to miss a round to a flaky API
 /// without ending someone's job.
 const CLOUD_OBSERVATION_INTERVAL_SECONDS: u64 = 45;
+const CLOUD_CAPACITY_REFRESH_INTERVAL_SECONDS: u64 = 30;
+const CLOUD_CLEANUP_RETRY_SECONDS: u64 = 60;
+const RPC_TRANSIENT_RETRY_SECONDS: u64 = 15;
+const RPC_MAINTENANCE_PACE_MILLIS: u64 = 150;
 /// LeaseStatus.Funded in the escrow's enum.
 const LEASE_STATUS_FUNDED: u8 = 1;
 const LEASE_STATUS_ACTIVE: u8 = 2;
@@ -73,6 +83,28 @@ const LEASE_STATUS_REFUNDED: u8 = 6;
 /// without the settlement worker refusing the receipt.
 fn retail_hourly(rate_per_second: u64) -> u64 {
     rate_per_second.saturating_mul(3_600)
+}
+
+fn provider_failure_state(error: &anyhow::Error) -> (&'static str, &'static str) {
+    match vast::failure_scope(error) {
+        Some(vast::FailureScope::Credit) => ("credit_blocked", "provider_credit"),
+        Some(vast::FailureScope::Auth) => ("auth_blocked", "provider_auth"),
+        Some(vast::FailureScope::Transient | vast::FailureScope::Resource) => {
+            ("transient_blocked", "provider_transient")
+        }
+        Some(vast::FailureScope::Permanent) | None => ("permanent_blocked", "provider_response"),
+    }
+}
+
+fn validated_provider_offer_ids(ids: Vec<u64>) -> anyhow::Result<Vec<u64>> {
+    if ids.len() > 64 || ids.contains(&0) {
+        anyhow::bail!("lifecycle action contains invalid failed provider offer IDs");
+    }
+    let mut seen = BTreeSet::new();
+    Ok(ids
+        .into_iter()
+        .filter(|offer_id| seen.insert(*offer_id))
+        .collect())
 }
 const CLOUD_CAPACITY_UPSERT: &str = "
     INSERT INTO cloud_capacity
@@ -86,6 +118,19 @@ const CLOUD_CAPACITY_UPSERT: &str = "
         observed_at = NOW(),
         updated_at = NOW()
 ";
+const BROKER_COMMITMENTS_QUERY: &str = "
+    SELECT count(*) FROM (
+        SELECT l.lease_id FROM leases l
+        WHERE l.state NOT IN ('finalized', 'refunded')
+          AND EXISTS (
+              SELECT 1 FROM cloud_capacity cc
+              WHERE cc.node_id = l.document->>'node_id' AND cc.provider = 'vast'
+          )
+        UNION
+        SELECT ci.lease_id FROM cloud_instances ci
+        WHERE ci.provider = 'vast' AND ci.status <> 'destroyed'
+    ) commitments
+";
 
 struct Worker {
     pool: PgPool,
@@ -98,6 +143,7 @@ struct Worker {
     cipher: CredentialCipher,
     vast: Option<VastBroker>,
     supply_note: tokio::sync::Mutex<Option<String>>,
+    last_cloud_capacity_refresh: tokio::sync::Mutex<Option<std::time::Instant>>,
     last_orphan_sweep: tokio::sync::Mutex<Option<std::time::Instant>>,
     last_cloud_observation: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -126,6 +172,13 @@ struct Action {
     chain_lease_id: ChainLeaseId,
     kind: ActionKind,
     transaction: Option<PreparedTransaction>,
+    failed_provider_offer_ids: Vec<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ActionDocument {
+    #[serde(default)]
+    failed_provider_offer_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +188,7 @@ enum ActionKind {
     CloseAccess,
     ExpireProvision,
     Finalize,
+    CleanupCloud,
 }
 
 #[derive(Clone)]
@@ -202,6 +256,17 @@ impl std::fmt::Display for StillProvisioning {
 }
 
 impl std::error::Error for StillProvisioning {}
+
+#[derive(Debug)]
+struct CloudCleanupPending(String);
+
+impl std::fmt::Display for CloudCleanupPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CloudCleanupPending {}
 
 /// Whether a host has used up its boot budget. `ssh_key_attached_at` is set
 /// once per instance right after it is created and cleared whenever one is
@@ -443,6 +508,7 @@ async fn main() -> anyhow::Result<()> {
             .context("PRISM_ACCESS_CREDENTIAL_KEY must be 32 bytes of hex")?,
         vast: VastBroker::from_environment()?,
         supply_note: tokio::sync::Mutex::new(None),
+        last_cloud_capacity_refresh: tokio::sync::Mutex::new(None),
         last_orphan_sweep: tokio::sync::Mutex::new(None),
         last_cloud_observation: tokio::sync::Mutex::new(None),
     };
@@ -509,6 +575,21 @@ impl Worker {
              WHERE state IN ('funded', 'provisioning', 'ready') \
                AND created_at <= NOW() - INTERVAL '10 minutes' \
              ON CONFLICT (lease_id, kind) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Reconcile after the new worker starts, rather than in the schema
+        // migration, so an older worker cannot claim an action kind it does not
+        // understand during a staged rollout.
+        query(
+            "INSERT INTO lifecycle_outbox (action_id, lease_id, kind) \
+             SELECT md5(l.lease_id::text || ':cleanup_cloud')::uuid, l.lease_id, 'cleanup_cloud' \
+             FROM leases l JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
+             WHERE l.state IN ('finalized', 'refunded') AND ci.status <> 'destroyed' \
+             ON CONFLICT (lease_id, kind) DO UPDATE \
+               SET status = 'queued', attempts = 0, available_at = NOW(), \
+                   lease_until = NULL, last_error = NULL, updated_at = NOW() \
+             WHERE lifecycle_outbox.status = 'failed'",
         )
         .execute(&self.pool)
         .await?;
@@ -765,6 +846,9 @@ impl Worker {
                 // died. Leaving `observed_at` alone lets the staleness window
                 // close the lease only if this keeps failing.
                 Err(error) => {
+                    if self.block_provider_failure(&error).await? {
+                        return Err(error);
+                    }
                     tracing::warn!(lease_id, %error, "could not observe a rented machine");
                     continue;
                 }
@@ -799,35 +883,72 @@ impl Worker {
         let Some(vast) = &self.vast else {
             return Ok(());
         };
-        let refreshed_recently: bool = query_scalar(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM cloud_capacity \
-                 WHERE node_id = ANY($1) AND updated_at >= NOW() - INTERVAL '30 seconds' \
-             )",
-        )
-        .bind(vast.node_ids.as_slice())
-        .fetch_one(&self.pool)
-        .await?;
-        if refreshed_recently {
-            return Ok(());
+        {
+            let mut last = self.last_cloud_capacity_refresh.lock().await;
+            let due = last.is_none_or(|at| {
+                at.elapsed()
+                    >= std::time::Duration::from_secs(CLOUD_CAPACITY_REFRESH_INTERVAL_SECONDS)
+            });
+            if !due {
+                return Ok(());
+            }
+            *last = Some(std::time::Instant::now());
         }
 
         // Nodes with a lease on them are not for sale, so they are neither
-        // advertised nor counted against the hosts we found.
-        let busy: Vec<String> = query_scalar(
+        // advertised nor counted against the hosts we found. A settled lease
+        // whose provider cleanup is unfinished also keeps its slot closed.
+        let busy: BTreeSet<String> = query_scalar::<_, String>(
             "SELECT document->>'node_id' FROM leases \
-             WHERE state IN ('funded', 'provisioning', 'ready', 'active', 'closing')",
+             WHERE state NOT IN ('finalized', 'refunded') \
+             UNION \
+             SELECT l.document->>'node_id' FROM leases l \
+             JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
+             WHERE ci.status <> 'destroyed'",
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await?
+        .into_iter()
+        .collect();
+        let committed = self.broker_commitments().await?;
         let free: Vec<&String> = vast
             .node_ids
             .iter()
-            .filter(|node_id| !busy.iter().any(|held| held == *node_id))
+            .filter(|node_id| !busy.contains(*node_id))
             .collect();
         if free.is_empty() {
+            self.disable_cloud_capacity(vast.node_ids.as_slice())
+                .await?;
             return Ok(());
         }
+
+        if self.provider_breaker_is_latched().await? {
+            self.disable_cloud_capacity(vast.node_ids.as_slice())
+                .await?;
+            tracing::error!("Vast provider breaker is latched; capacity remains disabled");
+            return Ok(());
+        }
+        let balance = match vast.account_balance_micros().await {
+            Ok(balance) => balance,
+            Err(error) => {
+                let (state, class) = provider_failure_state(&error);
+                self.block_cloud_provider(None, state, class).await?;
+                return Err(error);
+            }
+        };
+        let funded_slots = vast.funded_slots(balance, committed).min(free.len());
+        if funded_slots == 0 {
+            self.block_cloud_provider(Some(balance), "credit_blocked", "insufficient_balance")
+                .await?;
+            tracing::warn!(
+                balance_micros = balance,
+                committed,
+                reserve_per_slot_micros = vast.credit_per_slot_micros,
+                "Vast balance cannot cover another broker slot"
+            );
+            return Ok(());
+        }
+        self.record_healthy_cloud_provider(balance).await?;
 
         let offers = query_as::<_, (String, SqlJson<NodeOffer>)>(
             "SELECT node_id, document FROM node_offers WHERE node_id = ANY($1)",
@@ -836,6 +957,8 @@ impl Worker {
         .fetch_all(&self.pool)
         .await?;
         if offers.is_empty() {
+            self.disable_cloud_capacity(vast.node_ids.as_slice())
+                .await?;
             tracing::warn!("no Vast broker node is enrolled; cloud capacity is disabled");
             return Ok(());
         }
@@ -851,10 +974,18 @@ impl Worker {
                     rates.insert(node_id.clone(), rate);
                 }
                 Ok(_) => tracing::warn!(node_id, "registry reports a zero rate; skipping"),
+                Err(error) if prism_chain::is_transient_error(&error) => {
+                    self.disable_cloud_capacity(vast.node_ids.as_slice())
+                        .await?;
+                    return Err(error.context("registry rate refresh was rate-limited"));
+                }
                 Err(error) => tracing::warn!(node_id, %error, "could not read the registered rate"),
             }
+            tokio::time::sleep(Duration::from_millis(RPC_MAINTENANCE_PACE_MILLIS)).await;
         }
         if rates.is_empty() {
+            self.disable_cloud_capacity(vast.node_ids.as_slice())
+                .await?;
             tracing::warn!("no broker node has a readable rate; cloud capacity is disabled");
             return Ok(());
         }
@@ -867,17 +998,25 @@ impl Worker {
         // One search for the whole pool. Advertise as many slots as there are
         // distinct hosts to fill them with, so the market never lists capacity
         // that a second renter would find already taken.
-        let survey = vast.survey_many(retail_hourly(rate), free.len()).await?;
+        let survey = match vast.survey_many(retail_hourly(rate), funded_slots).await {
+            Ok(survey) => survey,
+            Err(error) => {
+                let (state, class) = provider_failure_state(&error);
+                self.block_cloud_provider(Some(balance), state, class)
+                    .await?;
+                return Err(error);
+            }
+        };
         self.report_supply(vast, &survey).await;
 
-        for (index, node_id) in free.iter().enumerate() {
-            let host = survey.hosts.get(index);
-            self.record_cloud_capacity(node_id, host).await?;
-            let Some(host) = host else { continue };
+        let mut validated = Vec::new();
+        for node_id in &free {
             let Some((_, SqlJson(offer))) = offers.iter().find(|(id, _)| id == *node_id) else {
+                tracing::warn!(node_id = %node_id, "broker node has no enrolled offer");
                 continue;
             };
             let Some(registered) = rates.get(*node_id).copied() else {
+                tracing::warn!(node_id = %node_id, "broker node has no current registry rate");
                 continue;
             };
             let mut offer = offer.clone();
@@ -888,28 +1027,237 @@ impl Worker {
             // slash, stayed in the catalogue and every lease matched to it
             // reverted with LeaseNotReady after the renter had paid. Ask the
             // registry the same question the escrow will ask.
-            offer.bonded = match self.is_schedulable(node_id).await {
+            let schedulable = match self.is_schedulable(node_id).await {
                 Ok(schedulable) => schedulable,
-                // Unreadable is not the same as unbonded. Dropping the whole
-                // catalogue on an RPC blip would be a worse outage than the one
-                // this prevents, so the last known answer stands.
+                Err(error) if prism_chain::is_transient_error(&error) => {
+                    self.disable_cloud_capacity(vast.node_ids.as_slice())
+                        .await?;
+                    return Err(error.context("registry eligibility refresh was rate-limited"));
+                }
                 Err(error) => {
                     tracing::warn!(node_id, %error, "could not confirm the node is still bonded");
-                    offer.bonded
+                    false
                 }
             };
+            tokio::time::sleep(Duration::from_millis(RPC_MAINTENANCE_PACE_MILLIS)).await;
+            if !schedulable {
+                tracing::warn!(node_id = %node_id, "broker node is not schedulable");
+                continue;
+            }
+            offer.bonded = true;
+            offer.online = true;
+            offer.updated_at = Utc::now();
+            validated.push(((*node_id).clone(), offer));
+        }
+
+        // Matching and confirmation use the same transaction lock. Re-read
+        // commitments only after taking it, then make the offer document and
+        // capacity row visible together. A funding confirmation that wins the
+        // lock is therefore counted before another slot can be advertised.
+        let mut transaction = self.pool.begin().await?;
+        query("SELECT pg_advisory_xact_lock($1)")
+            .bind(SCHEDULER_LOCK)
+            .execute(&mut *transaction)
+            .await?;
+        query(
+            "UPDATE cloud_capacity SET available = FALSE, updated_at = NOW() \
+             WHERE provider = 'vast' AND node_id = ANY($1)",
+        )
+        .bind(vast.node_ids.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        let provider_healthy: bool = query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM cloud_provider_state \
+                 WHERE provider = 'vast' AND state = 'healthy' \
+                   AND observed_at >= NOW() - INTERVAL '90 seconds' \
+             )",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !provider_healthy {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let current_busy: BTreeSet<String> = query_scalar::<_, String>(
+            "SELECT document->>'node_id' FROM leases \
+             WHERE state NOT IN ('finalized', 'refunded') \
+             UNION \
+             SELECT l.document->>'node_id' FROM leases l \
+             JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
+             WHERE ci.status <> 'destroyed'",
+        )
+        .fetch_all(&mut *transaction)
+        .await?
+        .into_iter()
+        .collect();
+        let committed: i64 = query_scalar(BROKER_COMMITMENTS_QUERY)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let funded_slots = vast
+            .funded_slots(balance, usize::try_from(committed)?)
+            .min(survey.hosts.len());
+        let current_free = validated
+            .into_iter()
+            .filter(|(node_id, _)| !current_busy.contains(node_id));
+        for ((node_id, mut offer), host) in current_free.take(funded_slots).zip(survey.hosts.iter())
+        {
             // Advertise the class that will actually be handed over, not the one
             // the broker enrolled with.
             offer.gpu.model = host.gpu_name.clone();
             offer.gpu.vram_mib = u32::try_from(host.gpu_ram)?;
-            offer.online = true;
-            offer.updated_at = Utc::now();
-            query("UPDATE node_offers SET document = $2, updated_at = NOW() WHERE node_id = $1")
-                .bind(node_id)
-                .bind(SqlJson(offer))
-                .execute(&self.pool)
+            let provider_offer_id = i64::try_from(host.id)?;
+            let hourly_micros = i64::try_from(vast::hourly_micros(host.dph_total)?)?;
+            query(CLOUD_CAPACITY_UPSERT)
+                .bind(&node_id)
+                .bind(true)
+                .bind(provider_offer_id)
+                .bind(hourly_micros)
+                .execute(&mut *transaction)
                 .await?;
+            query("UPDATE node_offers SET document = $2, updated_at = NOW() WHERE node_id = $1")
+                .bind(&node_id)
+                .bind(SqlJson(offer))
+                .execute(&mut *transaction)
+                .await?;
+            let price_unchanged: bool = query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM capacity_prices \
+                     WHERE node_id = $1 \
+                       AND hourly_cost_micros = $2 \
+                       AND provider_offer_id IS NOT DISTINCT FROM $3 \
+                       AND id = (SELECT max(id) FROM capacity_prices WHERE node_id = $1) \
+                 )",
+            )
+            .bind(&node_id)
+            .bind(hourly_micros)
+            .bind(provider_offer_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !price_unchanged {
+                query(
+                    "INSERT INTO capacity_prices \
+                         (node_id, provider, gpu_model, vram_mib, provider_offer_id, \
+                          hourly_cost_micros) \
+                     VALUES ($1, 'vast', $2, $3, $4, $5)",
+                )
+                .bind(&node_id)
+                .bind(&host.gpu_name)
+                .bind(i32::try_from(host.gpu_ram)?)
+                .bind(provider_offer_id)
+                .bind(hourly_micros)
+                .execute(&mut *transaction)
+                .await?;
+            }
         }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn provider_breaker_is_latched(&self) -> anyhow::Result<bool> {
+        query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM cloud_provider_state \
+                 WHERE provider = 'vast' \
+                   AND state IN ('auth_blocked', 'permanent_blocked') \
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn broker_commitments(&self) -> anyhow::Result<usize> {
+        let committed: i64 = query_scalar(BROKER_COMMITMENTS_QUERY)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(usize::try_from(committed)?)
+    }
+
+    async fn record_healthy_cloud_provider(&self, balance_micros: i64) -> anyhow::Result<()> {
+        let recorded = query(
+            "INSERT INTO cloud_provider_state \
+                 (provider, balance_micros, state, observed_at) \
+             VALUES ('vast', $1, 'healthy', NOW()) \
+             ON CONFLICT (provider) DO UPDATE SET \
+                 balance_micros = EXCLUDED.balance_micros, state = 'healthy', \
+                 failure_class = NULL, blocked_at = NULL, \
+                 observed_at = NOW(), consecutive_failures = 0, updated_at = NOW() \
+             WHERE cloud_provider_state.state NOT IN ('auth_blocked', 'permanent_blocked')",
+        )
+        .bind(balance_micros)
+        .execute(&self.pool)
+        .await?;
+        if recorded.rows_affected() != 1 {
+            anyhow::bail!("Vast provider breaker is latched");
+        }
+        Ok(())
+    }
+
+    async fn block_cloud_provider(
+        &self,
+        balance_micros: Option<i64>,
+        state: &str,
+        failure_class: &str,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        query(
+            "INSERT INTO cloud_provider_state \
+                 (provider, balance_micros, state, failure_class, blocked_at, \
+                  observed_at, consecutive_failures) \
+             VALUES ('vast', $1, $2, $3, NOW(), NOW(), 1) \
+             ON CONFLICT (provider) DO UPDATE SET \
+                 balance_micros = COALESCE(EXCLUDED.balance_micros, \
+                                           cloud_provider_state.balance_micros), \
+                 state = CASE \
+                     WHEN cloud_provider_state.state IN ('auth_blocked', 'permanent_blocked') \
+                      AND EXCLUDED.state NOT IN ('auth_blocked', 'permanent_blocked') \
+                     THEN cloud_provider_state.state ELSE EXCLUDED.state END, \
+                 failure_class = CASE \
+                     WHEN cloud_provider_state.state IN ('auth_blocked', 'permanent_blocked') \
+                      AND EXCLUDED.state NOT IN ('auth_blocked', 'permanent_blocked') \
+                     THEN cloud_provider_state.failure_class ELSE EXCLUDED.failure_class END, \
+                 blocked_at = CASE \
+                     WHEN cloud_provider_state.state IN ('auth_blocked', 'permanent_blocked') \
+                      AND EXCLUDED.state NOT IN ('auth_blocked', 'permanent_blocked') \
+                     THEN cloud_provider_state.blocked_at \
+                     WHEN cloud_provider_state.state = EXCLUDED.state \
+                     THEN cloud_provider_state.blocked_at ELSE NOW() END, \
+                 observed_at = NOW(), \
+                 consecutive_failures = cloud_provider_state.consecutive_failures + 1, \
+                 updated_at = NOW()",
+        )
+        .bind(balance_micros)
+        .bind(state)
+        .bind(failure_class)
+        .execute(&mut *transaction)
+        .await?;
+        query("UPDATE cloud_capacity SET available = FALSE, updated_at = NOW() WHERE provider = 'vast'")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn block_provider_failure(&self, error: &anyhow::Error) -> anyhow::Result<bool> {
+        match vast::failure_scope(error) {
+            None | Some(vast::FailureScope::Resource) => Ok(false),
+            Some(_) => {
+                let (state, class) = provider_failure_state(error);
+                self.block_cloud_provider(None, state, class).await?;
+                Ok(true)
+            }
+        }
+    }
+
+    async fn disable_cloud_capacity(&self, node_ids: &[String]) -> anyhow::Result<()> {
+        query(
+            "UPDATE cloud_capacity SET available = FALSE, updated_at = NOW() \
+             WHERE provider = 'vast' AND node_id = ANY($1)",
+        )
+        .bind(node_ids)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -948,76 +1296,6 @@ impl Worker {
         }
     }
 
-    async fn record_cloud_capacity(
-        &self,
-        node_id: &str,
-        offer: Option<&vast::Offer>,
-    ) -> anyhow::Result<()> {
-        let provider_offer_id = offer.map(|offer| i64::try_from(offer.id)).transpose()?;
-        let hourly_micros = offer
-            .map(|offer| vast::hourly_micros(offer.dph_total))
-            .transpose()?
-            .map(i64::try_from)
-            .transpose()?;
-        query(CLOUD_CAPACITY_UPSERT)
-            .bind(node_id)
-            .bind(offer.is_some())
-            .bind(provider_offer_id)
-            .bind(hourly_micros)
-            .execute(&self.pool)
-            .await?;
-        if let (Some(offer), Some(hourly)) = (offer, hourly_micros) {
-            self.record_price(node_id, offer, hourly).await?;
-        }
-        Ok(())
-    }
-
-    /// The upsert above keeps only the current price, so what a host cleared at
-    /// survives one refresh. Append the observation as well: across providers
-    /// and over time it is the only public record of what GPU time actually
-    /// costs, and it cannot be reconstructed later.
-    ///
-    /// Written only when the price or the host changes. Recording every poll
-    /// would measure the polling interval rather than the market.
-    async fn record_price(
-        &self,
-        node_id: &str,
-        offer: &vast::Offer,
-        hourly_micros: i64,
-    ) -> anyhow::Result<()> {
-        let offer_id = i64::try_from(offer.id)?;
-        let unchanged: bool = query_scalar(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM capacity_prices \
-                 WHERE node_id = $1 \
-                   AND hourly_cost_micros = $2 \
-                   AND provider_offer_id IS NOT DISTINCT FROM $3 \
-                   AND id = (SELECT max(id) FROM capacity_prices WHERE node_id = $1) \
-             )",
-        )
-        .bind(node_id)
-        .bind(hourly_micros)
-        .bind(offer_id)
-        .fetch_one(&self.pool)
-        .await?;
-        if unchanged {
-            return Ok(());
-        }
-        query(
-            "INSERT INTO capacity_prices \
-                 (node_id, provider, gpu_model, vram_mib, provider_offer_id, hourly_cost_micros) \
-             VALUES ($1, 'vast', $2, $3, $4, $5)",
-        )
-        .bind(node_id)
-        .bind(&offer.gpu_name)
-        .bind(i32::try_from(offer.gpu_ram)?)
-        .bind(offer_id)
-        .bind(hourly_micros)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     async fn claim(&self) -> anyhow::Result<Option<Action>> {
         let mut transaction = self.pool.begin().await?;
         let row = query_as::<
@@ -1030,14 +1308,17 @@ impl Worker {
                 Option<String>,
                 Option<String>,
                 Option<i64>,
+                SqlJson<ActionDocument>,
                 i64,
             ),
         >(
             "SELECT o.action_id, o.lease_id, l.chain_lease_id, o.kind, \
-                    o.raw_transaction, o.transaction_hash, o.transaction_nonce, \
+                    o.raw_transaction, o.transaction_hash, o.transaction_nonce, o.document, \
                     o.claim_generation \
              FROM lifecycle_outbox o JOIN leases l ON l.lease_id = o.lease_id \
-             WHERE o.attempts < 100 AND o.available_at <= NOW() \
+             WHERE (o.attempts < 100 OR o.status = 'submitted' \
+                    OR o.kind IN ('close_access', 'expire_provision', 'finalize')) \
+               AND o.available_at <= NOW() \
                AND (o.status IN ('queued', 'submitted') \
                     OR (o.status = 'processing' AND o.lease_until <= NOW())) \
              ORDER BY o.available_at, o.created_at LIMIT 1 \
@@ -1045,13 +1326,24 @@ impl Worker {
         )
         .fetch_optional(&mut *transaction)
         .await?;
-        let Some((action_id, lease_id, chain_lease_id, kind, raw, hash, nonce, generation)) = row
+        let Some((
+            action_id,
+            lease_id,
+            chain_lease_id,
+            kind,
+            raw,
+            hash,
+            nonce,
+            document,
+            generation,
+        )) = row
         else {
             transaction.commit().await?;
             return Ok(None);
         };
         let claim_generation: i64 = query_scalar(
-            "UPDATE lifecycle_outbox SET status = 'processing', attempts = attempts + 1, \
+            "UPDATE lifecycle_outbox SET status = 'processing', \
+                 attempts = LEAST(100, attempts + CASE WHEN status = 'submitted' THEN 0 ELSE 1 END), \
                  claim_generation = claim_generation + 1, \
                  lease_until = NOW() + INTERVAL '2 minutes', updated_at = NOW() \
              WHERE action_id = $1 AND claim_generation = $2 \
@@ -1063,6 +1355,9 @@ impl Worker {
         .await?;
         transaction.commit().await?;
         let parsed = (|| {
+            let SqlJson(document) = document;
+            let failed_provider_offer_ids =
+                validated_provider_offer_ids(document.failed_provider_offer_ids)?;
             let transaction = match (raw, hash, nonce) {
                 (Some(raw_transaction), Some(transaction_hash), Some(nonce)) => {
                     Some(PreparedTransaction {
@@ -1081,6 +1376,7 @@ impl Worker {
                 chain_lease_id: ChainLeaseId(u64::try_from(chain_lease_id)?),
                 kind: ActionKind::parse(&kind)?,
                 transaction,
+                failed_provider_offer_ids,
             })
         })();
         match parsed {
@@ -1096,6 +1392,12 @@ impl Worker {
     async fn process(&self, mut action: Action) -> anyhow::Result<()> {
         if action.kind == ActionKind::RefreshGrant {
             return self.refresh_grant(&action).await;
+        }
+        if action.kind == ActionKind::CleanupCloud {
+            self.destroy_cloud_instance(action.lease_id)
+                .await
+                .map_err(|error| CloudCleanupPending(format!("{error:#}")))?;
+            return self.skip_action(&action).await;
         }
         if action.kind == ActionKind::StartAccess && action.transaction.is_none() {
             // Funded is the only status a lease can still be started from.
@@ -1153,16 +1455,13 @@ impl Worker {
         }
         if action.kind == ActionKind::ExpireProvision && action.transaction.is_none() {
             match self.lease_status(action.chain_lease_id).await? {
-                1 => {
-                    self.destroy_cloud_instance(action.lease_id).await?;
-                }
+                1 => {}
                 // expireProvision is permissionless, so anyone may have already
                 // released this deposit. Skipping the action alone would leave
                 // the lease open in the database against an escrow that no
                 // longer holds anything for it, which reads as insolvency and
                 // keeps that alarm lit until someone edits the row by hand.
                 status @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
-                    self.destroy_cloud_instance(action.lease_id).await?;
                     return self.adopt_settled_lease(&action, status).await;
                 }
                 // Anything else belongs to a renter who is still using it.
@@ -1186,14 +1485,17 @@ impl Worker {
                 status => anyhow::bail!("lease cannot be finalized from onchain status {status}"),
             }
         }
-        if action.transaction.is_none() {
+        let prepared_here = action.transaction.is_none();
+        if prepared_here {
             action.transaction = Some(self.prepare(&action).await?);
         }
         let transaction = action
             .transaction
             .as_ref()
             .context("lifecycle transaction was not prepared")?;
-        self.chain.submit(transaction).await?;
+        if !prepared_here {
+            self.chain.submit(transaction).await?;
+        }
         match self
             .chain
             .finality(&transaction.transaction_hash, self.confirmations)
@@ -1218,7 +1520,20 @@ impl Worker {
                 block_number,
                 block_hash,
             } => {
-                let block_time = self.chain.block_timestamp(block_number).await?;
+                if matches!(
+                    action.kind,
+                    ActionKind::ExpireProvision | ActionKind::Finalize
+                ) {
+                    self.record_terminal_settlement(&action).await?;
+                }
+                let block_time = if matches!(
+                    action.kind,
+                    ActionKind::StartAccess | ActionKind::CloseAccess
+                ) {
+                    self.chain.block_timestamp(block_number).await?
+                } else {
+                    0
+                };
                 self.complete(action, block_number, &block_hash, block_time)
                     .await?;
             }
@@ -1292,6 +1607,9 @@ impl Worker {
             .execute(&mut *lock)
             .await;
         unlock?;
+        if let Err(error) = &result {
+            self.block_provider_failure(error).await?;
+        }
         result
     }
 
@@ -1409,6 +1727,12 @@ impl Worker {
             None => match self.adopt_labelled(vast, lease_id, &label).await? {
                 Some(instance_id) => (instance_id, None, false),
                 None => {
+                    if self.provider_breaker_is_latched().await? {
+                        anyhow::bail!("Vast provider breaker is latched");
+                    }
+                    let committed = self.broker_commitments().await?;
+                    let balance = vast.require_funded_slots(committed).await?;
+                    self.record_healthy_cloud_provider(balance).await?;
                     // Machines this lease has already refused, plus the ones other
                     // leases refused recently. Without the second set every lease
                     // spends its attempts rediscovering the same broken hosts.
@@ -1418,7 +1742,10 @@ impl Worker {
                             avoided.push(machine);
                         }
                     }
-                    let mut candidates = vast.ranked(CREATES_PER_PASS, &avoided, retail).await?;
+                    let mut failed_offers = action.failed_provider_offer_ids.clone();
+                    let mut candidates = vast
+                        .ranked(CREATES_PER_PASS, &avoided, &failed_offers, retail)
+                        .await?;
                     if candidates.is_empty() && avoided.len() > rejected.len() {
                         // The shared list is an optimisation, not a gate. If honouring
                         // it leaves nothing rentable, a known-bad host still beats
@@ -1428,7 +1755,9 @@ impl Worker {
                             avoided = avoided.len(),
                             "no candidate outside the shared rejection list, falling back"
                         );
-                        candidates = vast.ranked(CREATES_PER_PASS, &rejected, retail).await?;
+                        candidates = vast
+                            .ranked(CREATES_PER_PASS, &rejected, &failed_offers, retail)
+                            .await?;
                     }
                     if candidates.is_empty() {
                         anyhow::bail!(
@@ -1449,18 +1778,30 @@ impl Worker {
                                 break;
                             }
                             Err(error) => {
+                                let scope = vast::failure_scope(&error);
                                 tracing::warn!(
                                     lease_id,
                                     offer_id = offer.id,
                                     %error,
                                     "Vast offer unavailable, trying next candidate"
                                 );
-                                last_error = Some(error);
                                 if let Some(instance_id) =
                                     self.adopt_labelled(vast, lease_id, &label).await?
                                 {
                                     launched = Some((instance_id, offer, false));
                                     break;
+                                }
+                                last_error = Some(error);
+                                match scope {
+                                    Some(vast::FailureScope::Resource) => {
+                                        self.remember_failed_provider_offer(
+                                            action,
+                                            &mut failed_offers,
+                                            offer.id,
+                                        )
+                                        .await?;
+                                    }
+                                    _ => break,
                                 }
                             }
                         }
@@ -1939,7 +2280,7 @@ impl Worker {
                 self.complete_finalization(&action, block_number, block_hash)
                     .await?
             }
-            ActionKind::RefreshGrant => unreachable!(),
+            ActionKind::RefreshGrant | ActionKind::CleanupCloud => unreachable!(),
         }
         let completed = query(
             "UPDATE lifecycle_outbox SET status = 'completed', lease_until = NULL, \
@@ -2105,8 +2446,7 @@ impl Worker {
         receipt.receipt_hash = receipt_hash(&receipt)?;
         self.insert_receipt(action.lease_id, &receipt, block_number, block_hash)
             .await?;
-        self.set_lease_state(action.lease_id, LeaseState::Refunded)
-            .await
+        Ok(())
     }
 
     async fn complete_finalization(
@@ -2136,15 +2476,25 @@ impl Worker {
             .clone();
         self.insert_receipt(action.lease_id, &receipt, block_number, block_hash)
             .await?;
-        let mut transaction = self.pool.begin().await?;
         query(
             "UPDATE settlement_jobs SET status = 'finalized', updated_at = NOW() \
              WHERE lease_id = $1",
         )
         .bind(action.lease_id as i64)
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await?;
-        set_lease_state_in(&mut transaction, action.lease_id, LeaseState::Finalized).await?;
+        Ok(())
+    }
+
+    async fn record_terminal_settlement(&self, action: &Action) -> anyhow::Result<()> {
+        let state = match action.kind {
+            ActionKind::ExpireProvision => LeaseState::Refunded,
+            ActionKind::Finalize => LeaseState::Finalized,
+            _ => anyhow::bail!("lifecycle action is not a terminal settlement"),
+        };
+        let mut transaction = self.pool.begin().await?;
+        set_lease_state_in(&mut transaction, action.lease_id, state).await?;
+        enqueue_cloud_cleanup_in(&mut transaction, action.lease_id).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -2377,6 +2727,9 @@ impl Worker {
             .execute(&mut *lock)
             .await;
         unlock?;
+        if let Err(error) = &result {
+            self.block_provider_failure(error).await?;
+        }
         result
     }
 
@@ -2874,6 +3227,7 @@ impl Worker {
         .execute(&mut *transaction)
         .await?;
         set_lease_state_in(&mut transaction, action.lease_id, state).await?;
+        enqueue_cloud_cleanup_in(&mut transaction, action.lease_id).await?;
         let completed = query(
             "UPDATE lifecycle_outbox SET status = 'completed', lease_until = NULL, \
                  updated_at = NOW() \
@@ -2964,6 +3318,43 @@ impl Worker {
         Ok(())
     }
 
+    async fn remember_failed_provider_offer(
+        &self,
+        action: &Action,
+        failed: &mut Vec<u64>,
+        offer_id: u64,
+    ) -> anyhow::Result<()> {
+        if failed.contains(&offer_id) {
+            return Ok(());
+        }
+        if failed.len() == 64 {
+            failed.remove(0);
+        }
+        failed.push(offer_id);
+        let encoded = failed
+            .iter()
+            .copied()
+            .map(i64::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let updated = query(
+            "UPDATE lifecycle_outbox \
+             SET document = jsonb_set( \
+                     document, '{failed_provider_offer_ids}', to_jsonb($2::bigint[]), TRUE), \
+                 updated_at = NOW() \
+             WHERE action_id = $1 AND claim_generation = $3 \
+               AND status = 'processing' AND lease_until > NOW()",
+        )
+        .bind(action.action_id)
+        .bind(encoded)
+        .bind(action.claim_generation)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StillProvisioning.into());
+        }
+        Ok(())
+    }
+
     async fn set_lease_state(&self, lease_id: u64, state: LeaseState) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         set_lease_state_in(&mut transaction, lease_id, state).await?;
@@ -2979,7 +3370,7 @@ impl Worker {
              SET raw_transaction = NULL, transaction_hash = NULL, \
                  transaction_nonce = NULL, updated_at = NOW() \
              WHERE action_id = $1 AND claim_generation = $2 \
-               AND status = 'submitted'",
+               AND status IN ('processing', 'submitted')",
         )
         .bind(action.action_id)
         .bind(action.claim_generation)
@@ -3015,6 +3406,40 @@ impl Worker {
         error: &anyhow::Error,
     ) -> anyhow::Result<()> {
         let message: String = format!("{error:#}").chars().take(1_024).collect();
+        if error.downcast_ref::<CloudCleanupPending>().is_some() {
+            query(
+                "UPDATE lifecycle_outbox SET status = 'queued', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + make_interval(secs => $2), \
+                     last_error = $3, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $4 \
+                   AND status IN ('processing', 'submitted')",
+            )
+            .bind(action_id)
+            .bind(CLOUD_CLEANUP_RETRY_SECONDS as f64)
+            .bind(message)
+            .bind(claim_generation)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if prism_chain::is_transient_error(error) {
+            query(
+                "UPDATE lifecycle_outbox SET status = 'queued', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + make_interval(secs => $2), \
+                     last_error = $3, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $4 \
+                   AND status IN ('processing', 'submitted')",
+            )
+            .bind(action_id)
+            .bind(RPC_TRANSIENT_RETRY_SECONDS as f64)
+            .bind(message)
+            .bind(claim_generation)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
         if error.downcast_ref::<StillProvisioning>().is_some() {
             // Waiting is not an attempt, and `expire_provision` already bounds
             // how long the whole thing may take.
@@ -3035,13 +3460,19 @@ impl Worker {
         }
         let exhausted = query_scalar::<_, Option<i64>>(
             "UPDATE lifecycle_outbox SET \
-                 status = CASE WHEN attempts >= 100 THEN 'failed' ELSE 'queued' END, \
+                 status = CASE \
+                     WHEN attempts >= 100 \
+                      AND kind NOT IN ('close_access', 'expire_provision', 'finalize') \
+                     THEN 'failed' ELSE 'queued' END, \
                  lease_until = NULL, \
                  available_at = NOW() + make_interval(secs => LEAST(300, attempts * attempts)), \
                  last_error = $2, updated_at = NOW() \
              WHERE action_id = $1 AND claim_generation = $3 \
                AND status IN ('processing', 'submitted') \
-             RETURNING CASE WHEN attempts >= 100 THEN lease_id END",
+             RETURNING CASE \
+                 WHEN attempts >= 100 \
+                  AND kind NOT IN ('close_access', 'expire_provision', 'finalize') \
+                 THEN lease_id END",
         )
         .bind(action_id)
         .bind(message)
@@ -3052,7 +3483,6 @@ impl Worker {
         if let Some(lease_id) = exhausted {
             let lease_id = u64::try_from(lease_id)?;
             tracing::error!(lease_id, "lifecycle action exhausted its attempts");
-            self.set_lease_state(lease_id, LeaseState::Failed).await?;
         }
         Ok(())
     }
@@ -3066,6 +3496,7 @@ impl ActionKind {
             "close_access" => Ok(Self::CloseAccess),
             "expire_provision" => Ok(Self::ExpireProvision),
             "finalize" => Ok(Self::Finalize),
+            "cleanup_cloud" => Ok(Self::CleanupCloud),
             _ => anyhow::bail!("unknown lifecycle action {value}"),
         }
     }
@@ -3079,7 +3510,7 @@ impl ActionKind {
                 Some(Keccak256::digest(b"prism.provisioning-timeout.v1")),
             ),
             Self::Finalize => ("finalize(uint256)", None),
-            Self::RefreshGrant => unreachable!(),
+            Self::RefreshGrant | Self::CleanupCloud => unreachable!(),
         };
         let mut data = Vec::with_capacity(68);
         data.extend_from_slice(&selector(signature));
@@ -3135,6 +3566,7 @@ impl GatewayClient {
             .context("decode gateway probe response")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn issue_grant(
         &self,
         token_id: Uuid,
@@ -3222,6 +3654,25 @@ async fn set_lease_state_in(
     Ok(())
 }
 
+async fn enqueue_cloud_cleanup_in(
+    transaction: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+    lease_id: u64,
+) -> anyhow::Result<()> {
+    query(
+        "INSERT INTO lifecycle_outbox (action_id, lease_id, kind) \
+         SELECT md5($1::text || ':cleanup_cloud')::uuid, $1, 'cleanup_cloud' \
+         WHERE EXISTS (SELECT 1 FROM cloud_instances WHERE lease_id = $1) \
+         ON CONFLICT (lease_id, kind) DO UPDATE \
+           SET status = 'queued', attempts = 0, available_at = NOW(), lease_until = NULL, \
+               last_error = NULL, updated_at = NOW() \
+         WHERE lifecycle_outbox.status = 'failed'",
+    )
+    .bind(i64::try_from(lease_id)?)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 fn lease_state_name(state: &LeaseState) -> &'static str {
     match state {
         LeaseState::Funded => "funded",
@@ -3252,6 +3703,10 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
     .await?;
     let managed_jobs: Option<String> =
         query_scalar("SELECT to_regclass('public.managed_repro_jobs')::text")
+            .fetch_one(pool)
+            .await?;
+    let provider_state: Option<String> =
+        query_scalar("SELECT to_regclass('public.cloud_provider_state')::text")
             .fetch_one(pool)
             .await?;
     let managed_schema: bool = query_scalar(
@@ -3290,7 +3745,12 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
     )
     .fetch_one(pool)
     .await?;
-    if present.is_none() || !rejections || managed_jobs.is_none() || !managed_schema {
+    if present.is_none()
+        || !rejections
+        || managed_jobs.is_none()
+        || provider_state.is_none()
+        || !managed_schema
+    {
         anyhow::bail!("control-plane lifecycle migrations have not been applied");
     }
     Ok(())

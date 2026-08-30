@@ -18,6 +18,7 @@ alarm that repeats every five minutes gets muted by whoever reads it.
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -78,7 +79,10 @@ def check_supply(alarms, container, minimum):
         psql(
             container,
             "SELECT count(*) FROM cloud_capacity "
-            "WHERE available AND updated_at > NOW() - INTERVAL '5 minutes';",
+            "WHERE available AND observed_at > NOW() - INTERVAL '90 seconds' "
+            "AND EXISTS (SELECT 1 FROM cloud_provider_state "
+            "WHERE provider = 'vast' AND state = 'healthy' "
+            "AND observed_at > NOW() - INTERVAL '90 seconds');",
         )
     )
     if available < minimum:
@@ -179,6 +183,12 @@ def check_signers(alarms, rpc_url, signers, floor_wei):
 
 def check_provider_credit(alarms, api_key, floor_dollars):
     if not api_key:
+        alarms.append(
+            Alarm(
+                "provider_credit_config",
+                "VAST_API_KEY is empty, so provider balance is not monitored",
+            )
+        )
         return
     account = json.loads(
         get(
@@ -186,10 +196,17 @@ def check_provider_credit(alarms, api_key, floor_dollars):
             {"Authorization": f"Bearer {api_key}"},
         )
     )
-    credit = float(account.get("credit") or 0)
-    if credit < floor_dollars:
+    if "balance" not in account:
+        raise RuntimeError("Vast account response has no balance")
+    balance = float(account["balance"])
+    if not math.isfinite(balance):
+        raise RuntimeError("Vast account balance is invalid")
+    if balance < floor_dollars:
         alarms.append(
-            Alarm("provider_credit", f"Vast credit is ${credit:.2f}, under the ${floor_dollars:.2f} floor")
+            Alarm(
+                "provider_credit",
+                f"Vast balance is ${balance:.2f}, under the ${floor_dollars:.2f} floor",
+            )
         )
 
 

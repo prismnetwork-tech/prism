@@ -86,6 +86,7 @@ manifest=$(node -e '
   process.stdout.write(deployment.contractAddress);
 ' "$PWD/broadcast/DeployLocal.s.sol/4663/run-latest.json")
 escrow=$(cast call "$manifest" "escrow()(address)" --rpc-url "$rpc_url")
+registry=$(cast call "$manifest" "registry()(address)" --rpc-url "$rpc_url")
 test "$(cast call "$manifest" "leaseId()(uint256)" --rpc-url "$rpc_url")" = 1
 
 docker run -d --name "$postgres_container" \
@@ -101,6 +102,11 @@ for _ in $(seq 1 30); do
 done
 database_port=$(docker port "$postgres_container" 5432/tcp | awk -F: 'NR == 1 { print $NF }')
 database_url="postgres://prism:integration-secret@127.0.0.1:$database_port/prism"
+
+psql_exec() {
+  docker exec -e PGPASSWORD=integration-secret "$postgres_container" \
+    psql -v ON_ERROR_STOP=1 -U prism -d prism "$@"
+}
 
 env \
   DATABASE_URL="$database_url" \
@@ -145,13 +151,19 @@ curl --fail --silent \
   -d "{\"connection_id\":\"lifecycle-tunnel\",\"observed_at\":\"$observed_at\"}" \
   "$control_url/v1/gateway/tunnels/$node_id" >/dev/null
 
-request="{\"request\":{\"image\":\"registry.example/runtime@$image_digest\",\"duration_seconds\":60,\"min_vram_mib\":16000,\"preferred_node_id\":null}}"
-quote=$(curl --fail --silent \
+request="{\"request\":{\"image\":\"docker.io/library/runtime@$image_digest\",\"duration_seconds\":60,\"min_vram_mib\":16000,\"preferred_node_id\":null}}"
+quote_file="$root/quote.json"
+quote_status=$(curl --show-error --silent --output "$quote_file" --write-out '%{http_code}' \
   -H "Content-Type: application/json" \
   -H "x-prism-development-subject: did:privy:lifecycle" \
   -H "x-prism-development-session: session-lifecycle" \
   -H "x-request-id: lifecycle-match" \
   -d "$request" "$control_url/v1/leases/match")
+if [[ $quote_status != 200 ]]; then
+  cat "$quote_file" >&2
+  exit 1
+fi
+quote=$(<"$quote_file")
 quote_id=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).quote_id)' "$quote")
 ssh-keygen -q -t ed25519 -N "" -C prism-test -f "$root/renter"
 ssh_key=$(<"$root/renter.pub")
@@ -163,20 +175,17 @@ curl --fail --silent \
   -H "x-request-id: lifecycle-confirm" \
   -d "{\"quote_id\":\"$quote_id\",\"transaction_hash\":\"$funding_hash\",\"ssh_authorized_key\":\"$ssh_key\"}" \
   "$control_url/v1/leases/confirm" >/dev/null
-
-psql_exec() {
-  docker exec -e PGPASSWORD=integration-secret "$postgres_container" \
-    psql -v ON_ERROR_STOP=1 -U prism -d prism "$@"
-}
+lease_id=$(psql_exec -Atc "SELECT lease_id FROM leases WHERE quote_id = '$quote_id'")
+[[ $lease_id =~ ^[0-9]+$ ]]
 
 psql_exec -c \
-  "UPDATE leases SET state = 'ready', document = jsonb_set(document, '{state}', '\"ready\"'), updated_at = NOW() WHERE lease_id = 1;
+  "UPDATE leases SET state = 'ready', document = jsonb_set(document, '{state}', '\"ready\"'), updated_at = NOW() WHERE lease_id = $lease_id;
    INSERT INTO lease_lifecycle (lease_id, connection_id, node_ready_at)
-   VALUES (1, 'lifecycle-tunnel', NOW())
+   VALUES ($lease_id, 'lifecycle-tunnel', NOW())
    ON CONFLICT (lease_id) DO UPDATE
    SET connection_id = EXCLUDED.connection_id, node_ready_at = EXCLUDED.node_ready_at;
    INSERT INTO lifecycle_outbox (action_id, lease_id, kind)
-   VALUES ('018f0000-0000-7000-8000-000000000101', 1, 'start_access');" >/dev/null
+   VALUES ('018f0000-0000-7000-8000-000000000101', $lease_id, 'start_access');" >/dev/null
 
 PORT="$mock_port" node scripts/mock-external-services.mjs >"$root/mock.log" 2>&1 &
 mock_pid=$!
@@ -195,6 +204,7 @@ run_lifecycle() {
     PRISM_GATEWAY_CONTROL_URL="$mock_url" \
     PRISM_LEASE_ESCROW_ADDRESS="$escrow" \
     PRISM_LIFECYCLE_CONFIRMATIONS=1 \
+    PRISM_NODE_REGISTRY_ADDRESS="$registry" \
     PRISM_RPC_URL="$rpc_url" \
     PRISM_RUN_ONCE=1 \
     target/debug/prism-lifecycle-worker
@@ -208,30 +218,30 @@ run_lifecycle
 cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
 sleep 6
 run_lifecycle
-test "$(psql_exec -Atc "SELECT state FROM leases WHERE lease_id = 1")" = active
+test "$(psql_exec -Atc "SELECT state FROM leases WHERE lease_id = $lease_id")" = active
 
 access=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:lifecycle" \
   -H "x-prism-development-session: session-lifecycle" \
   -H "x-request-id: lifecycle-access" \
-  "$control_url/v1/leases/1/access")
+  "$control_url/v1/leases/$lease_id/access")
 node -e '
   const access = JSON.parse(process.argv[1]);
-  if (access.lease_id !== 1 || !access.token || !access.jupyter_token) process.exit(1);
-' "$access"
+  if (access.lease_id !== Number(process.argv[2]) || !access.token || !access.jupyter_token) process.exit(1);
+' "$access" "$lease_id"
 
 target/debug/prismd heartbeat \
   --identity "$root/device.json" \
   --control-plane "$control_url" \
   --tunnel-connected \
-  --active-lease 1 \
+  --active-lease "$lease_id" \
   --image-digest "$image_digest"
 sleep 2
 target/debug/prismd heartbeat \
   --identity "$root/device.json" \
   --control-plane "$control_url" \
   --tunnel-connected \
-  --active-lease 1 \
+  --active-lease "$lease_id" \
   --image-digest "$image_digest"
 
 cast rpc --rpc-url "$rpc_url" evm_increaseTime 5 >/dev/null
@@ -244,7 +254,7 @@ run_lifecycle
 cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
 sleep 6
 run_lifecycle
-test "$(psql_exec -Atc "SELECT status FROM settlement_jobs WHERE lease_id = 1")" = queued
+test "$(psql_exec -Atc "SELECT status FROM settlement_jobs WHERE lease_id = $lease_id")" = queued
 
 run_settlement() {
   env \
@@ -262,18 +272,18 @@ run_settlement
 cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
 sleep 6
 run_settlement
-test "$(psql_exec -Atc "SELECT status FROM settlement_jobs WHERE lease_id = 1")" = proposed
+test "$(psql_exec -Atc "SELECT status FROM settlement_jobs WHERE lease_id = $lease_id")" = proposed
 
 cast rpc --rpc-url "$rpc_url" evm_increaseTime 86401 >/dev/null
 cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
 psql_exec -c \
-  "UPDATE lifecycle_outbox SET available_at = NOW() WHERE lease_id = 1 AND kind = 'finalize';" \
+  "UPDATE lifecycle_outbox SET available_at = NOW() WHERE lease_id = $lease_id AND kind = 'finalize';" \
   >/dev/null
 run_lifecycle
 cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
 sleep 6
 run_lifecycle
-test "$(psql_exec -Atc "SELECT state FROM leases WHERE lease_id = 1")" = finalized
+test "$(psql_exec -Atc "SELECT state FROM leases WHERE lease_id = $lease_id")" = finalized
 
 timeout_reference=$(cast keccak timeout-quote)
 cast send "$escrow" "createLease(bytes32,uint32,bytes32)" \
@@ -305,8 +315,10 @@ curl --fail --silent \
   -H "x-request-id: timeout-confirm" \
   -d "{\"quote_id\":\"$quote_id\",\"transaction_hash\":\"$funding_hash\",\"ssh_authorized_key\":\"$ssh_key\"}" \
   "$control_url/v1/leases/confirm" >/dev/null
+timeout_lease_id=$(psql_exec -Atc "SELECT lease_id FROM leases WHERE quote_id = '$quote_id'")
+[[ $timeout_lease_id =~ ^[0-9]+$ ]]
 psql_exec -c \
-  "UPDATE leases SET created_at = NOW() - INTERVAL '11 minutes' WHERE lease_id = 2;" \
+  "UPDATE leases SET created_at = NOW() - INTERVAL '11 minutes' WHERE lease_id = $timeout_lease_id;" \
   >/dev/null
 cast rpc --rpc-url "$rpc_url" evm_increaseTime 601 >/dev/null
 cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
@@ -314,7 +326,7 @@ run_lifecycle
 cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
 sleep 6
 run_lifecycle
-test "$(psql_exec -Atc "SELECT state FROM leases WHERE lease_id = 2")" = refunded
+test "$(psql_exec -Atc "SELECT state FROM leases WHERE lease_id = $timeout_lease_id")" = refunded
 
 env \
   DATABASE_URL="$database_url" \

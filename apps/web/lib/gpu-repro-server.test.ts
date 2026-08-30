@@ -31,12 +31,9 @@ describe("GPU repro status client", () => {
     expect(JSON.parse(String(init?.body))).toEqual({ token });
   });
 
-  it("maps an unknown capability to awaiting approval", async () => {
+  it("rejects an unknown capability instead of polling forever", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404 })));
-    await expect(loadGpuReproStatus(token)).resolves.toEqual({
-      version: "prism.gpu-repro.status.v1",
-      status: "awaiting_approval",
-    });
+    await expect(loadGpuReproStatus(token)).rejects.toMatchObject({ code: "not_found" });
   });
 
   it("rejects malformed tokens without a network request", async () => {

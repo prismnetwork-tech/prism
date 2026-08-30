@@ -98,7 +98,7 @@ contract RefractionPrizeV2 {
         awards = prizeAwards;
     }
 
-    receive() external payable {}
+    receive() external payable { }
 
     /// `keccak256(abi.encode(answer, msg.sender, salt))`.
     ///
@@ -106,7 +106,7 @@ contract RefractionPrizeV2 {
     function commit(bytes32 commitment) external {
         if (block.timestamp < opensAt) revert NotOpenYet();
         if (block.timestamp > deadline) revert DeadlinePassed();
-        if (board.length == awards.length) revert PrizesGone();
+        if (board.length >= awards.length) revert PrizesGone();
         Entry storage entry = entries[msg.sender];
         if (entry.commitment != bytes32(0)) revert AlreadyCommitted();
         entry.commitment = commitment;
@@ -120,7 +120,7 @@ contract RefractionPrizeV2 {
         if (block.timestamp < opensAt) revert NotOpenYet();
         if (block.timestamp > deadline) revert DeadlinePassed();
         uint256 place = board.length;
-        if (place == awards.length) revert PrizesGone();
+        if (place >= awards.length) revert PrizesGone();
 
         Entry storage entry = entries[msg.sender];
         if (entry.commitment == bytes32(0)) revert NoCommitment();
@@ -149,7 +149,7 @@ contract RefractionPrizeV2 {
 
     /// What the next solver takes, or zero once all three are gone.
     function nextAward() external view returns (uint256) {
-        return board.length == awards.length ? 0 : awards[board.length];
+        return board.length >= awards.length ? 0 : awards[board.length];
     }
 
     /// Before the puzzle opens, the treasury can take the pool back. After it

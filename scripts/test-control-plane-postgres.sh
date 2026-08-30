@@ -55,12 +55,14 @@ docker run -d --name "$container" \
   >/dev/null
 
 for _ in $(seq 1 30); do
-  if docker exec "$container" pg_isready -U prism -d prism >/dev/null 2>&1; then
+  if [[ $(docker exec -e PGPASSWORD=integration-secret "$container" \
+    psql -U prism -d prism -Atc 'SELECT 1' 2>/dev/null || true) == 1 ]]; then
     break
   fi
   sleep 1
 done
-docker exec "$container" pg_isready -U prism -d prism >/dev/null
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -U prism -d prism -Atc 'SELECT 1' >/dev/null
 
 database_port=$(docker port "$container" 5432/tcp | awk -F: 'NR == 1 { print $NF }')
 database_url="postgres://prism:integration-secret@127.0.0.1:$database_port/prism"
@@ -166,7 +168,7 @@ node -e '
   if (summary.nodes[0].certificate_status !== "active") process.exit(1);
 ' "$supplier_summary"
 
-request='{"request":{"image":"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","duration_seconds":60,"min_vram_mib":16000,"preferred_node_id":null}}'
+request='{"request":{"image":"docker.io/library/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","duration_seconds":60,"min_vram_mib":16000,"preferred_node_id":null}}'
 node_suspend_id=018f0000-0000-7000-8000-000000000201
 node_suspend="{\"action_id\":\"$node_suspend_id\",\"action\":\"node_suspend\",\"target_id\":\"$node_id\",\"reason\":\"integration node suspension\",\"evidence_hash\":null}"
 curl --fail --silent \
@@ -268,8 +270,10 @@ confirmation=$(curl --fail --silent \
   "http://127.0.0.1:$port/v1/leases/confirm")
 node -e '
   const lease = JSON.parse(process.argv[1]);
-  if (lease.lease_id !== 1 || lease.quote_id !== process.argv[2] || lease.state !== "funded") process.exit(1);
+  if (lease.lease_id < 1000 || lease.chain_lease_id !== 1) process.exit(1);
+  if (lease.quote_id !== process.argv[2] || lease.state !== "funded") process.exit(1);
 ' "$confirmation" "$quote_id"
+internal_lease_id=$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).lease_id))' "$confirmation")
 
 leases=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:integration" \
@@ -313,11 +317,12 @@ command_pid=
 
 docker exec -e PGPASSWORD=integration-secret "$container" \
   psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
-  "UPDATE leases SET state = 'disputed', document = jsonb_set(document, '{state}', '\"disputed\"'), updated_at = NOW() WHERE lease_id = 1;
+  "UPDATE leases SET state = 'disputed', document = jsonb_set(document, '{state}', '\"disputed\"'), updated_at = NOW() WHERE lease_id = $internal_lease_id;
    INSERT INTO settlement_jobs (lease_id, evidence, status)
-   SELECT 1,
+   SELECT $internal_lease_id,
           jsonb_build_object(
-            'lease_id', 1,
+            'lease_id', $internal_lease_id,
+            'chain_lease_id', 1,
             'lease_nonce', 1,
             'node_id', '$node_id',
             'device_public_key', 'integration-device',
@@ -357,7 +362,7 @@ docker exec -e PGPASSWORD=integration-secret "$container" \
   "UPDATE settlement_jobs
    SET proposal = jsonb_build_object(
          'proposal', jsonb_build_object(
-           'lease_id', 1,
+           'lease_id', $internal_lease_id,
            'usage_seconds', 58,
            'receipt_hash', '$receipt_hash',
            'evidence_hash', '$evidence_hash'
@@ -366,7 +371,7 @@ docker exec -e PGPASSWORD=integration-secret "$container" \
        ),
        transaction_hash = '$settlement_hash',
        updated_at = NOW()
-   WHERE lease_id = 1;" >/dev/null
+   WHERE lease_id = $internal_lease_id;" >/dev/null
 disputes=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:operator" \
   -H "x-prism-development-session: session-operator" \
@@ -374,15 +379,16 @@ disputes=$(curl --fail --silent \
   "http://127.0.0.1:$port/v1/operator/disputes")
 node -e '
   const [dispute] = JSON.parse(process.argv[1]);
-  if (!dispute || dispute.lease_id !== 1 || dispute.evidence.telemetry_records !== 1) process.exit(1);
+  if (!dispute || dispute.lease_id !== Number(process.argv[2])) process.exit(1);
+  if (dispute.evidence.telemetry_records !== 1) process.exit(1);
   if (dispute.evidence.proposal_integrity_valid !== true || dispute.proposal.usage_seconds !== 58) process.exit(1);
   const transaction = dispute.accept_proposal_transaction;
   if (!transaction || transaction.to !== "0x2222222222222222222222222222222222222222") process.exit(1);
   if (!transaction.data.startsWith("0x001bb9c1") || transaction.data.length !== 202) process.exit(1);
-' "$disputes"
+' "$disputes" "$internal_lease_id"
 docker exec -e PGPASSWORD=integration-secret "$container" \
   psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
-  "UPDATE settlement_jobs SET proposal = jsonb_set(proposal, '{proposal,usage_seconds}', '61') WHERE lease_id = 1;" >/dev/null
+  "UPDATE settlement_jobs SET proposal = jsonb_set(proposal, '{proposal,usage_seconds}', '61') WHERE lease_id = $internal_lease_id;" >/dev/null
 disputes=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:operator" \
   -H "x-prism-development-session: session-operator" \

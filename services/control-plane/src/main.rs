@@ -3622,6 +3622,11 @@ impl MarketplaceStore {
                                   AND cc.provider = 'vast' \
                                   AND cc.available \
                                   AND cc.observed_at >= $1 \
+                                  AND EXISTS ( \
+                                      SELECT 1 FROM cloud_provider_state ps \
+                                      WHERE ps.provider = 'vast' AND ps.state = 'healthy' \
+                                        AND ps.observed_at >= $1 \
+                                  ) \
                             ) \
                      FROM node_offers o \
                      WHERE (o.document->>'bonded')::boolean = true \
@@ -3632,6 +3637,11 @@ impl MarketplaceStore {
                              AND cc0.provider = 'vast' \
                              AND cc0.available \
                              AND cc0.observed_at >= $1 \
+                             AND EXISTS ( \
+                                 SELECT 1 FROM cloud_provider_state ps \
+                                 WHERE ps.provider = 'vast' AND ps.state = 'healthy' \
+                                   AND ps.observed_at >= $1 \
+                             ) \
                        )) \
                        AND NOT EXISTS ( \
                            SELECT 1 FROM node_controls c \
@@ -3646,6 +3656,11 @@ impl MarketplaceStore {
                              AND cc.provider = 'vast' \
                              AND cc.available \
                              AND cc.observed_at >= $1 \
+                             AND EXISTS ( \
+                                 SELECT 1 FROM cloud_provider_state ps \
+                                 WHERE ps.provider = 'vast' AND ps.state = 'healthy' \
+                                   AND ps.observed_at >= $1 \
+                             ) \
                        ) \
                        ) \
                      ORDER BY (o.document->>'rate_per_second')::bigint ASC, o.updated_at DESC",
@@ -5114,7 +5129,12 @@ impl MarketplaceStore {
                         .collect();
                 let managed_batch: BTreeSet<String> = query_scalar(
                     "SELECT node_id FROM cloud_capacity \
-                     WHERE provider = 'vast' AND available AND observed_at >= $1",
+                     WHERE provider = 'vast' AND available AND observed_at >= $1 \
+                       AND EXISTS ( \
+                           SELECT 1 FROM cloud_provider_state ps \
+                           WHERE ps.provider = 'vast' AND ps.state = 'healthy' \
+                             AND ps.observed_at >= $1 \
+                       )",
                 )
                 .bind(cutoff)
                 .fetch_all(&mut *transaction)
@@ -5552,6 +5572,11 @@ impl MarketplaceStore {
                              SELECT 1 FROM cloud_capacity \
                              WHERE node_id = $1 AND provider = 'vast' \
                                AND available AND observed_at >= $2 \
+                               AND EXISTS ( \
+                                   SELECT 1 FROM cloud_provider_state ps \
+                                   WHERE ps.provider = 'vast' AND ps.state = 'healthy' \
+                                     AND ps.observed_at >= $2 \
+                               ) \
                          ), \
                          EXISTS ( \
                              SELECT 1 FROM node_command_requests \
@@ -9562,6 +9587,13 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("repro token claims"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0023_repro_token_claims.sql")),
+                false,
+            ),
+            Migration::new(
+                24,
+                Cow::Borrowed("provider admission"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0024_provider_admission.sql")),
                 false,
             ),
         ]),

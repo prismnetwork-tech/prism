@@ -32,7 +32,7 @@ export type GpuReproStatus = {
 };
 
 export class GpuReproStatusError extends Error {
-  constructor(readonly code: "invalid_token" | "unavailable" | "evidence_not_ready" | "verification_not_ready") {
+  constructor(readonly code: "invalid_token" | "not_found" | "unavailable" | "evidence_not_ready" | "verification_not_ready") {
     super(code.replaceAll("_", " "));
   }
 }
@@ -70,7 +70,7 @@ export async function loadGpuReproStatus(token: string): Promise<GpuReproStatus>
     throw new GpuReproStatusError("unavailable");
   }
   if (response.status === 404) {
-    return { version: "prism.gpu-repro.status.v1", status: "awaiting_approval" };
+    throw new GpuReproStatusError("not_found");
   }
   const contentLength = Number(response.headers.get("content-length") ?? 0);
   if (!response.ok || contentLength > maxResponseBytes) throw new GpuReproStatusError("unavailable");

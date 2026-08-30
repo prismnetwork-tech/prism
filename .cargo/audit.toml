@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # Runtime code uses RSA only to verify AMD certificate signatures. It never
+    # performs a private-key operation, so the Marvin timing attack has no key
+    # material to recover. Remove this exception when RustCrypto ships a fix.
+    "RUSTSEC-2023-0071",
+]

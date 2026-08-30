@@ -147,6 +147,28 @@ contract PrismStakeV1Test {
         require(_withdrawReverts(ALICE), "withdrew with nothing unbonding");
     }
 
+    function test_stake_rejects_an_amount_that_does_not_fit_the_position() public {
+        VM.expectRevert(PrismStakeV1.AmountTooLarge.selector);
+        staking.stake(uint256(type(uint128).max) + 1);
+
+        (uint256 staked,,,) = staking.positionOf(address(this));
+        require(staked == 0, "oversized stake changed the position");
+        require(staking.totalStaked() == 0, "oversized stake changed the total");
+    }
+
+    function test_stake_accepts_the_largest_storable_amount() public {
+        uint256 amount = type(uint128).max;
+        prism.mint(address(this), amount);
+        prism.approve(address(staking), amount);
+
+        staking.stake(amount);
+
+        (uint256 staked,,,) = staking.positionOf(address(this));
+        require(staked == amount, "largest stake was truncated");
+        require(staking.totalStaked() == amount, "largest stake changed the total");
+        require(prism.balanceOf(address(staking)) == amount, "largest stake did not transfer");
+    }
+
     // One staker must never reach another's position, and there is no
     // privileged path either: the contract has no owner.
     function test_positions_are_isolated() public {
@@ -207,6 +229,7 @@ contract PrismStakeV1Test {
 }
 
 interface Vm {
+    function expectRevert(bytes4 revertData) external;
     function warp(uint256 newTimestamp) external;
     function prank(address msgSender) external;
 }

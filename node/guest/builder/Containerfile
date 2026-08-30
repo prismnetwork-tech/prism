@@ -35,3 +35,8 @@ RUN apt-get update -o Acquire::Check-Valid-Until=false \
 ENV SOURCE_DATE_EPOCH=1767225600 \
     LC_ALL=C \
     TZ=UTC
+
+# This image only builds the guest filesystem and firmware. Root ownership is
+# part of the reproducible output; the image is never deployed as a service.
+#trivy:ignore:AVD-DS-0002
+USER root

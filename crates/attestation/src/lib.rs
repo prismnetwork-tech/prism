@@ -492,7 +492,6 @@ pub fn verify_sev_snp_attestation(
 /// earns Attested, the guest half of confidential; the GPU CC verdict is the
 /// other half.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn verify_tdx_lease_attestation(
     lease_id: u64,
     node_id: &str,

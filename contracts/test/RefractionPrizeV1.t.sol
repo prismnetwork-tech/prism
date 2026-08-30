@@ -86,8 +86,7 @@ contract RefractionPrizeV1Test {
         returns (bool)
     {
         VM.prank(solver);
-        (bool ok,) =
-            address(prize).call(abi.encodeCall(RefractionPrizeV1.reveal, (answer, salt)));
+        (bool ok,) = address(prize).call(abi.encodeCall(RefractionPrizeV1.reveal, (answer, salt)));
         return !ok;
     }
 
@@ -171,9 +170,10 @@ contract RefractionPrizeV1Test {
         _solve(BOB, bytes32("b"));
         _solve(CAROL, bytes32("c"));
         VM.prank(DAN);
-        (bool ok,) = address(prize).call(
-            abi.encodeCall(RefractionPrizeV1.commit, (_commitment(ANSWER, DAN, bytes32("d"))))
-        );
+        (bool ok,) = address(prize)
+            .call(
+                abi.encodeCall(RefractionPrizeV1.commit, (_commitment(ANSWER, DAN, bytes32("d"))))
+            );
         require(!ok, "committing after the last place is refused");
         require(prism.balanceOf(DAN) == 0, "and pays nothing");
     }

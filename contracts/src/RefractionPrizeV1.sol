@@ -102,7 +102,7 @@ contract RefractionPrizeV1 {
     /// Reproduce it exactly, including the sender, or the reveal cannot open it.
     function commit(bytes32 commitment) external {
         if (block.timestamp > deadline) revert DeadlinePassed();
-        if (board.length == awards.length) revert PrizesGone();
+        if (board.length >= awards.length) revert PrizesGone();
         Entry storage entry = entries[msg.sender];
         if (entry.commitment != bytes32(0)) revert AlreadyCommitted();
         entry.commitment = commitment;
@@ -115,7 +115,7 @@ contract RefractionPrizeV1 {
     function reveal(string calldata answer, bytes32 salt) external {
         if (block.timestamp > deadline) revert DeadlinePassed();
         uint256 place = board.length;
-        if (place == awards.length) revert PrizesGone();
+        if (place >= awards.length) revert PrizesGone();
 
         Entry storage entry = entries[msg.sender];
         if (entry.commitment == bytes32(0)) revert NoCommitment();
@@ -144,14 +144,15 @@ contract RefractionPrizeV1 {
 
     /// What the next solver takes, or zero once all three are gone.
     function nextAward() external view returns (uint256) {
-        return board.length == awards.length ? 0 : awards[board.length];
+        return board.length >= awards.length ? 0 : awards[board.length];
     }
 
     function reclaim() external {
         if (msg.sender != treasury) revert NotTreasury();
         if (block.timestamp <= deadline) revert DeadlineNotReached();
-        uint256 unclaimed;
-        for (uint256 place = board.length; place < awards.length; place += 1) {
+        uint256 unclaimed = 0;
+        uint256 awardCount = awards.length;
+        for (uint256 place = board.length; place < awardCount; place += 1) {
             unclaimed += awards[place];
         }
         emit Reclaimed(unclaimed);

@@ -2089,10 +2089,12 @@ mod tests {
         );
         assert!(!reusable(now), "expiring now must be rebuilt");
         assert!(!reusable(now - 1), "expired must be rebuilt");
-        assert!(
-            DEADLINE_MARGIN_SECONDS < 3_600,
-            "the margin has to leave a freshly signed proposal usable"
-        );
+        const {
+            assert!(
+                DEADLINE_MARGIN_SECONDS < 3_600,
+                "the margin has to leave a freshly signed proposal usable"
+            );
+        }
     }
 
     #[test]
