@@ -9873,6 +9873,7 @@ fn is_trusted_registry_host(host: &str) -> bool {
             | "registry.k8s.io"
             | "gcr.io"
             | "ghcr.io"
+            | "registry.prismnetwork.tech"
     ) || normalized.ends_with(".pkg.dev")
 }
 
@@ -13199,6 +13200,10 @@ mod tests {
         )));
         assert!(is_pinned_image(&format!(
             "pytorch/pytorch@sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(is_pinned_image(&format!(
+            "registry.prismnetwork.tech/gpu-repro@sha256:{}",
             "a".repeat(64)
         )));
         assert!(!is_pinned_image(&format!(

@@ -48,6 +48,7 @@ const trustedRegistries = new Set([
   "registry.k8s.io",
   "gcr.io",
   "ghcr.io",
+  "registry.prismnetwork.tech",
 ]);
 
 export class GpuCapabilityError extends Error {
