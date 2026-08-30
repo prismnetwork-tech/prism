@@ -13203,7 +13203,7 @@ mod tests {
             "a".repeat(64)
         )));
         assert!(is_pinned_image(&format!(
-            "registry.prismnetwork.tech/gpu-repro@sha256:{}",
+            "registry.prismnetwork.tech/prism-cuda-vectoradd:vast-base-20260826@sha256:{}",
             "a".repeat(64)
         )));
         assert!(!is_pinned_image(&format!(

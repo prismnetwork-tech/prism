@@ -89,7 +89,7 @@ describe("GPU capability planning", () => {
     expect(isPinnedPublicImage(`127.0.0.1/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(false);
     expect(isPinnedPublicImage(`registry.example/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(false);
     expect(isPinnedPublicImage(`docker.io/library/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(true);
-    expect(isPinnedPublicImage(`registry.prismnetwork.tech/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(true);
+    expect(isPinnedPublicImage(`registry.prismnetwork.tech/prism-cuda-vectoradd:vast-base-20260826@sha256:${"a".repeat(64)}`)).toBe(true);
     expect(isPinnedPublicImage(`docker.io/library/gpu-repro@sha256:${"A".repeat(64)}`)).toBe(false);
     expect(isPinnedPublicImage(`https://ghcr.io/prism-network/gpu-repro@sha256:${"a".repeat(64)}`)).toBe(false);
     expect(isPinnedPublicImage(image)).toBe(true);
