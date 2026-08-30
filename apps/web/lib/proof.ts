@@ -43,10 +43,12 @@ export type PublicProofReceipt = {
   receipt_hash: string;
   transaction_hash: string;
   /// The escrow that issued this lease id. Ids count from one inside a single
-  /// deployment, so the same number was handed out twice when the escrow was
-  /// replaced, and only this tells the two apart. Absent on nothing published
-  /// after 2026-08-15; older readers can ignore it.
+  /// deployment, so this field and `chain_lease_id` are required as a pair on
+  /// new artifacts. Receipts minted before the metadata existed may omit both.
   escrow_address?: string;
+  /// Decimal id emitted by `escrow_address`. It is additive metadata and is
+  /// intentionally excluded from the receipt hash.
+  chain_lease_id?: string;
 };
 
 export type PublicProofIndex = {
@@ -71,6 +73,7 @@ function isPublicProofReceipt(value: unknown): value is PublicProofReceipt {
   const receipt = value as Partial<PublicProofReceipt>;
   return isBoundedText(receipt.receipt_id, 1, 128)
     && isBoundedText(receipt.lease_id, 1, 128)
+    && isReceiptIdentity(receipt)
     && isHash(receipt.node_id_hash)
     && isBoundedText(receipt.gpu_model, 1, 128)
     && isBaseUnits(receipt.runtime_seconds, 21_600)
@@ -85,6 +88,16 @@ function isPublicProofReceipt(value: unknown): value is PublicProofReceipt {
     && (receipt.repro === undefined || isReproReceipt(receipt.repro))
     && /^[0-9a-f]{64}$/.test(receipt.receipt_hash ?? "")
     && isHash(receipt.transaction_hash);
+}
+
+function isReceiptIdentity(receipt: Partial<PublicProofReceipt>): boolean {
+  if (receipt.escrow_address === undefined && receipt.chain_lease_id === undefined) return true;
+  return typeof receipt.escrow_address === "string"
+    && /^0x[0-9a-f]{40}$/.test(receipt.escrow_address)
+    && typeof receipt.chain_lease_id === "string"
+    && /^[1-9][0-9]{0,19}$/.test(receipt.chain_lease_id)
+    && BigInt(receipt.chain_lease_id) <= 18_446_744_073_709_551_615n
+    && receipt.chain_lease_id === receipt.lease_id;
 }
 
 function isReproReceipt(value: unknown): value is NonNullable<PublicProofReceipt["repro"]> {

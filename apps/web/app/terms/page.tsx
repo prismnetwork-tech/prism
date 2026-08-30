@@ -97,7 +97,7 @@ export default function TermsPage() {
           <li>Usage is capped by funded duration and contract limits.</li>
           <li>Finalized charges allocate 90% to the provider and a 10% platform fee.</li>
           <li>Unused escrow is refunded when settlement is finalized.</li>
-          <li>A 24-hour dispute window applies before ordinary settlement finalization.</li>
+          <li>A five-minute dispute window applies before ordinary settlement finalization.</li>
           <li>Network gas, wallet, or third-party fees may be separate and non-refundable.</li>
         </ul>
       </LegalSection>

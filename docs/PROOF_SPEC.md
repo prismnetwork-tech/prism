@@ -7,6 +7,8 @@ event. It is intentionally pseudonymous.
 {
   "receipt_id": "uuid",
   "lease_id": "onchain escrow lease id, as a decimal string",
+  "escrow_address": "lowercase 0x-prefixed escrow address",
+  "chain_lease_id": "same decimal string as lease_id",
   "node_id_hash": "sha256-derived identifier",
   "gpu_model": "NVIDIA model",
   "runtime_seconds": 0,
@@ -75,6 +77,14 @@ decimal string. It is the value the settlement event carries, so a verifier can
 match a receipt to its transaction. It is not the identifier the HTTP API uses
 for the same lease; those are separate counters and they do not agree.
 
+`escrow_address` and `chain_lease_id` form the receipt's exact chain identity.
+Escrow counters restart after a deployment, so `chain_lease_id` alone is not
+globally unique. New receipts always carry both fields, the address is lowercase,
+and `chain_lease_id` must equal the legacy `lease_id` field. Receipts minted
+before this metadata existed may omit both fields; one field without the other
+is invalid. These two additive fields are excluded from `receipt_hash`, which
+preserves every existing onchain commitment.
+
 `receipt_hash` is the SHA-256 hash of the canonical payload with the
 `receipt_hash` and `transaction_hash` fields omitted. The transaction hash
 cannot be part of the receipt committed by the settlement transaction that
@@ -82,11 +92,22 @@ creates it. The proof worker rejects duplicate receipt IDs, malformed
 chain/node hashes and artifacts whose hash does not match before it writes
 `index.json` and `receipts/<receipt_id>.json`.
 
+`LeaseFinalized` commits `receipt_hash` onchain. The immutable v1
+`LeaseRefunded` event does not: its third field is `reasonHash`. For a
+worker-generated `provisioning_timeout` receipt, the proof worker requires that
+field to equal Keccak-256 of `prism.provisioning-timeout.v1`. A legacy refund
+with no failure class can be matched only to its escrow, chain lease id,
+transaction outcome and refunded amount. Its offchain receipt hash is
+self-consistency evidence, not a value committed by the refund event.
+
 Before publishing, the worker verifies that the RPC reports Robinhood Chain ID
 4663, the transaction succeeded, the configured confirmation threshold has
 elapsed, and the configured escrow emitted a matching finalization or refund
-event. Disputed receipts are not published as final proof. It removes stale
-receipt artifacts from the generated directory. The public site does not
+event. Finalizations must carry the exact receipt hash; refunds must carry the
+amount and, where the receipt names a supported failure class, its canonical
+reason hash. Disputed receipts are not published as final proof. When a
+previously published row is quarantined, the next complete publication removes
+its direct receipt artifact and all obsolete mutable page files. The public site does not
 expose wallet addresses, precise geography, full image references, files,
 terminal output or private telemetry. A repro receipt does publish the
 immutable image digest and hashes of the withheld command, output and signed
@@ -98,8 +119,15 @@ report.
 is the window the index itself lists; `total` is how many exist. When `total`
 is larger than that window, the index is truncated and the complete set is read
 by following `first_page` and then each page's `next` until it is `null`. Pages
-are newest first and each one repeats `total` and `pages`, so a verifier can
-tell mid-walk that the feed moved under it.
+are newest first, repeat `total` and `pages`, and live below a path derived from
+the exact ordered receipt set. A walk therefore stays on one immutable set even
+if a newer index is published concurrently.
+
+Verified individual receipts and immutable pages can be staged early. The
+mutable index is replaced only after a locked second database read finds no
+pending rows and matches the complete staged published set. A transient RPC
+error, a receipt still waiting for confirmations, or a backlog beyond the
+1,000-row verification batch leaves the previous authoritative index intact.
 
 ## Reproducing the hashes
 
@@ -124,9 +152,10 @@ charged_base_units, refunded_base_units, provider_paid_base_units,
 failure_class, outcome, trust_class, attestation, credited_seconds, repro
 ```
 
-`receipt_hash` and `transaction_hash` are not part of it. `failure_class` is
-serialized as `null` when absent; the four optional fields above are omitted.
-Numeric fields are JSON numbers, and `lease_id` is a JSON string.
+`receipt_hash`, `transaction_hash`, `escrow_address` and `chain_lease_id` are not
+part of it. `failure_class` is serialized as `null` when absent; the four
+optional payload fields above are omitted. Numeric fields are JSON numbers, and
+`lease_id` is a JSON string.
 
 The nested `repro` object uses this fixed field order:
 
@@ -210,10 +239,15 @@ states a class above `attested`, which is the ceiling
 `MAX_VERIFIABLE_TRUST_CLASS` enforces. `isolated` requires a verified GPU
 verdict; `attested` additionally requires a fresh lease-bound guest verdict.
 
-The checked-in proof worker provides receipt-file aggregation, safe-chain
-event verification, public artifact generation and a daily X outbox.
-Continuous ingestion from settlement events and publication to object storage
-remain release-gated. Posting failures
-remain outside the settlement path. Because the X endpoint does not expose an
+The checked-in proof worker provides durable database ingestion, receipt-file
+aggregation for development, safe-chain event verification, public artifact
+generation and an optional daily X outbox. Database mode is singleton. It verifies each
+pending row against that row's exact escrow and indexed chain lease id, isolates
+malformed or mismatched rows in `quarantined`, and builds the public index and
+daily digest exclusively from `published` rows. A database trigger makes the
+inserted identity and evidence immutable and permits only pending-to-published
+or pending-or-published-to-quarantined state changes. X posting is disabled unless
+`PRISM_ENABLE_X_DIGEST_POSTING=1`; proof publication requires no X credential.
+Posting failures remain outside the settlement path. Because the X endpoint does not expose an
 idempotency key, the worker includes a deterministic digest marker in each post
 and provides at-least-once, not exactly-once, delivery semantics.

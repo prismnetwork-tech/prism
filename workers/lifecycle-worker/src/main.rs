@@ -1,12 +1,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use k256::ecdsa::{
+    RecoveryId, Signature as EthereumSignature, VerifyingKey as EthereumVerifyingKey,
+};
 use prism_chain::{
     EthereumSigner, Finality, PreparedTransaction, RpcClient, address, selector, word_bytes32,
     word_u128,
@@ -17,13 +23,14 @@ use prism_protocol::{
     NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandReport, NodeOffer, NodeTelemetry,
     PublicReceipt, ROBINHOOD_CHAIN_ID, ReceiptAttestation, ReceiptOutcome, ReproExecutionEvidence,
     ReproExecutionReport, ReproExecutor, SettlementEvidence, TrustClass, node_id, receipt_hash,
-    verdict_digest, verifying_key,
+    validate_receipt_identity, verdict_digest, verifying_key,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Keccak256;
 use sqlx_core::{
-    query::query, query_as::query_as, query_scalar::query_scalar, types::Json as SqlJson,
+    acquire::Acquire, query::query, query_as::query_as, query_scalar::query_scalar,
+    types::Json as SqlJson,
 };
 use sqlx_postgres::{PgPool, PgPoolOptions};
 use tracing_subscriber::EnvFilter;
@@ -72,6 +79,8 @@ const CLOUD_OBSERVATION_INTERVAL_SECONDS: u64 = 45;
 const CLOUD_CAPACITY_REFRESH_INTERVAL_SECONDS: u64 = 30;
 const CLOUD_CLEANUP_RETRY_SECONDS: u64 = 60;
 const RPC_TRANSIENT_RETRY_SECONDS: u64 = 15;
+const TRANSACTION_REPREPARE_RETRY_SECONDS: u64 = 5;
+const TRANSACTION_BROADCAST_LIMIT_RETRY_SECONDS: u64 = 300;
 const RPC_MAINTENANCE_PACE_MILLIS: u64 = 150;
 /// LeaseStatus.Funded in the escrow's enum.
 const LEASE_STATUS_FUNDED: u8 = 1;
@@ -96,6 +105,13 @@ fn provider_failure_state(error: &anyhow::Error) -> (&'static str, &'static str)
     }
 }
 
+fn provider_state_is_latched(state: &str) -> bool {
+    matches!(
+        state,
+        "auth_blocked" | "permanent_blocked" | "operator_maintenance"
+    )
+}
+
 fn validated_provider_offer_ids(ids: Vec<u64>) -> anyhow::Result<Vec<u64>> {
     if ids.len() > 64 || ids.contains(&0) {
         anyhow::bail!("lifecycle action contains invalid failed provider offer IDs");
@@ -118,10 +134,13 @@ const CLOUD_CAPACITY_UPSERT: &str = "
         observed_at = NOW(),
         updated_at = NOW()
 ";
+// A superseded escrow's unfinished row no longer reserves this deployment, but
+// a provider machine keeps billing until it is actually destroyed.
 const BROKER_COMMITMENTS_QUERY: &str = "
     SELECT count(*) FROM (
         SELECT l.lease_id FROM leases l
-        WHERE l.state NOT IN ('finalized', 'refunded')
+        WHERE l.escrow_address = $1
+          AND l.state NOT IN ('finalized', 'refunded')
           AND EXISTS (
               SELECT 1 FROM cloud_capacity cc
               WHERE cc.node_id = l.document->>'node_id' AND cc.provider = 'vast'
@@ -130,6 +149,15 @@ const BROKER_COMMITMENTS_QUERY: &str = "
         SELECT ci.lease_id FROM cloud_instances ci
         WHERE ci.provider = 'vast' AND ci.status <> 'destroyed'
     ) commitments
+";
+const BROKER_BUSY_NODES_QUERY: &str = "
+    SELECT l.document->>'node_id' FROM leases l
+    WHERE l.escrow_address = $1
+      AND l.state NOT IN ('finalized', 'refunded')
+    UNION
+    SELECT l.document->>'node_id' FROM leases l
+    JOIN cloud_instances ci ON ci.lease_id = l.lease_id
+    WHERE ci.status <> 'destroyed'
 ";
 
 struct Worker {
@@ -146,6 +174,41 @@ struct Worker {
     last_cloud_capacity_refresh: tokio::sync::Mutex<Option<std::time::Instant>>,
     last_orphan_sweep: tokio::sync::Mutex<Option<std::time::Instant>>,
     last_cloud_observation: tokio::sync::Mutex<Option<std::time::Instant>>,
+}
+
+#[derive(Clone, Default)]
+struct Shutdown {
+    requested: Arc<AtomicBool>,
+    claim_gate: Arc<tokio::sync::Mutex<()>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Shutdown {
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    async fn request(&self) {
+        let _gate = self.claim_gate.lock().await;
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn claim_permit(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let permit = self.claim_gate.clone().lock_owned().await;
+        (!self.is_requested()).then_some(permit)
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// An id the escrow issued. Kept distinct from the internal `lease_id` in the
@@ -173,6 +236,20 @@ struct Action {
     kind: ActionKind,
     transaction: Option<PreparedTransaction>,
     failed_provider_offer_ids: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct ConfirmedAttempt {
+    transaction: PreparedTransaction,
+    block_number: u64,
+    block_hash: String,
+}
+
+#[derive(Debug)]
+enum AttemptObservation {
+    Confirmed(ConfirmedAttempt),
+    Pending(PreparedTransaction),
+    None,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -267,6 +344,87 @@ impl std::fmt::Display for CloudCleanupPending {
 }
 
 impl std::error::Error for CloudCleanupPending {}
+
+#[derive(Debug)]
+struct TransactionOutcomePending;
+
+impl std::fmt::Display for TransactionOutcomePending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a prior lifecycle transaction is still reconciling")
+    }
+}
+
+impl std::error::Error for TransactionOutcomePending {}
+
+#[derive(Debug)]
+struct TransactionRepreparePending;
+
+impl std::fmt::Display for TransactionRepreparePending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("transaction history is reconciled and a replacement can be prepared")
+    }
+}
+
+impl std::error::Error for TransactionRepreparePending {}
+
+#[derive(Debug)]
+struct TransactionBroadcastLimitReached;
+
+impl std::fmt::Display for TransactionBroadcastLimitReached {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("lifecycle transaction reached its broadcast-attempt limit")
+    }
+}
+
+impl std::error::Error for TransactionBroadcastLimitReached {}
+
+#[derive(Debug)]
+struct TransactionBindingError {
+    reason: &'static str,
+    detail: String,
+}
+
+impl TransactionBindingError {
+    fn new(reason: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TransactionBindingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "lifecycle transaction binding failed ({}): {}",
+            self.reason, self.detail
+        )
+    }
+}
+
+impl std::error::Error for TransactionBindingError {}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DecodedLegacyTransaction {
+    nonce: u64,
+    chain_id: u64,
+    destination: [u8; 20],
+    data: Vec<u8>,
+    signer: [u8; 20],
+    transaction_hash: String,
+}
+
+#[derive(Debug)]
+struct AccessReadinessPending;
+
+impl std::fmt::Display for AccessReadinessPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("onchain access is active while local gateway readiness is pending")
+    }
+}
+
+impl std::error::Error for AccessReadinessPending {}
 
 /// Whether a host has used up its boot budget. `ssh_key_attached_at` is set
 /// once per instance right after it is created and cleared whenever one is
@@ -415,10 +573,13 @@ fn decode_lease(bytes: &[u8]) -> anyhow::Result<OnchainLease> {
     }
     let mut created = [0u8; 8];
     created.copy_from_slice(&bytes[32 * 7 - 8..32 * 7]);
+    let mut started = [0u8; 8];
+    started.copy_from_slice(&bytes[32 * 8 - 8..32 * 8]);
     let mut ended = [0u8; 8];
     ended.copy_from_slice(&bytes[32 * 9 - 8..32 * 9]);
     Ok(OnchainLease {
         created_at: u64::from_be_bytes(created),
+        access_started_at: u64::from_be_bytes(started),
         access_ended_at: u64::from_be_bytes(ended),
         status: bytes[32 * 14 - 1],
     })
@@ -433,6 +594,7 @@ fn expirable(lease: OnchainLease, now: u64) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct OnchainLease {
     created_at: u64,
+    access_started_at: u64,
     /// Zero until access is closed. A renter can set this themselves with
     /// forceClose, so it moves without this worker doing anything.
     access_ended_at: u64,
@@ -512,6 +674,7 @@ async fn main() -> anyhow::Result<()> {
         last_orphan_sweep: tokio::sync::Mutex::new(None),
         last_cloud_observation: tokio::sync::Mutex::new(None),
     };
+    worker.audit_historical_transaction_bindings().await?;
     if let Some(vast) = worker.vast.as_ref() {
         tracing::info!(
             slots = vast.node_ids.len(),
@@ -520,10 +683,30 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
+    let shutdown = Shutdown::default();
+    let signal = shutdown.clone();
+    tokio::spawn(async move {
+        if let Err(error) = shutdown_signal().await {
+            tracing::error!(%error, "failed to install lifecycle shutdown signal");
+        }
+        signal.request().await;
+    });
+    run(&worker, run_once, &shutdown).await
+}
+
+async fn run(worker: &Worker, run_once: bool, shutdown: &Shutdown) -> anyhow::Result<()> {
     loop {
+        if shutdown.is_requested() {
+            tracing::info!("lifecycle shutdown complete before the next scan");
+            return Ok(());
+        }
         if let Err(error) = worker.scan().await {
             tracing::error!(%error, "lifecycle scan failed");
         }
+        let Some(claim_permit) = shutdown.claim_permit().await else {
+            tracing::info!("lifecycle shutdown complete before the next claim");
+            return Ok(());
+        };
         let claimed = match worker.claim().await {
             Ok(claimed) => claimed,
             Err(error) => {
@@ -531,11 +714,18 @@ async fn main() -> anyhow::Result<()> {
                 None
             }
         };
+        drop(claim_permit);
         let Some(action) = claimed else {
             if run_once {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                () = shutdown.wait() => {
+                    tracing::info!("lifecycle shutdown complete while idle");
+                    return Ok(());
+                }
+                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
             continue;
         };
         let action_id = action.action_id;
@@ -553,10 +743,268 @@ async fn main() -> anyhow::Result<()> {
         if run_once {
             return Ok(());
         }
+        if shutdown.is_requested() {
+            tracing::info!(%action_id, "lifecycle shutdown complete after the claimed action");
+            return Ok(());
+        }
     }
 }
 
 impl Worker {
+    fn escrow_address(&self) -> String {
+        format!("0x{}", hex::encode(self.escrow))
+    }
+
+    fn validate_transaction_binding(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> Result<String, TransactionBindingError> {
+        validate_lifecycle_transaction_binding(
+            transaction,
+            ROBINHOOD_CHAIN_ID,
+            self.escrow,
+            self.signer.address(),
+            &action.kind.calldata(action.chain_lease_id),
+        )
+    }
+
+    async fn escrow_gateway(&self) -> anyhow::Result<[u8; 20]> {
+        let encoded: String = self
+            .chain
+            .call(
+                "eth_call",
+                serde_json::json!([{
+                    "to": self.escrow_address(),
+                    "data": format!("0x{}", hex::encode(selector("gateway()")))
+                }, "latest"]),
+            )
+            .await?;
+        let bytes = hex::decode(encoded.strip_prefix("0x").unwrap_or(&encoded))?;
+        if bytes.len() != 32 || bytes[..12].iter().any(|byte| *byte != 0) {
+            anyhow::bail!("escrow returned an invalid gateway address");
+        }
+        let mut gateway = [0_u8; 20];
+        gateway.copy_from_slice(&bytes[12..]);
+        Ok(gateway)
+    }
+
+    async fn audit_historical_transaction_bindings(&self) -> anyhow::Result<()> {
+        let gateway = self
+            .escrow_gateway()
+            .await
+            .context("read the configured escrow gateway before transaction audit")?;
+        if gateway != self.signer.address() {
+            anyhow::bail!("configured lifecycle signer does not match the on-chain escrow gateway");
+        }
+        let mut database = self.pool.begin().await?;
+        query("SELECT pg_advisory_xact_lock($1)")
+            .bind(SIGNER_LOCK)
+            .execute(&mut *database)
+            .await?;
+        let attempts = query_as::<
+            _,
+            (
+                String,
+                String,
+                i64,
+                Uuid,
+                String,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                String,
+                String,
+            ),
+        >(
+            "SELECT attempt.transaction_hash, attempt.raw_transaction, \
+                    attempt.transaction_nonce, action.action_id, action.kind, \
+                    lease.escrow_address, lease.chain_lease_id, action.raw_transaction, \
+                    action.transaction_hash, action.transaction_nonce, action.status, lease.state \
+             FROM lifecycle_transaction_attempts AS attempt \
+             JOIN lifecycle_outbox AS action ON action.action_id = attempt.action_id \
+             JOIN leases AS lease ON lease.lease_id = action.lease_id \
+             WHERE attempt.generation_binding_state = 'pending' \
+               AND lease.escrow_address = $1 \
+             ORDER BY attempt.prepared_at, attempt.transaction_hash \
+             FOR UPDATE OF attempt, action, lease",
+        )
+        .bind(self.escrow_address())
+        .fetch_all(&mut *database)
+        .await?;
+        let mut verified = 0_u64;
+        let mut quarantined = 0_u64;
+        for (
+            transaction_hash,
+            raw_transaction,
+            transaction_nonce,
+            action_id,
+            kind,
+            escrow_address,
+            chain_lease_id,
+            action_raw,
+            action_hash,
+            action_nonce,
+            action_status,
+            lease_state,
+        ) in attempts
+        {
+            let prepared = PreparedTransaction {
+                nonce: u64::try_from(transaction_nonce)?,
+                raw_transaction,
+                transaction_hash: transaction_hash.clone(),
+            };
+            let expected = ActionKind::parse(&kind).and_then(|kind| {
+                Ok((
+                    address(&escrow_address)?,
+                    kind.calldata(ChainLeaseId(u64::try_from(chain_lease_id)?)),
+                ))
+            });
+            let audit = expected
+                .map_err(|error| {
+                    TransactionBindingError::new(
+                        "invalid_signed_transaction",
+                        format!("stored lifecycle identity is invalid: {error:#}"),
+                    )
+                })
+                .and_then(|(escrow, calldata)| {
+                    validate_lifecycle_transaction_binding(
+                        &prepared,
+                        ROBINHOOD_CHAIN_ID,
+                        escrow,
+                        self.signer.address(),
+                        &calldata,
+                    )
+                });
+            match audit {
+                Ok(signer) => {
+                    let updated = query(
+                        "UPDATE lifecycle_transaction_attempts AS attempt \
+                         SET signer_address = $2, generation_binding_state = 'verified' \
+                         FROM lifecycle_outbox AS action, leases AS lease \
+                         WHERE attempt.transaction_hash = $1 \
+                           AND attempt.action_id = action.action_id \
+                           AND action.action_id = $3 \
+                           AND action.lease_id = lease.lease_id \
+                           AND lease.escrow_address = $4 \
+                           AND lease.chain_lease_id = $5 \
+                           AND attempt.signer_address IS NULL \
+                           AND attempt.generation_binding_state = 'pending'",
+                    )
+                    .bind(&transaction_hash)
+                    .bind(signer)
+                    .bind(action_id)
+                    .bind(&escrow_address)
+                    .bind(chain_lease_id)
+                    .execute(&mut *database)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        anyhow::bail!(
+                            "historical lifecycle attempt {transaction_hash} changed during audit"
+                        );
+                    }
+                    verified += 1;
+                }
+                Err(error) => {
+                    let reason = error.reason;
+                    let updated = query(
+                        "UPDATE lifecycle_transaction_attempts AS attempt \
+                         SET generation_binding_state = 'quarantined', \
+                             generation_binding_reason = $2 \
+                         FROM lifecycle_outbox AS action, leases AS lease \
+                         WHERE attempt.transaction_hash = $1 \
+                           AND attempt.action_id = action.action_id \
+                           AND action.action_id = $3 \
+                           AND action.lease_id = lease.lease_id \
+                           AND lease.escrow_address = $4 \
+                           AND lease.chain_lease_id = $5 \
+                           AND attempt.generation_binding_state = 'pending'",
+                    )
+                    .bind(&transaction_hash)
+                    .bind(reason)
+                    .bind(action_id)
+                    .bind(&escrow_address)
+                    .bind(chain_lease_id)
+                    .execute(&mut *database)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        anyhow::bail!(
+                            "historical lifecycle attempt {transaction_hash} changed during quarantine"
+                        );
+                    }
+                    let cursor_matches = action_hash.as_deref() == Some(&transaction_hash)
+                        && action_raw.as_deref() == Some(prepared.raw_transaction.as_str())
+                        && action_nonce == Some(transaction_nonce);
+                    if cursor_matches {
+                        let rebuild = !matches!(lease_state.as_str(), "finalized" | "refunded")
+                            && action_status != "completed";
+                        let detached = query(
+                            "UPDATE lifecycle_outbox \
+                             SET raw_transaction = NULL, transaction_hash = NULL, \
+                                 transaction_nonce = NULL, confirmed_block = NULL, \
+                                 confirmed_block_hash = NULL, \
+                                 status = CASE WHEN $3 THEN 'queued' ELSE 'failed' END, \
+                                 attempts = CASE WHEN $3 THEN 0 ELSE attempts END, \
+                                 available_at = CASE WHEN $3 THEN NOW() ELSE available_at END, \
+                                 lease_until = NULL, \
+                                 last_error = $4, updated_at = NOW() \
+                             WHERE action_id = $1 AND transaction_hash = $2 \
+                               AND lease_id IN ( \
+                                   SELECT lease_id FROM leases \
+                                   WHERE escrow_address = $5 AND chain_lease_id = $6 \
+                               )",
+                        )
+                        .bind(action_id)
+                        .bind(&transaction_hash)
+                        .bind(rebuild)
+                        .bind(format!("historical lifecycle cursor quarantined: {reason}"))
+                        .bind(&escrow_address)
+                        .bind(chain_lease_id)
+                        .execute(&mut *database)
+                        .await?;
+                        if detached.rows_affected() != 1 {
+                            anyhow::bail!(
+                                "unsafe lifecycle cursor {transaction_hash} could not be detached"
+                            );
+                        }
+                    }
+                    tracing::error!(
+                        %transaction_hash,
+                        %action_id,
+                        reason,
+                        detail = %error.detail,
+                        "quarantined historical lifecycle transaction"
+                    );
+                    quarantined += 1;
+                }
+            }
+        }
+        let pending: i64 = query_scalar(
+            "SELECT COUNT(*) FROM lifecycle_transaction_attempts AS attempt \
+             JOIN lifecycle_outbox AS action ON action.action_id = attempt.action_id \
+             JOIN leases AS lease ON lease.lease_id = action.lease_id \
+             WHERE attempt.generation_binding_state = 'pending' \
+               AND lease.escrow_address = $1",
+        )
+        .bind(self.escrow_address())
+        .fetch_one(&mut *database)
+        .await?;
+        if pending != 0 {
+            anyhow::bail!("lifecycle transaction binding audit is incomplete");
+        }
+        database.commit().await?;
+        if verified > 0 || quarantined > 0 {
+            tracing::info!(
+                verified,
+                quarantined,
+                "audited historical lifecycle transactions"
+            );
+        }
+        Ok(())
+    }
+
     async fn scan(&self) -> anyhow::Result<()> {
         if let Err(error) = self.refresh_cloud_capacity().await {
             tracing::error!(%error, "cloud capacity refresh failed");
@@ -573,9 +1021,11 @@ impl Worker {
                     GREATEST(NOW(), created_at + INTERVAL '10 minutes') \
              FROM leases \
              WHERE state IN ('funded', 'provisioning', 'ready') \
+               AND escrow_address = $1 \
                AND created_at <= NOW() - INTERVAL '10 minutes' \
              ON CONFLICT (lease_id, kind) DO NOTHING",
         )
+        .bind(self.escrow_address())
         .execute(&self.pool)
         .await?;
         // Reconcile after the new worker starts, rather than in the schema
@@ -602,6 +1052,7 @@ impl Worker {
              LEFT JOIN node_tunnels t ON t.node_id = l.document->>'node_id' \
              LEFT JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
              WHERE l.state = 'active' \
+               AND l.escrow_address = $1 \
                AND (lc.access_started_at + \
                     make_interval(secs => (l.document->>'duration_seconds')::int) <= NOW() \
                     OR (ci.lease_id IS NULL AND ( \
@@ -615,6 +1066,7 @@ impl Worker {
                         OR ci.observed_at < NOW() - INTERVAL '150 seconds'))) \
              ON CONFLICT (lease_id, kind) DO NOTHING",
         )
+        .bind(self.escrow_address())
         .execute(&self.pool)
         .await?;
         query(
@@ -622,6 +1074,7 @@ impl Worker {
              SELECT md5(l.lease_id::text || ':refresh_grant')::uuid, l.lease_id, 'refresh_grant' \
              FROM leases l JOIN lease_lifecycle lc ON lc.lease_id = l.lease_id \
              WHERE l.state = 'active' \
+               AND l.escrow_address = $1 \
                AND lc.grant_expires_at <= NOW() + INTERVAL '10 minutes' \
                AND lc.access_started_at + \
                    make_interval(secs => (l.document->>'duration_seconds')::int) \
@@ -631,6 +1084,7 @@ impl Worker {
                    last_error = NULL, document = '{}'::jsonb, updated_at = NOW() \
              WHERE lifecycle_outbox.status = 'completed'",
         )
+        .bind(self.escrow_address())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -898,18 +1352,12 @@ impl Worker {
         // Nodes with a lease on them are not for sale, so they are neither
         // advertised nor counted against the hosts we found. A settled lease
         // whose provider cleanup is unfinished also keeps its slot closed.
-        let busy: BTreeSet<String> = query_scalar::<_, String>(
-            "SELECT document->>'node_id' FROM leases \
-             WHERE state NOT IN ('finalized', 'refunded') \
-             UNION \
-             SELECT l.document->>'node_id' FROM leases l \
-             JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
-             WHERE ci.status <> 'destroyed'",
-        )
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .collect();
+        let busy: BTreeSet<String> = query_scalar::<_, String>(BROKER_BUSY_NODES_QUERY)
+            .bind(self.escrow_address())
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .collect();
         let committed = self.broker_commitments().await?;
         let free: Vec<&String> = vast
             .node_ids
@@ -1079,19 +1527,14 @@ impl Worker {
             transaction.commit().await?;
             return Ok(());
         }
-        let current_busy: BTreeSet<String> = query_scalar::<_, String>(
-            "SELECT document->>'node_id' FROM leases \
-             WHERE state NOT IN ('finalized', 'refunded') \
-             UNION \
-             SELECT l.document->>'node_id' FROM leases l \
-             JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
-             WHERE ci.status <> 'destroyed'",
-        )
-        .fetch_all(&mut *transaction)
-        .await?
-        .into_iter()
-        .collect();
+        let current_busy: BTreeSet<String> = query_scalar::<_, String>(BROKER_BUSY_NODES_QUERY)
+            .bind(self.escrow_address())
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .collect();
         let committed: i64 = query_scalar(BROKER_COMMITMENTS_QUERY)
+            .bind(self.escrow_address())
             .fetch_one(&mut *transaction)
             .await?;
         let funded_slots = vast
@@ -1155,20 +1598,48 @@ impl Worker {
     }
 
     async fn provider_breaker_is_latched(&self) -> anyhow::Result<bool> {
-        query_scalar(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM cloud_provider_state \
-                 WHERE provider = 'vast' \
-                   AND state IN ('auth_blocked', 'permanent_blocked') \
-             )",
+        let state: Option<String> = query_scalar::<_, String>(
+            "SELECT state FROM cloud_provider_state WHERE provider = 'vast'",
         )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(state.as_deref().is_some_and(provider_state_is_latched))
+    }
+
+    async fn create_vast_instance(
+        &self,
+        vast: &VastBroker,
+        offer_id: u64,
+        image: &str,
+        lease_id: u64,
+    ) -> anyhow::Result<u64> {
+        let mut exclusion = self.pool.acquire().await?;
+        query("SELECT pg_advisory_lock($1)")
+            .bind(SCHEDULER_LOCK)
+            .execute(&mut *exclusion)
+            .await?;
+        let result = async {
+            let state: Option<String> =
+                query_scalar("SELECT state FROM cloud_provider_state WHERE provider = 'vast'")
+                    .fetch_optional(&mut *exclusion)
+                    .await?;
+            if state.as_deref().is_some_and(provider_state_is_latched) {
+                anyhow::bail!("Vast provider breaker is latched");
+            }
+            vast.create(offer_id, image, lease_id).await
+        }
+        .await;
+        let unlock = query("SELECT pg_advisory_unlock($1)")
+            .bind(SCHEDULER_LOCK)
+            .execute(&mut *exclusion)
+            .await;
+        unlock?;
+        result
     }
 
     async fn broker_commitments(&self) -> anyhow::Result<usize> {
         let committed: i64 = query_scalar(BROKER_COMMITMENTS_QUERY)
+            .bind(self.escrow_address())
             .fetch_one(&self.pool)
             .await?;
         Ok(usize::try_from(committed)?)
@@ -1183,7 +1654,9 @@ impl Worker {
                  balance_micros = EXCLUDED.balance_micros, state = 'healthy', \
                  failure_class = NULL, blocked_at = NULL, \
                  observed_at = NOW(), consecutive_failures = 0, updated_at = NOW() \
-             WHERE cloud_provider_state.state NOT IN ('auth_blocked', 'permanent_blocked')",
+             WHERE cloud_provider_state.state NOT IN ( \
+                 'auth_blocked', 'permanent_blocked', 'operator_maintenance' \
+             )",
         )
         .bind(balance_micros)
         .execute(&self.pool)
@@ -1210,14 +1683,20 @@ impl Worker {
                  balance_micros = COALESCE(EXCLUDED.balance_micros, \
                                            cloud_provider_state.balance_micros), \
                  state = CASE \
+                     WHEN cloud_provider_state.state = 'operator_maintenance' \
+                     THEN cloud_provider_state.state \
                      WHEN cloud_provider_state.state IN ('auth_blocked', 'permanent_blocked') \
                       AND EXCLUDED.state NOT IN ('auth_blocked', 'permanent_blocked') \
                      THEN cloud_provider_state.state ELSE EXCLUDED.state END, \
                  failure_class = CASE \
+                     WHEN cloud_provider_state.state = 'operator_maintenance' \
+                     THEN cloud_provider_state.failure_class \
                      WHEN cloud_provider_state.state IN ('auth_blocked', 'permanent_blocked') \
                       AND EXCLUDED.state NOT IN ('auth_blocked', 'permanent_blocked') \
                      THEN cloud_provider_state.failure_class ELSE EXCLUDED.failure_class END, \
                  blocked_at = CASE \
+                     WHEN cloud_provider_state.state = 'operator_maintenance' \
+                     THEN cloud_provider_state.blocked_at \
                      WHEN cloud_provider_state.state IN ('auth_blocked', 'permanent_blocked') \
                       AND EXCLUDED.state NOT IN ('auth_blocked', 'permanent_blocked') \
                      THEN cloud_provider_state.blocked_at \
@@ -1318,12 +1797,14 @@ impl Worker {
              FROM lifecycle_outbox o JOIN leases l ON l.lease_id = o.lease_id \
              WHERE (o.attempts < 100 OR o.status = 'submitted' \
                     OR o.kind IN ('close_access', 'expire_provision', 'finalize')) \
+               AND (o.kind = 'cleanup_cloud' OR l.escrow_address = $1) \
                AND o.available_at <= NOW() \
                AND (o.status IN ('queued', 'submitted') \
                     OR (o.status = 'processing' AND o.lease_until <= NOW())) \
              ORDER BY o.available_at, o.created_at LIMIT 1 \
              FOR UPDATE OF o SKIP LOCKED",
         )
+        .bind(self.escrow_address())
         .fetch_optional(&mut *transaction)
         .await?;
         let Some((
@@ -1390,31 +1871,49 @@ impl Worker {
     }
 
     async fn process(&self, mut action: Action) -> anyhow::Result<()> {
-        if action.kind == ActionKind::RefreshGrant {
-            return self.refresh_grant(&action).await;
-        }
         if action.kind == ActionKind::CleanupCloud {
             self.destroy_cloud_instance(action.lease_id)
                 .await
                 .map_err(|error| CloudCleanupPending(format!("{error:#}")))?;
             return self.skip_action(&action).await;
         }
-        if action.kind == ActionKind::StartAccess && action.transaction.is_none() {
-            // Funded is the only status a lease can still be started from.
-            // Without this check a refunded lease keeps renting machines for a
-            // renter who has already been paid back, and every attempt puts the
-            // lease back into a state that holds its node out of the market. One
-            // such lease sat in `provisioning` for hours after the escrow had
-            // refunded it, retrying start_access forty-six times.
-            match self.lease_status(action.chain_lease_id).await? {
-                LEASE_STATUS_FUNDED => self.probe(&action).await?,
-                settled @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
-                    self.adopt_settled_lease(&action, settled).await?;
-                    return self.skip_action(&action).await;
+        self.ensure_current_action(&action).await?;
+        if action.kind == ActionKind::RefreshGrant {
+            return self.refresh_grant(&action).await;
+        }
+        if action.kind == ActionKind::StartAccess {
+            // Reconcile every signed attempt before preparing or rebroadcasting
+            // one. An RPC can reject bytes as stale while another node is still
+            // propagating them; if those bytes land later, the escrow starts
+            // billing even though the outbox has moved on to a replacement.
+            let onchain = self.lease_summary(action.chain_lease_id).await?;
+            match onchain.status {
+                LEASE_STATUS_FUNDED if action.transaction.is_none() => self.probe(&action).await?,
+                LEASE_STATUS_FUNDED => {}
+                LEASE_STATUS_ACTIVE => {
+                    if onchain.access_started_at == 0 {
+                        anyhow::bail!("active escrow lease has no access start timestamp");
+                    }
+                    if let Some(confirmed) = self.confirmed_start_attempt(&action).await? {
+                        action.transaction = Some(confirmed.transaction);
+                        self.complete(
+                            action,
+                            confirmed.block_number,
+                            &confirmed.block_hash,
+                            onchain.access_started_at,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    self.reschedule_start_reconciliation(&action).await?;
+                    return Ok(());
                 }
-                // Already started, or disputed. Either way this action has
-                // nothing left to do, and guessing a settlement here would
-                // publish an outcome the chain never reached.
+                settled @ (LEASE_STATUS_FINALIZED | LEASE_STATUS_REFUNDED) => {
+                    return self.adopt_settled_lease(&action, settled).await;
+                }
+                // Disputed or settlement-proposed leases cannot be started.
+                // Their own actions will reconcile the money without issuing
+                // access this start never established.
                 status => {
                     tracing::warn!(
                         lease_id = action.lease_id,
@@ -1494,7 +1993,8 @@ impl Worker {
             .as_ref()
             .context("lifecycle transaction was not prepared")?;
         if !prepared_here {
-            self.chain.submit(transaction).await?;
+            self.submit_prepared_transaction(&action, transaction)
+                .await?;
         }
         match self
             .chain
@@ -1513,7 +2013,11 @@ impl Worker {
                 // marked failed while the escrow still held the deposit and the
                 // registry still held the node, so a transient revert became a
                 // permanent loss.
-                self.discard_prepared_transaction(&action).await?;
+                if self.reconcile_before_reprepare(&action).await? {
+                    return Err(TransactionOutcomePending.into());
+                }
+                self.discard_reverted_transaction(&action, transaction)
+                    .await?;
                 anyhow::bail!("lifecycle transaction reverted");
             }
             Finality::Confirmed {
@@ -1772,7 +2276,10 @@ impl Worker {
                     let mut launched = None;
                     let mut last_error = None;
                     for offer in candidates {
-                        match vast.create(offer.id, &context.lease.image, lease_id).await {
+                        match self
+                            .create_vast_instance(vast, offer.id, &context.lease.image, lease_id)
+                            .await
+                        {
                             Ok(instance_id) => {
                                 launched = Some((instance_id, offer, true));
                                 break;
@@ -2211,30 +2718,69 @@ impl Worker {
             .await?;
         let result = async {
             let existing = query_as::<_, (Option<String>, Option<String>, Option<i64>)>(
-                "SELECT raw_transaction, transaction_hash, transaction_nonce \
-                 FROM lifecycle_outbox \
-                 WHERE action_id = $1 AND claim_generation = $2 \
-                   AND status = 'processing' AND lease_until > NOW()",
+                "SELECT action.raw_transaction, action.transaction_hash, action.transaction_nonce \
+                 FROM lifecycle_outbox AS action \
+                 JOIN leases AS lease ON lease.lease_id = action.lease_id \
+                 WHERE action.action_id = $1 AND action.claim_generation = $2 \
+                   AND action.status = 'processing' AND action.lease_until > NOW() \
+                   AND lease.escrow_address = $3",
             )
             .bind(action.action_id)
             .bind(action.claim_generation)
+            .bind(self.escrow_address())
             .fetch_optional(&mut *connection)
             .await?
             .context("lifecycle action claim expired before transaction preparation")?;
             if let (Some(raw_transaction), Some(transaction_hash), Some(nonce)) = existing {
-                return Ok(PreparedTransaction {
+                let prepared = PreparedTransaction {
                     nonce: u64::try_from(nonce)?,
                     raw_transaction,
                     transaction_hash,
-                });
+                };
+                self.validate_transaction_binding(action, &prepared)?;
+                self.ensure_attempt_recorded(action, &prepared).await?;
+                return Ok(prepared);
             }
             let data = action.kind.calldata(action.chain_lease_id);
             let prepared = self
                 .chain
                 .prepare_transaction(&self.signer, self.escrow, &data, ROBINHOOD_CHAIN_ID)
                 .await?;
+            let signer_address = self.validate_transaction_binding(action, &prepared)?;
+            let mut database = connection.begin().await?;
+            let preserved: bool = query_scalar(
+                "WITH inserted AS ( \
+                     INSERT INTO lifecycle_transaction_attempts ( \
+                         transaction_hash, action_id, claim_generation, transaction_nonce, \
+                         signer_address, raw_transaction, status) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'prepared') \
+                     ON CONFLICT (transaction_hash) DO NOTHING \
+                     RETURNING transaction_hash \
+                 ) \
+                 SELECT EXISTS (SELECT 1 FROM inserted) OR EXISTS ( \
+                     SELECT 1 FROM lifecycle_transaction_attempts \
+                     WHERE transaction_hash = $1 AND action_id = $2 \
+                       AND transaction_nonce = $4 \
+                       AND signer_address = $5 \
+                       AND generation_binding_state = 'verified' \
+                       AND raw_transaction = $6 \
+                 )",
+            )
+            .bind(&prepared.transaction_hash)
+            .bind(action.action_id)
+            .bind(action.claim_generation)
+            .bind(i64::try_from(prepared.nonce)?)
+            .bind(&signer_address)
+            .bind(&prepared.raw_transaction)
+            .fetch_one(&mut *database)
+            .await?;
+            if !preserved {
+                database.rollback().await?;
+                anyhow::bail!("prepared lifecycle transaction was not preserved in history");
+            }
             let stored = query(
-                "UPDATE lifecycle_outbox SET raw_transaction = $2, transaction_hash = $3, \
+                "UPDATE lifecycle_outbox \
+                 SET raw_transaction = $2, transaction_hash = $3, \
                      transaction_nonce = $4, status = 'submitted', lease_until = NULL, \
                      updated_at = NOW() \
                  WHERE action_id = $1 AND claim_generation = $5 \
@@ -2243,14 +2789,16 @@ impl Worker {
             .bind(action.action_id)
             .bind(&prepared.raw_transaction)
             .bind(&prepared.transaction_hash)
-            .bind(prepared.nonce as i64)
+            .bind(i64::try_from(prepared.nonce)?)
             .bind(action.claim_generation)
-            .execute(&mut *connection)
+            .execute(&mut *database)
             .await?;
             if stored.rows_affected() != 1 {
+                database.rollback().await?;
                 anyhow::bail!("lifecycle action claim expired while preparing its transaction");
             }
-            self.chain.submit(&prepared).await?;
+            database.commit().await?;
+            self.submit_prepared_transaction(action, &prepared).await?;
             Ok::<_, anyhow::Error>(prepared)
         }
         .await;
@@ -2260,6 +2808,360 @@ impl Worker {
             .await;
         unlock?;
         result
+    }
+
+    async fn submit_prepared_transaction(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<()> {
+        self.validate_transaction_binding(action, transaction)?;
+        self.ensure_current_action(action).await?;
+        self.ensure_attempt_recorded(action, transaction).await?;
+        let status: String = query_scalar(
+            "SELECT status FROM lifecycle_transaction_attempts \
+             WHERE transaction_hash = $1 AND action_id = $2",
+        )
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(action.action_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if status == "confirmed" {
+            return Ok(());
+        }
+        if status == "superseded" {
+            if self.reconcile_before_reprepare(action).await? {
+                return Err(TransactionOutcomePending.into());
+            }
+            self.supersede_prepared_transaction(action, transaction)
+                .await?;
+            return Err(TransactionRepreparePending.into());
+        }
+        if status == "reverted" {
+            if self.reconcile_before_reprepare(action).await? {
+                return Err(TransactionOutcomePending.into());
+            }
+            self.discard_reverted_transaction(action, transaction)
+                .await?;
+            return Err(TransactionRepreparePending.into());
+        }
+        if self
+            .chain
+            .transaction_observed(&transaction.transaction_hash)
+            .await?
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.record_submission(action, transaction).await {
+            if error
+                .downcast_ref::<TransactionBroadcastLimitReached>()
+                .is_some()
+                && self.reconcile_before_reprepare(action).await?
+            {
+                return Err(TransactionOutcomePending.into());
+            }
+            return Err(error);
+        }
+        let result = self.chain.broadcast(transaction).await;
+        if let Err(error) = result {
+            if prism_chain::requires_transaction_reprepare(&error) {
+                if self.reconcile_before_reprepare(action).await? {
+                    return Err(TransactionOutcomePending.into());
+                }
+                self.supersede_prepared_transaction(action, transaction)
+                    .await
+                    .context("preserve and supersede stale lifecycle transaction")?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn ensure_attempt_recorded(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<()> {
+        let signer_address = self.validate_transaction_binding(action, transaction)?;
+        let preserved: bool = query_scalar(
+            "WITH inserted AS ( \
+                 INSERT INTO lifecycle_transaction_attempts ( \
+                     transaction_hash, action_id, claim_generation, transaction_nonce, \
+                     signer_address, raw_transaction, status) \
+                 VALUES ($1, $2, $3, $4, $6, $5, 'prepared') \
+                 ON CONFLICT (transaction_hash) DO NOTHING \
+                 RETURNING transaction_hash \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM inserted) OR EXISTS ( \
+                 SELECT 1 FROM lifecycle_transaction_attempts \
+                 WHERE transaction_hash = $1 AND action_id = $2 \
+                   AND transaction_nonce = $4 \
+                   AND signer_address = $6 \
+                   AND generation_binding_state = 'verified' \
+                   AND raw_transaction = $5 \
+             )",
+        )
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(action.action_id)
+        .bind(action.claim_generation)
+        .bind(i64::try_from(transaction.nonce)?)
+        .bind(transaction.raw_transaction.to_ascii_lowercase())
+        .bind(signer_address)
+        .fetch_one(&self.pool)
+        .await?;
+        if !preserved {
+            anyhow::bail!("lifecycle transaction hash conflicts with preserved evidence");
+        }
+        Ok(())
+    }
+
+    async fn record_submission(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<()> {
+        self.ensure_attempt_recorded(action, transaction).await?;
+        let submitted = query_scalar::<_, i16>(
+            "UPDATE lifecycle_transaction_attempts \
+             SET status = 'submitted', submitted_at = COALESCE(submitted_at, NOW()), \
+                 submission_count = submission_count + 1 \
+             WHERE transaction_hash = $1 AND action_id = $2 \
+               AND status IN ('prepared', 'submitted') AND submission_count < 100 \
+             RETURNING submission_count",
+        )
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(action.action_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if submitted.is_some() {
+            return Ok(());
+        }
+        let capped: bool = query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM lifecycle_transaction_attempts \
+                 WHERE transaction_hash = $1 AND action_id = $2 \
+                   AND status IN ('prepared', 'submitted') \
+                   AND submission_count >= 100 \
+             )",
+        )
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(action.action_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if capped {
+            return Err(TransactionBroadcastLimitReached.into());
+        }
+        anyhow::bail!("lifecycle transaction attempt cannot be submitted from its outcome")
+    }
+
+    async fn transaction_attempts(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Vec<PreparedTransaction>> {
+        query_as::<_, (String, i64, String)>(
+            "SELECT raw_transaction, transaction_nonce, transaction_hash \
+             FROM lifecycle_transaction_attempts \
+             WHERE action_id = $1 \
+               AND signer_address = $2 \
+               AND generation_binding_state = 'verified' \
+             ORDER BY prepared_at, transaction_hash",
+        )
+        .bind(action.action_id)
+        .bind(format!("0x{}", hex::encode(self.signer.address())))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(raw_transaction, nonce, transaction_hash)| {
+            let transaction = PreparedTransaction {
+                nonce: u64::try_from(nonce)?,
+                raw_transaction,
+                transaction_hash,
+            };
+            self.validate_transaction_binding(action, &transaction)?;
+            Ok(transaction)
+        })
+        .collect()
+    }
+
+    async fn observe_transaction_attempts(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<AttemptObservation> {
+        let mut pending = None;
+        for transaction in self.transaction_attempts(action).await? {
+            match self
+                .chain
+                .finality(&transaction.transaction_hash, self.confirmations)
+                .await?
+            {
+                Finality::Confirmed {
+                    block_number,
+                    block_hash,
+                } => {
+                    self.record_confirmed_attempt(action, &transaction, block_number, &block_hash)
+                        .await?;
+                    return Ok(AttemptObservation::Confirmed(ConfirmedAttempt {
+                        transaction,
+                        block_number,
+                        block_hash,
+                    }));
+                }
+                Finality::Reverted { .. } => {
+                    self.record_reverted_attempt(action, &transaction).await?;
+                }
+                Finality::Pending => {
+                    if pending.is_none()
+                        && self
+                            .chain
+                            .transaction_observed(&transaction.transaction_hash)
+                            .await?
+                    {
+                        pending = Some(transaction);
+                    }
+                }
+            }
+        }
+        Ok(pending
+            .map(AttemptObservation::Pending)
+            .unwrap_or(AttemptObservation::None))
+    }
+
+    async fn confirmed_start_attempt(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Option<ConfirmedAttempt>> {
+        match self.observe_transaction_attempts(action).await? {
+            AttemptObservation::Confirmed(confirmed) => {
+                let block_time = self.chain.block_timestamp(confirmed.block_number).await?;
+                let onchain = self.lease_summary(action.chain_lease_id).await?;
+                if onchain.status != LEASE_STATUS_ACTIVE
+                    || onchain.access_started_at == 0
+                    || block_time != onchain.access_started_at
+                {
+                    anyhow::bail!(
+                        "confirmed start transaction does not match the escrow access timestamp"
+                    );
+                }
+                Ok(Some(confirmed))
+            }
+            AttemptObservation::Pending(_) | AttemptObservation::None => Ok(None),
+        }
+    }
+
+    async fn reconcile_before_reprepare(&self, action: &Action) -> anyhow::Result<bool> {
+        match self.observe_transaction_attempts(action).await? {
+            AttemptObservation::Confirmed(confirmed) => {
+                self.select_canonical_attempt(action, &confirmed.transaction)
+                    .await?;
+                Ok(true)
+            }
+            AttemptObservation::Pending(transaction) => {
+                self.select_canonical_attempt(action, &transaction).await?;
+                Ok(true)
+            }
+            AttemptObservation::None if action.kind == ActionKind::StartAccess => {
+                Ok(self.lease_summary(action.chain_lease_id).await?.status == LEASE_STATUS_ACTIVE)
+            }
+            AttemptObservation::None => Ok(false),
+        }
+    }
+
+    async fn select_canonical_attempt(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<()> {
+        let selected = query(
+            "UPDATE lifecycle_outbox \
+             SET raw_transaction = $3, transaction_hash = $4, transaction_nonce = $5, \
+                 updated_at = NOW() \
+             WHERE action_id = $1 AND claim_generation = $2 \
+               AND status IN ('processing', 'submitted')",
+        )
+        .bind(action.action_id)
+        .bind(action.claim_generation)
+        .bind(&transaction.raw_transaction)
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(i64::try_from(transaction.nonce)?)
+        .execute(&self.pool)
+        .await?;
+        if selected.rows_affected() != 1 {
+            anyhow::bail!("lifecycle action claim changed during transaction reconciliation");
+        }
+        Ok(())
+    }
+
+    async fn record_confirmed_attempt(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+        block_number: u64,
+        block_hash: &str,
+    ) -> anyhow::Result<()> {
+        let recorded = query(
+            "UPDATE lifecycle_transaction_attempts \
+             SET status = 'confirmed', confirmed_at = COALESCE(confirmed_at, NOW()), \
+                 confirmed_block = COALESCE(confirmed_block, $3), \
+                 confirmed_block_hash = COALESCE(confirmed_block_hash, $4) \
+             WHERE transaction_hash = $1 AND action_id = $2 \
+               AND status IN ('prepared', 'submitted', 'superseded', 'confirmed') \
+               AND (confirmed_block IS NULL OR confirmed_block = $3) \
+               AND (confirmed_block_hash IS NULL OR confirmed_block_hash = $4)",
+        )
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(action.action_id)
+        .bind(i64::try_from(block_number)?)
+        .bind(block_hash.to_ascii_lowercase())
+        .execute(&self.pool)
+        .await?;
+        if recorded.rows_affected() != 1 {
+            anyhow::bail!("confirmed lifecycle transaction conflicts with attempt history");
+        }
+        Ok(())
+    }
+
+    async fn record_reverted_attempt(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<()> {
+        let recorded = query(
+            "UPDATE lifecycle_transaction_attempts \
+             SET status = 'reverted', reverted_at = COALESCE(reverted_at, NOW()) \
+             WHERE transaction_hash = $1 AND action_id = $2 \
+               AND status IN ('prepared', 'submitted', 'superseded', 'reverted')",
+        )
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(action.action_id)
+        .execute(&self.pool)
+        .await?;
+        if recorded.rows_affected() != 1 {
+            anyhow::bail!("reverted lifecycle transaction conflicts with attempt history");
+        }
+        Ok(())
+    }
+
+    async fn ensure_current_action(&self, action: &Action) -> anyhow::Result<()> {
+        let current: bool = query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM lifecycle_outbox AS outbox \
+                 JOIN leases AS lease ON lease.lease_id = outbox.lease_id \
+                 WHERE outbox.action_id = $1 \
+                   AND outbox.claim_generation = $2 \
+                   AND lease.escrow_address = $3 \
+                   AND (outbox.status = 'submitted' \
+                        OR (outbox.status = 'processing' AND outbox.lease_until > NOW())) \
+             )",
+        )
+        .bind(action.action_id)
+        .bind(action.claim_generation)
+        .bind(self.escrow_address())
+        .fetch_one(&self.pool)
+        .await?;
+        if !current {
+            anyhow::bail!("lifecycle action is not live for the configured escrow");
+        }
+        Ok(())
     }
 
     async fn complete(
@@ -2282,17 +3184,37 @@ impl Worker {
             }
             ActionKind::RefreshGrant | ActionKind::CleanupCloud => unreachable!(),
         }
+        let transaction = action
+            .transaction
+            .as_ref()
+            .context("completed lifecycle action has no transaction")?;
+        self.record_confirmed_attempt(&action, transaction, block_number, block_hash)
+            .await?;
+        query(
+            "UPDATE lifecycle_transaction_attempts \
+             SET status = 'superseded', superseded_at = COALESCE(superseded_at, NOW()) \
+             WHERE action_id = $1 AND transaction_hash <> $2 \
+               AND status IN ('prepared', 'submitted', 'superseded')",
+        )
+        .bind(action.action_id)
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .execute(&self.pool)
+        .await?;
         let completed = query(
             "UPDATE lifecycle_outbox SET status = 'completed', lease_until = NULL, \
                  confirmed_block = $2, confirmed_block_hash = $3, last_error = NULL, \
+                 raw_transaction = $5, transaction_hash = $6, transaction_nonce = $7, \
                  updated_at = NOW() \
              WHERE action_id = $1 AND claim_generation = $4 \
                AND status IN ('processing', 'submitted')",
         )
         .bind(action.action_id)
-        .bind(block_number as i64)
+        .bind(i64::try_from(block_number)?)
         .bind(block_hash.to_ascii_lowercase())
         .bind(action.claim_generation)
+        .bind(&transaction.raw_transaction)
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .bind(i64::try_from(transaction.nonce)?)
         .execute(&self.pool)
         .await?;
         if completed.rows_affected() != 1 {
@@ -2302,32 +3224,61 @@ impl Worker {
     }
 
     async fn complete_start(&self, action: &Action, block_time: u64) -> anyhow::Result<()> {
-        let started_at = DateTime::from_timestamp(block_time as i64, 0)
+        let started_at = DateTime::from_timestamp(i64::try_from(block_time)?, 0)
             .context("access start timestamp is invalid")?;
+        let transaction_hash = action
+            .transaction
+            .as_ref()
+            .context("start transaction is missing")?
+            .transaction_hash
+            .to_ascii_lowercase();
+        let mut database = self.pool.begin().await?;
+        let state: String = query_scalar("SELECT state FROM leases WHERE lease_id = $1 FOR UPDATE")
+            .bind(i64::try_from(action.lease_id)?)
+            .fetch_one(&mut *database)
+            .await?;
+        if !matches!(
+            state.as_str(),
+            "funded" | "provisioning" | "ready" | "active"
+        ) {
+            anyhow::bail!("local lease cannot adopt an onchain access start from state {state}");
+        }
         query(
             "UPDATE lease_lifecycle SET access_started_at = COALESCE(access_started_at, $2), \
                  start_transaction_hash = $3, updated_at = NOW() WHERE lease_id = $1",
         )
-        .bind(action.lease_id as i64)
+        .bind(i64::try_from(action.lease_id)?)
         .bind(started_at)
-        .bind(
-            action
-                .transaction
-                .as_ref()
-                .context("start transaction is missing")?
-                .transaction_hash
-                .to_ascii_lowercase(),
-        )
-        .execute(&self.pool)
+        .bind(transaction_hash)
+        .execute(&mut *database)
         .await?;
+        set_lease_state_in(&mut database, action.lease_id, LeaseState::Active).await?;
+        database.commit().await?;
+
         if should_issue_gateway_access(
             self.is_cloud_lease(action.lease_id).await?,
             self.is_batch_lease(action.lease_id).await?,
         ) {
-            self.issue_grant(action.lease_id, false).await?;
+            let context = self.lease_context(action.lease_id).await?;
+            if context.connection_id.is_none()
+                || context.node_ready_at.is_none()
+                || context.cuda_ready_at.is_none()
+                || context.gateway_ready_at.is_none()
+            {
+                return Err(AccessReadinessPending.into());
+            }
+            let ends_at =
+                started_at + chrono::Duration::seconds(i64::from(context.lease.duration_seconds));
+            if ends_at > Utc::now() {
+                self.issue_grant(action.lease_id, false).await?;
+            } else {
+                tracing::warn!(
+                    lease_id = action.lease_id,
+                    "adopted access after its grant window elapsed"
+                );
+            }
         }
-        self.set_lease_state(action.lease_id, LeaseState::Active)
-            .await
+        Ok(())
     }
 
     /// Records a close this worker did not perform and queues settlement from
@@ -2423,6 +3374,8 @@ impl Worker {
             // What the escrow numbered it, so a reader can find this lease on
             // chain. The internal id means nothing outside this database.
             lease_id: action.chain_lease_id.get().to_string(),
+            escrow_address: Some(self.escrow_address()),
+            chain_lease_id: Some(action.chain_lease_id.get().to_string()),
             node_id_hash: format!(
                 "0x{}",
                 hex::encode(Sha256::digest(context.lease.node_id.as_bytes()))
@@ -2468,6 +3421,7 @@ impl Worker {
                 .cloned()
                 .context("settlement proposal contains no receipt")?,
         )?;
+        self.enrich_receipt_identity(&mut receipt, action.chain_lease_id)?;
         receipt.transaction_hash = action
             .transaction
             .as_ref()
@@ -3170,20 +4124,71 @@ impl Worker {
         block_number: u64,
         block_hash: &str,
     ) -> anyhow::Result<()> {
-        query(
+        validate_receipt_identity(receipt)?;
+        let escrow_address = receipt
+            .escrow_address
+            .as_deref()
+            .context("receipt escrow identity is missing")?;
+        let chain_lease_id = receipt
+            .chain_lease_id
+            .as_deref()
+            .context("receipt chain identity is missing")?
+            .parse::<u64>()?;
+        let inserted = query_scalar::<_, Uuid>(
             "INSERT INTO proof_receipts \
-                 (receipt_id, lease_id, document, transaction_hash, block_number, block_hash) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (lease_id) DO NOTHING",
+                 (receipt_id, lease_id, escrow_address, chain_lease_id, document, \
+                  transaction_hash, block_number, block_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (lease_id) DO UPDATE SET receipt_id = proof_receipts.receipt_id \
+             WHERE proof_receipts.receipt_id = EXCLUDED.receipt_id \
+               AND proof_receipts.escrow_address = EXCLUDED.escrow_address \
+               AND proof_receipts.chain_lease_id = EXCLUDED.chain_lease_id \
+               AND proof_receipts.document = EXCLUDED.document \
+               AND proof_receipts.transaction_hash = EXCLUDED.transaction_hash \
+               AND proof_receipts.block_number = EXCLUDED.block_number \
+               AND proof_receipts.block_hash = EXCLUDED.block_hash \
+             RETURNING receipt_id",
         )
         .bind(receipt.receipt_id)
         .bind(internal_lease_id as i64)
+        .bind(escrow_address)
+        .bind(i64::try_from(chain_lease_id)?)
         .bind(SqlJson(receipt.clone()))
         .bind(receipt.transaction_hash.to_ascii_lowercase())
         .bind(block_number as i64)
         .bind(block_hash.to_ascii_lowercase())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
+        if inserted.is_none() {
+            anyhow::bail!("proof receipt conflicts with existing lease identity or evidence");
+        }
+        Ok(())
+    }
+
+    fn enrich_receipt_identity(
+        &self,
+        receipt: &mut PublicReceipt,
+        chain_lease_id: ChainLeaseId,
+    ) -> anyhow::Result<()> {
+        let escrow_address = self.escrow_address();
+        let chain_lease_id = chain_lease_id.get().to_string();
+        if receipt.lease_id != chain_lease_id {
+            anyhow::bail!("settlement receipt lease identity does not match lifecycle action");
+        }
+        if receipt
+            .escrow_address
+            .as_ref()
+            .is_some_and(|value| value != &escrow_address)
+            || receipt
+                .chain_lease_id
+                .as_ref()
+                .is_some_and(|value| value != &chain_lease_id)
+        {
+            anyhow::bail!("settlement receipt carries a conflicting chain identity");
+        }
+        receipt.escrow_address = Some(escrow_address);
+        receipt.chain_lease_id = Some(chain_lease_id);
+        validate_receipt_identity(receipt)?;
         Ok(())
     }
 
@@ -3211,19 +4216,18 @@ impl Worker {
     /// our own state. The public receipt is not published here, because a
     /// receipt names the settling transaction and we never observed one.
     async fn adopt_settled_lease(&self, action: &Action, status: u8) -> anyhow::Result<()> {
-        let (state, job) = if status == LEASE_STATUS_FINALIZED {
-            (LeaseState::Finalized, "finalized")
+        let state = if status == LEASE_STATUS_FINALIZED {
+            LeaseState::Finalized
         } else {
-            (LeaseState::Refunded, "failed")
+            LeaseState::Refunded
         };
         let mut transaction = self.pool.begin().await?;
         query(
-            "UPDATE settlement_jobs SET status = $2, \
+            "UPDATE settlement_jobs SET status = 'failed', \
                  last_error = 'settled on chain without an observed transaction', \
                  updated_at = NOW() WHERE lease_id = $1",
         )
         .bind(action.lease_id as i64)
-        .bind(job)
         .execute(&mut *transaction)
         .await?;
         set_lease_state_in(&mut transaction, action.lease_id, state).await?;
@@ -3355,29 +4359,75 @@ impl Worker {
         Ok(())
     }
 
-    async fn set_lease_state(&self, lease_id: u64, state: LeaseState) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
-        set_lease_state_in(&mut transaction, lease_id, state).await?;
-        transaction.commit().await?;
-        Ok(())
-    }
-
-    /// Forgets the transaction prepared for an action, so the next attempt
-    /// builds a fresh one against current chain state.
-    async fn discard_prepared_transaction(&self, action: &Action) -> anyhow::Result<()> {
-        let discarded = query(
-            "UPDATE lifecycle_outbox \
-             SET raw_transaction = NULL, transaction_hash = NULL, \
-                 transaction_nonce = NULL, updated_at = NOW() \
-             WHERE action_id = $1 AND claim_generation = $2 \
-               AND status IN ('processing', 'submitted')",
+    async fn supersede_prepared_transaction(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<()> {
+        let (preserved, discarded): (bool, bool) = query_as(
+            "WITH preserved AS ( \
+                 UPDATE lifecycle_transaction_attempts \
+                 SET status = CASE WHEN status = 'reverted' THEN status ELSE 'superseded' END, \
+                     superseded_at = CASE WHEN status = 'reverted' \
+                         THEN superseded_at ELSE COALESCE(superseded_at, NOW()) END \
+                 WHERE transaction_hash = $3 AND action_id = $1 \
+                   AND status IN ('prepared', 'submitted', 'superseded', 'reverted') \
+                 RETURNING transaction_hash \
+             ), discarded AS ( \
+                 UPDATE lifecycle_outbox \
+                 SET raw_transaction = NULL, transaction_hash = NULL, \
+                     transaction_nonce = NULL, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $2 \
+                   AND transaction_hash = $3 \
+                   AND status IN ('processing', 'submitted') \
+                 RETURNING action_id \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM preserved), EXISTS (SELECT 1 FROM discarded)",
         )
         .bind(action.action_id)
         .bind(action.claim_generation)
-        .execute(&self.pool)
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .fetch_one(&self.pool)
         .await?;
-        if discarded.rows_affected() != 1 {
-            anyhow::bail!("lifecycle action claim changed before discarding its transaction");
+        if !preserved {
+            anyhow::bail!("lifecycle transaction outcome changed before supersession");
+        }
+        if !discarded {
+            anyhow::bail!("lifecycle action claim changed before transaction supersession");
+        }
+        Ok(())
+    }
+
+    async fn discard_reverted_transaction(
+        &self,
+        action: &Action,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<()> {
+        let (preserved, discarded): (bool, bool) = query_as(
+            "WITH preserved AS ( \
+                 UPDATE lifecycle_transaction_attempts \
+                 SET status = 'reverted', reverted_at = COALESCE(reverted_at, NOW()) \
+                 WHERE transaction_hash = $3 AND action_id = $1 \
+                   AND status IN ('prepared', 'submitted', 'superseded', 'reverted') \
+                 RETURNING transaction_hash \
+             ), discarded AS ( \
+                 UPDATE lifecycle_outbox \
+                 SET raw_transaction = NULL, transaction_hash = NULL, \
+                     transaction_nonce = NULL, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $2 \
+                   AND transaction_hash = $3 \
+                   AND status IN ('processing', 'submitted') \
+                 RETURNING action_id \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM preserved), EXISTS (SELECT 1 FROM discarded)",
+        )
+        .bind(action.action_id)
+        .bind(action.claim_generation)
+        .bind(transaction.transaction_hash.to_ascii_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+        if !preserved || !discarded {
+            anyhow::bail!("reverted lifecycle transaction could not be preserved and released");
         }
         Ok(())
     }
@@ -3395,6 +4445,27 @@ impl Worker {
         .await?;
         if rescheduled.rows_affected() != 1 {
             anyhow::bail!("lifecycle action claim changed before rescheduling");
+        }
+        Ok(())
+    }
+
+    async fn reschedule_start_reconciliation(&self, action: &Action) -> anyhow::Result<()> {
+        let rescheduled = query(
+            "UPDATE lifecycle_outbox \
+             SET status = 'submitted', lease_until = NULL, \
+                 attempts = GREATEST(0, attempts - 1), \
+                 available_at = NOW() + INTERVAL '5 seconds', \
+                 last_error = 'waiting for the confirmed access-start transaction', \
+                 updated_at = NOW() \
+             WHERE action_id = $1 AND claim_generation = $2 \
+               AND status IN ('processing', 'submitted')",
+        )
+        .bind(action.action_id)
+        .bind(action.claim_generation)
+        .execute(&self.pool)
+        .await?;
+        if rescheduled.rows_affected() != 1 {
+            anyhow::bail!("start-access action claim changed during reconciliation");
         }
         Ok(())
     }
@@ -3417,6 +4488,95 @@ impl Worker {
             )
             .bind(action_id)
             .bind(CLOUD_CLEANUP_RETRY_SECONDS as f64)
+            .bind(message)
+            .bind(claim_generation)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if error.downcast_ref::<TransactionOutcomePending>().is_some() {
+            query(
+                "UPDATE lifecycle_outbox SET status = 'submitted', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + INTERVAL '1 second', \
+                     last_error = $2, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $3 \
+                   AND status IN ('processing', 'submitted')",
+            )
+            .bind(action_id)
+            .bind(message)
+            .bind(claim_generation)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if error.downcast_ref::<AccessReadinessPending>().is_some() {
+            query(
+                "UPDATE lifecycle_outbox SET status = 'submitted', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + INTERVAL '5 seconds', \
+                     last_error = $2, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $3 \
+                   AND status IN ('processing', 'submitted')",
+            )
+            .bind(action_id)
+            .bind(message)
+            .bind(claim_generation)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if error
+            .downcast_ref::<TransactionRepreparePending>()
+            .is_some()
+        {
+            query(
+                "UPDATE lifecycle_outbox SET status = 'queued', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + make_interval(secs => $2), \
+                     last_error = $3, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $4 \
+                   AND status IN ('processing', 'submitted')",
+            )
+            .bind(action_id)
+            .bind(TRANSACTION_REPREPARE_RETRY_SECONDS as f64)
+            .bind(message)
+            .bind(claim_generation)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if error
+            .downcast_ref::<TransactionBroadcastLimitReached>()
+            .is_some()
+        {
+            query(
+                "UPDATE lifecycle_outbox SET status = 'submitted', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + make_interval(secs => $2), \
+                     last_error = $3, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $4 \
+                   AND status IN ('processing', 'submitted')",
+            )
+            .bind(action_id)
+            .bind(TRANSACTION_BROADCAST_LIMIT_RETRY_SECONDS as f64)
+            .bind(message)
+            .bind(claim_generation)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if prism_chain::requires_transaction_reprepare(error) {
+            query(
+                "UPDATE lifecycle_outbox SET status = 'queued', lease_until = NULL, \
+                     attempts = GREATEST(0, attempts - 1), \
+                     available_at = NOW() + make_interval(secs => $2), \
+                     last_error = $3, updated_at = NOW() \
+                 WHERE action_id = $1 AND claim_generation = $4 \
+                   AND status IN ('processing', 'submitted')",
+            )
+            .bind(action_id)
+            .bind(TRANSACTION_REPREPARE_RETRY_SECONDS as f64)
             .bind(message)
             .bind(claim_generation)
             .execute(&self.pool)
@@ -3709,6 +4869,16 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
         query_scalar("SELECT to_regclass('public.cloud_provider_state')::text")
             .fetch_one(pool)
             .await?;
+    let provider_maintenance_state: bool = query_scalar(
+        "SELECT COALESCE(( \
+             SELECT POSITION('operator_maintenance' IN pg_get_constraintdef(oid)) > 0 \
+             FROM pg_constraint \
+             WHERE conrelid = 'cloud_provider_state'::regclass \
+               AND conname = 'cloud_provider_state_state_check' \
+         ), FALSE)",
+    )
+    .fetch_one(pool)
+    .await?;
     let managed_schema: bool = query_scalar(
         "SELECT \
              EXISTS ( \
@@ -3745,11 +4915,17 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
     )
     .fetch_one(pool)
     .await?;
+    let transaction_attempts: Option<String> =
+        query_scalar("SELECT to_regclass('public.lifecycle_transaction_attempts')::text")
+            .fetch_one(pool)
+            .await?;
     if present.is_none()
         || !rejections
         || managed_jobs.is_none()
         || provider_state.is_none()
+        || !provider_maintenance_state
         || !managed_schema
+        || transaction_attempts.is_none()
     {
         anyhow::bail!("control-plane lifecycle migrations have not been applied");
     }
@@ -3758,6 +4934,20 @@ async fn verify_schema(pool: &PgPool) -> anyhow::Result<()> {
 
 fn required_env(key: &str) -> anyhow::Result<String> {
     env::var(key).with_context(|| format!("{key} is required"))
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 fn is_lower_sha256(value: &str) -> bool {
@@ -3914,9 +5104,321 @@ fn bytes32(value: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("node id must contain 32 bytes"))
 }
 
+fn decode_legacy_transaction(raw: &str) -> anyhow::Result<DecodedLegacyTransaction> {
+    let encoded = raw
+        .strip_prefix("0x")
+        .context("lifecycle transaction must start with 0x")?;
+    let bytes = hex::decode(encoded)?;
+    let transaction = rlp::Rlp::new(&bytes);
+    if !transaction.is_list() || transaction.item_count()? != 9 {
+        anyhow::bail!("lifecycle transaction is not a signed legacy transaction");
+    }
+    let nonce: u64 = transaction.at(0)?.as_val()?;
+    let gas_price: u64 = transaction.at(1)?.as_val()?;
+    let gas_limit: u64 = transaction.at(2)?.as_val()?;
+    let destination = transaction.at(3)?.data()?;
+    let destination: [u8; 20] = destination
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("lifecycle transaction destination is invalid"))?;
+    let value: u64 = transaction.at(4)?.as_val()?;
+    if value != 0 {
+        anyhow::bail!("lifecycle transaction unexpectedly transfers value");
+    }
+    let data = transaction.at(5)?.data()?.to_vec();
+    let v: u64 = transaction.at(6)?.as_val()?;
+    let eip155 = v
+        .checked_sub(35)
+        .context("lifecycle transaction has no EIP-155 replay protection")?;
+    let chain_id = eip155 / 2;
+    let recovery_id = RecoveryId::from_byte((eip155 % 2) as u8)
+        .context("lifecycle transaction recovery id is invalid")?;
+    let signature = EthereumSignature::from_scalars(
+        padded_transaction_scalar(transaction.at(7)?.data()?)?,
+        padded_transaction_scalar(transaction.at(8)?.data()?)?,
+    )?;
+    if signature.normalize_s().is_some() {
+        anyhow::bail!("lifecycle transaction signature is not canonical");
+    }
+    let mut unsigned = rlp::RlpStream::new_list(9);
+    unsigned.append(&nonce);
+    unsigned.append(&gas_price);
+    unsigned.append(&gas_limit);
+    unsigned.append(&destination.as_slice());
+    unsigned.append(&0_u8);
+    unsigned.append(&data.as_slice());
+    unsigned.append(&chain_id);
+    unsigned.append(&0_u8);
+    unsigned.append(&0_u8);
+    let digest: [u8; 32] = Keccak256::digest(unsigned.out()).into();
+    let public_key = EthereumVerifyingKey::recover_from_prehash(&digest, &signature, recovery_id)?;
+    let point = public_key.to_encoded_point(false);
+    let signer: [u8; 20] = Keccak256::digest(&point.as_bytes()[1..])[12..]
+        .try_into()
+        .expect("Ethereum address is 20 bytes");
+    Ok(DecodedLegacyTransaction {
+        nonce,
+        chain_id,
+        destination,
+        data,
+        signer,
+        transaction_hash: format!("0x{}", hex::encode(Keccak256::digest(bytes))),
+    })
+}
+
+fn padded_transaction_scalar(value: &[u8]) -> anyhow::Result<[u8; 32]> {
+    if value.is_empty() || value.len() > 32 {
+        anyhow::bail!("lifecycle transaction signature scalar is invalid");
+    }
+    let mut padded = [0_u8; 32];
+    padded[32 - value.len()..].copy_from_slice(value);
+    Ok(padded)
+}
+
+fn validate_lifecycle_transaction_binding(
+    transaction: &PreparedTransaction,
+    expected_chain_id: u64,
+    expected_escrow: [u8; 20],
+    expected_signer: [u8; 20],
+    expected_calldata: &[u8],
+) -> Result<String, TransactionBindingError> {
+    let decoded = decode_legacy_transaction(&transaction.raw_transaction).map_err(|error| {
+        TransactionBindingError::new("invalid_signed_transaction", format!("{error:#}"))
+    })?;
+    if decoded.transaction_hash != transaction.transaction_hash {
+        return Err(TransactionBindingError::new(
+            "transaction_hash_mismatch",
+            "stored hash does not commit to the signed bytes",
+        ));
+    }
+    if decoded.nonce != transaction.nonce {
+        return Err(TransactionBindingError::new(
+            "signed_nonce_mismatch",
+            "stored nonce does not match the signed nonce",
+        ));
+    }
+    if decoded.chain_id != expected_chain_id {
+        return Err(TransactionBindingError::new(
+            "signed_chain_mismatch",
+            "signed transaction targets another chain",
+        ));
+    }
+    if decoded.destination != expected_escrow {
+        return Err(TransactionBindingError::new(
+            "signed_escrow_mismatch",
+            "signed transaction targets another escrow",
+        ));
+    }
+    if decoded.signer != expected_signer {
+        return Err(TransactionBindingError::new(
+            "signed_signer_mismatch",
+            "signed transaction was produced by another signer",
+        ));
+    }
+    if decoded.data != expected_calldata {
+        return Err(TransactionBindingError::new(
+            "calldata_mismatch",
+            "signed transaction targets another action or chain lease",
+        ));
+    }
+    Ok(format!("0x{}", hex::encode(decoded.signer)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn signed_lifecycle_transaction(
+        key: &str,
+        destination: [u8; 20],
+        calldata: &[u8],
+        chain_id: u64,
+        nonce: u64,
+    ) -> (PreparedTransaction, [u8; 20]) {
+        let signer = EthereumSigner::local(key).unwrap();
+        let gas_price = 1_u64;
+        let gas_limit = 200_000_u64;
+        let mut unsigned = rlp::RlpStream::new_list(9);
+        unsigned.append(&nonce);
+        unsigned.append(&gas_price);
+        unsigned.append(&gas_limit);
+        unsigned.append(&destination.as_slice());
+        unsigned.append(&0_u8);
+        unsigned.append(&calldata);
+        unsigned.append(&chain_id);
+        unsigned.append(&0_u8);
+        unsigned.append(&0_u8);
+        let digest: [u8; 32] = Keccak256::digest(unsigned.out()).into();
+        let signature = signer.sign_digest(&digest).await.unwrap();
+        let v = chain_id * 2 + 35 + u64::from(signature[64] - 27);
+        let mut signed = rlp::RlpStream::new_list(9);
+        signed.append(&nonce);
+        signed.append(&gas_price);
+        signed.append(&gas_limit);
+        signed.append(&destination.as_slice());
+        signed.append(&0_u8);
+        signed.append(&calldata);
+        signed.append(&v);
+        signed.append(&signature_scalar(&signature[..32]));
+        signed.append(&signature_scalar(&signature[32..64]));
+        let raw = signed.out().to_vec();
+        (
+            PreparedTransaction {
+                nonce,
+                transaction_hash: format!("0x{}", hex::encode(Keccak256::digest(&raw))),
+                raw_transaction: format!("0x{}", hex::encode(raw)),
+            },
+            signer.address(),
+        )
+    }
+
+    fn signature_scalar(value: &[u8]) -> &[u8] {
+        let first = value
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(value.len() - 1);
+        &value[first..]
+    }
+
+    #[tokio::test]
+    async fn signed_lifecycle_binding_covers_every_execution_identity() {
+        let escrow = [0x11; 20];
+        let calldata = ActionKind::Finalize.calldata(ChainLeaseId(42));
+        let (transaction, signer) = signed_lifecycle_transaction(
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            escrow,
+            &calldata,
+            ROBINHOOD_CHAIN_ID,
+            7,
+        )
+        .await;
+        assert_eq!(
+            validate_lifecycle_transaction_binding(
+                &transaction,
+                ROBINHOOD_CHAIN_ID,
+                escrow,
+                signer,
+                &calldata,
+            )
+            .unwrap(),
+            format!("0x{}", hex::encode(signer))
+        );
+
+        let cases = [
+            (
+                validate_lifecycle_transaction_binding(
+                    &transaction,
+                    ROBINHOOD_CHAIN_ID + 1,
+                    escrow,
+                    signer,
+                    &calldata,
+                ),
+                "signed_chain_mismatch",
+            ),
+            (
+                validate_lifecycle_transaction_binding(
+                    &transaction,
+                    ROBINHOOD_CHAIN_ID,
+                    [0x22; 20],
+                    signer,
+                    &calldata,
+                ),
+                "signed_escrow_mismatch",
+            ),
+            (
+                validate_lifecycle_transaction_binding(
+                    &transaction,
+                    ROBINHOOD_CHAIN_ID,
+                    escrow,
+                    [0x33; 20],
+                    &calldata,
+                ),
+                "signed_signer_mismatch",
+            ),
+            (
+                validate_lifecycle_transaction_binding(
+                    &transaction,
+                    ROBINHOOD_CHAIN_ID,
+                    escrow,
+                    signer,
+                    &ActionKind::Finalize.calldata(ChainLeaseId(43)),
+                ),
+                "calldata_mismatch",
+            ),
+        ];
+        for (result, reason) in cases {
+            assert_eq!(result.unwrap_err().reason, reason);
+        }
+
+        let mut wrong_nonce = transaction.clone();
+        wrong_nonce.nonce += 1;
+        assert_eq!(
+            validate_lifecycle_transaction_binding(
+                &wrong_nonce,
+                ROBINHOOD_CHAIN_ID,
+                escrow,
+                signer,
+                &calldata,
+            )
+            .unwrap_err()
+            .reason,
+            "signed_nonce_mismatch"
+        );
+        let mut wrong_hash = transaction;
+        wrong_hash.transaction_hash = format!("0x{}", "00".repeat(32));
+        assert_eq!(
+            validate_lifecycle_transaction_binding(
+                &wrong_hash,
+                ROBINHOOD_CHAIN_ID,
+                escrow,
+                signer,
+                &calldata,
+            )
+            .unwrap_err()
+            .reason,
+            "transaction_hash_mismatch"
+        );
+    }
+
+    #[test]
+    fn malformed_signed_lifecycle_bytes_are_rejected_before_rebroadcast() {
+        let transaction = PreparedTransaction {
+            nonce: 0,
+            raw_transaction: "0x04".to_owned(),
+            transaction_hash: format!("0x{}", "00".repeat(32)),
+        };
+        assert_eq!(
+            validate_lifecycle_transaction_binding(
+                &transaction,
+                ROBINHOOD_CHAIN_ID,
+                [0x11; 20],
+                [0x22; 20],
+                &[],
+            )
+            .unwrap_err()
+            .reason,
+            "invalid_signed_transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_the_claim_gate_and_wakes_waiters() {
+        let shutdown = Shutdown::default();
+        let permit = shutdown.claim_permit().await.unwrap();
+        let requester = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move { shutdown.request().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_requested());
+
+        drop(permit);
+        requester.await.unwrap();
+        assert!(shutdown.is_requested());
+        assert!(shutdown.claim_permit().await.is_none());
+        tokio::time::timeout(Duration::from_millis(50), shutdown.wait())
+            .await
+            .unwrap();
+    }
 
     /// The retry path tells a booting box apart from a broken one by downcast,
     /// so it has to survive whatever context a caller adds on the way up.
@@ -3945,6 +5447,13 @@ mod tests {
                 .downcast_ref::<StillProvisioning>()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn active_access_readiness_wait_stays_recognisable_through_context() {
+        let error = anyhow::Error::from(AccessReadinessPending)
+            .context("adopt onchain access for lease 39");
+        assert!(error.downcast_ref::<AccessReadinessPending>().is_some());
     }
 
     #[test]
@@ -4216,6 +5725,7 @@ mod tests {
     fn only_an_unprovisioned_lease_past_its_window_is_expirable() {
         let now = 1_000_000u64;
         let funded_and_stale = OnchainLease {
+            access_started_at: 0,
             access_ended_at: 0,
             created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
             status: 1,
@@ -4223,6 +5733,7 @@ mod tests {
         assert!(expirable(funded_and_stale, now));
 
         let funded_but_fresh = OnchainLease {
+            access_started_at: 0,
             access_ended_at: 0,
             created_at: now - 60,
             status: 1,
@@ -4234,6 +5745,7 @@ mod tests {
 
         for status in [0u8, 2, 3, 4, 5, 6] {
             let other = OnchainLease {
+                access_started_at: 0,
                 access_ended_at: 0,
                 created_at: now - PROVISION_TIMEOUT_SECONDS - 1,
                 status,
@@ -4255,6 +5767,16 @@ mod tests {
         assert_eq!(lease.created_at, 1_754_000_000);
         assert_eq!(lease.status, 5);
         assert!(decode_lease(&blob[..32 * 13]).is_err());
+    }
+
+    #[test]
+    fn provider_latches_block_new_cloud_instances() {
+        for state in ["auth_blocked", "permanent_blocked", "operator_maintenance"] {
+            assert!(provider_state_is_latched(state), "{state} must latch");
+        }
+        for state in ["healthy", "credit_blocked", "transient_blocked"] {
+            assert!(!provider_state_is_latched(state), "{state} may recover");
+        }
     }
 
     #[test]
@@ -4359,6 +5881,7 @@ mod tests {
 
         let lease = decode_lease(&bytes).unwrap();
         assert_eq!(lease.created_at, 1_700_000_000);
+        assert_eq!(lease.access_started_at, 1_700_000_111);
         assert_eq!(lease.access_ended_at, 1_700_000_222);
         assert_eq!(lease.status, LEASE_STATUS_ACTIVE);
 

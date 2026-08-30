@@ -26,10 +26,16 @@ import tempfile
 QUERY = (
     "select coalesce(json_agg(receipt order by block_number desc), '[]'::json)::text from ("
     "  select r.block_number,"
-    "         r.document || jsonb_build_object('escrow_address', l.escrow_address) as receipt"
+    "         r.document || jsonb_build_object("
+    "           'escrow_address', r.escrow_address,"
+    "           'chain_lease_id', r.chain_lease_id::text"
+    "         ) as receipt"
     "  from proof_receipts r"
     "  join leases l on l.lease_id = r.lease_id"
-    "  where r.document->>'outcome' = 'finalized'"
+    "    and l.escrow_address = r.escrow_address"
+    "    and l.chain_lease_id = r.chain_lease_id"
+    "  where r.publication_state <> 'quarantined'"
+    "    and r.document->>'outcome' = 'finalized'"
     ") as joined;"
 )
 
@@ -44,6 +50,7 @@ REQUIRED_FIELDS = (
     "receipt_hash",
     "transaction_hash",
     "escrow_address",
+    "chain_lease_id",
 )
 
 # The receipt hash is what the chain committed to, so it is recomputed here
@@ -53,7 +60,7 @@ REQUIRED_FIELDS = (
 # canonical JSON there is serde_json::to_string and that emits fields as
 # declared, not sorted. Postgres hands jsonb back in its own key order, so the
 # payload is rebuilt from these tuples rather than from the row as it arrives.
-# escrow_address is joined on at publication and was never in the hash.
+# Chain identity is attached at publication and is not part of the legacy hash.
 PAYLOAD_FIELDS = (
     "receipt_id",
     "lease_id",
@@ -126,6 +133,22 @@ def check(receipts: list) -> None:
             )
         if receipt["outcome"] != "finalized":
             raise SystemExit(f"receipt {receipt['receipt_id']} is not finalized")
+        escrow_address = receipt["escrow_address"]
+        chain_lease_id = receipt["chain_lease_id"]
+        if (
+            not isinstance(escrow_address, str)
+            or len(escrow_address) != 42
+            or not escrow_address.startswith("0x")
+            or any(character not in "0123456789abcdef" for character in escrow_address[2:])
+        ):
+            raise SystemExit(f"receipt {receipt['receipt_id']} has an invalid escrow identity")
+        if (
+            not isinstance(chain_lease_id, str)
+            or not chain_lease_id.isdigit()
+            or chain_lease_id.startswith("0")
+            or chain_lease_id != receipt["lease_id"]
+        ):
+            raise SystemExit(f"receipt {receipt['receipt_id']} has an invalid chain lease identity")
         trust = receipt.get("trust_class")
         if trust is not None:
             if trust not in TRUST_CLASSES:
@@ -201,6 +224,7 @@ PUBLISHED_RECEIPTS = [
         "receipt_hash": "6423582a59bb54c1afac11202e20aaf1235998d41e0965284961e09f9ffc764e",
         "failure_class": None,
         "escrow_address": "0x62c042265991bea17b07229322a01850974626da",
+        "chain_lease_id": "52",
         "runtime_seconds": 900,
         "transaction_hash": "0x96e26448a09ba301951452f737038c1d4443c97af875ea509b2a547e2d4a0301",
         "charged_base_units": 199800,
@@ -216,6 +240,7 @@ PUBLISHED_RECEIPTS = [
         "receipt_hash": "b51ff6f0b21eb8584fb2b36a986489a448da8ab997a88fa2014954c2ed49a915",
         "failure_class": None,
         "escrow_address": "0x71df0ef3bc81022cb3bec0b1a05f52f12bafcded",
+        "chain_lease_id": "32",
         "runtime_seconds": 600,
         "transaction_hash": "0x44b1f9ec5bc20b387faa4fe7292ca3b5d5dc0a36c9478e6dc30d136a0038af3c",
         "charged_base_units": 133200,
@@ -253,6 +278,7 @@ def self_test() -> int:
         "receipt_hash": "c63e4690f2e6be23ecf474e2f5e813b3eecce5b36a3d4a2b39b3c6e87e7de135",
         "transaction_hash": "0x" + "c" * 64,
         "escrow_address": "0x" + "e" * 40,
+        "chain_lease_id": "128",
     }
     assert receipt_hash(credited) == credited["receipt_hash"], (
         "the Python publisher and Rust credited receipt hash disagree"
@@ -312,6 +338,7 @@ def self_test() -> int:
         "repro": repro,
         "transaction_hash": "0x" + "d" * 64,
         "escrow_address": "0x" + "e" * 40,
+        "chain_lease_id": "129",
     }
     reproduced["receipt_hash"] = (
         "947448674b4c449999cf2106d7cd55f7a3e3041f3f4534086e8e9466fc6d395d"

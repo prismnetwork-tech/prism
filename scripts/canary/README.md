@@ -41,7 +41,7 @@ npm start -- --dry-run
   funding an escrow for GPU compute.
 - **After the lease window:** the network proposes settlement (`SettlementProposed`
   with the receipt hash).
-- **24h later:** `finalize()` becomes callable (`DISPUTE_WINDOW`), the escrow settles,
+- **Five minutes later:** `finalize()` becomes callable (`DISPUTE_WINDOW`), the escrow settles,
   and the receipt publishes to the public proof feed.
 
 Pre-production and unaudited. Run against a funded wallet you control.

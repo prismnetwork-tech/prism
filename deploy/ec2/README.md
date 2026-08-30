@@ -1,9 +1,9 @@
 # EC2 deployment
 
 This is the single-host topology for the launch path. It runs PostgreSQL, the
-Rust control plane, lifecycle and settlement workers, the access gateway with
-its Valkey grant store, and a Caddy TLS edge on EC2. The public web application
-remains on Render and is proxied by Caddy for `prismnetwork.tech`.
+Rust control plane, lifecycle, settlement and proof workers, the access gateway
+with its Valkey grant store, and a Caddy TLS edge on EC2. The public web
+application remains on Render and is proxied by Caddy for `prismnetwork.tech`.
 
 The Compose configuration passes repository validation. The repository does
 not contain evidence that a particular EC2 host, backup policy or recovery
@@ -18,12 +18,13 @@ Included:
 - Control plane
 - Vast lifecycle worker
 - KMS-backed settlement worker
+- Chain-verified proof artifact worker
 - Access gateway with the mTLS node tunnel and the renter relay
 - Valkey-backed temporary access state
 
 Intentionally excluded:
 
-- Proof and X publishing worker
+- X posting by default; it is a separate explicit opt-in
 - Operations monitor and Prometheus
 - High availability or managed backups
 
@@ -60,6 +61,9 @@ addresses, RPC URL, KMS key identifiers and the comma-separated
 Managed batch execution also requires `PRISM_REPRO_WORKER_IMAGE`; the worker
 reuses the access-credential encryption key and gateway KMS key already used by
 the control and lifecycle services.
+Proof publication also requires `PRISM_PROOF_WORKER_IMAGE`,
+`PRISM_PUBLIC_PROOF_URL` and `PRISM_PROOF_CONFIRMATIONS`. It does not require an
+X credential.
 The gateway additionally needs `PRISM_ACCESS_GATEWAY_IMAGE`,
 `PRISM_GATEWAY_HMAC_KEY`, `PRISM_GATEWAY_CONTROL_TOKEN` and
 `PRISM_REDIS_PASSWORD`. Every one of these belongs in the env file. Passing a
@@ -78,7 +82,7 @@ registry. An amd64 deployment needs a native amd64 builder, not emulation.
 release=$(git rev-parse HEAD)
 tag=$(git rev-parse --short=12 HEAD)
 
-for binary in prism-control-plane prism-lifecycle-worker prism-repro-worker prism-settlement-worker; do
+for binary in prism-control-plane prism-lifecycle-worker prism-repro-worker prism-settlement-worker prism-proof-worker; do
   docker buildx build --platform linux/arm64 --provenance=false --load \
     --file deploy/Dockerfile.rust \
     --build-arg "BINARY=$binary" \
@@ -87,7 +91,7 @@ for binary in prism-control-plane prism-lifecycle-worker prism-repro-worker pris
 done
 ```
 
-Transfer and load those exact images on the host. Persist all four references
+Transfer and load those exact images on the host. Persist all five references
 in `/opt/prism/.env`; shell-only assignments do not survive the next Compose
 operation:
 
@@ -96,20 +100,71 @@ PRISM_CONTROL_PLANE_IMAGE=prism-control-plane:<tag>
 PRISM_LIFECYCLE_WORKER_IMAGE=prism-lifecycle-worker:<tag>
 PRISM_REPRO_WORKER_IMAGE=prism-repro-worker:<tag>
 PRISM_SETTLEMENT_WORKER_IMAGE=prism-settlement-worker:<tag>
+PRISM_PROOF_WORKER_IMAGE=prism-proof-worker:<tag>
 ```
 
-Back up Postgres and the deployment files first. Start the control plane alone,
-wait for its health check, and verify the newly applied migrations before
-starting the coordinated workers:
+Back up Postgres and the deployment files first. Drain HTTP traffic, then stop
+admissions, every database writer and both proof publishers before migration
+0026 captures old signed cursor rows. The new control image's migration-only
+mode exits before registry, chain or HTTP startup, so no quote can be accepted
+between migration and the provider maintenance latch. Never restart an old
+worker after the new migrations are installed.
 
 ```sh
-docker compose up -d --no-deps --pull never control-plane
-docker compose up -d --no-deps --pull never lifecycle-worker repro-worker settlement-worker
+docker compose stop -t 180 \
+  control-plane lifecycle-worker repro-worker settlement-worker proof-worker
+if systemctl list-unit-files prism-proof-index.timer --no-legend 2>/dev/null \
+  | grep -q '^prism-proof-index.timer'; then
+  sudo systemctl disable --now prism-proof-index.timer
+fi
+if systemctl is-active --quiet prism-proof-index.timer; then
+  echo 'static proof publisher is still active' >&2
+  exit 1
+fi
+docker compose ps --status running \
+  control-plane lifecycle-worker repro-worker settlement-worker proof-worker
+docker compose run --rm --no-deps \
+  -e PRISM_RUN_MIGRATIONS_ONLY=1 control-plane
+docker compose exec -T postgres psql -U prism -d prism -v ON_ERROR_STOP=1 -c \
+  'SELECT version, success FROM _sqlx_migrations WHERE version BETWEEN 25 AND 28 ORDER BY version;'
 ```
 
-The public web/MCP image and any deployed proof worker or node daemon must be
-built from the same release commit. Verify every service's recorded build SHA
-before admitting new work.
+The `compose ps` command must print no containers, and the migration query must
+return exactly four successful rows. Stop if either invariant fails.
+
+Migration 0026 automatically archives and clears only proposal-only cursors it
+can prove were never signed or confirmed. Inspect those immutable snapshots in
+`settlement_legacy_partial_cursors`. If the migration reports any other partial
+cursor, it aborts before changing the schema or installing the job trigger;
+review the preserved fields and do not bypass the guard.
+
+Keep all normal workers and the control plane stopped. Continue with the
+[historical-generation maintenance drain](../../docs/vast-launch.md#historical-generation-maintenance-drain):
+pause both escrows, install `operator_maintenance` under advisory lock `4663`,
+drain the historical generation and then the current generation with only
+explicit generation-bound hardened processes, and cut proof publication to
+exactly one worker. A generic settlement, lifecycle or repro start before that
+drain completes is prohibited.
+
+Each generation's settlement startup audit recomputes the raw transaction hash,
+recovers the signer, validates chain `4663`, destination, nonce, calldata,
+proposal and receipt binding, and resolves signer/nonce ownership. Do not
+continue with a generation binding still `pending`, a nonce in `conflict`, or a
+current job cursor pointing at `quarantined` bytes. Preserve invalid attempts
+and reconcile them from exact chain evidence; never edit reservations or invent
+a signer.
+
+After the runbook clears only the maintenance latch and one current lifecycle
+owner has rebuilt fresh provider health, start the remaining current workers.
+Unpause only the current escrow and start the control plane last:
+
+```sh
+docker compose up -d --no-deps --pull never settlement-worker repro-worker proof-worker
+docker compose up -d --no-deps --pull never control-plane
+```
+
+The public web/MCP image and node daemon must be built from the same release
+commit. Verify every service's recorded build SHA before admitting new work.
 
 ### Alerts
 
@@ -221,10 +276,13 @@ is the renter relay that `PRISM_PUBLIC_RELAY_PORT` already advertises. Restrict
 SSH to an operator allowlist and do not expose PostgreSQL, Valkey, the
 control-plane container port or the gateway's 8081 control port.
 
-## Proof index
+## Legacy proof bridge and cutover
 
-`prismnetwork.tech/proof` reads `index.json` from the edge, which serves it out
-of `/opt/prism/proof-artifacts`. Publish it with:
+`prismnetwork.tech/proof` reads `/proof/index.json` from the edge, which serves
+it out of `/opt/prism/proof-artifacts`. Do not install or enable the static
+bridge on a new deployment or after migration 0027. The following commands
+document only the temporary publisher used by an older release before the
+stop-all-writers upgrade sequence:
 
 ```sh
 sudo install -m 0755 scripts/publish-proof-index.py /usr/local/sbin/publish-proof-index.py
@@ -235,8 +293,62 @@ sudo systemctl enable --now prism-proof-index.timer
 
 The timer refreshes every fifteen minutes. Run
 `publish-proof-index.py --dry-run` to see what would be published without
-writing. Only finalized receipts are published; refunded rows are mostly
-provisioning tests rather than work anyone paid for.
+writing. During the static-publisher bridge, valid `pending` and `published`
+rows remain eligible so migration 27 does not erase the existing public feed;
+`quarantined` rows never are. Disable this timer as part of the cutover before
+enabling the Rust proof worker or accepting new receipt producers. The publisher
+requires the stored escrow/chain identity to match the lease, lowercase
+`escrow_address` plus decimal `chain_lease_id`, and requires `chain_lease_id` to
+equal the receipt's legacy `lease_id`. It also recomputes the legacy receipt hash
+before writing. The two additive identity fields are not part of that hash.
+Refunded rows are mostly provisioning tests rather than work anyone paid for.
+
+Prepare the shared bind mount, stop the bridge, then start exactly one database
+proof worker:
+
+```sh
+sudo install -d -m 0755 -o 10001 -g 10001 /opt/prism/proof-artifacts
+sudo chown -R 10001:10001 /opt/prism/proof-artifacts
+sudo systemctl disable --now prism-proof-index.timer
+docker compose --env-file deploy/ec2/.env -f deploy/ec2/compose.yml \
+  up -d --no-deps --pull never proof-worker
+```
+
+The worker holds a PostgreSQL advisory lock for
+its lifetime and refuses to start when another publisher owns the lock. Migration
+27 backfills exact identity, preserves receipt documents and hashes whose legacy
+lease identity disagrees, and moves those rows to `quarantined` with
+`legacy_chain_identity_mismatch`. It also makes identity and evidence immutable
+after insertion and rejects publication-state rollback. Inspect quarantine
+before release:
+
+```sh
+docker compose --env-file deploy/ec2/.env -f deploy/ec2/compose.yml exec postgres \
+  psql -U prism -d prism -c \
+  "select receipt_id, escrow_address, chain_lease_id, quarantine_reason from proof_receipts where publication_state = 'quarantined' order by created_at;"
+```
+
+Do not edit and republish a quarantined document. Correct the source identity or
+leave the preserved artifact out of the public index. Verified receipts and
+content-addressed pages may be staged before cutover, but `index.json` is
+replaced only after a locked second read proves there are no pending rows and
+the complete published set still matches. A transient RPC failure or a backlog
+larger than one 1,000-row batch therefore preserves the existing full index.
+After a successful swap, stale direct receipt files and obsolete legacy pages
+are removed. Direct receipts have a 30-second cache lifetime; the index is
+authoritative and served with `no-cache`; content-addressed pages are immutable.
+
+X digest posting is disabled unless both settings are deliberately supplied:
+
+```dotenv
+PRISM_ENABLE_X_DIGEST_POSTING=1
+PRISM_X_USER_ACCESS_TOKEN=replace-with-x-user-token
+```
+
+Leave the enable flag at `0` to run proof publication without an X account. On
+SIGTERM the worker finishes its current publication, releases the singleton
+lock and exits before another batch; Compose allows three minutes for that
+handoff.
 
 Publishing on a timer matters because the index is a static file with no
 producer behind it: before this it was regenerated by hand, and the public feed

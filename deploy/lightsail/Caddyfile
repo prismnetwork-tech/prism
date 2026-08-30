@@ -20,9 +20,33 @@
 		file_server
 	}
 
+	@proof_pages path /proof-artifacts/pages/*
+	handle @proof_pages {
+		root * /srv/proof
+		uri strip_prefix /proof-artifacts
+		header Cache-Control "public, max-age=30"
+		file_server
+	}
+
+	@proof_sets path /proof-artifacts/sets/*
+	handle @proof_sets {
+		root * /srv/proof
+		uri strip_prefix /proof-artifacts
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	@proof_receipts path /proof-artifacts/receipts/*
+	handle @proof_receipts {
+		root * /srv/proof
+		uri strip_prefix /proof-artifacts
+		header Cache-Control "public, max-age=30"
+		file_server
+	}
+
 	handle_path /proof-artifacts/* {
 		root * /srv/proof
-		header Cache-Control "public, max-age=31536000, immutable"
+		header Cache-Control "no-cache"
 		file_server
 	}
 

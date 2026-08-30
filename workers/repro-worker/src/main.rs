@@ -1,4 +1,14 @@
-use std::{env, fs, os::unix::fs::PermissionsExt, process::Stdio, time::Duration};
+use std::{
+    env, fs,
+    future::Future,
+    os::unix::fs::PermissionsExt,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -26,6 +36,8 @@ use uuid::Uuid;
 
 const CLAIM_SECONDS: i64 = 45;
 const SLOW_CLAIM_SECONDS: i64 = 120;
+const CLAIM_HEARTBEAT_SECONDS: u64 = 30;
+const CLAIM_HEARTBEAT_TIMEOUT_SECONDS: u64 = 10;
 const SSH_TIMEOUT_SECONDS: u64 = 25;
 const SSH_OUTPUT_LIMIT: u64 = 256 * 1024;
 const EXECUTION_CLOSE_MARGIN_SECONDS: i64 = 15;
@@ -41,8 +53,44 @@ const MAX_RUNNING_ATTEMPTS: i16 = 120;
 #[derive(Clone)]
 struct Worker {
     pool: PgPool,
+    escrow_address: String,
     cipher: CredentialCipher,
-    signer: std::sync::Arc<EthereumSigner>,
+    signer: Arc<EthereumSigner>,
+}
+
+#[derive(Clone, Default)]
+struct Shutdown {
+    requested: Arc<AtomicBool>,
+    claim_gate: Arc<tokio::sync::Mutex<()>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Shutdown {
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    async fn request(&self) {
+        let _gate = self.claim_gate.lock().await;
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn claim_permit(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let permit = self.claim_gate.clone().lock_owned().await;
+        (!self.is_requested()).then_some(permit)
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +101,8 @@ struct Claim {
 }
 
 struct Job {
+    command_id: Uuid,
+    lease_id: u64,
     command: NodeCommand,
     status: String,
     private_key: Option<EncryptedSecret>,
@@ -70,6 +120,19 @@ struct Job {
     ssh_host: Option<String>,
     ssh_port: Option<u16>,
     cloud_status: Option<String>,
+}
+
+struct ClaimedJobRow {
+    lease_id: u64,
+    command: NodeCommand,
+    status: String,
+    private_key: Option<EncryptedSecret>,
+    host_key: Option<String>,
+    host_key_sha256: Option<String>,
+    gpu_model: Option<String>,
+    gpu_vram_mib: Option<u32>,
+    started_at: Option<DateTime<Utc>>,
+    prepared_instance_id: Option<u64>,
 }
 
 struct SshOutput {
@@ -102,6 +165,33 @@ enum RemoteState {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ExecutionLeaseGate {
+    Release,
+    Launch,
+    Poll,
+    Fail,
+}
+
+#[derive(Clone, Copy)]
+enum ExternalOperation {
+    Preflight,
+    Launch,
+    Poll,
+    Report,
+}
+
+impl ExternalOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::Launch => "launch",
+            Self::Poll => "poll",
+            Self::Report => "report",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -122,20 +212,42 @@ async fn main() -> anyhow::Result<()> {
 
     let worker = Worker {
         pool,
+        escrow_address: normalize_escrow_address(&required_env("PRISM_LEASE_ESCROW_ADDRESS")?)?,
         cipher: CredentialCipher::from_hex(&required_env("PRISM_ACCESS_CREDENTIAL_KEY")?)
             .context("PRISM_ACCESS_CREDENTIAL_KEY must be 32 bytes of hex")?,
-        signer: std::sync::Arc::new(
-            EthereumSigner::from_environment("PRISM_GATEWAY_KMS_KEY_ID").await?,
-        ),
+        signer: Arc::new(EthereumSigner::from_environment("PRISM_GATEWAY_KMS_KEY_ID").await?),
     };
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
+    let shutdown = Shutdown::default();
+    let signal = shutdown.clone();
+    tokio::spawn(async move {
+        if let Err(error) = shutdown_signal().await {
+            tracing::error!(%error, "failed to install repro shutdown signal");
+        }
+        signal.request().await;
+    });
+    run(&worker, run_once, &shutdown).await
+}
 
+async fn run(worker: &Worker, run_once: bool, shutdown: &Shutdown) -> anyhow::Result<()> {
     loop {
-        let Some(claim) = worker.claim().await? else {
+        let Some(claim_permit) = shutdown.claim_permit().await else {
+            tracing::info!("managed repro shutdown complete before the next claim");
+            return Ok(());
+        };
+        let claim = worker.claim().await?;
+        drop(claim_permit);
+        let Some(claim) = claim else {
             if run_once {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                () = shutdown.wait() => {
+                    tracing::info!("managed repro shutdown complete while idle");
+                    return Ok(());
+                }
+                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
             continue;
         };
         if let Err(error) = worker.process(claim).await {
@@ -147,35 +259,16 @@ async fn main() -> anyhow::Result<()> {
         if run_once {
             return Ok(());
         }
+        if shutdown.is_requested() {
+            tracing::info!(command_id = %claim.command_id, "managed repro shutdown complete after the claimed job");
+            return Ok(());
+        }
     }
 }
 
 impl Worker {
     async fn claim(&self) -> anyhow::Result<Option<Claim>> {
-        let token = Uuid::now_v7();
-        let row = query_as::<_, (Uuid, i64)>(
-            "WITH candidate AS ( \
-                 SELECT command_id FROM managed_repro_jobs \
-                 WHERE status IN ('queued', 'preparing', 'ready', 'launching', 'running') \
-                   AND available_at <= NOW() \
-                   AND (lease_until IS NULL OR lease_until <= NOW()) \
-                 ORDER BY available_at, created_at LIMIT 1 FOR UPDATE SKIP LOCKED \
-             ) \
-             UPDATE managed_repro_jobs j \
-             SET claim_token = $2, claim_generation = claim_generation + 1, \
-                 lease_until = NOW() + make_interval(secs => $1), updated_at = NOW() \
-             FROM candidate WHERE j.command_id = candidate.command_id \
-             RETURNING j.command_id, j.claim_generation",
-        )
-        .bind(CLAIM_SECONDS as f64)
-        .bind(token)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(command_id, generation)| Claim {
-            command_id,
-            token,
-            generation,
-        }))
+        claim_job(&self.pool, &self.escrow_address).await
     }
 
     async fn process(&self, claim: Claim) -> anyhow::Result<()> {
@@ -189,47 +282,33 @@ impl Worker {
     }
 
     async fn load(&self, claim: Claim) -> anyhow::Result<Job> {
-        let (
-            SqlJson(command),
-            status,
-            private_key,
-            host_key,
-            host_key_sha256,
-            gpu_model,
-            gpu_vram_mib,
-            started_at,
-            prepared_instance_id,
-        ) = query_as::<
-            _,
-            (
-                SqlJson<NodeCommand>,
-                String,
-                Option<SqlJson<EncryptedSecret>>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<i32>,
-                Option<DateTime<Utc>>,
-                Option<i64>,
-            ),
-        >(
-            "SELECT command, status, runner_private_key, transport_host_key, \
-                    transport_host_key_sha256, gpu_model, gpu_vram_mib, started_at, \
-                    prepared_provider_instance_id \
-             FROM managed_repro_jobs WHERE command_id = $1 AND claim_token = $2 \
-               AND claim_generation = $3",
-        )
-        .bind(claim.command_id)
-        .bind(claim.token)
-        .bind(claim.generation)
-        .fetch_one(&self.pool)
-        .await?;
-        let SqlJson(lease) = query_scalar::<_, SqlJson<LeaseRecord>>(
-            "SELECT document FROM leases WHERE lease_id = $1",
-        )
-        .bind(command.lease_id as i64)
-        .fetch_one(&self.pool)
-        .await?;
+        let claimed = load_claimed_job(&self.pool, &self.escrow_address, claim).await?;
+        let lease_id = claimed.lease_id;
+        let (SqlJson(mut lease), stored_escrow, stored_chain_lease_id) =
+            query_as::<_, (SqlJson<LeaseRecord>, String, i64)>(
+                "SELECT document, escrow_address, chain_lease_id FROM leases \
+             WHERE lease_id = $1 AND escrow_address = $2",
+            )
+            .bind(i64::try_from(lease_id)?)
+            .bind(&self.escrow_address)
+            .fetch_one(&self.pool)
+            .await?;
+        if !lease.escrow_address.is_empty()
+            && normalize_escrow_address(&lease.escrow_address)
+                .context("managed repro lease document has an invalid escrow address")?
+                != stored_escrow
+        {
+            anyhow::bail!("managed repro lease document disagrees with its escrow generation");
+        }
+        let stored_chain_lease_id = u64::try_from(stored_chain_lease_id)?;
+        if lease.chain_lease_id != 0 && lease.chain_lease_id != stored_chain_lease_id {
+            anyhow::bail!("managed repro lease document disagrees with its chain lease id");
+        }
+        lease.escrow_address = stored_escrow;
+        lease.chain_lease_id = stored_chain_lease_id;
+        if lease.lease_id != lease_id {
+            anyhow::bail!("managed repro lease document disagrees with its internal lease id");
+        }
         let SqlJson(quote) = query_scalar::<_, SqlJson<LeaseQuote>>(
             "SELECT document FROM lease_quotes WHERE quote_id = $1",
         )
@@ -242,14 +321,14 @@ impl Worker {
         >(
             "SELECT access_started_at, access_ended_at FROM lease_lifecycle WHERE lease_id = $1",
         )
-        .bind(command.lease_id as i64)
+        .bind(i64::try_from(lease_id)?)
         .fetch_one(&self.pool)
         .await?;
         let cloud = query_as::<_, (Option<i64>, Option<String>, Option<i32>, String)>(
             "SELECT provider_instance_id, ssh_host, ssh_port, status \
              FROM cloud_instances WHERE lease_id = $1",
         )
-        .bind(command.lease_id as i64)
+        .bind(i64::try_from(lease_id)?)
         .fetch_optional(&self.pool)
         .await?;
         let (instance_id, ssh_host, ssh_port, cloud_status) = match cloud {
@@ -263,15 +342,17 @@ impl Worker {
         };
 
         Ok(Job {
-            command,
-            status,
-            private_key: private_key.map(|SqlJson(value)| value),
-            host_key,
-            host_key_sha256,
-            gpu_model,
-            gpu_vram_mib: gpu_vram_mib.map(u32::try_from).transpose()?,
-            started_at,
-            prepared_instance_id: prepared_instance_id.map(u64::try_from).transpose()?,
+            command_id: claim.command_id,
+            lease_id,
+            command: claimed.command,
+            status: claimed.status,
+            private_key: claimed.private_key,
+            host_key: claimed.host_key,
+            host_key_sha256: claimed.host_key_sha256,
+            gpu_model: claimed.gpu_model,
+            gpu_vram_mib: claimed.gpu_vram_mib,
+            started_at: claimed.started_at,
+            prepared_instance_id: claimed.prepared_instance_id,
             lease,
             quote,
             access_started_at,
@@ -285,6 +366,7 @@ impl Worker {
 
     async fn generate_key(&self, claim: Claim, job: &Job) -> anyhow::Result<()> {
         ensure_prestart(job)?;
+        ensure_job_contract(job)?;
         if Utc::now() >= job.command.expires_at {
             return self
                 .fail_terminal(claim, job, "managed command expired before provisioning")
@@ -298,10 +380,15 @@ impl Worker {
         let mut transaction = self.pool.begin().await?;
         let cloud = query(
             "UPDATE cloud_instances SET ssh_authorized_key = $2, updated_at = NOW() \
-             WHERE lease_id = $1 AND (ssh_authorized_key IS NULL OR ssh_authorized_key = $2)",
+             WHERE lease_id = $1 AND (ssh_authorized_key IS NULL OR ssh_authorized_key = $2) \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = cloud_instances.lease_id \
+                     AND l.escrow_address = $3 \
+                     AND l.state IN ('funded', 'provisioning', 'ready'))",
         )
-        .bind(job.command.lease_id as i64)
+        .bind(i64::try_from(job.lease_id)?)
         .bind(&public_key)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_one(cloud.rows_affected(), "install managed SSH key")?;
@@ -311,13 +398,18 @@ impl Worker {
                  attempts = 0, claim_token = NULL, lease_until = NULL, available_at = NOW(), \
                  last_error = NULL, updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = 'queued'",
+               AND status = 'queued' \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id \
+                     AND l.escrow_address = $6 \
+                     AND l.state IN ('funded', 'provisioning', 'ready'))",
         )
         .bind(claim.command_id)
         .bind(claim.token)
         .bind(claim.generation)
         .bind(SqlJson(encrypted))
         .bind(&public_key)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_one(
@@ -330,6 +422,7 @@ impl Worker {
 
     async fn preflight(&self, claim: Claim, job: &Job) -> anyhow::Result<()> {
         ensure_prestart(job)?;
+        ensure_job_contract(job)?;
         if Utc::now() >= job.command.expires_at {
             return self
                 .fail_terminal(claim, job, "managed command expired before preflight")
@@ -351,7 +444,14 @@ impl Worker {
         }
         let private_key = self.decrypt_key(job)?;
         let output = self
-            .run_ssh(claim, &private_key, None, host, port, PREFLIGHT_SCRIPT)
+            .run_ssh(
+                claim,
+                ExternalOperation::Preflight,
+                &private_key,
+                None,
+                (host, port),
+                PREFLIGHT_SCRIPT,
+            )
             .await?;
         let known_hosts = output.known_hosts.trim().to_owned();
         let host_key_sha256 = known_hosts_fingerprint(&known_hosts)?;
@@ -371,12 +471,17 @@ impl Worker {
         let mut transaction = self.pool.begin().await?;
         let cloud = query(
             "UPDATE cloud_instances SET gpu_model = $3, gpu_vram_mib = $4, updated_at = NOW() \
-             WHERE lease_id = $1 AND provider_instance_id = $2 AND status = 'running'",
+             WHERE lease_id = $1 AND provider_instance_id = $2 AND status = 'running' \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = cloud_instances.lease_id \
+                     AND l.escrow_address = $5 \
+                     AND l.state IN ('funded', 'provisioning', 'ready'))",
         )
-        .bind(job.command.lease_id as i64)
+        .bind(i64::try_from(job.lease_id)?)
         .bind(instance_id)
         .bind(&gpu_model)
         .bind(gpu_vram_mib)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_one(cloud.rows_affected(), "bind preflight to provider instance")?;
@@ -387,7 +492,11 @@ impl Worker {
                  status = 'ready', attempts = 0, claim_token = NULL, lease_until = NULL, \
                  available_at = NOW(), last_error = NULL, updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = 'preparing'",
+               AND status = 'preparing' \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id \
+                     AND l.escrow_address = $9 \
+                     AND l.state IN ('funded', 'provisioning', 'ready'))",
         )
         .bind(claim.command_id)
         .bind(claim.token)
@@ -397,6 +506,7 @@ impl Worker {
         .bind(&gpu_model)
         .bind(gpu_vram_mib)
         .bind(instance_id)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_one(updated.rows_affected(), "complete managed repro preflight")?;
@@ -406,6 +516,15 @@ impl Worker {
 
     async fn execute(&self, claim: Claim, job: &Job) -> anyhow::Result<()> {
         ensure_job_contract(job)?;
+        match execution_lease_gate(&job.status, &job.lease.state)? {
+            ExecutionLeaseGate::Release => return self.release(claim, 2, true).await,
+            ExecutionLeaseGate::Fail => {
+                return self
+                    .fail_terminal(claim, job, "lease ended before managed execution")
+                    .await;
+            }
+            ExecutionLeaseGate::Launch | ExecutionLeaseGate::Poll => {}
+        }
         let prepared_instance_id = job
             .prepared_instance_id
             .context("managed repro has no preflight instance binding")?;
@@ -421,21 +540,6 @@ impl Worker {
                 .await
             };
         }
-        if matches!(
-            job.lease.state,
-            LeaseState::Funded | LeaseState::Provisioning | LeaseState::Ready
-        ) {
-            return self.release(claim, 2, true).await;
-        }
-        if matches!(
-            job.lease.state,
-            LeaseState::Refunded | LeaseState::Finalized | LeaseState::Disputed
-        ) {
-            return self
-                .fail_terminal(claim, job, "lease ended before managed execution")
-                .await;
-        }
-
         let window_start = job
             .access_started_at
             .context("active managed repro has no access start")?;
@@ -486,6 +590,7 @@ impl Worker {
                     .await;
             }
             let script = start_script(
+                job.command_id,
                 &job.command,
                 remaining as u64,
                 window_start,
@@ -497,7 +602,14 @@ impl Worker {
                     .context("managed repro has no preflight GPU memory")?,
             )?;
             let output = self
-                .run_ssh(claim, &private_key, Some(host_key), host, port, &script)
+                .run_ssh(
+                    claim,
+                    ExternalOperation::Launch,
+                    &private_key,
+                    Some(host_key),
+                    (host, port),
+                    &script,
+                )
                 .await?;
             return match parse_start_state(&output.stdout)? {
                 StartState::Expired => {
@@ -522,9 +634,16 @@ impl Worker {
             };
         }
 
-        let script = poll_script(job.command.command_id);
+        let script = poll_script(job.command_id);
         let polled = self
-            .run_ssh(claim, &private_key, Some(host_key), host, port, &script)
+            .run_ssh(
+                claim,
+                ExternalOperation::Poll,
+                &private_key,
+                Some(host_key),
+                (host, port),
+                &script,
+            )
             .await;
         match polled.and_then(|output| parse_remote_state(&output.stdout)) {
             Ok(RemoteState::Done {
@@ -568,7 +687,7 @@ impl Worker {
                 }
             }
             Err(error) if closing || Utc::now() >= ssh_failure_cutoff => {
-                tracing::warn!(command_id = %job.command.command_id, %error, "managed repro result unavailable at close");
+                tracing::warn!(command_id = %job.command_id, %error, "managed repro result unavailable at close");
                 self.fail_terminal(claim, job, "managed result could not be retrieved")
                     .await
             }
@@ -611,8 +730,8 @@ impl Worker {
         let payload = ManagedCommandReportPayload {
             report_id: Uuid::now_v7(),
             signer: signer.clone(),
-            command_id: job.command.command_id,
-            lease_id: job.command.lease_id,
+            command_id: job.command_id,
+            lease_id: job.lease_id,
             provider: ManagedProvider::Vast,
             provider_instance_id: instance_id,
             gpu_model: gpu_model.clone(),
@@ -624,12 +743,14 @@ impl Worker {
             error: None,
             result: Some(result.clone()),
         };
-        self.extend_claim(claim, SLOW_CLAIM_SECONDS).await?;
         let signature = self
-            .signer
-            .sign_digest(&managed_command_report_digest(&payload)?)
+            .while_claimed(
+                claim,
+                ExternalOperation::Report,
+                self.signer
+                    .sign_digest(&managed_command_report_digest(&payload)?),
+            )
             .await?;
-        self.extend_claim(claim, CLAIM_SECONDS).await?;
         let report = ManagedCommandReport {
             report_id: payload.report_id,
             signer,
@@ -658,26 +779,33 @@ impl Worker {
              WHERE command_id = $1 AND claim_token = $5 AND claim_generation = $6 \
                AND status IN ('ready', 'launching', 'running') AND report IS NULL \
                AND prepared_provider_instance_id = $7 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id \
+                     AND l.escrow_address = $8 \
+                     AND l.state IN ('active', 'closing', 'settlement_pending', 'failed')) \
                AND EXISTS (SELECT 1 FROM cloud_instances ci \
                    WHERE ci.lease_id = managed_repro_jobs.lease_id \
                      AND ci.provider_instance_id = $7 \
                      AND ci.gpu_model = managed_repro_jobs.gpu_model \
                      AND ci.gpu_vram_mib = managed_repro_jobs.gpu_vram_mib)",
         )
-        .bind(job.command.command_id)
+        .bind(job.command_id)
         .bind(SqlJson(report))
         .bind(started_at)
         .bind(finished_at)
         .bind(claim.token)
         .bind(claim.generation)
         .bind(i64::try_from(instance_id)?)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_one(completed.rows_affected(), "persist signed managed report")?;
         let SqlJson(mut lease) = query_scalar::<_, SqlJson<LeaseRecord>>(
-            "SELECT document FROM leases WHERE lease_id = $1 FOR UPDATE",
+            "SELECT document FROM leases \
+             WHERE lease_id = $1 AND escrow_address = $2 FOR UPDATE",
         )
-        .bind(job.command.lease_id as i64)
+        .bind(i64::try_from(job.lease_id)?)
+        .bind(&self.escrow_address)
         .fetch_one(&mut *transaction)
         .await?;
         if lease.state == LeaseState::Active {
@@ -685,21 +813,24 @@ impl Worker {
             lease.updated_at = Utc::now();
             let closed = query(
                 "UPDATE leases SET document = $2, state = 'closing', updated_at = NOW() \
-                 WHERE lease_id = $1 AND state = 'active'",
+                 WHERE lease_id = $1 AND state = 'active' AND escrow_address = $3",
             )
-            .bind(job.command.lease_id as i64)
+            .bind(i64::try_from(job.lease_id)?)
             .bind(SqlJson(lease))
+            .bind(&self.escrow_address)
             .execute(&mut *transaction)
             .await?;
             expect_one(closed.rows_affected(), "close completed managed lease")?;
         }
         let outbox = query(
             "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
-             VALUES ($1, $2, 'close_access', NOW()) \
+             SELECT $1, l.lease_id, 'close_access', NOW() FROM leases l \
+             WHERE l.lease_id = $2 AND l.escrow_address = $3 \
              ON CONFLICT (lease_id, kind) DO NOTHING",
         )
         .bind(Uuid::now_v7())
-        .bind(job.command.lease_id as i64)
+        .bind(i64::try_from(job.lease_id)?)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_at_most_one(outbox.rows_affected(), "queue managed access close")?;
@@ -711,7 +842,15 @@ impl Worker {
         let started_at = job
             .started_at
             .context("started managed repro has no supervisor start time")?;
-        let finished_at = job.access_ended_at.unwrap_or_else(Utc::now);
+        let window_start = job
+            .access_started_at
+            .context("managed repro has no access start")?;
+        let finished_at = terminal_failure_time(
+            started_at,
+            Utc::now(),
+            execution_deadline(job, window_start)?,
+            job.access_ended_at,
+        )?;
         validate_execution_times(job, started_at, Some(finished_at))?;
         let instance_id = job
             .prepared_instance_id
@@ -731,8 +870,8 @@ impl Worker {
         let payload = ManagedCommandReportPayload {
             report_id: Uuid::now_v7(),
             signer: signer.clone(),
-            command_id: job.command.command_id,
-            lease_id: job.command.lease_id,
+            command_id: job.command_id,
+            lease_id: job.lease_id,
             provider: ManagedProvider::Vast,
             provider_instance_id: instance_id,
             gpu_model: gpu_model.clone(),
@@ -744,12 +883,14 @@ impl Worker {
             error: Some(reason.to_owned()),
             result: None,
         };
-        self.extend_claim(claim, SLOW_CLAIM_SECONDS).await?;
         let signature = self
-            .signer
-            .sign_digest(&managed_command_report_digest(&payload)?)
+            .while_claimed(
+                claim,
+                ExternalOperation::Report,
+                self.signer
+                    .sign_digest(&managed_command_report_digest(&payload)?),
+            )
             .await?;
-        self.extend_claim(claim, CLAIM_SECONDS).await?;
         let report = ManagedCommandReport {
             report_id: payload.report_id,
             signer,
@@ -776,9 +917,13 @@ impl Worker {
                  runner_private_key = NULL, last_error = $4, updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $5 AND claim_generation = $6 \
                AND status = 'running' AND started_at = $7 AND report IS NULL \
-               AND prepared_provider_instance_id = $8",
+               AND prepared_provider_instance_id = $8 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id \
+                     AND l.escrow_address = $9 \
+                     AND l.state IN ('active', 'closing', 'settlement_pending', 'failed'))",
         )
-        .bind(job.command.command_id)
+        .bind(job.command_id)
         .bind(SqlJson(report))
         .bind(finished_at)
         .bind(reason)
@@ -786,14 +931,17 @@ impl Worker {
         .bind(claim.generation)
         .bind(started_at)
         .bind(i64::try_from(instance_id)?)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_one(failed.rows_affected(), "persist signed managed failure")?;
 
         let SqlJson(mut lease) = query_scalar::<_, SqlJson<LeaseRecord>>(
-            "SELECT document FROM leases WHERE lease_id = $1 FOR UPDATE",
+            "SELECT document FROM leases \
+             WHERE lease_id = $1 AND escrow_address = $2 FOR UPDATE",
         )
-        .bind(job.command.lease_id as i64)
+        .bind(i64::try_from(job.lease_id)?)
+        .bind(&self.escrow_address)
         .fetch_one(&mut *transaction)
         .await?;
         if lease.state == LeaseState::Active {
@@ -801,21 +949,24 @@ impl Worker {
             lease.updated_at = Utc::now();
             let closed = query(
                 "UPDATE leases SET document = $2, state = 'closing', updated_at = NOW() \
-                 WHERE lease_id = $1 AND state = 'active'",
+                 WHERE lease_id = $1 AND state = 'active' AND escrow_address = $3",
             )
-            .bind(job.command.lease_id as i64)
+            .bind(i64::try_from(job.lease_id)?)
             .bind(SqlJson(lease))
+            .bind(&self.escrow_address)
             .execute(&mut *transaction)
             .await?;
             expect_one(closed.rows_affected(), "close failed managed lease")?;
         }
         let outbox = query(
             "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
-             VALUES ($1, $2, 'close_access', NOW()) \
+             SELECT $1, l.lease_id, 'close_access', NOW() FROM leases l \
+             WHERE l.lease_id = $2 AND l.escrow_address = $3 \
              ON CONFLICT (lease_id, kind) DO NOTHING",
         )
         .bind(Uuid::now_v7())
-        .bind(job.command.lease_id as i64)
+        .bind(i64::try_from(job.lease_id)?)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_at_most_one(outbox.rows_affected(), "queue failed managed access close")?;
@@ -830,7 +981,10 @@ impl Worker {
                  available_at = NOW() + INTERVAL '1 second', last_error = NULL, \
                  updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = 'ready' AND prepared_provider_instance_id = $4",
+               AND status = 'ready' AND prepared_provider_instance_id = $4 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id \
+                     AND l.escrow_address = $5 AND l.state = 'active')",
         )
         .bind(claim.command_id)
         .bind(claim.token)
@@ -839,6 +993,7 @@ impl Worker {
             job.prepared_instance_id
                 .context("missing instance binding")?,
         )?)
+        .bind(&self.escrow_address)
         .execute(&self.pool)
         .await?;
         expect_one(
@@ -859,7 +1014,10 @@ impl Worker {
                  lease_until = NULL, available_at = NOW() + INTERVAL '1 second', \
                  last_error = NULL, updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = 'ready' AND prepared_provider_instance_id = $5",
+               AND status = 'ready' AND prepared_provider_instance_id = $5 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id \
+                     AND l.escrow_address = $6 AND l.state = 'active')",
         )
         .bind(claim.command_id)
         .bind(claim.token)
@@ -869,6 +1027,7 @@ impl Worker {
             job.prepared_instance_id
                 .context("missing instance binding")?,
         )?)
+        .bind(&self.escrow_address)
         .execute(&self.pool)
         .await?;
         expect_one(updated.rows_affected(), "advance managed repro to running")
@@ -886,7 +1045,9 @@ impl Worker {
                  available_at = NOW(), last_error = NULL, updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
                AND status = 'launching' AND started_at IS NULL \
-               AND prepared_provider_instance_id = $5",
+               AND prepared_provider_instance_id = $5 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id AND l.escrow_address = $6)",
         )
         .bind(claim.command_id)
         .bind(claim.token)
@@ -896,6 +1057,7 @@ impl Worker {
             job.prepared_instance_id
                 .context("missing instance binding")?,
         )?)
+        .bind(&self.escrow_address)
         .execute(&self.pool)
         .await?;
         expect_one(updated.rows_affected(), "record managed supervisor start")
@@ -912,13 +1074,16 @@ impl Worker {
                  attempts = 0, claim_token = NULL, lease_until = NULL, last_error = NULL, \
                  available_at = NOW() + make_interval(secs => $5), updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = 'running' AND (started_at IS NULL OR started_at = $4 OR $4 IS NULL)",
+               AND status = 'running' AND (started_at IS NULL OR started_at = $4 OR $4 IS NULL) \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id AND l.escrow_address = $6)",
         )
         .bind(claim.command_id)
         .bind(claim.token)
         .bind(claim.generation)
         .bind(started_at)
         .bind(seconds as f64)
+        .bind(&self.escrow_address)
         .execute(&self.pool)
         .await?;
         expect_one(
@@ -935,7 +1100,9 @@ impl Worker {
                  started_at = NULL, finished_at = NULL, attempts = 0, claim_token = NULL, \
                  lease_until = NULL, available_at = NOW(), last_error = NULL, updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = 'ready' AND prepared_provider_instance_id = $4",
+               AND status = 'ready' AND prepared_provider_instance_id = $4 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id AND l.escrow_address = $5)",
         )
         .bind(claim.command_id)
         .bind(claim.token)
@@ -944,6 +1111,7 @@ impl Worker {
             job.prepared_instance_id
                 .context("missing instance binding")?,
         )?)
+        .bind(&self.escrow_address)
         .execute(&self.pool)
         .await?;
         expect_one(updated.rows_affected(), "reset drifted managed preflight")
@@ -951,7 +1119,9 @@ impl Worker {
 
     async fn retry(&self, claim: Claim) -> anyhow::Result<()> {
         let job = self.load(claim).await?;
-        let next_attempt = job_attempts(&self.pool, claim).await?.saturating_add(1);
+        let next_attempt = job_attempts(&self.pool, &self.escrow_address, claim)
+            .await?
+            .saturating_add(1);
         if next_attempt >= stage_attempt_cap(&job.status)? {
             let reason = match job.status.as_str() {
                 "queued" => "managed runner key generation exhausted its retry limit",
@@ -969,7 +1139,9 @@ impl Worker {
                  lease_until = NULL, available_at = NOW() + make_interval(secs => $5), \
                  last_error = 'managed execution pass failed', updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = $6",
+               AND status = $6 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id AND l.escrow_address = $7)",
         )
         .bind(claim.command_id)
         .bind(claim.token)
@@ -977,6 +1149,7 @@ impl Worker {
         .bind(next_attempt)
         .bind(delay as f64)
         .bind(&job.status)
+        .bind(&self.escrow_address)
         .execute(&self.pool)
         .await?;
         expect_one(updated.rows_affected(), "schedule managed repro retry")
@@ -993,13 +1166,16 @@ impl Worker {
                  claim_token = NULL, lease_until = NULL, \
                  last_error = CASE WHEN $4 THEN NULL ELSE last_error END, \
                  available_at = NOW() + make_interval(secs => $5), updated_at = NOW() \
-             WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3",
+             WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id AND l.escrow_address = $6)",
         )
         .bind(claim.command_id)
         .bind(claim.token)
         .bind(claim.generation)
         .bind(reset_attempts)
         .bind(seconds as f64)
+        .bind(&self.escrow_address)
         .execute(&self.pool)
         .await?;
         expect_one(updated.rows_affected(), "release managed repro claim")
@@ -1015,30 +1191,35 @@ impl Worker {
                  lease_until = NULL, runner_private_key = NULL, last_error = $4, \
                  updated_at = NOW() \
              WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status = $5",
+               AND status = $5 \
+               AND EXISTS (SELECT 1 FROM leases l \
+                   WHERE l.lease_id = managed_repro_jobs.lease_id AND l.escrow_address = $6)",
         )
         .bind(claim.command_id)
         .bind(claim.token)
         .bind(claim.generation)
         .bind(reason)
         .bind(&job.status)
+        .bind(&self.escrow_address)
         .execute(&mut *transaction)
         .await?;
         expect_one(failed.rows_affected(), "fail managed repro")?;
 
-        let active = matches!(
+        let access_opened = matches!(
             job.lease.state,
             LeaseState::Active
                 | LeaseState::Closing
                 | LeaseState::SettlementPending
                 | LeaseState::Failed
         );
-        if active {
+        if access_opened {
             if job.lease.state == LeaseState::Active {
                 let SqlJson(mut lease) = query_scalar::<_, SqlJson<LeaseRecord>>(
-                    "SELECT document FROM leases WHERE lease_id = $1 FOR UPDATE",
+                    "SELECT document FROM leases \
+                     WHERE lease_id = $1 AND escrow_address = $2 FOR UPDATE",
                 )
-                .bind(job.command.lease_id as i64)
+                .bind(i64::try_from(job.lease_id)?)
+                .bind(&self.escrow_address)
                 .fetch_one(&mut *transaction)
                 .await?;
                 if lease.state == LeaseState::Active {
@@ -1046,10 +1227,11 @@ impl Worker {
                     lease.updated_at = Utc::now();
                     let closed = query(
                         "UPDATE leases SET document = $2, state = 'closing', updated_at = NOW() \
-                         WHERE lease_id = $1 AND state = 'active'",
+                         WHERE lease_id = $1 AND state = 'active' AND escrow_address = $3",
                     )
-                    .bind(job.command.lease_id as i64)
+                    .bind(i64::try_from(job.lease_id)?)
                     .bind(SqlJson(lease))
+                    .bind(&self.escrow_address)
                     .execute(&mut *transaction)
                     .await?;
                     expect_one(closed.rows_affected(), "close failed managed lease")?;
@@ -1057,24 +1239,30 @@ impl Worker {
             }
             let outbox = query(
                 "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
-                 VALUES ($1, $2, 'close_access', NOW()) \
+                 SELECT $1, l.lease_id, 'close_access', NOW() FROM leases l \
+                 WHERE l.lease_id = $2 AND l.escrow_address = $3 \
                  ON CONFLICT (lease_id, kind) DO NOTHING",
             )
             .bind(Uuid::now_v7())
-            .bind(job.command.lease_id as i64)
+            .bind(i64::try_from(job.lease_id)?)
+            .bind(&self.escrow_address)
             .execute(&mut *transaction)
             .await?;
             expect_at_most_one(outbox.rows_affected(), "queue failed managed access close")?;
-        } else {
+        } else if matches!(
+            job.lease.state,
+            LeaseState::Funded | LeaseState::Provisioning | LeaseState::Ready
+        ) {
             let outbox = query(
                 "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
                  SELECT $1, $2, 'expire_provision', \
                         GREATEST(NOW(), created_at + INTERVAL '10 minutes') \
-                 FROM leases WHERE lease_id = $2 \
+                 FROM leases WHERE lease_id = $2 AND escrow_address = $3 \
                  ON CONFLICT (lease_id, kind) DO NOTHING",
             )
             .bind(Uuid::now_v7())
-            .bind(job.command.lease_id as i64)
+            .bind(i64::try_from(job.lease_id)?)
+            .bind(&self.escrow_address)
             .execute(&mut *transaction)
             .await?;
             expect_at_most_one(outbox.rows_affected(), "queue managed provision expiry")?;
@@ -1083,35 +1271,69 @@ impl Worker {
         Ok(())
     }
 
-    async fn extend_claim(&self, claim: Claim, seconds: i64) -> anyhow::Result<()> {
-        let updated = query(
-            "UPDATE managed_repro_jobs \
-             SET lease_until = NOW() + make_interval(secs => $4), updated_at = NOW() \
-             WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
-               AND status IN ('queued', 'preparing', 'ready', 'launching', 'running')",
-        )
-        .bind(claim.command_id)
-        .bind(claim.token)
-        .bind(claim.generation)
-        .bind(seconds as f64)
-        .execute(&self.pool)
-        .await?;
-        expect_one(updated.rows_affected(), "extend managed repro claim")
-    }
-
     async fn run_ssh(
         &self,
         claim: Claim,
+        operation: ExternalOperation,
         private_key: &str,
         known_hosts: Option<&str>,
-        host: &str,
-        port: u16,
+        target: (&str, u16),
         script: &str,
     ) -> anyhow::Result<SshOutput> {
-        self.extend_claim(claim, SLOW_CLAIM_SECONDS).await?;
-        let result = run_ssh(private_key, known_hosts, host, port, script).await;
-        self.extend_claim(claim, CLAIM_SECONDS).await?;
-        result
+        let (host, port) = target;
+        self.while_claimed(
+            claim,
+            operation,
+            run_ssh(private_key, known_hosts, host, port, script),
+        )
+        .await
+    }
+
+    async fn while_claimed<T, F>(
+        &self,
+        claim: Claim,
+        kind: ExternalOperation,
+        operation: F,
+    ) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        self.renew_claim(claim, kind, SLOW_CLAIM_SECONDS).await?;
+        tokio::pin!(operation);
+        let first_heartbeat =
+            tokio::time::Instant::now() + Duration::from_secs(CLAIM_HEARTBEAT_SECONDS);
+        let mut heartbeat = tokio::time::interval_at(
+            first_heartbeat,
+            Duration::from_secs(CLAIM_HEARTBEAT_SECONDS),
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                result = &mut operation => {
+                    self.renew_claim(claim, kind, CLAIM_SECONDS).await?;
+                    return result;
+                }
+                _ = heartbeat.tick() => {
+                    self.renew_claim(claim, kind, SLOW_CLAIM_SECONDS).await?;
+                }
+            }
+        }
+    }
+
+    async fn renew_claim(
+        &self,
+        claim: Claim,
+        operation: ExternalOperation,
+        seconds: i64,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(
+            Duration::from_secs(CLAIM_HEARTBEAT_TIMEOUT_SECONDS),
+            extend_operation_claim(&self.pool, &self.escrow_address, claim, seconds, operation),
+        )
+        .await
+        .context("managed repro claim renewal timed out")??;
+        Ok(())
     }
 
     fn decrypt_key(&self, job: &Job) -> anyhow::Result<String> {
@@ -1122,6 +1344,38 @@ impl Worker {
                     .context("managed repro has no runner key")?,
             )
             .context("decrypt managed runner key")
+    }
+}
+
+fn execution_lease_gate(status: &str, state: &LeaseState) -> anyhow::Result<ExecutionLeaseGate> {
+    match (status, state) {
+        ("ready", LeaseState::Funded | LeaseState::Provisioning | LeaseState::Ready)
+        | (
+            "launching" | "running",
+            LeaseState::Funded | LeaseState::Provisioning | LeaseState::Ready,
+        ) => Ok(ExecutionLeaseGate::Release),
+        ("ready", LeaseState::Active) => Ok(ExecutionLeaseGate::Launch),
+        (
+            "launching" | "running",
+            LeaseState::Active
+            | LeaseState::Closing
+            | LeaseState::SettlementPending
+            | LeaseState::Failed,
+        ) => Ok(ExecutionLeaseGate::Poll),
+        (
+            "ready",
+            LeaseState::Closing
+            | LeaseState::SettlementPending
+            | LeaseState::Disputed
+            | LeaseState::Finalized
+            | LeaseState::Refunded
+            | LeaseState::Failed,
+        )
+        | (
+            "launching" | "running",
+            LeaseState::Disputed | LeaseState::Finalized | LeaseState::Refunded,
+        ) => Ok(ExecutionLeaseGate::Fail),
+        _ => anyhow::bail!("managed execution has unsupported status or lease state"),
     }
 }
 
@@ -1152,7 +1406,9 @@ fn ensure_job_contract(job: &Job) -> anyhow::Result<()> {
     else {
         anyhow::bail!("managed repro command is not a batch");
     };
-    if job.command.lease_id != job.lease.lease_id
+    if job.command_id != job.command.command_id
+        || job.lease_id != job.command.lease_id
+        || job.lease_id != job.lease.lease_id
         || job.command.node_id != job.lease.node_id
         || image != &job.lease.image
         || job.lease.command.as_ref() != Some(command)
@@ -1185,6 +1441,19 @@ fn execution_deadline(job: &Job, window_start: DateTime<Utc>) -> anyhow::Result<
         anyhow::bail!("managed execution duration does not match its lease");
     }
     Ok(window_start + chrono::Duration::seconds(i64::from(duration)))
+}
+
+fn terminal_failure_time(
+    started_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    deadline: DateTime<Utc>,
+    access_ended_at: Option<DateTime<Utc>>,
+) -> anyhow::Result<DateTime<Utc>> {
+    let latest = access_ended_at.map_or(deadline, |ended_at| ended_at.min(deadline));
+    if latest < started_at {
+        anyhow::bail!("managed access ended before the supervisor started");
+    }
+    Ok(observed_at.max(started_at).min(latest))
 }
 
 fn validate_execution_times(
@@ -1222,14 +1491,149 @@ fn validate_execution_times(
     Ok(())
 }
 
-async fn job_attempts(pool: &PgPool, claim: Claim) -> anyhow::Result<i16> {
-    query_scalar(
-        "SELECT attempts FROM managed_repro_jobs \
-         WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3",
+async fn claim_job(pool: &PgPool, escrow_address: &str) -> anyhow::Result<Option<Claim>> {
+    let token = Uuid::now_v7();
+    let row = query_as::<_, (Uuid, i64)>(
+        "WITH candidate AS ( \
+             SELECT j.command_id FROM managed_repro_jobs j \
+             JOIN leases l ON l.lease_id = j.lease_id \
+             WHERE l.escrow_address = $3 \
+               AND j.status IN ('queued', 'preparing', 'ready', 'launching', 'running') \
+               AND j.available_at <= NOW() \
+               AND (j.lease_until IS NULL OR j.lease_until <= NOW()) \
+             ORDER BY j.available_at, j.created_at LIMIT 1 \
+             FOR UPDATE OF j SKIP LOCKED \
+         ) \
+         UPDATE managed_repro_jobs j \
+         SET claim_token = $2, claim_generation = j.claim_generation + 1, \
+             lease_until = NOW() + make_interval(secs => $1), updated_at = NOW() \
+         FROM candidate WHERE j.command_id = candidate.command_id \
+           AND EXISTS (SELECT 1 FROM leases l \
+               WHERE l.lease_id = j.lease_id AND l.escrow_address = $3) \
+         RETURNING j.command_id, j.claim_generation",
+    )
+    .bind(CLAIM_SECONDS as f64)
+    .bind(token)
+    .bind(escrow_address)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(command_id, generation)| Claim {
+        command_id,
+        token,
+        generation,
+    }))
+}
+
+async fn load_claimed_job(
+    pool: &PgPool,
+    escrow_address: &str,
+    claim: Claim,
+) -> anyhow::Result<ClaimedJobRow> {
+    let (
+        row_lease_id,
+        SqlJson(command),
+        status,
+        private_key,
+        host_key,
+        host_key_sha256,
+        gpu_model,
+        gpu_vram_mib,
+        started_at,
+        prepared_instance_id,
+    ) = query_as::<
+        _,
+        (
+            i64,
+            SqlJson<NodeCommand>,
+            String,
+            Option<SqlJson<EncryptedSecret>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+            Option<DateTime<Utc>>,
+            Option<i64>,
+        ),
+    >(
+        "SELECT j.lease_id, j.command, j.status, j.runner_private_key, \
+                j.transport_host_key, j.transport_host_key_sha256, j.gpu_model, \
+                j.gpu_vram_mib, j.started_at, j.prepared_provider_instance_id \
+         FROM managed_repro_jobs j JOIN leases l ON l.lease_id = j.lease_id \
+         WHERE j.command_id = $1 AND j.claim_token = $2 \
+           AND j.claim_generation = $3 AND l.escrow_address = $4",
     )
     .bind(claim.command_id)
     .bind(claim.token)
     .bind(claim.generation)
+    .bind(escrow_address)
+    .fetch_one(pool)
+    .await?;
+    let lease_id = u64::try_from(row_lease_id)?;
+    if lease_id == 0 || command.command_id != claim.command_id || command.lease_id != lease_id {
+        anyhow::bail!("managed repro command identity disagrees with its claimed row");
+    }
+    Ok(ClaimedJobRow {
+        lease_id,
+        command,
+        status,
+        private_key: private_key.map(|SqlJson(value)| value),
+        host_key,
+        host_key_sha256,
+        gpu_model,
+        gpu_vram_mib: gpu_vram_mib.map(u32::try_from).transpose()?,
+        started_at,
+        prepared_instance_id: prepared_instance_id.map(u64::try_from).transpose()?,
+    })
+}
+
+async fn extend_operation_claim(
+    pool: &PgPool,
+    escrow_address: &str,
+    claim: Claim,
+    seconds: i64,
+    operation: ExternalOperation,
+) -> anyhow::Result<()> {
+    let updated = query(
+        "UPDATE managed_repro_jobs j \
+         SET lease_until = NOW() + make_interval(secs => $4), updated_at = NOW() \
+         FROM leases l \
+         WHERE j.command_id = $1 AND j.claim_token = $2 AND j.claim_generation = $3 \
+           AND l.lease_id = j.lease_id AND l.escrow_address = $5 \
+           AND ( \
+               ($6 = 'preflight' AND j.status = 'preparing' \
+                   AND l.state IN ('funded', 'provisioning', 'ready')) \
+               OR ($6 = 'launch' AND j.status = 'ready' AND l.state = 'active') \
+               OR ($6 = 'poll' AND j.status IN ('launching', 'running') \
+                   AND l.state IN ('active', 'closing', 'settlement_pending', 'failed')) \
+               OR ($6 = 'report' AND j.status IN ('ready', 'launching', 'running') \
+                   AND l.state IN ('active', 'closing', 'settlement_pending', 'failed')) \
+           )",
+    )
+    .bind(claim.command_id)
+    .bind(claim.token)
+    .bind(claim.generation)
+    .bind(seconds as f64)
+    .bind(escrow_address)
+    .bind(operation.as_str())
+    .execute(pool)
+    .await?;
+    expect_one(
+        updated.rows_affected(),
+        "renew managed repro external-operation claim",
+    )
+}
+
+async fn job_attempts(pool: &PgPool, escrow_address: &str, claim: Claim) -> anyhow::Result<i16> {
+    query_scalar(
+        "SELECT attempts FROM managed_repro_jobs \
+         WHERE command_id = $1 AND claim_token = $2 AND claim_generation = $3 \
+           AND EXISTS (SELECT 1 FROM leases l \
+               WHERE l.lease_id = managed_repro_jobs.lease_id AND l.escrow_address = $4)",
+    )
+    .bind(claim.command_id)
+    .bind(claim.token)
+    .bind(claim.generation)
+    .bind(escrow_address)
     .fetch_one(pool)
     .await
     .context("load fenced managed repro attempts")
@@ -1518,6 +1922,7 @@ fn single_marker<'a>(text: &'a str, prefix: &str) -> anyhow::Result<&'a str> {
 }
 
 fn start_script(
+    command_id: Uuid,
     command: &NodeCommand,
     max_run_seconds: u64,
     window_start: DateTime<Utc>,
@@ -1532,9 +1937,8 @@ fn start_script(
     let command_base64 = STANDARD.encode(command_text.as_bytes());
     let command_sha256 = hex::encode(Sha256::digest(command_text.as_bytes()));
     let gpu_model_base64 = STANDARD.encode(gpu_model.as_bytes());
-    let job = format!("/var/lib/prism-repro/{}", command.command_id);
-    let work = format!("/var/tmp/prism-repro-work/{}", command.command_id);
-    let command_id = command.command_id;
+    let job = format!("/var/lib/prism-repro/{command_id}");
+    let work = format!("/var/tmp/prism-repro-work/{command_id}");
     let expires_ns = command
         .expires_at
         .timestamp_nanos_opt()
@@ -1739,6 +2143,31 @@ fn required_env(key: &str) -> anyhow::Result<String> {
     env::var(key).with_context(|| format!("{key} is required"))
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
+fn normalize_escrow_address(value: &str) -> anyhow::Result<String> {
+    let body = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .context("PRISM_LEASE_ESCROW_ADDRESS is not an EVM address")?;
+    if body.len() != 40 || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("PRISM_LEASE_ESCROW_ADDRESS is not an EVM address");
+    }
+    Ok(format!("0x{}", body.to_ascii_lowercase()))
+}
+
 async fn record_service_version(pool: &PgPool) -> anyhow::Result<()> {
     let version = prism_protocol::build_version();
     tracing::info!(service = "repro-worker", %version, "recording build version");
@@ -1772,12 +2201,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shutdown_closes_the_claim_gate_and_wakes_waiters() {
+        let shutdown = Shutdown::default();
+        let permit = shutdown.claim_permit().await.unwrap();
+        let requested = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { shutdown.request().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_requested());
+        drop(permit);
+        requested.await.unwrap();
+
+        assert!(shutdown.is_requested());
+        assert!(shutdown.claim_permit().await.is_none());
+        tokio::time::timeout(
+            Duration::milliseconds(50).to_std().unwrap(),
+            shutdown.wait(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_listener_observes_sigterm() {
+        let listener = tokio::spawn(shutdown_signal());
+        let status = tokio::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .await
+            .unwrap();
+
+        assert!(status.success());
+        tokio::time::timeout(std::time::Duration::from_secs(1), listener)
+            .await
+            .expect("SIGTERM listener timed out")
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn remote_script_carries_the_command_as_data() {
         let raw = "python -c \"print('quoted $HOME')\"";
         let command = command(raw);
         let start = command.issued_at;
         let script = start_script(
+            command.command_id,
             &command,
             60,
             start,
@@ -1817,6 +2288,7 @@ mod tests {
         let command = command("nvidia-smi");
         let start = command.issued_at;
         let script = start_script(
+            command.command_id,
             &command,
             60,
             start,
@@ -1968,6 +2440,460 @@ mod tests {
         assert_eq!(stage_backoff_seconds("preparing", 1).unwrap(), 2);
         assert_eq!(stage_backoff_seconds("preparing", 5).unwrap(), 30);
         assert_eq!(stage_backoff_seconds("running", 100).unwrap(), 30);
+    }
+
+    #[test]
+    fn terminal_failure_time_stays_inside_the_authorized_window() {
+        let started_at = DateTime::parse_from_rfc3339("2026-08-30T10:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let deadline = DateTime::parse_from_rfc3339("2026-08-30T10:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let after_deadline = DateTime::parse_from_rfc3339("2026-08-30T10:45:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let access_ended_at = DateTime::parse_from_rfc3339("2026-08-30T10:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            terminal_failure_time(started_at, after_deadline, deadline, None).unwrap(),
+            deadline
+        );
+        assert_eq!(
+            terminal_failure_time(started_at, after_deadline, deadline, Some(access_ended_at))
+                .unwrap(),
+            access_ended_at
+        );
+        assert_eq!(
+            terminal_failure_time(
+                started_at,
+                started_at - Duration::seconds(1),
+                deadline,
+                None
+            )
+            .unwrap(),
+            started_at
+        );
+        assert!(
+            terminal_failure_time(
+                started_at,
+                after_deadline,
+                deadline,
+                Some(started_at - Duration::seconds(1))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn escrow_addresses_are_validated_and_normalized() {
+        assert_eq!(
+            normalize_escrow_address("0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa").unwrap(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(normalize_escrow_address("0x1234").is_err());
+        assert!(normalize_escrow_address("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
+        assert!(normalize_escrow_address("0xgggggggggggggggggggggggggggggggggggggggg").is_err());
+    }
+
+    #[test]
+    fn claim_heartbeat_has_time_to_fail_closed() {
+        assert!(
+            CLAIM_HEARTBEAT_SECONDS + CLAIM_HEARTBEAT_TIMEOUT_SECONDS
+                < u64::try_from(SLOW_CLAIM_SECONDS).unwrap()
+        );
+        assert!(SSH_TIMEOUT_SECONDS < u64::try_from(SLOW_CLAIM_SECONDS).unwrap());
+    }
+
+    #[test]
+    fn ready_jobs_launch_only_while_the_lease_is_active() {
+        assert_eq!(
+            execution_lease_gate("ready", &LeaseState::Active).unwrap(),
+            ExecutionLeaseGate::Launch
+        );
+        for state in [
+            LeaseState::Closing,
+            LeaseState::SettlementPending,
+            LeaseState::Failed,
+            LeaseState::Disputed,
+            LeaseState::Finalized,
+            LeaseState::Refunded,
+        ] {
+            assert_eq!(
+                execution_lease_gate("ready", &state).unwrap(),
+                ExecutionLeaseGate::Fail
+            );
+        }
+        assert_eq!(
+            execution_lease_gate("running", &LeaseState::Closing).unwrap(),
+            ExecutionLeaseGate::Poll
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PRISM_TEST_DATABASE_URL"]
+    async fn postgres_escrow_generations_claim_independently() -> anyhow::Result<()> {
+        let database_url = env::var("PRISM_TEST_DATABASE_URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await?;
+        query("DROP TABLE IF EXISTS managed_repro_jobs, leases CASCADE")
+            .execute(&pool)
+            .await?;
+        query(
+            "CREATE TABLE leases ( \
+                 lease_id BIGINT PRIMARY KEY, \
+                 escrow_address TEXT NOT NULL, \
+                 chain_lease_id BIGINT NOT NULL, \
+                 state TEXT NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await?;
+        query(
+            "CREATE TABLE managed_repro_jobs ( \
+                 command_id UUID PRIMARY KEY, \
+                 lease_id BIGINT NOT NULL REFERENCES leases(lease_id), \
+                 command JSONB NOT NULL, \
+                 status TEXT NOT NULL, \
+                 runner_private_key JSONB, \
+                 transport_host_key TEXT, \
+                 transport_host_key_sha256 TEXT, \
+                 gpu_model TEXT, \
+                 gpu_vram_mib INTEGER, \
+                 started_at TIMESTAMPTZ, \
+                 prepared_provider_instance_id BIGINT, \
+                 attempts SMALLINT NOT NULL DEFAULT 0, \
+                 available_at TIMESTAMPTZ NOT NULL, \
+                 claim_token UUID, \
+                 claim_generation BIGINT NOT NULL DEFAULT 0, \
+                 lease_until TIMESTAMPTZ, \
+                 created_at TIMESTAMPTZ NOT NULL, \
+                 updated_at TIMESTAMPTZ NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await?;
+
+        let current = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let previous = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let previous_command = Uuid::parse_str("018f0000-0000-7000-8000-000000000301")?;
+        let current_command = Uuid::parse_str("018f0000-0000-7000-8000-000000000302")?;
+        let mut previous_document = command("previous");
+        previous_document.command_id = previous_command;
+        previous_document.lease_id = 301;
+        let mut current_document = command("current");
+        current_document.command_id = current_command;
+        current_document.lease_id = 302;
+        let mut mismatched_lease_document = current_document.clone();
+        mismatched_lease_document.lease_id = 301;
+        query(
+            "INSERT INTO leases (lease_id, escrow_address, chain_lease_id, state) \
+             VALUES (301, $1, 42, 'active'), (302, $2, 42, 'active')",
+        )
+        .bind(previous)
+        .bind(current)
+        .execute(&pool)
+        .await?;
+        query(
+            "INSERT INTO managed_repro_jobs \
+                 (command_id, lease_id, command, status, available_at, created_at, updated_at) \
+             VALUES ($1, 301, $2, 'queued', NOW() - INTERVAL '2 minutes', NOW(), NOW()), \
+                    ($3, 302, $4, 'queued', NOW() - INTERVAL '1 minute', NOW(), NOW())",
+        )
+        .bind(previous_command)
+        .bind(SqlJson(&previous_document))
+        .bind(current_command)
+        .bind(SqlJson(&mismatched_lease_document))
+        .execute(&pool)
+        .await?;
+
+        let current_claim = claim_job(&pool, current).await?.context("current claim")?;
+        assert_eq!(current_claim.command_id, current_command);
+        assert!(
+            load_claimed_job(&pool, current, current_claim)
+                .await
+                .is_err()
+        );
+        query("UPDATE managed_repro_jobs SET command = $2 WHERE command_id = $1")
+            .bind(current_command)
+            .bind(SqlJson(&current_document))
+            .execute(&pool)
+            .await?;
+        query("UPDATE managed_repro_jobs SET status = 'ready' WHERE command_id = $1")
+            .bind(current_command)
+            .execute(&pool)
+            .await?;
+        for state in ["closing", "failed"] {
+            query("UPDATE leases SET state = $2 WHERE lease_id = $1")
+                .bind(302_i64)
+                .bind(state)
+                .execute(&pool)
+                .await?;
+            assert!(
+                extend_operation_claim(
+                    &pool,
+                    current,
+                    current_claim,
+                    CLAIM_SECONDS,
+                    ExternalOperation::Launch,
+                )
+                .await
+                .is_err()
+            );
+        }
+        query("UPDATE leases SET state = 'active' WHERE lease_id = $1")
+            .bind(302_i64)
+            .execute(&pool)
+            .await?;
+        extend_operation_claim(
+            &pool,
+            current,
+            current_claim,
+            CLAIM_SECONDS,
+            ExternalOperation::Launch,
+        )
+        .await?;
+        let loaded = load_claimed_job(&pool, current, current_claim).await?;
+        assert_eq!(loaded.lease_id, 302);
+        let mut mismatched_command_document = current_document.clone();
+        mismatched_command_document.command_id = previous_command;
+        query("UPDATE managed_repro_jobs SET command = $2 WHERE command_id = $1")
+            .bind(current_command)
+            .bind(SqlJson(&mismatched_command_document))
+            .execute(&pool)
+            .await?;
+        assert!(
+            load_claimed_job(&pool, current, current_claim)
+                .await
+                .is_err()
+        );
+        query("UPDATE managed_repro_jobs SET command = $2 WHERE command_id = $1")
+            .bind(current_command)
+            .bind(SqlJson(&current_document))
+            .execute(&pool)
+            .await?;
+        let previous_unclaimed: bool = query_scalar(
+            "SELECT claim_token IS NULL FROM managed_repro_jobs WHERE command_id = $1",
+        )
+        .bind(previous_command)
+        .fetch_one(&pool)
+        .await?;
+        assert!(previous_unclaimed);
+        let previous_claim = claim_job(&pool, previous)
+            .await?
+            .context("previous claim")?;
+        assert_eq!(previous_claim.command_id, previous_command);
+        assert_eq!(
+            load_claimed_job(&pool, previous, previous_claim)
+                .await?
+                .lease_id,
+            301
+        );
+        assert!(
+            load_claimed_job(&pool, current, previous_claim)
+                .await
+                .is_err()
+        );
+        assert!(claim_job(&pool, current).await?.is_none());
+        assert!(claim_job(&pool, previous).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PRISM_TEST_DATABASE_URL"]
+    async fn postgres_restart_after_deadline_persists_terminal_report() -> anyhow::Result<()> {
+        let database_url = env::var("PRISM_TEST_DATABASE_URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await?;
+        query("DROP TABLE IF EXISTS lifecycle_outbox, managed_repro_jobs, leases CASCADE")
+            .execute(&pool)
+            .await?;
+        query(
+            "CREATE TABLE leases ( \
+                 lease_id BIGINT PRIMARY KEY, escrow_address TEXT NOT NULL, \
+                 state TEXT NOT NULL, document JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await?;
+        query(
+            "CREATE TABLE managed_repro_jobs ( \
+                 command_id UUID PRIMARY KEY, lease_id BIGINT NOT NULL, status TEXT NOT NULL, \
+                 report JSONB, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, \
+                 claim_token UUID, claim_generation BIGINT NOT NULL, lease_until TIMESTAMPTZ, \
+                 runner_private_key JSONB, last_error TEXT, \
+                 prepared_provider_instance_id BIGINT, updated_at TIMESTAMPTZ NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await?;
+        query(
+            "CREATE TABLE lifecycle_outbox ( \
+                 action_id UUID PRIMARY KEY, lease_id BIGINT NOT NULL, kind TEXT NOT NULL, \
+                 available_at TIMESTAMPTZ NOT NULL, UNIQUE (lease_id, kind) \
+             )",
+        )
+        .execute(&pool)
+        .await?;
+
+        let escrow = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let window_start = Utc::now() - Duration::hours(1);
+        let started_at = window_start + Duration::minutes(1);
+        let deadline = window_start + Duration::minutes(30);
+        let quote_id = Uuid::now_v7();
+        let capability = prism_protocol::ReproCapability {
+            token_hash: "11".repeat(32),
+            spec_hash: "22".repeat(32),
+            expected_exit_code: 0,
+            executor: ReproExecutor::Managed,
+        };
+        let image = format!("docker.io/library/test@sha256:{}", "33".repeat(32));
+        let mut command = command("nvidia-smi");
+        command.issued_at = window_start - Duration::minutes(1);
+        command.expires_at = window_start + Duration::minutes(10);
+        let quote = LeaseQuote {
+            quote_id,
+            node_id: command.node_id.clone(),
+            image: image.clone(),
+            duration_seconds: 1_800,
+            min_vram_mib: 24_576,
+            rate_per_second: 1,
+            maximum_escrow: 1_800,
+            trust_class: prism_protocol::TrustClass::Open,
+            command: Some("nvidia-smi".to_owned()),
+            repro: Some(capability.clone()),
+            expires_at: window_start + Duration::minutes(5),
+        };
+        let lease = LeaseRecord {
+            lease_id: command.lease_id,
+            chain_lease_id: command.lease_id,
+            escrow_address: escrow.to_owned(),
+            quote_id,
+            node_id: command.node_id.clone(),
+            renter_wallet: format!("0x{}", "44".repeat(20)),
+            image,
+            duration_seconds: 1_800,
+            rate_per_second: 1,
+            maximum_escrow: 1_800,
+            trust_class: prism_protocol::TrustClass::Open,
+            funding_transaction_hash: format!("0x{}", "55".repeat(32)),
+            state: LeaseState::Active,
+            command: Some("nvidia-smi".to_owned()),
+            repro: Some(capability),
+            created_at: window_start,
+            updated_at: window_start,
+        };
+        let claim = Claim {
+            command_id: command.command_id,
+            token: Uuid::now_v7(),
+            generation: 1,
+        };
+        let instance_id = 9001_u64;
+        let host_key_sha256 = "66".repeat(32);
+        query(
+            "INSERT INTO leases (lease_id, escrow_address, state, document, updated_at) \
+             VALUES ($1, $2, 'active', $3, NOW())",
+        )
+        .bind(i64::try_from(lease.lease_id)?)
+        .bind(escrow)
+        .bind(SqlJson(&lease))
+        .execute(&pool)
+        .await?;
+        query(
+            "INSERT INTO managed_repro_jobs ( \
+                 command_id, lease_id, status, started_at, claim_token, claim_generation, \
+                 lease_until, prepared_provider_instance_id, updated_at \
+             ) VALUES ($1, $2, 'running', $3, $4, $5, NOW() + INTERVAL '1 minute', $6, NOW())",
+        )
+        .bind(claim.command_id)
+        .bind(i64::try_from(lease.lease_id)?)
+        .bind(started_at)
+        .bind(claim.token)
+        .bind(claim.generation)
+        .bind(i64::try_from(instance_id)?)
+        .execute(&pool)
+        .await?;
+
+        let worker = Worker {
+            pool: pool.clone(),
+            escrow_address: escrow.to_owned(),
+            cipher: CredentialCipher::from_hex(&"77".repeat(32))?,
+            signer: Arc::new(EthereumSigner::local(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )?),
+        };
+        let job = Job {
+            command_id: command.command_id,
+            lease_id: lease.lease_id,
+            command,
+            status: "running".to_owned(),
+            private_key: None,
+            host_key: None,
+            host_key_sha256: Some(host_key_sha256.clone()),
+            gpu_model: Some("NVIDIA RTX 6000 Ada".to_owned()),
+            gpu_vram_mib: Some(49_140),
+            started_at: Some(started_at),
+            prepared_instance_id: Some(instance_id),
+            lease,
+            quote,
+            access_started_at: Some(window_start),
+            access_ended_at: None,
+            instance_id: Some(instance_id),
+            ssh_host: None,
+            ssh_port: None,
+            cloud_status: Some("running".to_owned()),
+        };
+        worker
+            .finish_failed(
+                claim,
+                &job,
+                "managed result retrieval exhausted its retry limit",
+            )
+            .await?;
+
+        let (status, stored_finished_at, SqlJson(report), claim_released) =
+            query_as::<_, (String, DateTime<Utc>, SqlJson<ManagedCommandReport>, bool)>(
+                "SELECT status, finished_at, report, claim_token IS NULL \
+             FROM managed_repro_jobs WHERE command_id = $1",
+            )
+            .bind(claim.command_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(status, "failed");
+        assert_eq!(stored_finished_at, deadline);
+        assert!(claim_released);
+        assert_eq!(report.command_id, claim.command_id);
+        assert_eq!(report.lease_id, job.lease_id);
+        assert_eq!(report.provider_instance_id, instance_id);
+        assert_eq!(report.transport_host_key_sha256, host_key_sha256);
+        assert_eq!(report.started_at, started_at);
+        assert_eq!(report.finished_at, deadline);
+        assert_eq!(report.outcome, NodeCommandOutcome::Failed);
+        assert!(report.error.is_some());
+        assert!(report.result.is_none());
+        report.verify()?;
+
+        let (lease_state, SqlJson(stored_lease)): (String, SqlJson<LeaseRecord>) =
+            query_as("SELECT state, document FROM leases WHERE lease_id = $1")
+                .bind(i64::try_from(job.lease_id)?)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(lease_state, "closing");
+        assert_eq!(stored_lease.state, LeaseState::Closing);
+        let close_actions: i64 = query_scalar(
+            "SELECT COUNT(*) FROM lifecycle_outbox WHERE lease_id = $1 AND kind = 'close_access'",
+        )
+        .bind(i64::try_from(job.lease_id)?)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(close_actions, 1);
+        Ok(())
     }
 
     #[test]

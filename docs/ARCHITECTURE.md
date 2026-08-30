@@ -171,7 +171,7 @@ sequenceDiagram
     W->>E: startAccess (after finality)
     Note over R,G: metered runtime
     W->>E: proposeSettlement (EIP-712)
-    Note over E: 24h dispute window
+    Note over E: five-minute dispute window
     W->>E: finalize → pay / refund
     W-->>R: public proof receipt
 ```
@@ -186,7 +186,7 @@ sequenceDiagram
    checks before billing starts.
 5. Duration expiry, stale node telemetry, stale tunnel state, or a signed node
    completion closes access and creates a durable settlement job.
-6. The attestor proposes signed metering. After 24 hours without dispute, the
+6. The attestor proposes signed metering. After five minutes without dispute, the
    lifecycle worker finalizes payment/refund and queues public proof.
 
 ## Integrity monitoring

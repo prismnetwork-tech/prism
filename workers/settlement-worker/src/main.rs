@@ -1,19 +1,24 @@
 use std::{
-    collections::BTreeMap,
-    env, fs,
+    collections::{BTreeMap, BTreeSet},
+    env, fmt, fs,
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use k256::ecdsa::{
+    RecoveryId, Signature as EthereumSignature, VerifyingKey as EthereumVerifyingKey,
+};
 use prism_chain::EthereumSigner;
 use prism_protocol::{
     CommandResult, ExecutionEvidence, MAX_VERIFIABLE_TRUST_CLASS, ManagedCommandReport,
     ManagedProvider, NodeCommandKind, NodeCommandOutcome, PublicReceipt, ROBINHOOD_CHAIN_ID,
     ReceiptOutcome, ReproExecutionReport, ReproExecutor, ReproReceiptEvidence, SettlementEvidence,
     TrustClass, gpu_repro_spec_hash, managed_repro_report_hash, node_id, receipt_hash,
-    repro_command_hash, repro_report_hash, repro_result_hash, repro_stream_hash, verifying_key,
+    receipt_hash_matches, repro_command_hash, repro_report_hash, repro_result_hash,
+    repro_stream_hash, validate_receipt_identity, verifying_key,
 };
 use rlp::RlpStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -23,6 +28,7 @@ use sqlx_core::{
     query::query, query_as::query_as, query_scalar::query_scalar, types::Json as SqlJson,
 };
 use sqlx_postgres::{PgConnection, PgPool, PgPoolOptions};
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 /// Rebuild a settlement proposal rather than resubmit it after this many
@@ -33,6 +39,7 @@ use tracing_subscriber::EnvFilter;
 /// attempt for nothing.
 const DEADLINE_MARGIN_SECONDS: u64 = 600;
 const RESIGN_AFTER_ATTEMPTS: i16 = 5;
+const SIGNER_LOCK: i64 = 4_663_002;
 const MAX_EVIDENCE_BYTES: u64 = 20_000_000;
 const MAX_EVIDENCE_RECORDS: usize = 1_000;
 const MAX_LEASE_SECONDS: u64 = 21_600;
@@ -79,6 +86,181 @@ struct ManagedReproBinding {
     report: Option<ManagedCommandReport>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EscrowGeneration {
+    chain_address: [u8; 20],
+    database_address: String,
+}
+
+impl EscrowGeneration {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        let chain_address = address(value)?;
+        Ok(Self {
+            chain_address,
+            database_address: format!("0x{}", hex::encode(chain_address)),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ClaimedSettlement {
+    lease_id: u64,
+    chain_lease_id: u64,
+    claim_generation: i64,
+    evidence: SettlementEvidence,
+}
+
+#[derive(Debug)]
+struct HistoricalNonceAttempt {
+    transaction_hash: String,
+    lease_id: i64,
+    status: String,
+}
+
+struct HistoricalBindingAudit {
+    transaction_hash: String,
+    signer_address: String,
+    stored_proposal: serde_json::Value,
+    current_job_proposal: Option<serde_json::Value>,
+    result: GenerationBindingAudit,
+}
+
+struct SelectedSubmission {
+    submission: Submission,
+    chain_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoricalNonceResolution {
+    ReservedBy(i64),
+    Conflict(&'static str),
+}
+
+enum GenerationBindingAudit {
+    Verified(Submission),
+    Normalized(Submission),
+    Quarantined(&'static str),
+}
+
+#[derive(Clone)]
+struct ShutdownGate {
+    receiver: watch::Receiver<bool>,
+}
+
+impl ShutdownGate {
+    fn channel() -> (Self, watch::Sender<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (Self { receiver }, sender)
+    }
+
+    fn requested(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
+    async fn wait(&self) {
+        let mut receiver = self.receiver.clone();
+        if *receiver.borrow() {
+            return;
+        }
+        let _ = receiver.changed().await;
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownRequested;
+
+impl fmt::Display for ShutdownRequested {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("settlement worker shutdown requested")
+    }
+}
+
+impl std::error::Error for ShutdownRequested {}
+
+impl GenerationBindingAudit {
+    fn state(&self) -> &'static str {
+        match self {
+            Self::Verified(_) => "verified",
+            Self::Normalized(_) => "normalized",
+            Self::Quarantined(_) => "quarantined",
+        }
+    }
+
+    fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Verified(_) => None,
+            Self::Normalized(_) => Some("legacy_receipt_identity_normalized"),
+            Self::Quarantined(reason) => Some(reason),
+        }
+    }
+
+    fn proposal(&self) -> Option<&Submission> {
+        match self {
+            Self::Verified(proposal) | Self::Normalized(proposal) => Some(proposal),
+            Self::Quarantined(_) => None,
+        }
+    }
+}
+
+const CONFIRMED_HISTORICAL_NONCE_OWNER: &str = "confirmed_historical_nonce_owner";
+const NO_CONFIRMED_HISTORICAL_NONCE_OWNER: &str =
+    "historical_nonce_collision_without_confirmed_owner";
+const MULTIPLE_CONFIRMED_HISTORICAL_NONCE_OWNERS: &str =
+    "historical_nonce_collision_with_multiple_confirmed_owners";
+
+enum ClaimHeartbeat<'a> {
+    Detached,
+    Durable {
+        pool: &'a PgPool,
+        escrow: &'a EscrowGeneration,
+        settlement: &'a ClaimedSettlement,
+        shutdown: &'a ShutdownGate,
+    },
+}
+
+impl ClaimHeartbeat<'_> {
+    async fn renew(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Detached => Ok(()),
+            Self::Durable {
+                pool,
+                escrow,
+                settlement,
+                ..
+            } => extend_settlement_claim(pool, escrow, settlement).await,
+        }
+    }
+
+    async fn run<T>(&self, future: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        self.renew().await?;
+        tokio::pin!(future);
+        loop {
+            match self {
+                Self::Detached => {
+                    let value = future.await?;
+                    return Ok(value);
+                }
+                Self::Durable { shutdown, .. } => {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.wait() => {
+                            return Err(ShutdownRequested.into());
+                        }
+                        result = &mut future => {
+                            let value = result?;
+                            self.renew().await?;
+                            return Ok(value);
+                        }
+                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                            self.renew().await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct ChainClient {
     client: reqwest::Client,
     rpc_url: url::Url,
@@ -111,6 +293,36 @@ struct BlockHeader {
     timestamp: String,
 }
 
+enum SettlementFinality {
+    Pending,
+    Confirmed {
+        block_number: u64,
+        block_hash: String,
+        block_time: u64,
+    },
+    Reverted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptObservation {
+    Adopt,
+    Ignore,
+    MarkReverted,
+    CheckTransaction,
+}
+
+fn observe_attempt(status: &str, finality: &SettlementFinality) -> AttemptObservation {
+    match status {
+        "confirmed" => AttemptObservation::Adopt,
+        "reverted" => AttemptObservation::Ignore,
+        _ => match finality {
+            SettlementFinality::Confirmed { .. } => AttemptObservation::Adopt,
+            SettlementFinality::Reverted => AttemptObservation::MarkReverted,
+            SettlementFinality::Pending => AttemptObservation::CheckTransaction,
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -119,19 +331,49 @@ async fn main() -> anyhow::Result<()> {
         )
         .json()
         .init();
+    let shutdown = install_shutdown_gate()?;
     if let Ok(database_url) = env::var("DATABASE_URL") {
-        return run_database(&database_url).await;
+        return run_database(&database_url, &shutdown).await;
     }
     if env::var("PRISM_ALLOW_DEVELOPMENT_FILE_HANDOFF").as_deref() != Ok("1") {
         anyhow::bail!("DATABASE_URL is required for durable settlement processing");
     }
-    run_file().await
+    run_file(&shutdown).await
 }
 
-async fn run_file() -> anyhow::Result<()> {
+fn install_shutdown_gate() -> anyhow::Result<ShutdownGate> {
+    let (shutdown, sender) = ShutdownGate::channel();
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install SIGTERM handler")?;
+        tokio::spawn(async move {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "settlement interrupt handler failed");
+                    }
+                }
+                _ = terminate.recv() => {}
+            }
+            let _ = sender.send(true);
+        });
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "settlement interrupt handler failed");
+        }
+        let _ = sender.send(true);
+    });
+    Ok(shutdown)
+}
+
+async fn run_file(shutdown: &ShutdownGate) -> anyhow::Result<()> {
     let evidence_path = PathBuf::from(required_env("PRISM_SETTLEMENT_EVIDENCE_FILE")?);
     let outbox_path = PathBuf::from(required_env("PRISM_SETTLEMENT_OUTBOX_FILE")?);
-    let escrow = address(&required_env("PRISM_LEASE_ESCROW_ADDRESS")?)?;
+    let escrow = EscrowGeneration::parse(&required_env("PRISM_LEASE_ESCROW_ADDRESS")?)?;
     let evidence: Vec<SettlementEvidence> =
         serde_json::from_slice(&read_bounded(&evidence_path, MAX_EVIDENCE_BYTES)?)?;
     if evidence.len() > MAX_EVIDENCE_RECORDS {
@@ -143,11 +385,14 @@ async fn run_file() -> anyhow::Result<()> {
     if chain_id != ROBINHOOD_CHAIN_ID {
         anyhow::bail!("RPC chain ID does not match Robinhood Chain mainnet");
     }
-    let gateway = chain.gateway(escrow).await?;
+    let gateway = chain.gateway(escrow.chain_address).await?;
     let mut proposals = evidence
         .iter()
         .map(|evidence| reconcile_with_gateway(evidence, Some(gateway)))
         .collect::<Result<Vec<_>, _>>()?;
+    for proposal in &mut proposals {
+        enrich_receipt_identity(proposal, &escrow)?;
+    }
     proposals.sort_by_key(|proposal| proposal.lease_id);
 
     let signer = EthereumSigner::from_environment("PRISM_ATTESTOR_KMS_KEY_ID").await?;
@@ -156,11 +401,31 @@ async fn run_file() -> anyhow::Result<()> {
     } else {
         Outbox::default()
     };
+    let heartbeat = ClaimHeartbeat::Detached;
 
     for proposal in proposals {
+        if shutdown.requested() {
+            tracing::info!("settlement worker stopped before claiming more file submissions");
+            return Ok(());
+        }
         let lease_id = proposal.lease_id;
         if !outbox.submissions.contains_key(&lease_id) {
-            let submission = prepare_submission(&chain, &signer, escrow, proposal).await?;
+            let signer_address = format!("0x{}", hex::encode(signer.address()));
+            let nonce = chain
+                .quantity(
+                    "eth_getTransactionCount",
+                    serde_json::json!([signer_address, "pending"]),
+                )
+                .await?;
+            let submission = prepare_submission(
+                &chain,
+                &signer,
+                escrow.chain_address,
+                proposal,
+                nonce,
+                &heartbeat,
+            )
+            .await?;
             outbox
                 .submissions
                 .insert(submission.proposal.lease_id, submission);
@@ -203,27 +468,34 @@ async fn run_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_database(database_url: &str) -> anyhow::Result<()> {
+async fn run_database(database_url: &str, shutdown: &ShutdownGate) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(database_url)
         .await
         .context("connect settlement database")?;
-    let present: Option<String> =
-        query_scalar("SELECT to_regclass('public.settlement_jobs')::text")
-            .fetch_one(&pool)
-            .await?;
-    if present.is_none() {
+    let present = query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT to_regclass('public.settlement_transaction_attempts')::text, \
+                to_regclass('public.settlement_signer_nonce_reservations')::text",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if present.0.is_none() || present.1.is_none() {
         anyhow::bail!("control-plane settlement migrations have not been applied");
     }
     record_service_version(&pool, "settlement-worker").await?;
-    let escrow = address(&required_env("PRISM_LEASE_ESCROW_ADDRESS")?)?;
+    let escrow = EscrowGeneration::parse(&required_env("PRISM_LEASE_ESCROW_ADDRESS")?)?;
+    tracing::info!(
+        escrow_generation = %escrow.database_address,
+        "settlement worker bound to escrow generation"
+    );
     let chain = ChainClient::new(secure_url(&required_env("PRISM_RPC_URL")?)?)?;
     if chain.quantity("eth_chainId", serde_json::json!([])).await? != ROBINHOOD_CHAIN_ID {
         anyhow::bail!("settlement RPC is not Robinhood Chain");
     }
     let signer = EthereumSigner::from_environment("PRISM_ATTESTOR_KMS_KEY_ID").await?;
+    backfill_attempt_signers(&pool).await?;
     let confirmations = env::var("PRISM_SETTLEMENT_CONFIRMATIONS")
         .ok()
         .map(|value| value.parse::<u64>())
@@ -234,26 +506,50 @@ async fn run_database(database_url: &str) -> anyhow::Result<()> {
     }
     let run_once = env::var("PRISM_RUN_ONCE").as_deref() == Ok("1");
     loop {
-        let Some((lease_id, evidence)) = claim_settlement(&pool).await? else {
+        let settlement = tokio::select! {
+            biased;
+            () = shutdown.wait() => {
+                tracing::info!("settlement worker stopped before claiming another job");
+                return Ok(());
+            }
+            settlement = claim_settlement(&pool, &escrow) => settlement?,
+        };
+        let Some(settlement) = settlement else {
             if run_once {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::select! {
+                biased;
+                () = shutdown.wait() => {
+                    tracing::info!("settlement worker stopped while idle");
+                    return Ok(());
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            }
             continue;
         };
+        let lease_id = settlement.lease_id;
         let result = process_settlement(
             &pool,
             &chain,
             &signer,
-            escrow,
+            &escrow,
             confirmations,
-            lease_id,
-            &evidence,
+            &settlement,
+            shutdown,
         )
         .await;
+        if shutdown.requested() {
+            if let Err(error) = &result {
+                tracing::info!(lease_id, %error, "settlement job stopped at a durable boundary");
+            }
+            release_settlement_claim(&pool, &escrow, &settlement).await?;
+            tracing::info!("settlement worker shut down cleanly");
+            return Ok(());
+        }
         if let Err(error) = result {
             tracing::error!(lease_id, %error, "settlement job failed");
-            retry_settlement(&pool, lease_id, &error).await?;
+            retry_settlement(&pool, &escrow, &settlement, &error).await?;
         }
         if run_once {
             return Ok(());
@@ -264,36 +560,802 @@ async fn run_database(database_url: &str) -> anyhow::Result<()> {
 /// Claims a job. The stored proposal is deliberately not returned: whether it
 /// can still be reused is decided in `prepare_durable_submission`, which is the
 /// only place that knows the rules for rebuilding one.
-async fn claim_settlement(pool: &PgPool) -> anyhow::Result<Option<(u64, SettlementEvidence)>> {
+async fn claim_settlement(
+    pool: &PgPool,
+    escrow: &EscrowGeneration,
+) -> anyhow::Result<Option<ClaimedSettlement>> {
     let mut transaction = pool.begin().await?;
-    let row = query_as::<_, (i64, SqlJson<SettlementEvidence>)>(
-        "SELECT lease_id, evidence FROM settlement_jobs \
-         WHERE attempts < 100 AND available_at <= NOW() \
-           AND (status IN ('queued', 'submitted') \
-                OR (status = 'processing' AND lease_until <= NOW())) \
-         ORDER BY available_at, created_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+    let row = query_as::<_, (i64, i64, SqlJson<SettlementEvidence>)>(
+        "SELECT job.lease_id, lease.chain_lease_id, job.evidence \
+         FROM settlement_jobs AS job \
+         JOIN leases AS lease ON lease.lease_id = job.lease_id \
+         WHERE lease.escrow_address = $1 \
+           AND job.attempts < 100 AND job.available_at <= NOW() \
+           AND (job.status IN ('queued', 'submitted') \
+                OR (job.status = 'processing' AND job.lease_until <= NOW())) \
+         ORDER BY job.available_at, job.created_at LIMIT 1 \
+         FOR UPDATE OF job, lease SKIP LOCKED",
     )
+    .bind(&escrow.database_address)
     .fetch_optional(&mut *transaction)
     .await?;
-    let Some((lease_id, SqlJson(evidence))) = row else {
+    let Some((lease_id, chain_lease_id, SqlJson(evidence))) = row else {
         transaction.commit().await?;
         return Ok(None);
     };
-    query(
-        "UPDATE settlement_jobs SET status = 'processing', attempts = attempts + 1, \
+    let settlement = ClaimedSettlement {
+        lease_id: u64::try_from(lease_id)?,
+        chain_lease_id: u64::try_from(chain_lease_id)?,
+        claim_generation: 0,
+        evidence,
+    };
+    validate_claimed_identity(&settlement)?;
+    let claim_generation: i64 = query_scalar(
+        "UPDATE settlement_jobs AS job \
+         SET status = 'processing', attempts = attempts + 1, \
+             claim_generation = claim_generation + 1, \
              lease_until = NOW() + INTERVAL '2 minutes', updated_at = NOW() \
-         WHERE lease_id = $1",
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $2 AND lease.chain_lease_id = $3 \
+         RETURNING job.claim_generation",
     )
     .bind(lease_id)
-    .execute(&mut *transaction)
+    .bind(&escrow.database_address)
+    .bind(chain_lease_id)
+    .fetch_one(&mut *transaction)
     .await?;
+    if claim_generation <= 0 {
+        anyhow::bail!("settlement claim generation is invalid");
+    }
     transaction.commit().await?;
-    Ok(Some((u64::try_from(lease_id)?, evidence)))
+    Ok(Some(ClaimedSettlement {
+        claim_generation,
+        ..settlement
+    }))
+}
+
+fn validate_claimed_identity(settlement: &ClaimedSettlement) -> anyhow::Result<()> {
+    if settlement.evidence.lease_id != settlement.lease_id
+        || settlement.evidence.chain_lease_id != settlement.chain_lease_id
+        || settlement.chain_lease_id == 0
+    {
+        anyhow::bail!("settlement evidence does not match its lease identity");
+    }
+    Ok(())
+}
+
+fn validate_stored_binding(
+    settlement: &ClaimedSettlement,
+    binding: Option<(i64, SqlJson<SettlementEvidence>)>,
+) -> anyhow::Result<()> {
+    let Some((chain_lease_id, SqlJson(evidence))) = binding else {
+        anyhow::bail!("settlement lease does not belong to this escrow generation");
+    };
+    if u64::try_from(chain_lease_id)? != settlement.chain_lease_id
+        || evidence != settlement.evidence
+    {
+        anyhow::bail!("settlement binding changed after it was claimed");
+    }
+    validate_claimed_identity(settlement)
+}
+
+fn current_job_proposal_matches_attempt(
+    attempt: &serde_json::Value,
+    current: &serde_json::Value,
+    escrow_address: &str,
+    chain_lease_id: i64,
+) -> bool {
+    if current == attempt {
+        return true;
+    }
+    let Ok(mut legacy) = serde_json::from_value::<Submission>(current.clone()) else {
+        return false;
+    };
+    if legacy.proposal.receipt.escrow_address.is_some()
+        || legacy.proposal.receipt.chain_lease_id.is_some()
+    {
+        return false;
+    }
+    legacy.proposal.receipt.escrow_address = Some(escrow_address.to_owned());
+    legacy.proposal.receipt.chain_lease_id = Some(chain_lease_id.to_string());
+    serde_json::to_value(legacy).is_ok_and(|normalized| normalized == *attempt)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_generation_binding(
+    transaction_hash: &str,
+    raw_transaction: &str,
+    stored_nonce: i64,
+    lease_id: i64,
+    escrow_address: &str,
+    chain_lease_id: i64,
+    proposal_value: &serde_json::Value,
+    current_job_proposal: Option<&serde_json::Value>,
+    decoded: &DecodedLegacyTransaction,
+) -> GenerationBindingAudit {
+    let raw_bytes = match hex::decode(
+        raw_transaction
+            .strip_prefix("0x")
+            .unwrap_or(raw_transaction),
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => return GenerationBindingAudit::Quarantined("submission_transaction_mismatch"),
+    };
+    let computed_hash = format!("0x{}", hex::encode(Keccak256::digest(raw_bytes)));
+    if computed_hash != transaction_hash {
+        return GenerationBindingAudit::Quarantined("transaction_hash_mismatch");
+    }
+    if current_job_proposal.is_some_and(|proposal| {
+        !current_job_proposal_matches_attempt(
+            proposal_value,
+            proposal,
+            escrow_address,
+            chain_lease_id,
+        )
+    }) {
+        return GenerationBindingAudit::Quarantined("job_attempt_proposal_mismatch");
+    }
+    let Ok(mut submission) = serde_json::from_value::<Submission>(proposal_value.clone()) else {
+        return GenerationBindingAudit::Quarantined("invalid_stored_submission");
+    };
+    if submission.raw_transaction != raw_transaction
+        || submission.transaction_hash != transaction_hash
+    {
+        return GenerationBindingAudit::Quarantined("submission_transaction_mismatch");
+    }
+    if decoded.chain_id != ROBINHOOD_CHAIN_ID {
+        return GenerationBindingAudit::Quarantined("signed_chain_mismatch");
+    }
+    let Ok(expected_escrow) = address(escrow_address) else {
+        return GenerationBindingAudit::Quarantined("signed_escrow_mismatch");
+    };
+    if decoded.destination != expected_escrow {
+        return GenerationBindingAudit::Quarantined("signed_escrow_mismatch");
+    }
+    if i64::try_from(decoded.nonce).ok() != Some(stored_nonce) {
+        return GenerationBindingAudit::Quarantined("signed_nonce_mismatch");
+    }
+    if i64::try_from(submission.proposal.lease_id).ok() != Some(lease_id)
+        || i64::try_from(submission.proposal.chain_lease_id).ok() != Some(chain_lease_id)
+        || submission.proposal.receipt.lease_id != chain_lease_id.to_string()
+    {
+        return GenerationBindingAudit::Quarantined("proposal_lease_mismatch");
+    }
+    if submission.proposal.receipt.receipt_hash != submission.proposal.receipt_hash
+        || !receipt_hash_matches(&submission.proposal.receipt).unwrap_or(false)
+    {
+        return GenerationBindingAudit::Quarantined("receipt_hash_mismatch");
+    }
+    let normalized = match (
+        submission.proposal.receipt.escrow_address.as_deref(),
+        submission.proposal.receipt.chain_lease_id.as_deref(),
+    ) {
+        (None, None) => true,
+        (Some(receipt_escrow), Some(receipt_chain_lease_id))
+            if receipt_escrow == escrow_address
+                && receipt_chain_lease_id == chain_lease_id.to_string()
+                && validate_receipt_identity(&submission.proposal.receipt).is_ok() =>
+        {
+            false
+        }
+        _ => return GenerationBindingAudit::Quarantined("receipt_identity_mismatch"),
+    };
+    let Ok(attestation_signature) = hex::decode(
+        submission
+            .attestation_signature
+            .strip_prefix("0x")
+            .unwrap_or(&submission.attestation_signature),
+    ) else {
+        return GenerationBindingAudit::Quarantined("attestation_signature_mismatch");
+    };
+    let Ok(attestation_signature) = <[u8; 65]>::try_from(attestation_signature) else {
+        return GenerationBindingAudit::Quarantined("attestation_signature_mismatch");
+    };
+    if proposal_calldata(&submission.proposal, &attestation_signature)
+        .map_or(true, |calldata| calldata != decoded.data)
+    {
+        return GenerationBindingAudit::Quarantined("calldata_mismatch");
+    }
+    let Ok(digest) = settlement_digest(ROBINHOOD_CHAIN_ID, expected_escrow, &submission.proposal)
+    else {
+        return GenerationBindingAudit::Quarantined("attestation_signature_mismatch");
+    };
+    if recover_digest_signer(&digest, &attestation_signature)
+        .map_or(true, |signer| signer != decoded.signer_address)
+    {
+        return GenerationBindingAudit::Quarantined("attestation_signature_mismatch");
+    }
+    if !normalized {
+        return GenerationBindingAudit::Verified(submission);
+    }
+    let committed_receipt_hash = submission.proposal.receipt_hash.clone();
+    submission.proposal.receipt.escrow_address = Some(escrow_address.to_owned());
+    submission.proposal.receipt.chain_lease_id = Some(chain_lease_id.to_string());
+    if validate_receipt_identity(&submission.proposal.receipt).is_err()
+        || receipt_hash(&submission.proposal.receipt).ok().as_deref()
+            != Some(committed_receipt_hash.as_str())
+    {
+        return GenerationBindingAudit::Quarantined("receipt_identity_mismatch");
+    }
+    GenerationBindingAudit::Normalized(submission)
+}
+
+fn recover_digest_signer(digest: &[u8; 32], signature: &[u8; 65]) -> anyhow::Result<String> {
+    let recovery_id = signature[64]
+        .checked_sub(27)
+        .and_then(RecoveryId::from_byte)
+        .context("signature recovery id is invalid")?;
+    let signature = EthereumSignature::from_slice(&signature[..64])?;
+    if signature.normalize_s().is_some() {
+        anyhow::bail!("signature scalar is not canonical");
+    }
+    let signer = EthereumVerifyingKey::recover_from_prehash(digest, &signature, recovery_id)?;
+    let point = signer.to_encoded_point(false);
+    Ok(format!(
+        "0x{}",
+        hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..])
+    ))
+}
+
+async fn backfill_attempt_signers(pool: &PgPool) -> anyhow::Result<()> {
+    let mut transaction = pool.begin().await?;
+    query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SIGNER_LOCK)
+        .execute(&mut *transaction)
+        .await?;
+    let attempts = query_as::<
+        _,
+        (
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            SqlJson<serde_json::Value>,
+            Option<String>,
+            Option<SqlJson<serde_json::Value>>,
+            String,
+            i64,
+        ),
+    >(
+        "SELECT attempt.transaction_hash, attempt.raw_transaction, attempt.lease_id, \
+                attempt.transaction_nonce, attempt.status, attempt.signer_address, \
+                attempt.nonce_reservation_state, attempt.nonce_reservation_reason, \
+                attempt.generation_binding_state, attempt.generation_binding_reason, \
+                attempt.proposal, job.transaction_hash, job.proposal, \
+                lease.escrow_address, lease.chain_lease_id \
+         FROM settlement_transaction_attempts AS attempt \
+         JOIN settlement_jobs AS job ON job.lease_id = attempt.lease_id \
+         JOIN leases AS lease ON lease.lease_id = attempt.lease_id \
+         ORDER BY attempt.prepared_at, attempt.transaction_hash \
+         FOR UPDATE OF attempt, job, lease",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let mut groups = BTreeMap::<(String, i64), Vec<HistoricalNonceAttempt>>::new();
+    let mut binding_audits = Vec::<HistoricalBindingAudit>::new();
+    for (
+        transaction_hash,
+        raw_transaction,
+        lease_id,
+        stored_nonce,
+        status,
+        stored_signer,
+        reservation_state,
+        reservation_reason,
+        binding_state,
+        _binding_reason,
+        SqlJson(attempt_proposal),
+        job_transaction_hash,
+        job_proposal,
+        escrow_address,
+        chain_lease_id,
+    ) in attempts
+    {
+        let decoded = match decode_legacy_transaction(&raw_transaction) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                quarantine_undecodable_attempt(&mut transaction, &transaction_hash).await?;
+                tracing::error!(
+                    transaction_hash,
+                    %error,
+                    "quarantined undecodable historical settlement transaction"
+                );
+                continue;
+            }
+        };
+        let signer_address = decoded.signer_address.clone();
+        let signed_nonce = i64::try_from(decoded.nonce)?;
+        if stored_signer
+            .as_ref()
+            .is_some_and(|stored| stored != &signer_address)
+        {
+            anyhow::bail!("settlement transaction signer backfill conflicted");
+        }
+        if reservation_state == "pending" && reservation_reason.is_some() {
+            anyhow::bail!("pending settlement nonce reservation has a resolution reason");
+        }
+        let is_current_job = job_transaction_hash.as_deref() == Some(&transaction_hash);
+        let current_job_proposal = if is_current_job {
+            job_proposal.map(|SqlJson(proposal)| proposal)
+        } else {
+            None
+        };
+        let mut audit = if is_current_job && current_job_proposal.is_none() {
+            GenerationBindingAudit::Quarantined("job_attempt_proposal_mismatch")
+        } else {
+            audit_generation_binding(
+                &transaction_hash,
+                &raw_transaction,
+                stored_nonce,
+                lease_id,
+                &escrow_address,
+                chain_lease_id,
+                &attempt_proposal,
+                current_job_proposal.as_ref(),
+                &decoded,
+            )
+        };
+        if binding_state == "normalized"
+            && let GenerationBindingAudit::Verified(proposal) = audit
+        {
+            audit = GenerationBindingAudit::Normalized(proposal);
+        }
+        binding_audits.push(HistoricalBindingAudit {
+            transaction_hash: transaction_hash.clone(),
+            signer_address: signer_address.clone(),
+            stored_proposal: attempt_proposal,
+            current_job_proposal,
+            result: audit,
+        });
+        groups
+            .entry((signer_address, signed_nonce))
+            .or_default()
+            .push(HistoricalNonceAttempt {
+                transaction_hash,
+                lease_id,
+                status,
+            });
+    }
+
+    let resolutions = groups
+        .iter()
+        .map(|(key, attempts)| (key.clone(), resolve_historical_nonce(attempts)))
+        .collect::<Vec<_>>();
+    let conflicts = resolutions
+        .iter()
+        .filter_map(|((signer, nonce), resolution)| match resolution {
+            HistoricalNonceResolution::ReservedBy(_) => None,
+            HistoricalNonceResolution::Conflict(reason) => Some((signer.clone(), *nonce, *reason)),
+        })
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        for ((signer, nonce), resolution) in &resolutions {
+            let HistoricalNonceResolution::Conflict(reason) = resolution else {
+                continue;
+            };
+            for attempt in groups.get(&(signer.clone(), *nonce)).into_iter().flatten() {
+                annotate_historical_nonce_attempt(
+                    &mut transaction,
+                    attempt,
+                    signer,
+                    "conflict",
+                    Some(reason),
+                )
+                .await?;
+            }
+        }
+        for audit in &binding_audits {
+            if matches!(audit.result, GenerationBindingAudit::Quarantined(_)) {
+                annotate_historical_generation_binding(
+                    &mut transaction,
+                    &audit.transaction_hash,
+                    &audit.signer_address,
+                    &audit.stored_proposal,
+                    &audit.result,
+                )
+                .await?;
+            }
+        }
+        detach_unsafe_historical_job_cursors(&mut transaction).await?;
+        transaction.commit().await?;
+        let details = conflicts
+            .into_iter()
+            .map(|(signer, nonce, reason)| format!("{signer}:{nonce} ({reason})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "historical settlement signer nonce conflicts require operator resolution: {details}"
+        );
+    }
+
+    for ((signer, nonce), resolution) in resolutions {
+        let HistoricalNonceResolution::ReservedBy(owner) = resolution else {
+            unreachable!("historical nonce conflicts returned before reservation")
+        };
+        let attempts = groups
+            .get(&(signer.clone(), nonce))
+            .context("historical settlement nonce group disappeared")?;
+        for attempt in attempts {
+            let (state, reason) = if attempt.lease_id == owner {
+                ("reserved", None)
+            } else {
+                ("noncanonical", Some(CONFIRMED_HISTORICAL_NONCE_OWNER))
+            };
+            annotate_historical_nonce_attempt(&mut transaction, attempt, &signer, state, reason)
+                .await?;
+        }
+        reserve_historical_nonce(&mut transaction, &signer, nonce, owner, attempts).await?;
+    }
+    for audit in binding_audits {
+        annotate_historical_generation_binding(
+            &mut transaction,
+            &audit.transaction_hash,
+            &audit.signer_address,
+            &audit.stored_proposal,
+            &audit.result,
+        )
+        .await?;
+        let (Some(original), GenerationBindingAudit::Normalized(normalized)) =
+            (audit.current_job_proposal, &audit.result)
+        else {
+            continue;
+        };
+        normalize_historical_job_proposal(
+            &mut transaction,
+            &audit.transaction_hash,
+            &original,
+            &serde_json::to_value(normalized)?,
+        )
+        .await?;
+    }
+    detach_unsafe_historical_job_cursors(&mut transaction).await?;
+    let incomplete: i64 = query_scalar(
+        "SELECT COUNT(*) FROM settlement_transaction_attempts \
+         WHERE generation_binding_state = 'pending' \
+            OR ((signer_address IS NULL OR nonce_reservation_state = 'pending') \
+                AND NOT (generation_binding_state = 'quarantined' \
+                         AND generation_binding_reason = 'invalid_signed_transaction'))",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if incomplete != 0 {
+        anyhow::bail!("settlement transaction signer backfill is incomplete");
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn annotate_historical_generation_binding(
+    transaction: &mut sqlx_postgres::PgTransaction<'_>,
+    transaction_hash: &str,
+    signer: &str,
+    original_proposal: &serde_json::Value,
+    audit: &GenerationBindingAudit,
+) -> anyhow::Result<()> {
+    let proposal = audit
+        .proposal()
+        .map(serde_json::to_value)
+        .transpose()?
+        .unwrap_or_else(|| original_proposal.clone());
+    let state = audit.state();
+    let reason = audit.reason();
+    let updated = query(
+        "UPDATE settlement_transaction_attempts \
+         SET signer_address = $2, proposal = $3, generation_binding_state = $4, \
+             generation_binding_reason = $5 \
+         WHERE transaction_hash = $1 \
+           AND (signer_address IS NULL OR signer_address = $2) \
+           AND (generation_binding_state = 'pending' \
+                OR (generation_binding_state = $4 \
+                    AND generation_binding_reason IS NOT DISTINCT FROM $5 \
+                    AND proposal = $3))",
+    )
+    .bind(transaction_hash)
+    .bind(signer)
+    .bind(SqlJson(proposal.clone()))
+    .bind(state)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!(
+            "settlement attempt {transaction_hash} has an incompatible generation binding: {state}/{}",
+            reason.unwrap_or("none")
+        );
+    }
+
+    Ok(())
+}
+
+async fn quarantine_undecodable_attempt(
+    transaction: &mut sqlx_postgres::PgTransaction<'_>,
+    transaction_hash: &str,
+) -> anyhow::Result<()> {
+    let quarantined = query(
+        "UPDATE settlement_transaction_attempts \
+         SET generation_binding_state = 'quarantined', \
+             generation_binding_reason = 'invalid_signed_transaction' \
+         WHERE transaction_hash = $1 \
+           AND (generation_binding_state = 'pending' \
+                OR (generation_binding_state = 'quarantined' \
+                    AND generation_binding_reason = 'invalid_signed_transaction'))",
+    )
+    .bind(transaction_hash)
+    .execute(&mut **transaction)
+    .await?;
+    if quarantined.rows_affected() != 1 {
+        anyhow::bail!(
+            "settlement attempt {transaction_hash} has an incompatible undecodable transaction binding"
+        );
+    }
+    Ok(())
+}
+
+async fn normalize_historical_job_proposal(
+    transaction: &mut sqlx_postgres::PgTransaction<'_>,
+    transaction_hash: &str,
+    original: &serde_json::Value,
+    normalized: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let eligible: bool = query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM settlement_transaction_attempts AS attempt \
+             WHERE attempt.transaction_hash = $1 \
+               AND attempt.generation_binding_state = 'normalized' \
+               AND attempt.nonce_reservation_state = 'reserved' \
+               AND attempt.signer_address IS NOT NULL \
+               AND EXISTS ( \
+                   SELECT 1 FROM settlement_signer_nonce_reservations AS reservation \
+                   WHERE reservation.signer_address = attempt.signer_address \
+                     AND reservation.transaction_nonce = attempt.transaction_nonce \
+                     AND reservation.lease_id = attempt.lease_id \
+               ) \
+         )",
+    )
+    .bind(transaction_hash)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !eligible {
+        return Ok(());
+    }
+    let updated = query(
+        "UPDATE settlement_jobs AS job \
+         SET proposal = $2, updated_at = NOW() \
+         FROM settlement_transaction_attempts AS attempt \
+         WHERE attempt.transaction_hash = $1 \
+           AND attempt.lease_id = job.lease_id \
+           AND attempt.generation_binding_state = 'normalized' \
+           AND attempt.nonce_reservation_state = 'reserved' \
+           AND attempt.signer_address IS NOT NULL \
+           AND attempt.proposal = $2 \
+           AND job.transaction_hash = attempt.transaction_hash \
+           AND job.raw_transaction = attempt.raw_transaction \
+           AND job.transaction_nonce = attempt.transaction_nonce \
+           AND job.proposal = $3 \
+           AND EXISTS ( \
+               SELECT 1 FROM settlement_signer_nonce_reservations AS reservation \
+               WHERE reservation.signer_address = attempt.signer_address \
+                 AND reservation.transaction_nonce = attempt.transaction_nonce \
+                 AND reservation.lease_id = attempt.lease_id \
+           )",
+    )
+    .bind(transaction_hash)
+    .bind(SqlJson(normalized.clone()))
+    .bind(SqlJson(original.clone()))
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!(
+            "settlement job for attempt {transaction_hash} could not normalize its legacy receipt identity"
+        );
+    }
+    Ok(())
+}
+
+async fn detach_unsafe_historical_job_cursors(
+    transaction: &mut sqlx_postgres::PgTransaction<'_>,
+) -> anyhow::Result<()> {
+    let detached = query(
+        "UPDATE settlement_jobs AS job \
+         SET proposal = NULL, raw_transaction = NULL, transaction_hash = NULL, \
+             transaction_nonce = NULL, \
+             status = CASE \
+                 WHEN job.status IN ('queued', 'processing', 'submitted') THEN 'queued' \
+                 WHEN job.status IN ('proposed', 'disputed', 'finalized') THEN 'failed' \
+                 ELSE job.status \
+             END, \
+             attempts = CASE WHEN job.status IN ('queued', 'processing', 'submitted') \
+                             THEN 0 ELSE job.attempts END, \
+             available_at = CASE WHEN job.status IN ('queued', 'processing', 'submitted') \
+                                 THEN NOW() ELSE job.available_at END, \
+             lease_until = CASE WHEN job.status IN ('queued', 'processing', 'submitted') \
+                                THEN NULL ELSE job.lease_until END, \
+             confirmed_block = NULL, confirmed_block_hash = NULL, \
+             last_error = 'historical settlement cursor quarantined; immutable attempt evidence retained', \
+             updated_at = NOW() \
+         FROM settlement_transaction_attempts AS attempt \
+         WHERE attempt.transaction_hash = job.transaction_hash \
+           AND attempt.lease_id = job.lease_id \
+           AND NOT ( \
+               attempt.raw_transaction = job.raw_transaction \
+               AND attempt.transaction_nonce = job.transaction_nonce \
+               AND attempt.proposal = job.proposal \
+               AND attempt.signer_address IS NOT NULL \
+               AND attempt.nonce_reservation_state = 'reserved' \
+               AND attempt.generation_binding_state IN ('verified', 'normalized') \
+               AND EXISTS ( \
+                   SELECT 1 FROM settlement_signer_nonce_reservations AS reservation \
+                   WHERE reservation.signer_address = attempt.signer_address \
+                     AND reservation.transaction_nonce = attempt.transaction_nonce \
+                     AND reservation.lease_id = attempt.lease_id \
+               ) \
+           )",
+    )
+    .execute(&mut **transaction)
+    .await?;
+    if detached.rows_affected() > 0 {
+        tracing::warn!(
+            jobs = detached.rows_affected(),
+            "detached unsafe historical settlement job cursors"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_historical_nonce(attempts: &[HistoricalNonceAttempt]) -> HistoricalNonceResolution {
+    let leases = attempts
+        .iter()
+        .map(|attempt| attempt.lease_id)
+        .collect::<BTreeSet<_>>();
+    if let [lease_id] = leases.iter().copied().collect::<Vec<_>>().as_slice() {
+        return HistoricalNonceResolution::ReservedBy(*lease_id);
+    }
+    let confirmed = attempts
+        .iter()
+        .filter(|attempt| attempt.status == "confirmed")
+        .map(|attempt| attempt.lease_id)
+        .collect::<BTreeSet<_>>();
+    match confirmed.iter().copied().collect::<Vec<_>>().as_slice() {
+        [lease_id] => HistoricalNonceResolution::ReservedBy(*lease_id),
+        [] => HistoricalNonceResolution::Conflict(NO_CONFIRMED_HISTORICAL_NONCE_OWNER),
+        _ => HistoricalNonceResolution::Conflict(MULTIPLE_CONFIRMED_HISTORICAL_NONCE_OWNERS),
+    }
+}
+
+async fn annotate_historical_nonce_attempt(
+    transaction: &mut sqlx_postgres::PgTransaction<'_>,
+    attempt: &HistoricalNonceAttempt,
+    signer: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let updated = query(
+        "UPDATE settlement_transaction_attempts \
+         SET signer_address = $2, nonce_reservation_state = $3, \
+             nonce_reservation_reason = $4 \
+         WHERE transaction_hash = $1 \
+           AND (signer_address IS NULL OR signer_address = $2) \
+           AND (nonce_reservation_state = 'pending' \
+                OR (nonce_reservation_state = 'conflict' \
+                    AND $3 IN ('reserved', 'noncanonical')) \
+                OR (nonce_reservation_state = $3 \
+                    AND nonce_reservation_reason IS NOT DISTINCT FROM $4))",
+    )
+    .bind(&attempt.transaction_hash)
+    .bind(signer)
+    .bind(state)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!(
+            "settlement attempt {} has an incompatible nonce reservation state",
+            attempt.transaction_hash
+        );
+    }
+    Ok(())
+}
+
+async fn reserve_historical_nonce(
+    transaction: &mut sqlx_postgres::PgTransaction<'_>,
+    signer: &str,
+    nonce: i64,
+    owner: i64,
+    attempts: &[HistoricalNonceAttempt],
+) -> anyhow::Result<()> {
+    let existing = query_as::<_, (i64, Option<i64>)>(
+        "SELECT lease_id, corrected_from_lease_id \
+         FROM settlement_signer_nonce_reservations \
+         WHERE signer_address = $1 AND transaction_nonce = $2 \
+         FOR UPDATE",
+    )
+    .bind(signer)
+    .bind(nonce)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((reserved_owner, corrected_from)) = existing else {
+        query(
+            "INSERT INTO settlement_signer_nonce_reservations ( \
+                 signer_address, transaction_nonce, lease_id \
+             ) VALUES ($1, $2, $3)",
+        )
+        .bind(signer)
+        .bind(nonce)
+        .bind(owner)
+        .execute(&mut **transaction)
+        .await?;
+        return Ok(());
+    };
+    if reserved_owner == owner {
+        return Ok(());
+    }
+    let group_leases = attempts
+        .iter()
+        .map(|attempt| attempt.lease_id)
+        .collect::<BTreeSet<_>>();
+    if corrected_from.is_some() || !group_leases.contains(&reserved_owner) {
+        anyhow::bail!(
+            "settlement signer {signer} nonce {nonce} is reserved by unrelated lease {reserved_owner}"
+        );
+    }
+    let corrected = query(
+        "UPDATE settlement_signer_nonce_reservations \
+         SET corrected_from_lease_id = lease_id, lease_id = $3, \
+             corrected_at = NOW(), correction_reason = $4 \
+         WHERE signer_address = $1 AND transaction_nonce = $2 \
+           AND lease_id = $5 AND corrected_from_lease_id IS NULL",
+    )
+    .bind(signer)
+    .bind(nonce)
+    .bind(owner)
+    .bind(CONFIRMED_HISTORICAL_NONCE_OWNER)
+    .bind(reserved_owner)
+    .execute(&mut **transaction)
+    .await?;
+    if corrected.rows_affected() != 1 {
+        anyhow::bail!("historical settlement nonce reservation correction conflicted");
+    }
+    Ok(())
+}
+
+async fn extend_settlement_claim(
+    pool: &PgPool,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+) -> anyhow::Result<()> {
+    let extended = query(
+        "UPDATE settlement_jobs AS job \
+         SET lease_until = NOW() + INTERVAL '2 minutes' \
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $2 AND lease.chain_lease_id = $3 \
+           AND job.claim_generation = $4 AND job.evidence = $5 \
+           AND job.status = 'processing'",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
+    .execute(pool)
+    .await?;
+    if extended.rows_affected() != 1 {
+        anyhow::bail!("settlement claim ownership changed during preparation");
+    }
+    Ok(())
 }
 
 async fn load_managed_repro_binding(
     connection: &mut PgConnection,
-    lease_id: u64,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
 ) -> anyhow::Result<Option<ManagedReproBinding>> {
     let Some((
         provider_instance_id,
@@ -313,12 +1375,17 @@ async fn load_managed_repro_binding(
             Option<SqlJson<ManagedCommandReport>>,
         ),
     >(
-        "SELECT prepared_provider_instance_id, prepared_hourly_cost_micros, \
-                gpu_model, gpu_vram_mib, \
-                transport_host_key_sha256, report \
-         FROM managed_repro_jobs WHERE lease_id = $1",
+        "SELECT repro.prepared_provider_instance_id, repro.prepared_hourly_cost_micros, \
+                repro.gpu_model, repro.gpu_vram_mib, \
+                repro.transport_host_key_sha256, repro.report \
+         FROM managed_repro_jobs AS repro \
+         JOIN leases AS lease ON lease.lease_id = repro.lease_id \
+         WHERE repro.lease_id = $1 AND lease.escrow_address = $2 \
+           AND lease.chain_lease_id = $3",
     )
-    .bind(i64::try_from(lease_id)?)
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
     .fetch_optional(connection)
     .await?
     else {
@@ -351,85 +1418,515 @@ async fn load_managed_repro_binding(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_settlement(
-    pool: &PgPool,
+fn submission_matches_settlement(submission: &Submission, proposal: &SettlementProposal) -> bool {
+    submission.proposal.lease_id == proposal.lease_id
+        && submission.proposal.chain_lease_id == proposal.chain_lease_id
+        && submission.proposal.usage_seconds == proposal.usage_seconds
+        && submission.proposal.receipt_hash == proposal.receipt_hash
+        && submission.proposal.nonce == proposal.nonce
+        && submission.proposal.evidence_hash == proposal.evidence_hash
+        && submission.proposal.receipt == proposal.receipt
+}
+
+fn deadline_has_margin(deadline: u64, now: u64) -> bool {
+    deadline > now.saturating_add(DEADLINE_MARGIN_SECONDS)
+}
+
+fn pending_attempt_is_reusable(transaction_known: bool, deadline: u64, now: u64) -> bool {
+    transaction_known && deadline_has_margin(deadline, now)
+}
+
+fn current_timestamp() -> anyhow::Result<u64> {
+    u64::try_from(Utc::now().timestamp()).context("system clock is before the Unix epoch")
+}
+
+async fn reconcile_transaction_attempts(
+    connection: &mut PgConnection,
     chain: &ChainClient,
-    signer: &EthereumSigner,
-    escrow: [u8; 20],
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+    proposal: &SettlementProposal,
     confirmations: u64,
-    lease_id: u64,
-    evidence: &SettlementEvidence,
+    heartbeat: &ClaimHeartbeat<'_>,
+) -> anyhow::Result<Option<SelectedSubmission>> {
+    let attempts = query_as::<_, (SqlJson<Submission>, String, String, i64, String, String)>(
+        "SELECT proposal, status, raw_transaction, transaction_nonce, transaction_hash, \
+                signer_address \
+         FROM settlement_transaction_attempts \
+         WHERE lease_id = $1 AND escrow_address = $2 AND chain_lease_id = $3 \
+           AND nonce_reservation_state = 'reserved' \
+           AND generation_binding_state IN ('verified', 'normalized') \
+         ORDER BY prepared_at DESC",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut known = None;
+    for (SqlJson(submission), status, raw_transaction, nonce, transaction_hash, signer_address) in
+        attempts
+    {
+        if !submission_matches_settlement(&submission, proposal)
+            || submission.raw_transaction != raw_transaction
+            || submission.transaction_hash != transaction_hash
+            || i64::try_from(transaction_nonce(&submission.raw_transaction)?)? != nonce
+            || transaction_signer(&submission.raw_transaction)? != signer_address
+        {
+            anyhow::bail!("settlement attempt no longer matches verified evidence");
+        }
+        if status == "confirmed" {
+            return Ok(Some(SelectedSubmission {
+                submission,
+                chain_confirmed: true,
+            }));
+        }
+        if status == "reverted" {
+            continue;
+        }
+        let finality = heartbeat
+            .run(chain.finality(&submission.transaction_hash, confirmations))
+            .await?;
+        match observe_attempt(&status, &finality) {
+            AttemptObservation::Adopt => {
+                return Ok(Some(SelectedSubmission {
+                    submission,
+                    chain_confirmed: true,
+                }));
+            }
+            AttemptObservation::Ignore => continue,
+            AttemptObservation::MarkReverted => {
+                let reverted = query(
+                    "UPDATE settlement_transaction_attempts AS attempt \
+                     SET status = 'reverted', reverted_at = COALESCE(reverted_at, NOW()) \
+                     FROM settlement_jobs AS job, leases AS lease \
+                     WHERE attempt.transaction_hash = $1 AND attempt.lease_id = job.lease_id \
+                       AND job.lease_id = $2 AND job.claim_generation = $3 \
+                       AND job.evidence = $4 AND lease.lease_id = job.lease_id \
+                       AND lease.escrow_address = $5 AND lease.chain_lease_id = $6 \
+                       AND attempt.nonce_reservation_state = 'reserved' \
+                       AND attempt.generation_binding_state IN ('verified', 'normalized') \
+                       AND attempt.status IN ('prepared', 'submitted', 'superseded')",
+                )
+                .bind(&submission.transaction_hash)
+                .bind(i64::try_from(settlement.lease_id)?)
+                .bind(settlement.claim_generation)
+                .bind(SqlJson(settlement.evidence.clone()))
+                .bind(&escrow.database_address)
+                .bind(i64::try_from(settlement.chain_lease_id)?)
+                .execute(&mut *connection)
+                .await?;
+                if reverted.rows_affected() != 1 {
+                    anyhow::bail!("reverted settlement attempt lost its active claim");
+                }
+                anyhow::bail!(
+                    "settlement proposal transaction reverted after the confirmation threshold"
+                );
+            }
+            AttemptObservation::CheckTransaction => {
+                let transaction: Option<serde_json::Value> = heartbeat
+                    .run(chain.call(
+                        "eth_getTransactionByHash",
+                        serde_json::json!([submission.transaction_hash]),
+                    ))
+                    .await?;
+                if known.is_none() {
+                    if pending_attempt_is_reusable(
+                        transaction.is_some(),
+                        submission.proposal.deadline,
+                        current_timestamp()?,
+                    ) {
+                        known = Some(SelectedSubmission {
+                            submission,
+                            chain_confirmed: false,
+                        });
+                    } else if transaction.is_some() {
+                        tracing::warn!(
+                            lease_id = settlement.lease_id,
+                            transaction_hash = %submission.transaction_hash,
+                            deadline = submission.proposal.deadline,
+                            "settlement attempt is too close to expiry; preparing replacement"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(known)
+}
+
+async fn persist_existing_submission(
+    connection: &mut PgConnection,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+    submission: &Submission,
 ) -> anyhow::Result<()> {
-    // Always ask. Taking the claimed submission directly used to bypass the
-    // rebuild rules entirely, so a proposal that could no longer land was
-    // resubmitted verbatim until the job ran out of attempts.
-    let submission = prepare_durable_submission(pool, chain, signer, escrow, evidence).await?;
-    let known: Option<serde_json::Value> = chain
-        .call(
-            "eth_getTransactionByHash",
-            serde_json::json!([submission.transaction_hash]),
-        )
-        .await?;
-    if known.is_none() {
-        let transaction_hash: String = chain
-            .call(
+    let stored = query(
+        "UPDATE settlement_jobs AS job \
+         SET proposal = $2, raw_transaction = $3, transaction_hash = $4, \
+             transaction_nonce = $5, updated_at = NOW() \
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $6 AND lease.chain_lease_id = $7 \
+           AND job.claim_generation = $8 AND job.evidence = $9 \
+           AND EXISTS ( \
+               SELECT 1 FROM settlement_transaction_attempts AS attempt \
+               WHERE attempt.transaction_hash = $4 AND attempt.lease_id = job.lease_id \
+                 AND attempt.escrow_address = $6 AND attempt.chain_lease_id = $7 \
+                 AND attempt.raw_transaction = $3 AND attempt.transaction_nonce = $5 \
+                 AND attempt.proposal = $2 \
+                 AND attempt.nonce_reservation_state = 'reserved' \
+                 AND attempt.generation_binding_state IN ('verified', 'normalized') \
+           )",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(SqlJson(submission.clone()))
+    .bind(&submission.raw_transaction)
+    .bind(&submission.transaction_hash)
+    .bind(i64::try_from(transaction_nonce(
+        &submission.raw_transaction,
+    )?)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
+    .execute(connection)
+    .await?;
+    if stored.rows_affected() != 1 {
+        anyhow::bail!("settlement attempt lost its active claim");
+    }
+    Ok(())
+}
+
+async fn persist_new_submission(
+    connection: &mut PgConnection,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+    submission: &Submission,
+    signer_address: &str,
+) -> anyhow::Result<()> {
+    let nonce = i64::try_from(transaction_nonce(&submission.raw_transaction)?)?;
+    let stored: Option<i64> = query_scalar(
+        "WITH eligible AS ( \
+             SELECT job.lease_id FROM settlement_jobs AS job \
+             JOIN leases AS lease ON lease.lease_id = job.lease_id \
+             WHERE job.lease_id = $1 AND lease.escrow_address = $2 \
+               AND lease.chain_lease_id = $3 AND job.claim_generation = $4 \
+               AND job.evidence = $9 \
+             FOR UPDATE OF job, lease \
+         ), reservation AS ( \
+             INSERT INTO settlement_signer_nonce_reservations ( \
+                 signer_address, transaction_nonce, lease_id \
+             ) \
+             SELECT $10, $6, eligible.lease_id FROM eligible \
+             ON CONFLICT (signer_address, transaction_nonce) DO UPDATE \
+             SET lease_id = settlement_signer_nonce_reservations.lease_id \
+             WHERE settlement_signer_nonce_reservations.lease_id = EXCLUDED.lease_id \
+             RETURNING lease_id \
+         ), attempt AS ( \
+             INSERT INTO settlement_transaction_attempts ( \
+                 transaction_hash, lease_id, claim_generation, escrow_address, \
+                 chain_lease_id, transaction_nonce, signer_address, raw_transaction, \
+                 proposal, status, nonce_reservation_state, generation_binding_state \
+             ) \
+             SELECT $5, eligible.lease_id, $4, $2, $3, $6, $10, $7, $8, \
+                    'prepared', 'reserved', 'verified' \
+             FROM eligible, reservation \
+             WHERE reservation.lease_id = eligible.lease_id \
+             RETURNING transaction_hash \
+         ), superseded AS ( \
+             UPDATE settlement_transaction_attempts AS prior \
+             SET status = 'superseded', superseded_at = COALESCE(superseded_at, NOW()) \
+             WHERE prior.lease_id = $1 AND prior.escrow_address = $2 \
+               AND prior.chain_lease_id = $3 AND prior.transaction_hash <> $5 \
+               AND prior.status IN ('prepared', 'submitted') \
+               AND prior.generation_binding_state IN ('verified', 'normalized') \
+               AND EXISTS (SELECT 1 FROM attempt) \
+         ) \
+         UPDATE settlement_jobs AS job \
+         SET proposal = $8, raw_transaction = $7, transaction_hash = $5, \
+             transaction_nonce = $6, updated_at = NOW() \
+         FROM leases AS lease, attempt \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $2 AND lease.chain_lease_id = $3 \
+           AND job.claim_generation = $4 AND job.evidence = $9 \
+         RETURNING job.lease_id",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(&submission.transaction_hash)
+    .bind(nonce)
+    .bind(&submission.raw_transaction)
+    .bind(SqlJson(submission.clone()))
+    .bind(SqlJson(settlement.evidence.clone()))
+    .bind(signer_address)
+    .fetch_optional(connection)
+    .await?;
+    if stored.is_none() {
+        anyhow::bail!("settlement preparation lost its active claim");
+    }
+    Ok(())
+}
+
+async fn record_submission_attempt(
+    connection: &mut PgConnection,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+    submission: &Submission,
+    broadcasting: bool,
+) -> anyhow::Result<()> {
+    let attempt = query(
+        "UPDATE settlement_transaction_attempts AS attempt \
+         SET status = CASE WHEN attempt.status IN ('confirmed', 'reverted', 'superseded') \
+                           THEN attempt.status ELSE 'submitted' END, \
+             submission_count = CASE \
+                 WHEN attempt.status IN ('confirmed', 'reverted', 'superseded') \
+                 THEN attempt.submission_count \
+                 ELSE LEAST(100, CASE WHEN $9 \
+                     THEN attempt.submission_count + 1 \
+                     ELSE GREATEST(attempt.submission_count, 1) END) END, \
+             submitted_at = CASE \
+                 WHEN attempt.status IN ('confirmed', 'reverted', 'superseded') \
+                 THEN attempt.submitted_at ELSE COALESCE(attempt.submitted_at, NOW()) END \
+         FROM settlement_jobs AS job, leases AS lease \
+         WHERE attempt.transaction_hash = $1 AND attempt.lease_id = $2 \
+           AND attempt.escrow_address = $3 AND attempt.chain_lease_id = $4 \
+           AND job.lease_id = attempt.lease_id AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $3 AND lease.chain_lease_id = $4 \
+           AND job.claim_generation = $5 AND job.evidence = $6 \
+           AND attempt.raw_transaction = $7 AND attempt.proposal = $8 \
+           AND attempt.nonce_reservation_state = 'reserved' \
+           AND attempt.generation_binding_state IN ('verified', 'normalized')",
+    )
+    .bind(&submission.transaction_hash)
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
+    .bind(&submission.raw_transaction)
+    .bind(SqlJson(submission.clone()))
+    .bind(broadcasting)
+    .execute(connection)
+    .await?;
+    if attempt.rows_affected() != 1 {
+        anyhow::bail!("settlement attempt lost its active claim before submission");
+    }
+    Ok(())
+}
+
+async fn mark_settlement_submitted(
+    connection: &mut PgConnection,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+    submission: &Submission,
+) -> anyhow::Result<()> {
+    let submitted = query(
+        "UPDATE settlement_jobs AS job \
+         SET status = 'submitted', lease_until = NULL, \
+             available_at = NOW() + INTERVAL '5 seconds', updated_at = NOW() \
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $2 AND lease.chain_lease_id = $3 \
+           AND job.claim_generation = $4 AND job.evidence = $5 \
+           AND job.transaction_hash = $6 AND job.raw_transaction = $7 \
+           AND job.proposal = $8",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
+    .bind(&submission.transaction_hash)
+    .bind(&submission.raw_transaction)
+    .bind(SqlJson(submission.clone()))
+    .execute(connection)
+    .await?;
+    if submitted.rows_affected() != 1 {
+        anyhow::bail!("settlement submission lost its escrow-generation binding");
+    }
+    Ok(())
+}
+
+async fn submit_durable_submission(
+    connection: &mut PgConnection,
+    chain: &ChainClient,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+    submission: &Submission,
+    chain_confirmed: bool,
+    heartbeat: &ClaimHeartbeat<'_>,
+) -> anyhow::Result<()> {
+    if !chain_confirmed && !deadline_has_margin(submission.proposal.deadline, current_timestamp()?)
+    {
+        anyhow::bail!("settlement proposal deadline is too close for safe submission");
+    }
+    let broadcasting = if chain_confirmed {
+        false
+    } else {
+        let known: Option<serde_json::Value> = heartbeat
+            .run(chain.call(
+                "eth_getTransactionByHash",
+                serde_json::json!([submission.transaction_hash]),
+            ))
+            .await?;
+        known.is_none()
+    };
+
+    // Preserve the exact bytes and the fact that a broadcast was attempted
+    // before touching the RPC. A lost response can then only cause an exact
+    // resubmission, never a second transaction signed for the same job.
+    record_submission_attempt(connection, escrow, settlement, submission, broadcasting).await?;
+    if broadcasting {
+        let transaction_hash: String = heartbeat
+            .run(chain.call(
                 "eth_sendRawTransaction",
                 serde_json::json!([submission.raw_transaction]),
-            )
+            ))
             .await?;
         if !transaction_hash.eq_ignore_ascii_case(&submission.transaction_hash) {
             anyhow::bail!("RPC returned an unexpected transaction hash");
         }
     }
-    // Waiting for confirmations is not an attempt. Charging one for every poll
-    // burned the whole allowance in about eight minutes of a slow inclusion,
-    // after which the job could never be claimed again. Its status stayed
-    // 'submitted' rather than 'failed', so the critical alert never fired and
-    // the finalize step, which is only scheduled on the confirmed path, was
-    // never queued at all.
-    query(
-        "UPDATE settlement_jobs SET status = 'submitted', lease_until = NULL, \
-             attempts = GREATEST(0, attempts - 1), \
-             available_at = NOW() + INTERVAL '5 seconds', updated_at = NOW() \
-         WHERE lease_id = $1",
+    mark_settlement_submitted(connection, escrow, settlement, submission).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_settlement(
+    pool: &PgPool,
+    chain: &ChainClient,
+    signer: &EthereumSigner,
+    escrow: &EscrowGeneration,
+    confirmations: u64,
+    settlement: &ClaimedSettlement,
+    shutdown: &ShutdownGate,
+) -> anyhow::Result<()> {
+    // Always ask. Taking the claimed submission directly used to bypass the
+    // rebuild rules entirely, so a proposal that could no longer land was
+    // resubmitted verbatim until the job ran out of attempts.
+    let submission = prepare_durable_submission(
+        pool,
+        chain,
+        signer,
+        escrow,
+        confirmations,
+        settlement,
+        shutdown,
     )
-    .bind(lease_id as i64)
-    .execute(pool)
     .await?;
-    let Some((block_number, block_hash, block_time)) = chain
-        .confirmed(&submission.transaction_hash, confirmations)
+    if shutdown.requested() {
+        return Err(ShutdownRequested.into());
+    }
+    let (block_number, block_hash, block_time) = match chain
+        .finality(&submission.transaction_hash, confirmations)
         .await?
-    else {
-        return Ok(());
+    {
+        SettlementFinality::Pending => {
+            refund_pending_settlement_attempt(pool, escrow, settlement, &submission).await?;
+            return Ok(());
+        }
+        SettlementFinality::Reverted => {
+            let reverted = query(
+                "UPDATE settlement_transaction_attempts AS attempt \
+                 SET status = 'reverted', reverted_at = COALESCE(reverted_at, NOW()) \
+                 FROM settlement_jobs AS job, leases AS lease \
+                 WHERE attempt.transaction_hash = $1 AND attempt.lease_id = job.lease_id \
+                   AND job.lease_id = $2 AND job.claim_generation = $3 \
+                   AND lease.lease_id = job.lease_id AND lease.escrow_address = $4 \
+                   AND lease.chain_lease_id = $5 \
+                   AND attempt.nonce_reservation_state = 'reserved' \
+                   AND attempt.generation_binding_state IN ('verified', 'normalized')",
+            )
+            .bind(&submission.transaction_hash)
+            .bind(i64::try_from(settlement.lease_id)?)
+            .bind(settlement.claim_generation)
+            .bind(&escrow.database_address)
+            .bind(i64::try_from(settlement.chain_lease_id)?)
+            .execute(pool)
+            .await?;
+            if reverted.rows_affected() != 1 {
+                anyhow::bail!("reverted settlement attempt lost its active claim");
+            }
+            anyhow::bail!("settlement proposal transaction reverted");
+        }
+        SettlementFinality::Confirmed {
+            block_number,
+            block_hash,
+            block_time,
+        } => (block_number, block_hash, block_time),
     };
-    let dispute_window = chain.dispute_window(escrow).await?;
-    let finalize_at = DateTime::from_timestamp(block_time as i64 + dispute_window as i64, 0)
+    if shutdown.requested() {
+        return Err(ShutdownRequested.into());
+    }
+    let dispute_window = chain.dispute_window(escrow.chain_address).await?;
+    let finalize_timestamp = i64::try_from(block_time)?
+        .checked_add(i64::try_from(dispute_window)?)
+        .context("settlement finalization time is invalid")?;
+    let finalize_at = DateTime::from_timestamp(finalize_timestamp, 0)
         .context("settlement finalization time is invalid")?;
     let mut transaction = pool.begin().await?;
-    query(
-        "UPDATE settlement_jobs SET status = 'proposed', lease_until = NULL, \
+    let proposed = query(
+        "UPDATE settlement_jobs AS job \
+         SET status = 'proposed', lease_until = NULL, \
              confirmed_block = $2, confirmed_block_hash = $3, last_error = NULL, \
-             updated_at = NOW() WHERE lease_id = $1",
+             updated_at = NOW() \
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $4 AND lease.chain_lease_id = $5 \
+           AND job.claim_generation = $6 AND job.evidence = $7",
     )
-    .bind(lease_id as i64)
-    .bind(block_number as i64)
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(i64::try_from(block_number)?)
     .bind(block_hash.to_ascii_lowercase())
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
     .execute(&mut *transaction)
     .await?;
+    if proposed.rows_affected() != 1 {
+        anyhow::bail!("settlement confirmation lost its escrow-generation binding");
+    }
+    let confirmed = query(
+        "UPDATE settlement_transaction_attempts AS attempt \
+         SET status = 'confirmed', confirmed_at = COALESCE(confirmed_at, NOW()), \
+             confirmed_block = $2, confirmed_block_hash = $3 \
+         FROM settlement_jobs AS job \
+         WHERE attempt.transaction_hash = $1 AND attempt.lease_id = job.lease_id \
+           AND job.lease_id = $4 AND job.claim_generation = $5 \
+           AND attempt.nonce_reservation_state = 'reserved' \
+           AND attempt.generation_binding_state IN ('verified', 'normalized')",
+    )
+    .bind(&submission.transaction_hash)
+    .bind(i64::try_from(block_number)?)
+    .bind(block_hash.to_ascii_lowercase())
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(settlement.claim_generation)
+    .execute(&mut *transaction)
+    .await?;
+    if confirmed.rows_affected() != 1 {
+        anyhow::bail!("confirmed settlement attempt lost its active claim");
+    }
     query(
         "INSERT INTO lifecycle_outbox (action_id, lease_id, kind, available_at) \
-         VALUES ($1, $2, 'finalize', $3) \
+         SELECT $1, lease.lease_id, 'finalize', $3 \
+         FROM leases AS lease \
+         WHERE lease.lease_id = $2 AND lease.escrow_address = $4 \
+           AND lease.chain_lease_id = $5 \
          ON CONFLICT (lease_id, kind) DO NOTHING",
     )
     .bind(uuid::Uuid::now_v7())
-    .bind(lease_id as i64)
+    .bind(i64::try_from(settlement.lease_id)?)
     .bind(finalize_at)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
     tracing::info!(
-        lease_id,
+        lease_id = settlement.lease_id,
         transaction_hash = %submission.transaction_hash,
         "settlement proposal reached finality"
     );
@@ -440,19 +1937,73 @@ async fn prepare_durable_submission(
     pool: &PgPool,
     chain: &ChainClient,
     signer: &EthereumSigner,
-    escrow: [u8; 20],
-    evidence: &SettlementEvidence,
+    escrow: &EscrowGeneration,
+    confirmations: u64,
+    settlement: &ClaimedSettlement,
+    shutdown: &ShutdownGate,
 ) -> anyhow::Result<Submission> {
     let mut connection = pool.acquire().await?;
-    query("SELECT pg_advisory_lock(4663002)")
-        .execute(&mut *connection)
-        .await?;
+    let heartbeat = ClaimHeartbeat::Durable {
+        pool,
+        escrow,
+        settlement,
+        shutdown,
+    };
+    loop {
+        heartbeat.renew().await?;
+        let acquired: bool = query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(SIGNER_LOCK)
+            .fetch_one(&mut *connection)
+            .await?;
+        if acquired {
+            break;
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.wait() => return Err(ShutdownRequested.into()),
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+        }
+    }
     let result = async {
-        let gateway = chain.gateway(escrow).await?;
+        heartbeat.renew().await?;
+        let binding = query_as::<_, (i64, SqlJson<SettlementEvidence>)>(
+            "SELECT lease.chain_lease_id, job.evidence \
+             FROM settlement_jobs AS job \
+             JOIN leases AS lease ON lease.lease_id = job.lease_id \
+             WHERE job.lease_id = $1 AND lease.escrow_address = $2 \
+               AND lease.chain_lease_id = $3 AND job.claim_generation = $4",
+        )
+        .bind(i64::try_from(settlement.lease_id)?)
+        .bind(&escrow.database_address)
+        .bind(i64::try_from(settlement.chain_lease_id)?)
+        .bind(settlement.claim_generation)
+        .fetch_optional(&mut *connection)
+        .await?;
+        validate_stored_binding(settlement, binding)?;
+        let gateway = heartbeat.run(chain.gateway(escrow.chain_address)).await?;
         let managed_binding =
-            load_managed_repro_binding(&mut connection, evidence.lease_id).await?;
-        let proposal =
-            reconcile_with_managed_binding(evidence, Some(gateway), managed_binding.as_ref())?;
+            load_managed_repro_binding(&mut connection, escrow, settlement).await?;
+        let mut proposal = reconcile_with_managed_binding(
+            &settlement.evidence,
+            Some(gateway),
+            managed_binding.as_ref(),
+        )?;
+        enrich_receipt_identity(&mut proposal, escrow)?;
+        if let Some(selected) = reconcile_transaction_attempts(
+            &mut connection,
+            chain,
+            escrow,
+            settlement,
+            &proposal,
+            confirmations,
+            &heartbeat,
+        )
+        .await?
+        {
+            persist_existing_submission(&mut connection, escrow, settlement, &selected.submission)
+                .await?;
+            return Ok(selected);
+        }
         // Reusing the stored submission is what makes settlement idempotent, but
         // those bytes carry the gas price they were signed at. If the chain has
         // rejected them repeatedly they can never land, and resubmitting until
@@ -462,60 +2013,203 @@ async fn prepare_durable_submission(
         // rejects the proposal with Expired() no matter how often it is sent,
         // so a stale one is rebuilt rather than retried.
         if let Some(SqlJson(existing)) = query_scalar::<_, SqlJson<Submission>>(
-            "SELECT proposal FROM settlement_jobs \
-                 WHERE lease_id = $1 AND proposal IS NOT NULL AND attempts < $2",
+            "SELECT job.proposal FROM settlement_jobs AS job \
+             JOIN leases AS lease ON lease.lease_id = job.lease_id \
+             WHERE job.lease_id = $1 AND job.proposal IS NOT NULL \
+               AND job.attempts < $2 AND lease.escrow_address = $3 \
+               AND lease.chain_lease_id = $4 AND job.claim_generation = $5 \
+               AND EXISTS ( \
+                   SELECT 1 FROM settlement_transaction_attempts AS attempt \
+                   WHERE attempt.transaction_hash = job.transaction_hash \
+                     AND attempt.status NOT IN ('reverted', 'superseded') \
+                     AND attempt.nonce_reservation_state = 'reserved' \
+                     AND attempt.generation_binding_state IN ('verified', 'normalized') \
+               )",
         )
-        .bind(evidence.lease_id as i64)
+        .bind(i64::try_from(settlement.lease_id)?)
         .bind(RESIGN_AFTER_ATTEMPTS)
+        .bind(&escrow.database_address)
+        .bind(i64::try_from(settlement.chain_lease_id)?)
+        .bind(settlement.claim_generation)
         .fetch_optional(&mut *connection)
         .await?
-            && existing.proposal.deadline
-                > (Utc::now().timestamp() as u64) + DEADLINE_MARGIN_SECONDS
+            && deadline_has_margin(existing.proposal.deadline, current_timestamp()?)
         {
-            if existing.proposal.receipt_hash != proposal.receipt_hash {
+            if existing.proposal.lease_id != settlement.lease_id
+                || existing.proposal.chain_lease_id != settlement.chain_lease_id
+                || existing.proposal.receipt_hash != proposal.receipt_hash
+            {
                 anyhow::bail!("stored settlement proposal no longer matches verified evidence");
             }
-            return Ok(existing);
+            persist_existing_submission(&mut connection, escrow, settlement, &existing).await?;
+            return Ok(SelectedSubmission {
+                submission: existing,
+                chain_confirmed: false,
+            });
         }
-        let submission = prepare_submission(chain, signer, escrow, proposal).await?;
-        query(
-            "UPDATE settlement_jobs SET proposal = $2, raw_transaction = $3, \
-                 transaction_hash = $4, transaction_nonce = $5, status = 'submitted', \
-                 lease_until = NULL, updated_at = NOW() WHERE lease_id = $1",
+        let signer_address = format!("0x{}", hex::encode(signer.address()));
+        let nonce = next_signer_nonce(
+            &mut connection,
+            chain,
+            &signer_address,
+            settlement,
+            &heartbeat,
         )
-        .bind(evidence.lease_id as i64)
-        .bind(SqlJson(submission.clone()))
-        .bind(&submission.raw_transaction)
-        .bind(&submission.transaction_hash)
-        .bind(transaction_nonce(&submission.raw_transaction)? as i64)
-        .execute(&mut *connection)
         .await?;
-        Ok::<_, anyhow::Error>(submission)
+        let submission = prepare_submission(
+            chain,
+            signer,
+            escrow.chain_address,
+            proposal,
+            nonce,
+            &heartbeat,
+        )
+        .await?;
+        persist_new_submission(
+            &mut connection,
+            escrow,
+            settlement,
+            &submission,
+            &signer_address,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(SelectedSubmission {
+            submission,
+            chain_confirmed: false,
+        })
     }
     .await;
-    query("SELECT pg_advisory_unlock(4663002)")
+    let result = match result {
+        Ok(selected) => submit_durable_submission(
+            &mut connection,
+            chain,
+            escrow,
+            settlement,
+            &selected.submission,
+            selected.chain_confirmed,
+            &heartbeat,
+        )
+        .await
+        .map(|()| selected.submission),
+        Err(error) => Err(error),
+    };
+    query("SELECT pg_advisory_unlock($1)")
+        .bind(SIGNER_LOCK)
         .execute(&mut *connection)
         .await?;
     result
 }
 
+async fn refund_pending_settlement_attempt(
+    pool: &PgPool,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+    submission: &Submission,
+) -> anyhow::Result<()> {
+    let refunded = query(
+        "UPDATE settlement_jobs AS job \
+         SET attempts = GREATEST(0, attempts - 1), updated_at = NOW() \
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $2 AND lease.chain_lease_id = $3 \
+           AND job.claim_generation = $4 AND job.evidence = $5 \
+           AND job.status = 'submitted' AND job.transaction_hash = $6 \
+           AND EXISTS ( \
+               SELECT 1 FROM settlement_transaction_attempts AS attempt \
+               WHERE attempt.transaction_hash = $6 AND attempt.lease_id = job.lease_id \
+                 AND attempt.escrow_address = $2 AND attempt.chain_lease_id = $3 \
+                 AND attempt.raw_transaction = $7 AND attempt.proposal = $8 \
+                 AND attempt.status = 'submitted' \
+                 AND attempt.nonce_reservation_state = 'reserved' \
+                 AND attempt.generation_binding_state IN ('verified', 'normalized') \
+           )",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
+    .bind(&submission.transaction_hash)
+    .bind(&submission.raw_transaction)
+    .bind(SqlJson(submission.clone()))
+    .execute(pool)
+    .await?;
+    if refunded.rows_affected() != 1 {
+        tracing::warn!(
+            lease_id = settlement.lease_id,
+            claim_generation = settlement.claim_generation,
+            "pending settlement poll was not refunded after claim ownership changed"
+        );
+    }
+    Ok(())
+}
+
 async fn retry_settlement(
     pool: &PgPool,
-    lease_id: u64,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
     error: &anyhow::Error,
 ) -> anyhow::Result<()> {
     let message: String = format!("{error:#}").chars().take(1_024).collect();
-    query(
-        "UPDATE settlement_jobs SET \
+    let retried = query(
+        "UPDATE settlement_jobs AS job SET \
              status = CASE WHEN attempts >= 100 THEN 'failed' ELSE 'queued' END, \
              lease_until = NULL, \
              available_at = NOW() + make_interval(secs => LEAST(300, attempts * attempts)), \
-             last_error = $2, updated_at = NOW() WHERE lease_id = $1",
+             last_error = $2, updated_at = NOW() \
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $3 AND lease.chain_lease_id = $4 \
+           AND job.claim_generation = $5 AND job.evidence = $6",
     )
-    .bind(lease_id as i64)
+    .bind(i64::try_from(settlement.lease_id)?)
     .bind(message)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
     .execute(pool)
     .await?;
+    if retried.rows_affected() != 1 {
+        tracing::warn!(
+            lease_id = settlement.lease_id,
+            claim_generation = settlement.claim_generation,
+            "settlement retry ignored after claim ownership changed"
+        );
+    }
+    Ok(())
+}
+
+async fn release_settlement_claim(
+    pool: &PgPool,
+    escrow: &EscrowGeneration,
+    settlement: &ClaimedSettlement,
+) -> anyhow::Result<()> {
+    let released = query(
+        "UPDATE settlement_jobs AS job \
+         SET status = CASE WHEN transaction_hash IS NULL THEN 'queued' ELSE 'submitted' END, \
+             attempts = GREATEST(0, attempts - 1), lease_until = NULL, \
+             available_at = NOW(), updated_at = NOW() \
+         FROM leases AS lease \
+         WHERE job.lease_id = $1 AND lease.lease_id = job.lease_id \
+           AND lease.escrow_address = $2 AND lease.chain_lease_id = $3 \
+           AND job.claim_generation = $4 AND job.evidence = $5 \
+           AND job.status = 'processing'",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(&escrow.database_address)
+    .bind(i64::try_from(settlement.chain_lease_id)?)
+    .bind(settlement.claim_generation)
+    .bind(SqlJson(settlement.evidence.clone()))
+    .execute(pool)
+    .await?;
+    if released.rows_affected() == 1 {
+        tracing::info!(
+            lease_id = settlement.lease_id,
+            claim_generation = settlement.claim_generation,
+            "settlement claim returned for another worker"
+        );
+    }
     Ok(())
 }
 
@@ -525,6 +2219,79 @@ fn transaction_nonce(raw: &str) -> anyhow::Result<u64> {
         .at(0)?
         .as_val()
         .context("settlement transaction nonce is invalid")
+}
+
+struct DecodedLegacyTransaction {
+    nonce: u64,
+    chain_id: u64,
+    destination: [u8; 20],
+    data: Vec<u8>,
+    signer_address: String,
+}
+
+fn decode_legacy_transaction(raw: &str) -> anyhow::Result<DecodedLegacyTransaction> {
+    let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(raw))?;
+    let transaction = rlp::Rlp::new(&bytes);
+    if !transaction.is_list() || transaction.item_count()? != 9 {
+        anyhow::bail!("settlement transaction is not a legacy signed transaction");
+    }
+    let nonce: u64 = transaction.at(0)?.as_val()?;
+    let gas_price: u64 = transaction.at(1)?.as_val()?;
+    let gas_limit: u64 = transaction.at(2)?.as_val()?;
+    let to = transaction.at(3)?.data()?;
+    if to.len() != 20 {
+        anyhow::bail!("settlement transaction destination is invalid");
+    }
+    let mut destination = [0_u8; 20];
+    destination.copy_from_slice(to);
+    let value: u64 = transaction.at(4)?.as_val()?;
+    if value != 0 {
+        anyhow::bail!("settlement transaction unexpectedly transfers value");
+    }
+    let data = transaction.at(5)?.data()?;
+    let v: u64 = transaction.at(6)?.as_val()?;
+    let eip155 = v
+        .checked_sub(35)
+        .context("settlement transaction has no EIP-155 replay protection")?;
+    let chain_id = eip155 / 2;
+    let recovery_id = RecoveryId::from_byte((eip155 % 2) as u8)
+        .context("settlement transaction recovery id is invalid")?;
+    let signature = EthereumSignature::from_scalars(
+        padded_scalar(transaction.at(7)?.data()?)?,
+        padded_scalar(transaction.at(8)?.data()?)?,
+    )?;
+    let unsigned =
+        legacy_unsigned_transaction(nonce, gas_price, gas_limit, destination, data, chain_id);
+    let digest: [u8; 32] = Keccak256::digest(unsigned).into();
+    let signer = EthereumVerifyingKey::recover_from_prehash(&digest, &signature, recovery_id)?;
+    let point = signer.to_encoded_point(false);
+    Ok(DecodedLegacyTransaction {
+        nonce,
+        chain_id,
+        destination,
+        data: data.to_vec(),
+        signer_address: format!(
+            "0x{}",
+            hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..])
+        ),
+    })
+}
+
+fn transaction_signer(raw: &str) -> anyhow::Result<String> {
+    let transaction = decode_legacy_transaction(raw)?;
+    if transaction.chain_id != ROBINHOOD_CHAIN_ID {
+        anyhow::bail!("settlement transaction is signed for another chain");
+    }
+    Ok(transaction.signer_address)
+}
+
+fn padded_scalar(value: &[u8]) -> anyhow::Result<[u8; 32]> {
+    if value.is_empty() || value.len() > 32 {
+        anyhow::bail!("settlement transaction signature scalar is invalid");
+    }
+    let mut padded = [0_u8; 32];
+    padded[32 - value.len()..].copy_from_slice(value);
+    Ok(padded)
 }
 
 /// How far short of its paid window a lease has to end before the ending is
@@ -555,6 +2322,7 @@ fn reconcile_with_managed_binding(
     managed_binding: Option<&ManagedReproBinding>,
 ) -> anyhow::Result<SettlementProposal> {
     if evidence.lease_id == 0
+        || evidence.chain_lease_id == 0
         || evidence.lease_nonce == 0
         || evidence.rate_per_second == 0
         || evidence.deposit_base_units == 0
@@ -640,6 +2408,8 @@ fn reconcile_with_managed_binding(
     let mut receipt = PublicReceipt {
         receipt_id: uuid::Uuid::from_bytes(receipt_id),
         lease_id: evidence.chain_lease_id.to_string(),
+        escrow_address: None,
+        chain_lease_id: None,
         node_id_hash: format!(
             "0x{}",
             hex::encode(Sha256::digest(evidence.node_id.as_bytes()))
@@ -671,6 +2441,20 @@ fn reconcile_with_managed_binding(
         evidence_hash,
         receipt,
     })
+}
+
+fn enrich_receipt_identity(
+    proposal: &mut SettlementProposal,
+    escrow: &EscrowGeneration,
+) -> anyhow::Result<()> {
+    let chain_lease_id = proposal.chain_lease_id.to_string();
+    if proposal.receipt.lease_id != chain_lease_id {
+        anyhow::bail!("settlement receipt chain lease does not match the proposal");
+    }
+    proposal.receipt.escrow_address = Some(escrow.database_address.clone());
+    proposal.receipt.chain_lease_id = Some(chain_lease_id);
+    validate_receipt_identity(&proposal.receipt)?;
+    Ok(())
 }
 
 fn validate_managed_execution_binding(
@@ -989,34 +2773,89 @@ fn terminal_report_shape(
     }
 }
 
+async fn next_signer_nonce(
+    connection: &mut PgConnection,
+    chain: &ChainClient,
+    signer_address: &str,
+    settlement: &ClaimedSettlement,
+    heartbeat: &ClaimHeartbeat<'_>,
+) -> anyhow::Result<u64> {
+    let own_nonce: Option<i64> = query_scalar(
+        "SELECT job.transaction_nonce \
+         FROM settlement_jobs AS job \
+         JOIN settlement_transaction_attempts AS attempt \
+           ON attempt.transaction_hash = job.transaction_hash \
+         WHERE job.lease_id = $1 AND job.transaction_nonce IS NOT NULL \
+           AND attempt.signer_address = $2 \
+           AND attempt.status IN ('prepared', 'submitted', 'superseded') \
+           AND attempt.nonce_reservation_state = 'reserved' \
+           AND attempt.generation_binding_state IN ('verified', 'normalized') \
+           AND EXISTS ( \
+               SELECT 1 FROM settlement_signer_nonce_reservations AS reservation \
+               WHERE reservation.signer_address = attempt.signer_address \
+                 AND reservation.transaction_nonce = attempt.transaction_nonce \
+                 AND reservation.lease_id = attempt.lease_id \
+           )",
+    )
+    .bind(i64::try_from(settlement.lease_id)?)
+    .bind(signer_address)
+    .fetch_optional(&mut *connection)
+    .await?;
+    if let Some(nonce) = own_nonce {
+        return u64::try_from(nonce).context("reserved settlement nonce is invalid");
+    }
+
+    let chain_nonce = heartbeat
+        .run(chain.quantity(
+            "eth_getTransactionCount",
+            serde_json::json!([signer_address, "pending"]),
+        ))
+        .await?;
+    let highest_reserved: Option<i64> = query_scalar(
+        "SELECT MAX(transaction_nonce) \
+         FROM settlement_signer_nonce_reservations \
+         WHERE signer_address = $1",
+    )
+    .bind(signer_address)
+    .fetch_one(connection)
+    .await?;
+    let after_reservations = highest_reserved
+        .map(u64::try_from)
+        .transpose()?
+        .map(|nonce| {
+            nonce
+                .checked_add(1)
+                .context("settlement nonce space is exhausted")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(chain_nonce.max(after_reservations))
+}
+
 async fn prepare_submission(
     chain: &ChainClient,
     signer: &EthereumSigner,
     escrow: [u8; 20],
     proposal: SettlementProposal,
+    nonce: u64,
+    heartbeat: &ClaimHeartbeat<'_>,
 ) -> anyhow::Result<Submission> {
     let digest = settlement_digest(ROBINHOOD_CHAIN_ID, escrow, &proposal)?;
-    let signature = signer.sign_digest(&digest).await?;
+    let signature = heartbeat.run(signer.sign_digest(&digest)).await?;
     let calldata = proposal_calldata(&proposal, &signature)?;
     let from = format!("0x{}", hex::encode(signer.address()));
     let to = format!("0x{}", hex::encode(escrow));
-    let nonce = chain
-        .quantity(
-            "eth_getTransactionCount",
-            serde_json::json!([from, "pending"]),
-        )
-        .await?;
-    let gas_price = chain.suggested_gas_price().await?;
-    let gas_limit = chain
-        .quantity(
+    let gas_price = heartbeat.run(chain.suggested_gas_price()).await?;
+    let gas_limit = heartbeat
+        .run(chain.quantity(
             "eth_estimateGas",
             serde_json::json!([{
                 "from": from,
                 "to": to,
                 "data": format!("0x{}", hex::encode(&calldata)),
                 "value": "0x0"
-            }]),
-        )
+            }, "latest"]),
+        ))
         .await?;
     let unsigned = legacy_unsigned_transaction(
         nonce,
@@ -1027,7 +2866,9 @@ async fn prepare_submission(
         ROBINHOOD_CHAIN_ID,
     );
     let transaction_digest: [u8; 32] = Keccak256::digest(&unsigned).into();
-    let transaction_signature = signer.sign_digest(&transaction_digest).await?;
+    let transaction_signature = heartbeat
+        .run(signer.sign_digest(&transaction_digest))
+        .await?;
     let raw = legacy_signed_transaction(
         nonce,
         gas_price,
@@ -1233,11 +3074,11 @@ impl ChainClient {
         Ok(window)
     }
 
-    async fn confirmed(
+    async fn finality(
         &self,
         transaction_hash: &str,
         confirmations: u64,
-    ) -> anyhow::Result<Option<(u64, String, u64)>> {
+    ) -> anyhow::Result<SettlementFinality> {
         let receipt: Option<TransactionReceipt> = self
             .call(
                 "eth_getTransactionReceipt",
@@ -1245,17 +3086,14 @@ impl ChainClient {
             )
             .await?;
         let Some(receipt) = receipt else {
-            return Ok(None);
+            return Ok(SettlementFinality::Pending);
         };
-        if parse_quantity(&receipt.status)? != 1 {
-            anyhow::bail!("settlement proposal transaction reverted");
-        }
         let block_number = parse_quantity(&receipt.block_number)?;
         let current = self
             .quantity("eth_blockNumber", serde_json::json!([]))
             .await?;
         if current < block_number.saturating_add(confirmations) {
-            return Ok(None);
+            return Ok(SettlementFinality::Pending);
         }
         let block: Option<BlockHeader> = self
             .call(
@@ -1264,16 +3102,19 @@ impl ChainClient {
             )
             .await?;
         let Some(block) = block else {
-            return Ok(None);
+            return Ok(SettlementFinality::Pending);
         };
         if !block.hash.eq_ignore_ascii_case(&receipt.block_hash) {
-            return Ok(None);
+            return Ok(SettlementFinality::Pending);
         }
-        Ok(Some((
+        if parse_quantity(&receipt.status)? != 1 {
+            return Ok(SettlementFinality::Reverted);
+        }
+        Ok(SettlementFinality::Confirmed {
             block_number,
-            receipt.block_hash,
-            parse_quantity(&block.timestamp)?,
-        )))
+            block_hash: receipt.block_hash,
+            block_time: parse_quantity(&block.timestamp)?,
+        })
     }
 
     async fn call<T: DeserializeOwned>(
@@ -1514,6 +3355,70 @@ mod tests {
         evidence_with_key(&DeviceSigningKey::generate(&mut OsRng))
     }
 
+    #[test]
+    fn escrow_generation_uses_the_canonical_database_identity() {
+        let generation =
+            EscrowGeneration::parse("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+
+        assert_eq!(
+            generation.database_address,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(generation.chain_address, [0xaa; 20]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_wakes_waiters_and_stays_closed() {
+        let (shutdown, sender) = ShutdownGate::channel();
+        assert!(!shutdown.requested());
+
+        sender.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), shutdown.wait())
+            .await
+            .unwrap();
+        assert!(shutdown.requested());
+    }
+
+    #[test]
+    fn a_reused_chain_id_does_not_make_another_internal_lease_the_same_job() {
+        let mut current_evidence = evidence();
+        current_evidence.lease_id = 1_001;
+        current_evidence.chain_lease_id = 42;
+        let current = ClaimedSettlement {
+            lease_id: 1_001,
+            chain_lease_id: 42,
+            claim_generation: 1,
+            evidence: current_evidence.clone(),
+        };
+        let mut historical_evidence = current_evidence;
+        historical_evidence.lease_id = 7;
+
+        assert!(validate_claimed_identity(&current).is_ok());
+        assert!(
+            validate_stored_binding(&current, Some((42, SqlJson(historical_evidence)))).is_err()
+        );
+    }
+
+    #[test]
+    fn a_shallow_revert_stays_recheckable_until_finality() {
+        assert_eq!(
+            observe_attempt("submitted", &SettlementFinality::Pending),
+            AttemptObservation::CheckTransaction
+        );
+    }
+
+    #[test]
+    fn a_finalized_revert_is_retired_instead_of_reused() {
+        assert_eq!(
+            observe_attempt("submitted", &SettlementFinality::Reverted),
+            AttemptObservation::MarkReverted
+        );
+        assert_eq!(
+            observe_attempt("reverted", &SettlementFinality::Pending),
+            AttemptObservation::Ignore
+        );
+    }
+
     fn repro_evidence(exit_code: i32, expected_exit_code: i32) -> SettlementEvidence {
         let key = DeviceSigningKey::generate(&mut OsRng);
         let mut evidence = evidence_with_key(&key);
@@ -1654,23 +3559,63 @@ mod tests {
 
     fn sign_managed_report(report: &mut ManagedCommandReport) {
         let digest = managed_command_report_digest(&report.payload()).unwrap();
+        report.signature = format!("0x{}", hex::encode(sign_test_digest(&digest)));
+    }
+
+    fn sign_test_digest(digest: &[u8; 32]) -> [u8; 65] {
         let mut key_bytes = [0_u8; 32];
         key_bytes[31] = 1;
         let key = ManagedSigningKey::from_slice(&key_bytes).unwrap();
-        let signature: Signature = key.sign_prehash(&digest).unwrap();
+        let signature: Signature = key.sign_prehash(digest).unwrap();
         let signature = signature.normalize_s().unwrap_or(signature);
         let recovery_id = [0_u8, 1]
             .into_iter()
             .filter_map(RecoveryId::from_byte)
             .find(|recovery_id| {
-                VerifyingKey::recover_from_prehash(&digest, &signature, *recovery_id)
+                VerifyingKey::recover_from_prehash(digest, &signature, *recovery_id)
                     .is_ok_and(|recovered| recovered == *key.verifying_key())
             })
             .unwrap();
         let mut encoded = [0_u8; 65];
         encoded[..64].copy_from_slice(&signature.to_bytes());
         encoded[64] = 27 + recovery_id.to_byte();
-        report.signature = format!("0x{}", hex::encode(encoded));
+        encoded
+    }
+
+    fn legacy_submission(escrow: [u8; 20], nonce: u64) -> (Submission, DecodedLegacyTransaction) {
+        let proposal = reconcile(&evidence()).unwrap();
+        let digest = settlement_digest(ROBINHOOD_CHAIN_ID, escrow, &proposal).unwrap();
+        let attestation_signature = sign_test_digest(&digest);
+        let calldata = proposal_calldata(&proposal, &attestation_signature).unwrap();
+        let unsigned =
+            legacy_unsigned_transaction(nonce, 2, 500_000, escrow, &calldata, ROBINHOOD_CHAIN_ID);
+        let transaction_digest: [u8; 32] = Keccak256::digest(unsigned).into();
+        let transaction_signature = sign_test_digest(&transaction_digest);
+        let raw = legacy_signed_transaction(
+            nonce,
+            2,
+            500_000,
+            escrow,
+            &calldata,
+            ROBINHOOD_CHAIN_ID,
+            &transaction_signature,
+        );
+        let raw_transaction = format!("0x{}", hex::encode(raw));
+        let transaction_hash = format!(
+            "0x{}",
+            hex::encode(Keccak256::digest(
+                hex::decode(raw_transaction.trim_start_matches("0x")).unwrap()
+            ))
+        );
+        let submission = Submission {
+            proposal,
+            attestation_signature: format!("0x{}", hex::encode(attestation_signature)),
+            raw_transaction,
+            transaction_hash,
+            submitted: true,
+        };
+        let decoded = decode_legacy_transaction(&submission.raw_transaction).unwrap();
+        (submission, decoded)
     }
 
     /// A lease whose machine went away 200s into a 900s window, noticed 150s
@@ -2078,23 +4023,49 @@ mod tests {
     /// before that, with enough margin that a proposal does not expire while it
     /// is in flight.
     #[test]
-    fn a_signature_is_not_reused_once_it_is_close_to_expiring() {
+    fn a_known_pending_signature_is_not_reused_once_it_is_close_to_expiring() {
         let now = 1_700_000_000u64;
-        let reusable = |deadline: u64| deadline > now + DEADLINE_MARGIN_SECONDS;
 
-        assert!(reusable(now + 3_600), "a fresh hour-long signature is fine");
         assert!(
-            !reusable(now + DEADLINE_MARGIN_SECONDS),
+            pending_attempt_is_reusable(true, now + 3_600, now),
+            "a fresh hour-long signature is fine"
+        );
+        assert!(
+            !pending_attempt_is_reusable(true, now + DEADLINE_MARGIN_SECONDS, now),
             "exactly at the margin is already too late to start"
         );
-        assert!(!reusable(now), "expiring now must be rebuilt");
-        assert!(!reusable(now - 1), "expired must be rebuilt");
+        assert!(
+            !pending_attempt_is_reusable(true, now, now),
+            "expiring now must be rebuilt"
+        );
+        assert!(
+            !pending_attempt_is_reusable(true, now - 1, now),
+            "expired must be rebuilt"
+        );
+        assert!(
+            !pending_attempt_is_reusable(true, u64::MAX, u64::MAX),
+            "timestamp overflow must fail closed"
+        );
+        assert!(
+            !pending_attempt_is_reusable(false, now + 3_600, now),
+            "unknown bytes must not be adopted even with a fresh deadline"
+        );
         const {
             assert!(
                 DEADLINE_MARGIN_SECONDS < 3_600,
                 "the margin has to leave a freshly signed proposal usable"
             );
         }
+    }
+
+    #[test]
+    fn replacement_deadlines_do_not_change_settlement_identity() {
+        let (submission, _) = legacy_submission([0x11; 20], 7);
+        let mut replacement = submission.proposal.clone();
+        replacement.deadline = replacement.deadline.saturating_add(1);
+
+        assert!(submission_matches_settlement(&submission, &replacement));
+        assert_ne!(submission.proposal.deadline, replacement.deadline);
     }
 
     #[test]
@@ -2139,5 +4110,200 @@ mod tests {
             decoded.at(6).unwrap().as_val::<u64>().unwrap(),
             ROBINHOOD_CHAIN_ID * 2 + 35
         );
+    }
+
+    #[test]
+    fn legacy_transaction_recovers_its_nonce_owner() {
+        let mut key_bytes = [0_u8; 32];
+        key_bytes[31] = 1;
+        let key = ManagedSigningKey::from_slice(&key_bytes).unwrap();
+        let unsigned =
+            legacy_unsigned_transaction(7, 2, 100_000, [9_u8; 20], &[1, 2, 3], ROBINHOOD_CHAIN_ID);
+        let digest: [u8; 32] = Keccak256::digest(unsigned).into();
+        let signature: Signature = key.sign_prehash(&digest).unwrap();
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let recovery_id = [0_u8, 1]
+            .into_iter()
+            .filter_map(RecoveryId::from_byte)
+            .find(|recovery_id| {
+                VerifyingKey::recover_from_prehash(&digest, &signature, *recovery_id)
+                    .is_ok_and(|recovered| recovered == *key.verifying_key())
+            })
+            .unwrap();
+        let mut encoded = [0_u8; 65];
+        encoded[..64].copy_from_slice(&signature.to_bytes());
+        encoded[64] = 27 + recovery_id.to_byte();
+        let raw = legacy_signed_transaction(
+            7,
+            2,
+            100_000,
+            [9_u8; 20],
+            &[1, 2, 3],
+            ROBINHOOD_CHAIN_ID,
+            &encoded,
+        );
+
+        assert_eq!(
+            transaction_signer(&format!("0x{}", hex::encode(raw))).unwrap(),
+            "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
+    }
+
+    #[test]
+    fn a_fully_bound_legacy_submission_normalizes_only_receipt_identity() {
+        let escrow = [0x11; 20];
+        let escrow_address = format!("0x{}", hex::encode(escrow));
+        let (submission, decoded) = legacy_submission(escrow, 7);
+        let original_receipt_hash = submission.proposal.receipt.receipt_hash.clone();
+        let value = serde_json::to_value(&submission).unwrap();
+
+        let audit = audit_generation_binding(
+            &submission.transaction_hash,
+            &submission.raw_transaction,
+            7,
+            i64::try_from(submission.proposal.lease_id).unwrap(),
+            &escrow_address,
+            i64::try_from(submission.proposal.chain_lease_id).unwrap(),
+            &value,
+            Some(&value),
+            &decoded,
+        );
+
+        let GenerationBindingAudit::Normalized(normalized) = audit else {
+            panic!("valid legacy submission was not normalized")
+        };
+        assert_eq!(
+            normalized.proposal.receipt.escrow_address.as_deref(),
+            Some(escrow_address.as_str())
+        );
+        assert_eq!(
+            normalized.proposal.receipt.chain_lease_id.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            normalized.proposal.receipt.receipt_hash,
+            original_receipt_hash
+        );
+        assert!(receipt_hash_matches(&normalized.proposal.receipt).unwrap());
+        let normalized_value = serde_json::to_value(&normalized).unwrap();
+        assert!(current_job_proposal_matches_attempt(
+            &normalized_value,
+            &value,
+            &escrow_address,
+            1,
+        ));
+        let mut mismatched = value;
+        mismatched["submitted"] = serde_json::Value::Bool(false);
+        assert!(!current_job_proposal_matches_attempt(
+            &normalized_value,
+            &mismatched,
+            &escrow_address,
+            1,
+        ));
+    }
+
+    #[test]
+    fn historical_bytes_for_another_escrow_generation_are_quarantined() {
+        let current_escrow = [0x22; 20];
+        let historical_escrow = [0x11; 20];
+        let (submission, decoded) = legacy_submission(current_escrow, 9);
+        let value = serde_json::to_value(&submission).unwrap();
+
+        let audit = audit_generation_binding(
+            &submission.transaction_hash,
+            &submission.raw_transaction,
+            9,
+            i64::try_from(submission.proposal.lease_id).unwrap(),
+            &format!("0x{}", hex::encode(historical_escrow)),
+            i64::try_from(submission.proposal.chain_lease_id).unwrap(),
+            &value,
+            Some(&value),
+            &decoded,
+        );
+
+        assert!(matches!(
+            audit,
+            GenerationBindingAudit::Quarantined("signed_escrow_mismatch")
+        ));
+    }
+
+    #[test]
+    fn historical_bytes_with_a_false_transaction_hash_are_quarantined() {
+        let escrow = [0x11; 20];
+        let (submission, decoded) = legacy_submission(escrow, 11);
+        let value = serde_json::to_value(&submission).unwrap();
+
+        let audit = audit_generation_binding(
+            &format!("0x{}", "00".repeat(32)),
+            &submission.raw_transaction,
+            11,
+            i64::try_from(submission.proposal.lease_id).unwrap(),
+            &format!("0x{}", hex::encode(escrow)),
+            i64::try_from(submission.proposal.chain_lease_id).unwrap(),
+            &value,
+            Some(&value),
+            &decoded,
+        );
+
+        assert!(matches!(
+            audit,
+            GenerationBindingAudit::Quarantined("transaction_hash_mismatch")
+        ));
+    }
+
+    #[test]
+    fn a_unique_confirmed_lease_owns_a_historical_nonce_collision() {
+        let attempts = [
+            historical_attempt(13, "prepared", 'a'),
+            historical_attempt(14, "confirmed", 'b'),
+        ];
+
+        assert_eq!(
+            resolve_historical_nonce(&attempts),
+            HistoricalNonceResolution::ReservedBy(14)
+        );
+    }
+
+    #[test]
+    fn same_lease_replacements_share_one_historical_nonce_reservation() {
+        let attempts = [
+            historical_attempt(14, "superseded", 'a'),
+            historical_attempt(14, "submitted", 'b'),
+            historical_attempt(14, "confirmed", 'c'),
+        ];
+
+        assert_eq!(
+            resolve_historical_nonce(&attempts),
+            HistoricalNonceResolution::ReservedBy(14)
+        );
+    }
+
+    #[test]
+    fn ambiguous_cross_lease_historical_nonces_fail_closed() {
+        let unconfirmed = [
+            historical_attempt(13, "prepared", 'a'),
+            historical_attempt(14, "submitted", 'b'),
+        ];
+        assert_eq!(
+            resolve_historical_nonce(&unconfirmed),
+            HistoricalNonceResolution::Conflict(NO_CONFIRMED_HISTORICAL_NONCE_OWNER)
+        );
+
+        let multiply_confirmed = [
+            historical_attempt(13, "confirmed", 'a'),
+            historical_attempt(14, "confirmed", 'b'),
+        ];
+        assert_eq!(
+            resolve_historical_nonce(&multiply_confirmed),
+            HistoricalNonceResolution::Conflict(MULTIPLE_CONFIRMED_HISTORICAL_NONCE_OWNERS)
+        );
+    }
+
+    fn historical_attempt(lease_id: i64, status: &str, marker: char) -> HistoricalNonceAttempt {
+        HistoricalNonceAttempt {
+            transaction_hash: format!("0x{}", marker.to_string().repeat(64)),
+            lease_id,
+            status: status.to_owned(),
+        }
     }
 }

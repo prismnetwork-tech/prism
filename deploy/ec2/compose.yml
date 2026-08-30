@@ -189,6 +189,7 @@ services:
   lifecycle-worker:
     image: ${PRISM_LIFECYCLE_WORKER_IMAGE:?set PRISM_LIFECYCLE_WORKER_IMAGE}
     restart: unless-stopped
+    stop_grace_period: 3m
     read_only: true
     cap_drop: [ALL]
     environment:
@@ -207,7 +208,7 @@ services:
       PRISM_VAST_DISK_GB: ${PRISM_VAST_DISK_GB:-16}
       PRISM_VAST_CREDIT_PER_SLOT_MICROS: ${PRISM_VAST_CREDIT_PER_SLOT_MICROS:-5000000}
       PRISM_VAST_MAX_HOURLY_MICROS: ${PRISM_VAST_MAX_HOURLY_MICROS:-640000}
-      PRISM_VAST_GPU_MODELS: ${PRISM_VAST_GPU_MODELS:-L40S}
+      PRISM_VAST_GPU_MODELS: ${PRISM_VAST_GPU_MODELS:-L40S,RTX 6000Ada}
       PRISM_VAST_MIN_GPU_RAM_MIB: ${PRISM_VAST_MIN_GPU_RAM_MIB:-45000}
       PRISM_VAST_NODE_ID: ${PRISM_VAST_NODE_ID:-}
       PRISM_VAST_NODE_IDS: ${PRISM_VAST_NODE_IDS:-}
@@ -220,6 +221,7 @@ services:
   repro-worker:
     image: ${PRISM_REPRO_WORKER_IMAGE:?set PRISM_REPRO_WORKER_IMAGE}
     restart: unless-stopped
+    stop_grace_period: 3m
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -229,8 +231,31 @@ services:
       DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
       PRISM_ACCESS_CREDENTIAL_KEY: ${PRISM_ACCESS_CREDENTIAL_KEY:?set PRISM_ACCESS_CREDENTIAL_KEY}
       PRISM_GATEWAY_KMS_KEY_ID: ${PRISM_GATEWAY_KMS_KEY_ID:?set PRISM_GATEWAY_KMS_KEY_ID}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
     depends_on:
       control-plane:
+        condition: service_healthy
+
+  proof-worker:
+    image: ${PRISM_PROOF_WORKER_IMAGE:?set PRISM_PROOF_WORKER_IMAGE}
+    restart: unless-stopped
+    stop_grace_period: 3m
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      DATABASE_URL: postgres://prism:${PRISM_POSTGRES_PASSWORD:?set PRISM_POSTGRES_PASSWORD}@postgres:5432/prism
+      PRISM_ALLOW_LOCAL_PROOF_ARTIFACTS: "1"
+      PRISM_PROOF_ARTIFACT_DIR: /var/lib/prism-proof
+      PRISM_PUBLIC_PROOF_URL: ${PRISM_PUBLIC_PROOF_URL:?set PRISM_PUBLIC_PROOF_URL}
+      PRISM_ENABLE_X_DIGEST_POSTING: ${PRISM_ENABLE_X_DIGEST_POSTING:-0}
+      PRISM_X_USER_ACCESS_TOKEN: ${PRISM_X_USER_ACCESS_TOKEN:-}
+      PRISM_RPC_URL: ${PRISM_RPC_URL:?set PRISM_RPC_URL}
+      PRISM_LEASE_ESCROW_ADDRESS: ${PRISM_LEASE_ESCROW_ADDRESS:?set PRISM_LEASE_ESCROW_ADDRESS}
+      PRISM_PROOF_CONFIRMATIONS: ${PRISM_PROOF_CONFIRMATIONS:-12}
+    volumes:
+      - ./proof-artifacts:/var/lib/prism-proof
+    depends_on:
+      postgres:
         condition: service_healthy
 
   reconciliation-monitor:
@@ -252,6 +277,7 @@ services:
   settlement-worker:
     image: ${PRISM_SETTLEMENT_WORKER_IMAGE:?set PRISM_SETTLEMENT_WORKER_IMAGE}
     restart: unless-stopped
+    stop_grace_period: 3m
     read_only: true
     cap_drop: [ALL]
     environment:

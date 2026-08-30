@@ -15,6 +15,8 @@ cargo build --workspace
 ./scripts/lint-automation.sh
 ./scripts/security-scan.sh
 ./scripts/test-control-plane-postgres.sh
+./scripts/test-proof-identity-postgres.sh
+./scripts/test-repro-escrow-fence.sh
 ./scripts/test-control-plane-load.sh
 ./scripts/test-monitor-chaos.sh
 ./scripts/test-lifecycle-e2e.sh
@@ -25,7 +27,7 @@ cargo build --workspace
 ./scripts/test-lightsail-tls.sh
 ./scripts/test-lightsail-compose.sh
 PRISM_INFERENCE_ENV_FILE=/dev/null \
-  docker compose --env-file deploy/lightsail/.env.example -f deploy/ec2/compose.yml config --quiet
+  docker compose --env-file deploy/ec2/.env.example -f deploy/ec2/compose.yml config --quiet
 ./scripts/test-compose-env.sh
 ./scripts/test-web-build-env.sh
 ./scripts/test-observability.sh

@@ -67,6 +67,17 @@ docker exec -e PGPASSWORD=integration-secret "$container" \
 database_port=$(docker port "$container" 5432/tcp | awk -F: 'NR == 1 { print $NF }')
 database_url="postgres://prism:integration-secret@127.0.0.1:$database_port/prism"
 
+env \
+  DATABASE_URL="$database_url" \
+  PRISM_RUN_MIGRATIONS_ONLY=1 \
+  target/debug/prism-control-plane >"$root/migrations-only.log" 2>&1
+[[ $(docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -U prism -d prism -Atc 'SELECT max(version) FROM _sqlx_migrations') == 28 ]]
+if grep -q 'listening on' "$root/migrations-only.log"; then
+  echo 'migration-only control plane opened a listener' >&2
+  exit 1
+fi
+
 start_control_plane() {
   port=$(node -e '
     const server = require("net").createServer();
@@ -250,6 +261,42 @@ curl --fail --silent \
   -d "$risk_release" \
   "http://127.0.0.1:$port/v1/operator/controls" >/dev/null
 
+# A superseded escrow's failed rows are history, not current chain capacity.
+# A provider instance is physical state and remains occupied across redeploys
+# until cleanup actually destroys it.
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "INSERT INTO accounts (subject) VALUES ('did:privy:historical');
+   INSERT INTO lease_quotes
+       (quote_id, node_id, document, expires_at, subject, consumed_at)
+   SELECT md5('prior-quote-' || n::text)::uuid, '$node_id', '{}'::jsonb,
+          NOW() + INTERVAL '1 hour', 'did:privy:historical', NOW()
+   FROM generate_series(1, 50) AS n;
+   INSERT INTO leases
+       (quote_id, subject, renter_wallet, funding_transaction_hash, document, state,
+        escrow_address, chain_lease_id)
+   SELECT md5('prior-quote-' || n::text)::uuid, 'did:privy:historical',
+          '0x1111111111111111111111111111111111111111',
+          '0xaa' || lpad(to_hex(n), 62, '0'),
+          jsonb_build_object('node_id', '$node_id'), 'failed',
+          '0x1111111111111111111111111111111111111111', n
+   FROM generate_series(1, 50) AS n;
+   INSERT INTO cloud_instances (lease_id, provider_instance_id, status)
+   SELECT lease_id, 99001, 'running' FROM leases
+   WHERE subject = 'did:privy:historical' ORDER BY lease_id LIMIT 1;" >/dev/null
+
+historical_live_match=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -H "Content-Type: application/json" \
+  -H "x-prism-development-subject: did:privy:integration" \
+  -H "x-prism-development-session: session-integration" \
+  -H "x-request-id: historical-live-match-integration" \
+  -d "$request" "http://127.0.0.1:$port/v1/leases/match")
+[[ $historical_live_match == 409 ]]
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "UPDATE cloud_instances SET status = 'destroyed', destroyed_at = NOW()
+   WHERE provider_instance_id = 99001;" >/dev/null
+
 quote=$(curl --fail --silent "${auth_headers[@]}" -d "$request" \
   "http://127.0.0.1:$port/v1/leases/match")
 node -e '
@@ -261,6 +308,22 @@ quote_id=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).quote_id)' 
 funding_hash=0x0000000000000001000000001111111111111111111111111111111111111111
 ssh-keygen -q -t ed25519 -N "" -f "$root/renter"
 ssh_key=$(cat "$root/renter.pub")
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "UPDATE cloud_instances SET status = 'running', destroyed_at = NULL
+   WHERE provider_instance_id = 99001;" >/dev/null
+historical_live_confirm=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -H "Content-Type: application/json" \
+  -H "x-prism-development-subject: did:privy:integration" \
+  -H "x-prism-development-session: session-integration" \
+  -H "x-request-id: historical-live-confirm-integration" \
+  -d "{\"quote_id\":\"$quote_id\",\"transaction_hash\":\"$funding_hash\",\"ssh_authorized_key\":\"$ssh_key\"}" \
+  "http://127.0.0.1:$port/v1/leases/confirm")
+[[ $historical_live_confirm == 409 ]]
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "UPDATE cloud_instances SET status = 'destroyed', destroyed_at = NOW()
+   WHERE provider_instance_id = 99001;" >/dev/null
 confirmation=$(curl --fail --silent \
   -H "Content-Type: application/json" \
   -H "x-prism-development-subject: did:privy:integration" \
@@ -274,6 +337,12 @@ node -e '
   if (lease.quote_id !== process.argv[2] || lease.state !== "funded") process.exit(1);
 ' "$confirmation" "$quote_id"
 internal_lease_id=$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).lease_id))' "$confirmation")
+
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "DELETE FROM leases WHERE subject = 'did:privy:historical';
+   DELETE FROM lease_quotes WHERE subject = 'did:privy:historical';
+   DELETE FROM accounts WHERE subject = 'did:privy:historical';" >/dev/null
 
 leases=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:integration" \
@@ -315,9 +384,12 @@ kill "$command_pid"
 wait "$command_pid" 2>/dev/null || true
 command_pid=
 
+# The operator read-path still has to render a preserved pre-0026 disputed
+# marker. New writes cannot create this shape, so the fixture bypasses triggers.
 docker exec -e PGPASSWORD=integration-secret "$container" \
   psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
   "UPDATE leases SET state = 'disputed', document = jsonb_set(document, '{state}', '\"disputed\"'), updated_at = NOW() WHERE lease_id = $internal_lease_id;
+   SET session_replication_role = replica;
    INSERT INTO settlement_jobs (lease_id, evidence, status)
    SELECT $internal_lease_id,
           jsonb_build_object(
@@ -338,7 +410,8 @@ docker exec -e PGPASSWORD=integration-secret "$container" \
             'gateway_closed_at', 1700000060,
             'node_telemetry', jsonb_build_array((SELECT document FROM node_telemetry LIMIT 1))
           ),
-          'disputed';" >/dev/null
+          'disputed';
+   SET session_replication_role = origin;" >/dev/null
 forbidden_dispute_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
   -H "x-prism-development-subject: did:privy:integration" \
   -H "x-prism-development-session: session-integration" \
@@ -357,9 +430,13 @@ evidence_hash=$(node -e '
 ' "$disputes")
 receipt_hash="0x$(printf '12%.0s' {1..32})"
 settlement_hash="0x$(printf '34%.0s' {1..32})"
+# Recreate a pre-0026 partial dispute cursor. The hardened schema correctly
+# rejects creating this shape; the operator read-path regression still needs to
+# prove it renders and flags preserved legacy evidence without trusting it.
 docker exec -e PGPASSWORD=integration-secret "$container" \
   psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
-  "UPDATE settlement_jobs
+  "SET session_replication_role = replica;
+   UPDATE settlement_jobs
    SET proposal = jsonb_build_object(
          'proposal', jsonb_build_object(
            'lease_id', $internal_lease_id,
@@ -371,7 +448,8 @@ docker exec -e PGPASSWORD=integration-secret "$container" \
        ),
        transaction_hash = '$settlement_hash',
        updated_at = NOW()
-   WHERE lease_id = $internal_lease_id;" >/dev/null
+   WHERE lease_id = $internal_lease_id;
+   SET session_replication_role = origin;" >/dev/null
 disputes=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:operator" \
   -H "x-prism-development-session: session-operator" \
@@ -388,7 +466,11 @@ node -e '
 ' "$disputes" "$internal_lease_id"
 docker exec -e PGPASSWORD=integration-secret "$container" \
   psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
-  "UPDATE settlement_jobs SET proposal = jsonb_set(proposal, '{proposal,usage_seconds}', '61') WHERE lease_id = $internal_lease_id;" >/dev/null
+  "SET session_replication_role = replica;
+   UPDATE settlement_jobs
+   SET proposal = jsonb_set(proposal, '{proposal,usage_seconds}', '61')
+   WHERE lease_id = $internal_lease_id;
+   SET session_replication_role = origin;" >/dev/null
 disputes=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:operator" \
   -H "x-prism-development-session: session-operator" \

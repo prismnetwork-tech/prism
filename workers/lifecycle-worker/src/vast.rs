@@ -9,7 +9,7 @@ const DEFAULT_API_URL: &str = "https://console.vast.ai/api/v0/";
 const DEFAULT_MAX_HOURLY_MICROS: u64 = 640_000;
 const DEFAULT_CREDIT_PER_SLOT_MICROS: u64 = 5_000_000;
 const DEFAULT_DISK_GB: u64 = 16;
-const DEFAULT_GPU_MODELS: &str = "L40S";
+const DEFAULT_GPU_MODELS: &str = "L40S,RTX 6000Ada";
 const DEFAULT_MIN_GPU_RAM_MIB: u64 = 45_000;
 const MAX_LEASE_HOURS: u64 = 6;
 
@@ -26,8 +26,8 @@ pub(crate) struct VastBroker {
     pub(crate) max_hourly_micros: u64,
     pub(crate) credit_per_slot_micros: u64,
     /// Which GPUs the broker will rent on a renter's behalf. One class leaves
-    /// the network at the mercy of one market: when a verified L40S costs more
-    /// than a lease charges, there is nothing to sell at any price.
+    /// the network at the mercy of one market: when every host of that class
+    /// costs more than a lease charges, there is nothing safe to sell.
     pub(crate) gpu_models: Arc<Vec<String>>,
     pub(crate) min_gpu_ram_mib: u64,
     disk_gb: u32,
@@ -1124,18 +1124,19 @@ mod tests {
         assert!(format!("{error:#}").contains("no such instance"));
     }
 
-    /// A verified L40S costing more than a lease charges means no capacity at
-    /// all while an A6000 with the same memory sits at half the price.
+    /// A verified L40S costing more than a lease charges must not hide a
+    /// configured workstation-class Ada GPU with the same usable memory.
     #[test]
     fn a_broker_rents_every_class_it_is_configured_for() {
+        assert_eq!(DEFAULT_GPU_MODELS, "L40S,RTX 6000Ada");
         let single = broker(&["L40S"], 45_000, 900_000);
         assert!(single.admits("L40S", 46_068));
-        assert!(!single.admits("RTX A6000", 46_068));
+        assert!(!single.admits("RTX 6000Ada", 49_140));
         assert!(!single.admits("L40S", 24_576));
 
-        let wide = broker(&["L40S", "RTX A6000"], 45_000, 900_000);
+        let wide = broker(&["L40S", "RTX 6000Ada"], 45_000, 900_000);
         assert!(wide.admits("L40S", 46_068));
-        assert!(wide.admits("rtx a6000", 46_068));
+        assert!(wide.admits("rtx 6000ada", 49_140));
         assert!(!wide.admits("RTX 4090", 24_564));
     }
 

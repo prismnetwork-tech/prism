@@ -1783,6 +1783,10 @@ pub struct ReproReceiptEvidence {
 pub struct PublicReceipt {
     pub receipt_id: Uuid,
     pub lease_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escrow_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_lease_id: Option<String>,
     pub node_id_hash: String,
     pub gpu_model: String,
     pub runtime_seconds: u64,
@@ -2222,6 +2226,36 @@ pub fn receipt_hash_matches(receipt: &PublicReceipt) -> Result<bool, ProtocolErr
     Ok(receipt.receipt_hash == receipt_hash(receipt)?)
 }
 
+pub fn validate_receipt_identity(receipt: &PublicReceipt) -> Result<(), ProtocolError> {
+    match (&receipt.escrow_address, &receipt.chain_lease_id) {
+        (None, None) => Ok(()),
+        (Some(escrow_address), Some(chain_lease_id))
+            if is_canonical_address(escrow_address)
+                && is_canonical_chain_id(chain_lease_id)
+                && receipt.lease_id == *chain_lease_id =>
+        {
+            Ok(())
+        }
+        _ => Err(ProtocolError::InvalidReceiptIdentity),
+    }
+}
+
+fn is_canonical_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_canonical_chain_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && !value.starts_with('0')
+        && value.parse::<u64>().is_ok_and(|value| value > 0)
+}
+
 /// Hashes the exact v1 workload contract. This is deliberately domain
 /// separated from every other JSON hash in the protocol.
 pub fn gpu_repro_spec_hash(spec: &GpuReproSpec) -> Result<String, ProtocolError> {
@@ -2368,6 +2402,8 @@ pub enum ProtocolError {
     AttestationTooLarge,
     #[error("attestation is malformed")]
     InvalidAttestation,
+    #[error("public receipt chain identity is invalid")]
+    InvalidReceiptIdentity,
 }
 
 #[cfg(test)]
@@ -2623,6 +2659,8 @@ mod tests {
         let mut receipt = PublicReceipt {
             receipt_id: Uuid::now_v7(),
             lease_id: "lease-1".to_owned(),
+            escrow_address: None,
+            chain_lease_id: None,
             node_id_hash: "0x1234".to_owned(),
             gpu_model: "NVIDIA L4".to_owned(),
             runtime_seconds: 60,
@@ -2648,6 +2686,25 @@ mod tests {
         assert!(receipt_hash_matches(&receipt).unwrap());
     }
 
+    #[test]
+    fn receipt_identity_is_additive_and_exact() {
+        let mut receipt = receipt_at("17", Uuid::now_v7());
+        let legacy_hash = receipt_hash(&receipt).unwrap();
+        receipt.escrow_address = Some(format!("0x{}", "a".repeat(40)));
+        receipt.chain_lease_id = Some("17".to_owned());
+
+        validate_receipt_identity(&receipt).unwrap();
+        assert_eq!(receipt_hash(&receipt).unwrap(), legacy_hash);
+
+        receipt.chain_lease_id = Some("18".to_owned());
+        assert!(validate_receipt_identity(&receipt).is_err());
+        receipt.chain_lease_id = Some("17".to_owned());
+        receipt.escrow_address = Some(format!("0x{}", "A".repeat(40)));
+        assert!(validate_receipt_identity(&receipt).is_err());
+        receipt.escrow_address = None;
+        assert!(validate_receipt_identity(&receipt).is_err());
+    }
+
     /// Receipts already published on chain carry no trust class. Their hashes
     /// are committed by settlement transactions, so the payload must still
     /// serialize exactly as it did before the field existed.
@@ -2657,6 +2714,8 @@ mod tests {
         let receipt = PublicReceipt {
             receipt_id,
             lease_id: "11".to_owned(),
+            escrow_address: None,
+            chain_lease_id: None,
             node_id_hash: "0x1234".to_owned(),
             gpu_model: "NVIDIA L40S".to_owned(),
             runtime_seconds: 300,
@@ -2687,6 +2746,8 @@ mod tests {
         let mut receipt = PublicReceipt {
             receipt_id: Uuid::now_v7(),
             lease_id: "12".to_owned(),
+            escrow_address: None,
+            chain_lease_id: None,
             node_id_hash: "0x1234".to_owned(),
             gpu_model: "NVIDIA L40S".to_owned(),
             runtime_seconds: 300,
@@ -2713,6 +2774,8 @@ mod tests {
         PublicReceipt {
             receipt_id,
             lease_id: lease_id.to_owned(),
+            escrow_address: None,
+            chain_lease_id: None,
             node_id_hash: "0x1234".to_owned(),
             gpu_model: "NVIDIA H100 PCIe".to_owned(),
             runtime_seconds: 300,
@@ -2881,6 +2944,8 @@ mod tests {
         let receipt = PublicReceipt {
             receipt_id: Uuid::parse_str("019f0000-0000-7000-8000-000000000002").unwrap(),
             lease_id: "129".to_owned(),
+            escrow_address: None,
+            chain_lease_id: None,
             node_id_hash: format!("0x{}", "b".repeat(64)),
             gpu_model: "NVIDIA L4".to_owned(),
             runtime_seconds: 60,
@@ -4175,6 +4240,8 @@ mod tests {
         let receipt = PublicReceipt {
             receipt_id: Uuid::parse_str("019f0000-0000-7000-8000-000000000001").unwrap(),
             lease_id: "128".to_owned(),
+            escrow_address: None,
+            chain_lease_id: None,
             node_id_hash: format!("0x{}", "a".repeat(64)),
             gpu_model: "NVIDIA L40S".to_owned(),
             runtime_seconds: 200,

@@ -1541,6 +1541,13 @@ async fn main() -> anyhow::Result<()> {
 
     let allow_development_auth = env::var("PRISM_ALLOW_DEVELOPMENT_AUTH").as_deref() == Ok("1");
     let store = MarketplaceStore::from_environment().await?;
+    if env::var("PRISM_RUN_MIGRATIONS_ONLY").as_deref() == Ok("1") {
+        if store.is_development() {
+            anyhow::bail!("PRISM_RUN_MIGRATIONS_ONLY requires DATABASE_URL");
+        }
+        tracing::info!("control-plane migrations applied; exiting before admission startup");
+        return Ok(());
+    }
     let allow_development_registry =
         env::var("PRISM_ALLOW_DEVELOPMENT_REGISTRY").as_deref() == Ok("1");
     if allow_development_registry && !allow_development_auth {
@@ -1953,6 +1960,15 @@ impl ChainVerifier {
         }
     }
 
+    fn active_escrow_address(&self) -> &str {
+        match self {
+            Self::Development { escrow_address } => escrow_address
+                .as_deref()
+                .unwrap_or(DEVELOPMENT_ESCROW_ADDRESS),
+            Self::Rpc { escrow_address, .. } => escrow_address,
+        }
+    }
+
     fn from_environment(allow_development: bool) -> anyhow::Result<Self> {
         let rpc_url = env::var("PRISM_RPC_URL")
             .ok()
@@ -2000,7 +2016,9 @@ impl ChainVerifier {
             }
             (None, escrow_address) if allow_development => {
                 tracing::warn!("accepting synthetic lease funding only in local development");
-                Ok(Self::Development { escrow_address })
+                Ok(Self::Development {
+                    escrow_address: escrow_address.map(|address| address.to_ascii_lowercase()),
+                })
             }
             _ => anyhow::bail!(
                 "PRISM_RPC_URL and PRISM_LEASE_ESCROW_ADDRESS are required outside local development"
@@ -2017,13 +2035,16 @@ impl ChainVerifier {
             return Err(ChainError::InvalidTransactionHash);
         }
         match self {
-            Self::Development { .. } => {
+            Self::Development { escrow_address } => {
                 let lease_id = u64::from_str_radix(&transaction_hash[2..18], 16)
                     .map_err(|_| ChainError::InvalidTransactionHash)?
                     .max(1);
                 Ok(ConfirmedFunding {
                     lease_id,
-                    escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+                    escrow_address: escrow_address
+                        .as_deref()
+                        .unwrap_or(DEVELOPMENT_ESCROW_ADDRESS)
+                        .to_owned(),
                     renter_wallet: format!(
                         "0x{}",
                         &transaction_hash[transaction_hash.len() - 40..]
@@ -4878,11 +4899,28 @@ impl MarketplaceStore {
         }
     }
 
+    #[cfg(test)]
     async fn quote(
         &self,
         subject: &str,
         request: &LeaseRequest,
         staked_whole_tokens: u64,
+    ) -> Result<LeaseQuote, StoreError> {
+        self.quote_for_escrow(
+            subject,
+            request,
+            staked_whole_tokens,
+            DEVELOPMENT_ESCROW_ADDRESS,
+        )
+        .await
+    }
+
+    async fn quote_for_escrow(
+        &self,
+        subject: &str,
+        request: &LeaseRequest,
+        staked_whole_tokens: u64,
+        escrow_address: &str,
     ) -> Result<LeaseQuote, StoreError> {
         match self {
             Self::Memory(market) => {
@@ -4953,12 +4991,7 @@ impl MarketplaceStore {
                 let unsettled = market
                     .leases
                     .values()
-                    .filter(|(_, lease)| {
-                        !matches!(
-                            lease.state,
-                            LeaseState::Finalized | LeaseState::Refunded | LeaseState::Failed
-                        )
-                    })
+                    .filter(|(_, lease)| occupies_node_for_escrow(lease, escrow_address))
                     .count();
                 if active_quote_count + unsettled >= MAX_NETWORK_LEASES {
                     return Err(StoreError::NetworkCapacity);
@@ -4975,7 +5008,7 @@ impl MarketplaceStore {
                     market
                         .leases
                         .values()
-                        .filter(|(_, lease)| occupies_node(lease))
+                        .filter(|(_, lease)| occupies_node_for_escrow(lease, escrow_address))
                         .map(|(_, lease)| lease.node_id.clone()),
                 );
                 let now = Utc::now();
@@ -5078,15 +5111,21 @@ impl MarketplaceStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
+                // Only the escrow that can still settle a lease consumes this
+                // chain cap. The reservation below keeps provider machines held
+                // globally until their own cleanup says they were destroyed.
                 let quote_count: i64 = query_scalar(
                     "SELECT \
                          (SELECT COUNT(*) FROM lease_quotes \
                           WHERE consumed_at IS NULL AND expires_at > NOW()) + \
-                         (SELECT COUNT(*) FROM leases WHERE state NOT IN ('finalized', 'refunded'))",
+                         (SELECT COUNT(*) FROM leases \
+                          WHERE escrow_address = $1 \
+                            AND state NOT IN ('finalized', 'refunded'))",
                 )
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(StoreError::Storage)?;
+                .bind(escrow_address)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
                 if quote_count >= MAX_NETWORK_LEASES as i64 {
                     return Err(StoreError::NetworkCapacity);
                 }
@@ -5095,9 +5134,14 @@ impl MarketplaceStore {
                      WHERE consumed_at IS NULL AND expires_at > NOW() \
                        AND created_at > NOW() - make_interval(secs => $1) \
                      UNION SELECT document->>'node_id' FROM leases \
-                     WHERE state NOT IN ('finalized', 'refunded')",
+                     WHERE escrow_address = $2 \
+                       AND state NOT IN ('finalized', 'refunded') \
+                     UNION SELECT l.document->>'node_id' FROM leases l \
+                     JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
+                     WHERE ci.status <> 'destroyed'",
                 )
                 .bind(QUOTE_HOLD_SECONDS as f64)
+                .bind(escrow_address)
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?
@@ -5392,11 +5436,10 @@ impl MarketplaceStore {
                     None,
                     now,
                 );
-                if market
-                    .leases
-                    .values()
-                    .any(|(_, current)| current.node_id == lease.node_id && occupies_node(current))
-                {
+                if market.leases.values().any(|(_, current)| {
+                    current.node_id == lease.node_id
+                        && occupies_node_for_escrow(current, &lease.escrow_address)
+                }) {
                     return Err(StoreError::FundingCapacityUnavailable);
                 }
                 market.consumed_quotes.insert(quote.quote_id);
@@ -5528,14 +5571,23 @@ impl MarketplaceStore {
                     None,
                     now,
                 );
+                // Keep the same logical/current and physical/global split used
+                // when the quote was cut; either side can change before funding.
                 let node_busy = query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM leases \
                          WHERE document->>'node_id' = $1 \
+                           AND escrow_address = $2 \
                            AND state NOT IN ('finalized', 'refunded') \
+                         UNION \
+                         SELECT 1 FROM leases l \
+                         JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
+                         WHERE l.document->>'node_id' = $1 \
+                           AND ci.status <> 'destroyed' \
                      )",
                 )
                 .bind(&lease.node_id)
+                .bind(&lease.escrow_address)
                 .fetch_one(&mut *transaction)
                 .await
                 .map_err(StoreError::Storage)?;
@@ -7552,6 +7604,10 @@ fn occupies_node(lease: &LeaseRecord) -> bool {
     !matches!(lease.state, LeaseState::Finalized | LeaseState::Refunded)
 }
 
+fn occupies_node_for_escrow(lease: &LeaseRecord, escrow_address: &str) -> bool {
+    lease.escrow_address.eq_ignore_ascii_case(escrow_address) && occupies_node(lease)
+}
+
 fn lease_state_name(state: &LeaseState) -> &'static str {
     match state {
         LeaseState::Funded => "funded",
@@ -8870,7 +8926,12 @@ async fn match_lease(
         .await;
     state
         .store
-        .quote(&account.subject, &payload.request, staked)
+        .quote_for_escrow(
+            &account.subject,
+            &payload.request,
+            staked,
+            state.chain.active_escrow_address(),
+        )
         .await
         .map(Json)
         .map_err(store_error)
@@ -9594,6 +9655,38 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("provider admission"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0024_provider_admission.sql")),
+                false,
+            ),
+            Migration::new(
+                25,
+                Cow::Borrowed("lifecycle transaction attempts"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0025_lifecycle_transaction_attempts.sql"
+                )),
+                false,
+            ),
+            Migration::new(
+                26,
+                Cow::Borrowed("settlement transaction attempts"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0026_settlement_attempts.sql")),
+                false,
+            ),
+            Migration::new(
+                27,
+                Cow::Borrowed("proof receipt identity"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0027_proof_receipt_identity.sql"
+                )),
+                false,
+            ),
+            Migration::new(
+                28,
+                Cow::Borrowed("provider maintenance"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0028_provider_maintenance.sql")),
                 false,
             ),
         ]),
@@ -13310,6 +13403,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn development_funding_uses_the_scheduler_escrow() {
+        let configured = "0x2222222222222222222222222222222222222222";
+        let chain = ChainVerifier::Development {
+            escrow_address: Some(configured.to_owned()),
+        };
+        let listing = offer("only", 100, 10_000);
+        let quote = quote_for_offers_unstaked(
+            &lease_request(TrustClass::Open, None),
+            [&listing],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let funding = chain
+            .verify_funding(&format!("0x{}", "01".repeat(32)), &quote)
+            .await
+            .unwrap();
+
+        assert_eq!(chain.active_escrow_address(), configured);
+        assert_eq!(funding.escrow_address, configured);
+        assert_eq!(
+            ChainVerifier::Development {
+                escrow_address: None,
+            }
+            .active_escrow_address(),
+            DEVELOPMENT_ESCROW_ADDRESS
+        );
+    }
+
+    #[tokio::test]
     async fn scheduler_serializes_concurrent_quotes_at_the_network_cap() {
         let now = Utc::now();
         let mut market = MemoryMarketplace::default();
@@ -13349,6 +13471,63 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn network_cap_counts_failed_leases_only_for_the_active_escrow() {
+        let current = "0x2222222222222222222222222222222222222222";
+        let superseded = "0x1111111111111111111111111111111111111111";
+        let now = Utc::now();
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 100, 10_000));
+        market.tunnels.insert("only".to_owned(), now);
+        for index in 0..MAX_NETWORK_LEASES {
+            let lease_id = index as u64 + 1;
+            let lease = LeaseRecord {
+                lease_id,
+                chain_lease_id: lease_id,
+                escrow_address: superseded.to_owned(),
+                quote_id: Uuid::now_v7(),
+                node_id: "only".to_owned(),
+                renter_wallet: format!("0x{}", "11".repeat(20)),
+                image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+                duration_seconds: 60,
+                rate_per_second: 100,
+                maximum_escrow: 6_000,
+                trust_class: TrustClass::Open,
+                funding_transaction_hash: format!("0x{lease_id:064x}"),
+                state: LeaseState::Failed,
+                command: None,
+                repro: None,
+                created_at: now,
+                updated_at: now,
+            };
+            market
+                .leases
+                .insert(lease_id, (format!("historical-{index}"), lease));
+        }
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = lease_request(TrustClass::Open, None);
+
+        store
+            .quote_for_escrow("renter", &request, 0, current)
+            .await
+            .expect("superseded failed leases must not consume the current network cap");
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        for (_, lease) in market.write().await.leases.values_mut() {
+            lease.escrow_address = current.to_owned();
+        }
+        assert!(matches!(
+            store
+                .quote_for_escrow("next-renter", &request, 0, current)
+                .await,
+            Err(StoreError::NetworkCapacity)
+        ));
+    }
+
     /// The renter who abandons a quote is the one most likely to ask for
     /// another, and on a one-node network its own five-minute hold used to
     /// lock it out until the quote expired.
@@ -13381,9 +13560,6 @@ mod tests {
         ));
     }
 
-    /// Settlement runs for a further 24 hours after the machine is torn down.
-    /// Holding the node for that whole window took the one-node network out of
-    /// service for a day after every lease.
     /// One renter quoting and walking away used to take a one-node network out
     /// of service for the full five minutes the quote stayed valid.
     #[tokio::test]
@@ -13563,12 +13739,8 @@ mod tests {
         let MarketplaceStore::Memory(market) = &store else {
             unreachable!()
         };
-        // #83 released the node here, on the reasoning that its machine was
-        // already gone. The escrow disagrees: it holds activeLeaseId until
-        // finalize or refund, so quoting now reverts with LeaseNotReady. That
-        // optimisation existed because finalize was hardcoded 24h out; #96 made
-        // it read DISPUTE_WINDOW, so settling costs about five minutes and
-        // waiting for it is cheap.
+        // The escrow holds activeLeaseId until finalize or refund, so capacity
+        // remains reserved after the machine is gone.
         market.write().await.leases.get_mut(&27).unwrap().1.state = LeaseState::SettlementPending;
 
         assert!(matches!(
@@ -13781,12 +13953,11 @@ mod tests {
     }
 
     /// Production regression. Replacing the escrow restarted its lease counter
-    /// at 1, so a fresh lease 3 arrived while a superseded escrow's lease 3 was
-    /// still on file. Confirm matched on the id alone, called it a replay, and
-    /// rejected a renter whose USDG had already moved on chain. Every id up to
-    /// the old high-water mark would have failed the same way.
+    /// at 1, so a fresh lease 3 arrived while a superseded escrow's failed lease
+    /// 3 was still on file. The historical row must neither reserve the node nor
+    /// make confirmation look like a replay.
     #[tokio::test]
-    async fn a_reused_chain_lease_id_from_a_new_escrow_is_not_a_replay() {
+    async fn a_failed_lease_from_a_superseded_escrow_does_not_reserve_or_replay() {
         let superseded = "0x71df0ef3bc81022cb3bec0b1a05f52f12bafcded";
         let current = "0x62c042265991bea17b07229322a01850974626da";
         let mut market = MemoryMarketplace::default();
@@ -13799,7 +13970,7 @@ mod tests {
             chain_lease_id: 3,
             escrow_address: superseded.to_owned(),
             quote_id: Uuid::now_v7(),
-            node_id: "node".to_owned(),
+            node_id: "only".to_owned(),
             renter_wallet: format!("0x{}", "11".repeat(20)),
             image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
             duration_seconds: 60,
@@ -13807,7 +13978,7 @@ mod tests {
             maximum_escrow: 13_320,
             trust_class: TrustClass::Open,
             funding_transaction_hash: format!("0x{}", "cc".repeat(32)),
-            state: LeaseState::Refunded,
+            state: LeaseState::Failed,
             command: None,
             repro: None,
             created_at: Utc::now(),
@@ -13827,7 +13998,10 @@ mod tests {
             command: None,
             repro: None,
         };
-        let quote = store.quote("renter", &request, 0).await.unwrap();
+        let quote = store
+            .quote_for_escrow("renter", &request, 0, current)
+            .await
+            .expect("a superseded escrow must not reserve current capacity");
         let confirmed = store
             .confirm_funding(FundingConfirmation {
                 subject: "renter",
@@ -13855,6 +14029,24 @@ mod tests {
             "the internal id must not collide with the superseded record"
         );
         assert!(confirmed.lease_id >= INTERNAL_LEASE_ID_FLOOR);
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market
+            .write()
+            .await
+            .leases
+            .get_mut(&confirmed.lease_id)
+            .unwrap()
+            .1
+            .state = LeaseState::Failed;
+        assert!(matches!(
+            store
+                .quote_for_escrow("next-renter", &request, 0, current)
+                .await,
+            Err(StoreError::CapacityReserved)
+        ));
     }
 
     #[test]
@@ -15061,6 +15253,8 @@ mod tests {
         let mut receipt = PublicReceipt {
             receipt_id: Uuid::now_v7(),
             lease_id: "77".to_owned(),
+            escrow_address: None,
+            chain_lease_id: None,
             node_id_hash: format!("0x{}", hex::encode(Sha256::digest(node_id.as_bytes()))),
             gpu_model: "NVIDIA L4".to_owned(),
             runtime_seconds: 2,

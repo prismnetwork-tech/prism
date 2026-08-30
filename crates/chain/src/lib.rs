@@ -22,6 +22,8 @@ const RPC_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const RPC_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const RPC_RETRY_AFTER_LIMIT: Duration = Duration::from_secs(10);
 const RPC_ERROR_BODY_LIMIT: usize = 1_024;
+const TRANSACTION_RECONCILIATION_ATTEMPTS: usize = 3;
+const TRANSACTION_RECONCILIATION_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub struct RpcClient {
@@ -57,6 +59,37 @@ struct TransientRpcError {
     source: Option<reqwest::Error>,
 }
 
+#[derive(Debug)]
+pub struct RpcApplicationError {
+    method: &'static str,
+    code: i64,
+    message: String,
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct TransactionReprepareRequired {
+    source: anyhow::Error,
+}
+
+impl RpcApplicationError {
+    pub fn method(&self) -> &'static str {
+        self.method
+    }
+
+    pub fn code(&self) -> i64 {
+        self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn data(&self) -> Option<&serde_json::Value> {
+        self.data.as_ref()
+    }
+}
+
 impl std::fmt::Display for TransientRpcError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
@@ -71,11 +104,117 @@ impl std::error::Error for TransientRpcError {
     }
 }
 
+impl std::fmt::Display for RpcApplicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "RPC {} failed with {}: {}",
+            self.method, self.code, self.message
+        )?;
+        if let Some(data) = self.data.as_ref() {
+            match data {
+                serde_json::Value::String(data) => write!(formatter, " ({data})")?,
+                data => write!(formatter, " ({data})")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RpcApplicationError {}
+
+impl std::fmt::Display for TransactionReprepareRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "signed transaction must be rebuilt: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for TransactionReprepareRequired {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Whether an RPC call exhausted retries on a transport or retryable HTTP failure.
 pub fn is_transient_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<TransientRpcError>().is_some())
+}
+
+/// Whether submission proved a signed transaction unusable and it must be rebuilt.
+///
+/// A nonce error qualifies only after the exact transaction is absent from
+/// both the transaction and receipt lookups. Ambiguous failures retain it.
+pub fn requires_transaction_reprepare(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<TransactionReprepareRequired>()
+            .is_some()
+    })
+}
+
+fn is_repreparable_submission(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(error) = cause.downcast_ref::<RpcApplicationError>() else {
+            return false;
+        };
+        if error.method != "eth_sendRawTransaction" {
+            return false;
+        }
+        rpc_error_contains(
+            error,
+            &[
+                "nonce too low",
+                "nonce is too low",
+                "nonce too high",
+                "nonce is too high",
+                "replacement transaction underpriced",
+                "transaction underpriced",
+                "fee too low",
+                "max fee per gas less than block base fee",
+                "max fee per gas is less than block base fee",
+                "gas price is less than block base fee",
+                "gas price below block base fee",
+                "transaction gas price is too low",
+            ],
+        )
+    })
+}
+
+fn is_known_transaction_submission(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(error) = cause.downcast_ref::<RpcApplicationError>() else {
+            return false;
+        };
+        if error.method != "eth_sendRawTransaction" {
+            return false;
+        }
+        let text = rpc_error_text(error);
+        text.contains("already known")
+            || text.contains("already-known")
+            || ((text.contains("known transaction") || text.contains("known-transaction"))
+                && !text.contains("unknown transaction")
+                && !text.contains("unknown-transaction"))
+    })
+}
+
+fn rpc_error_contains(error: &RpcApplicationError, needles: &[&str]) -> bool {
+    let text = rpc_error_text(error);
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn rpc_error_text(error: &RpcApplicationError) -> String {
+    let mut text = error.message.to_ascii_lowercase();
+    if let Some(data) = error.data.as_ref() {
+        text.push(' ');
+        text.push_str(&data.to_string().to_ascii_lowercase());
+    }
+    text
 }
 
 pub enum EthereumSigner {
@@ -100,6 +239,23 @@ pub struct PreparedTransaction {
     pub nonce: u64,
     pub raw_transaction: String,
     pub transaction_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionOutcome {
+    /// The exact hash was visible before any broadcast call was made.
+    AlreadyObserved,
+    /// `eth_sendRawTransaction` accepted the bytes and returned their hash.
+    BroadcastAccepted,
+    /// A broadcast was attempted and the endpoint, or an exact-hash recheck,
+    /// proved that the same transaction was already known.
+    BroadcastKnown,
+}
+
+impl SubmissionOutcome {
+    pub fn broadcast_attempted(self) -> bool {
+        self != Self::AlreadyObserved
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,7 +302,7 @@ struct RpcError {
     /// Revert payload. Without it every failed call is an indistinguishable
     /// "execution reverted", which hides the contract's own error.
     #[serde(default)]
-    data: Option<String>,
+    data: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -200,14 +356,13 @@ impl RpcClient {
         }))?;
         let response = self.send(method, &body, rand::random()).await?;
         if let Some(error) = response.error {
-            match error.data {
-                Some(data) => anyhow::bail!(
-                    "RPC {method} failed with {}: {} ({data})",
-                    error.code,
-                    error.message
-                ),
-                None => anyhow::bail!("RPC {method} failed with {}: {}", error.code, error.message),
+            return Err(RpcApplicationError {
+                method,
+                code: error.code,
+                message: error.message,
+                data: error.data,
             }
+            .into());
         }
         serde_json::from_value(response.result).context("RPC response contains an invalid result")
     }
@@ -419,7 +574,10 @@ impl RpcClient {
         })
     }
 
-    pub async fn submit(&self, transaction: &PreparedTransaction) -> anyhow::Result<()> {
+    pub async fn submit(
+        &self,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<SubmissionOutcome> {
         let known: Option<serde_json::Value> = self
             .call(
                 "eth_getTransactionByHash",
@@ -427,18 +585,65 @@ impl RpcClient {
             )
             .await?;
         if known.is_some() {
-            return Ok(());
+            return Ok(SubmissionOutcome::AlreadyObserved);
         }
-        let hash: String = self
+        self.broadcast(transaction).await
+    }
+
+    /// Broadcasts bytes whose durable owner has already checked exact-hash
+    /// visibility and recorded the send attempt.
+    pub async fn broadcast(
+        &self,
+        transaction: &PreparedTransaction,
+    ) -> anyhow::Result<SubmissionOutcome> {
+        let submitted = self
             .call(
                 "eth_sendRawTransaction",
                 serde_json::json!([transaction.raw_transaction]),
             )
-            .await?;
+            .await;
+        let hash: String = match submitted {
+            Ok(hash) => hash,
+            Err(error) if is_known_transaction_submission(&error) => {
+                return Ok(SubmissionOutcome::BroadcastKnown);
+            }
+            Err(error) if is_repreparable_submission(&error) => {
+                if self
+                    .transaction_observed(&transaction.transaction_hash)
+                    .await?
+                {
+                    return Ok(SubmissionOutcome::BroadcastKnown);
+                }
+                return Err(TransactionReprepareRequired { source: error }.into());
+            }
+            Err(error) => return Err(error),
+        };
         if !hash.eq_ignore_ascii_case(&transaction.transaction_hash) {
             anyhow::bail!("RPC returned an unexpected transaction hash");
         }
-        Ok(())
+        Ok(SubmissionOutcome::BroadcastAccepted)
+    }
+
+    /// Whether the exact transaction is visible by hash or has a receipt.
+    ///
+    /// Multiple bounded reads tolerate ordinary RPC indexing lag without
+    /// treating an ambiguous miss as proof that signed bytes are unusable.
+    pub async fn transaction_observed(&self, transaction_hash: &str) -> anyhow::Result<bool> {
+        for attempt in 1..=TRANSACTION_RECONCILIATION_ATTEMPTS {
+            let known: Option<serde_json::Value> = self
+                .call(
+                    "eth_getTransactionByHash",
+                    serde_json::json!([transaction_hash]),
+                )
+                .await?;
+            if known.is_some() || self.transaction_receipt(transaction_hash).await?.is_some() {
+                return Ok(true);
+            }
+            if attempt < TRANSACTION_RECONCILIATION_ATTEMPTS {
+                tokio::time::sleep(TRANSACTION_RECONCILIATION_DELAY).await;
+            }
+        }
+        Ok(false)
     }
 
     pub async fn finality(
@@ -656,7 +861,12 @@ fn retryable_rpc_application_error(error: &RpcError) -> bool {
     if !(-32_099..=-32_000).contains(&error.code) {
         return false;
     }
-    let message = error.message.to_ascii_lowercase();
+    let error = RpcApplicationError {
+        method: "rpc",
+        code: error.code,
+        message: error.message.clone(),
+        data: error.data.clone(),
+    };
     [
         "rate limit",
         "rate-limit",
@@ -668,7 +878,7 @@ fn retryable_rpc_application_error(error: &RpcError) -> bool {
         "try again later",
     ]
     .iter()
-    .any(|needle| message.contains(needle))
+    .any(|needle| rpc_error_contains(&error, &[*needle]))
 }
 
 fn sanitised_rpc_message(value: &str) -> String {
@@ -1053,8 +1263,385 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("execution reverted (0xdead)"));
         assert!(!is_transient_error(&error));
+        let rpc = error.downcast_ref::<RpcApplicationError>().unwrap();
+        assert_eq!(rpc.method(), "eth_call");
+        assert_eq!(rpc.code(), -32_000);
+        assert_eq!(rpc.message(), "execution reverted");
+        assert_eq!(rpc.data(), Some(&serde_json::json!("0xdead")));
         server.task.await.unwrap();
         assert_eq!(server.bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn object_valued_rpc_data_is_typed_and_classified() {
+        let server = mock_server(vec![MockResponse::json(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"submission failed","data":{"cause":{"message":"nonce too low"},"txHash":"0xdead"}}}"#,
+        )])
+        .await;
+        let error = rpc_client(&server.url, 1)
+            .call::<String>("eth_sendRawTransaction", serde_json::json!(["0x01"]))
+            .await
+            .unwrap_err();
+
+        assert!(is_repreparable_submission(&error));
+        let rpc = error.downcast_ref::<RpcApplicationError>().unwrap();
+        assert_eq!(rpc.data().unwrap()["cause"]["message"], "nonce too low");
+        server.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn known_transaction_errors_are_accepted() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"already known"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"submission failed","data":{"message":"known transaction"}}}"#,
+        ] {
+            let server = mock_server(vec![
+                MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+                MockResponse::json("200 OK", body),
+            ])
+            .await;
+
+            let outcome = rpc_client(&server.url, 1)
+                .submit(&stored_transaction())
+                .await
+                .unwrap();
+            assert_eq!(outcome, SubmissionOutcome::BroadcastKnown);
+            assert!(outcome.broadcast_attempted());
+            server.task.await.unwrap();
+            assert_eq!(server.bodies.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_observed_transaction_skips_the_broadcast() {
+        let server = mock_server(vec![MockResponse::json(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+        )])
+        .await;
+
+        let outcome = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, SubmissionOutcome::AlreadyObserved);
+        assert!(!outcome.broadcast_attempted());
+        server.task.await.unwrap();
+        let bodies = server.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let request: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(request["method"], "eth_getTransactionByHash");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_broadcast_is_reported_separately() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"result":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            ),
+        ])
+        .await;
+
+        let outcome = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, SubmissionOutcome::BroadcastAccepted);
+        assert!(outcome.broadcast_attempted());
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_transaction_errors_are_not_misclassified_as_known() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unknown transaction"}}"#,
+            ),
+        ])
+        .await;
+
+        let error = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown transaction"));
+        server.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_proven_unusable_transactions_are_reprepare_candidates() {
+        let server = mock_server(vec![
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32003,"message":"Nonce is too low for this account"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"replacement transaction underpriced"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"submission rejected","data":{"cause":"max fee per gas less than block base fee"}}}"#,
+            ),
+            MockResponse::json("503 Service Unavailable", "try later"),
+        ])
+        .await;
+        let client = rpc_client(&server.url, 1);
+
+        for _ in 0..2 {
+            let error = client
+                .call::<String>("eth_sendRawTransaction", serde_json::json!(["0x01"]))
+                .await
+                .unwrap_err()
+                .context("submit lifecycle transaction");
+            assert!(is_repreparable_submission(&error));
+            assert!(!requires_transaction_reprepare(&error));
+        }
+
+        let wrong_method = client
+            .call::<String>("eth_call", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(!is_repreparable_submission(&wrong_method));
+
+        let underpriced = client
+            .call::<String>("eth_sendRawTransaction", serde_json::json!(["0x01"]))
+            .await
+            .unwrap_err();
+        assert!(is_repreparable_submission(&underpriced));
+
+        let base_fee = client
+            .call::<String>("eth_sendRawTransaction", serde_json::json!(["0x01"]))
+            .await
+            .unwrap_err();
+        assert!(is_repreparable_submission(&base_fee));
+
+        let ambiguous = client
+            .call::<String>("eth_sendRawTransaction", serde_json::json!(["0x01"]))
+            .await
+            .unwrap_err();
+        assert!(is_transient_error(&ambiguous));
+        assert!(!is_repreparable_submission(&ambiguous));
+        assert!(!requires_transaction_reprepare(&ambiguous));
+
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn transaction_preparation_reads_the_pending_nonce() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"0x5208"}"#),
+        ])
+        .await;
+        let signer = EthereumSigner::local(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let prepared = rpc_client(&server.url, 1)
+            .prepare_transaction(&signer, [7; 20], &[1, 2, 3], 4_663)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.nonce, 42);
+        server.task.await.unwrap();
+        let bodies = server.bodies.lock().unwrap();
+        let nonce_request: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(nonce_request["method"], "eth_getTransactionCount");
+        assert_eq!(nonce_request["params"][1], "pending");
+    }
+
+    fn stored_transaction() -> PreparedTransaction {
+        PreparedTransaction {
+            nonce: 7,
+            raw_transaction: "0x01".to_owned(),
+            transaction_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn nonce_error_keeps_a_transaction_that_appears_on_recheck() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+            ),
+        ])
+        .await;
+
+        let outcome = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SubmissionOutcome::BroadcastKnown);
+        server.task.await.unwrap();
+        let bodies = server.bodies.lock().unwrap();
+        let methods = bodies
+            .iter()
+            .map(|body| {
+                serde_json::from_slice::<serde_json::Value>(body).unwrap()["method"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            [
+                "eth_getTransactionByHash",
+                "eth_sendRawTransaction",
+                "eth_getTransactionByHash"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_error_keeps_a_transaction_with_an_exact_receipt() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+            ),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"status":"0x1","blockNumber":"0x2a","blockHash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","logs":[]}}"#,
+            ),
+        ])
+        .await;
+
+        let outcome = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SubmissionOutcome::BroadcastKnown);
+        server.task.await.unwrap();
+        let bodies = server.bodies.lock().unwrap();
+        let last: serde_json::Value = serde_json::from_slice(bodies.last().unwrap()).unwrap();
+        assert_eq!(last["method"], "eth_getTransactionReceipt");
+        assert_eq!(last["params"][0], stored_transaction().transaction_hash);
+    }
+
+    #[tokio::test]
+    async fn nonce_error_requires_reprepare_after_an_exact_hash_double_miss() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+            ),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+        ])
+        .await;
+
+        let error = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap_err();
+        assert!(requires_transaction_reprepare(&error));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn underpriced_replacement_requires_reprepare_only_after_exact_hash_misses() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"submission rejected","data":{"message":"replacement transaction underpriced"}}}"#,
+            ),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+        ])
+        .await;
+
+        let error = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap_err();
+        assert!(requires_transaction_reprepare(&error));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn nonce_reconciliation_tolerates_bounded_indexing_lag() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+            ),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+            ),
+        ])
+        .await;
+
+        let outcome = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SubmissionOutcome::BroadcastKnown);
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn failed_nonce_reconciliation_retains_the_stored_transaction() {
+        let server = mock_server(vec![
+            MockResponse::json("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+            MockResponse::json(
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+            ),
+            MockResponse::json("503 Service Unavailable", "try later"),
+        ])
+        .await;
+
+        let error = rpc_client(&server.url, 1)
+            .submit(&stored_transaction())
+            .await
+            .unwrap_err();
+        assert!(is_transient_error(&error));
+        assert!(!requires_transaction_reprepare(&error));
+        server.task.await.unwrap();
+        assert_eq!(server.bodies.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ const published: PublicProofReceipt = {
   receipt_hash: "6423582a59bb54c1afac11202e20aaf1235998d41e0965284961e09f9ffc764e",
   failure_class: null,
   escrow_address: "0x62c042265991bea17b07229322a01850974626da",
+  chain_lease_id: "52",
   runtime_seconds: 900,
   transaction_hash: "0x96e26448a09ba301951452f737038c1d4443c97af875ea509b2a547e2d4a0301",
   charged_base_units: 199_800,
@@ -62,6 +63,33 @@ describe("isPublicProofIndex", () => {
 
   it("accepts a receipt that carries one", () => {
     expect(isPublicProofIndex(index([{ ...receipt, trust_class: "isolated", attestation }]))).toBe(true);
+  });
+
+  it("requires an exact escrow and chain-id pair when identity metadata is present", () => {
+    expect(isPublicProofIndex(index([{ ...receipt, escrow_address: `0x${"a".repeat(40)}` }]))).toBe(false);
+    expect(isPublicProofIndex(index([{
+      ...receipt,
+      escrow_address: `0x${"a".repeat(40)}`,
+      chain_lease_id: "1",
+    }]))).toBe(false);
+    expect(isPublicProofIndex(index([{
+      ...receipt,
+      lease_id: "1",
+      escrow_address: `0x${"A".repeat(40)}`,
+      chain_lease_id: "1",
+    }]))).toBe(false);
+    expect(isPublicProofIndex(index([{
+      ...receipt,
+      lease_id: "1",
+      escrow_address: `0x${"a".repeat(40)}`,
+      chain_lease_id: "1",
+    }]))).toBe(true);
+    expect(isPublicProofIndex(index([{
+      ...receipt,
+      lease_id: "18446744073709551616",
+      escrow_address: `0x${"a".repeat(40)}`,
+      chain_lease_id: "18446744073709551616",
+    }]))).toBe(false);
   });
 
   it("rejects a malformed attestation", () => {
