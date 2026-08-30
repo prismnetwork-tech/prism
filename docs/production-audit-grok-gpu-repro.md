@@ -225,6 +225,16 @@ database backup and restore path must be built and rehearsed before migration
 - [ ] **Vast funding:** fund the scoped broker account for at least the configured
   per-slot reserve, then require a fresh `healthy` provider state and available
   rows no greater than the funded-slot calculation.
+- [ ] **Managed SSH readiness:** three paid runs on 2026-08-30 proved the
+  workload itself — a digest-pinned CUDA job returning `Test PASSED` on a real
+  RTX A6000 over direct SSH — and all three refunded in full with no orphan
+  provider instances. None produced a receipt. Instances are created
+  `ssh_direct`, and the worker was handing renters Vast's relay address, which
+  accepts the connection and never speaks SSH; that is fixed. What remains: an
+  SSH attempt made before Vast has propagated the attached key fails, the
+  instance reaches `exited`, and a terminal `failed` is latched on the first
+  such failure. An early auth failure must be retried inside the boot budget,
+  not treated as a permanent provisioning failure.
 - [ ] **Paid canary:** after explicit human review of network, asset, executor,
   duration, image digest and maximum escrow, run one paid pinned repro. The
   runner reaches `settled` once it has verified the CUDA success marker, the
