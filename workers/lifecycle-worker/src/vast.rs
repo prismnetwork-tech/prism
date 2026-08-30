@@ -8,6 +8,13 @@ use url::Url;
 const DEFAULT_API_URL: &str = "https://console.vast.ai/api/v0/";
 const DEFAULT_MAX_HOURLY_MICROS: u64 = 640_000;
 const DEFAULT_CREDIT_PER_SLOT_MICROS: u64 = 5_000_000;
+/// A renter's image has to land and unpack inside HOST_BOOT_BUDGET_SECONDS or
+/// the lease is refused, and PROVISION_TIMEOUT leaves room for barely one
+/// attempt. Cheapest-first ranking used to hand a 1.4 GB image to a 180 Mbit
+/// host in Vietnam and lose the lease waiting for it. A measured host at
+/// 2 Gbit and 5 GB/s of disk reached ssh in 148s.
+const DEFAULT_MIN_INET_DOWN_MBPS: u64 = 500;
+const DEFAULT_MIN_DISK_BW_MBPS: u64 = 500;
 const DEFAULT_DISK_GB: u64 = 16;
 const DEFAULT_GPU_MODELS: &str = "L40S,RTX 6000Ada";
 const DEFAULT_MIN_GPU_RAM_MIB: u64 = 45_000;
@@ -30,6 +37,8 @@ pub(crate) struct VastBroker {
     /// costs more than a lease charges, there is nothing safe to sell.
     pub(crate) gpu_models: Arc<Vec<String>>,
     pub(crate) min_gpu_ram_mib: u64,
+    min_inet_down_mbps: u64,
+    min_disk_bw_mbps: u64,
     disk_gb: u32,
 }
 
@@ -40,6 +49,14 @@ pub(crate) struct Offer {
     pub(crate) gpu_name: String,
     pub(crate) gpu_ram: u64,
     pub(crate) dph_total: f64,
+    /// Megabits per second the host measured downloading. A renter's image has
+    /// to cross this link before the GPU does any work.
+    #[serde(default)]
+    pub(crate) inet_down: Option<f64>,
+    /// Megabytes per second of host disk. Vast rebuilds the renter image into
+    /// its own ssh wrapper on the host, so extraction speed is on the clock.
+    #[serde(default)]
+    pub(crate) disk_bw: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +267,15 @@ impl VastBroker {
         if !(16..=2_048).contains(&disk_gb) {
             anyhow::bail!("PRISM_VAST_DISK_GB must be between 16 and 2048");
         }
+        let min_inet_down_mbps =
+            env_u64("PRISM_VAST_MIN_INET_DOWN_MBPS", DEFAULT_MIN_INET_DOWN_MBPS)?;
+        if min_inet_down_mbps > 100_000 {
+            anyhow::bail!("PRISM_VAST_MIN_INET_DOWN_MBPS is outside the supported range");
+        }
+        let min_disk_bw_mbps = env_u64("PRISM_VAST_MIN_DISK_BW_MBPS", DEFAULT_MIN_DISK_BW_MBPS)?;
+        if min_disk_bw_mbps > 100_000 {
+            anyhow::bail!("PRISM_VAST_MIN_DISK_BW_MBPS is outside the supported range");
+        }
         Ok(Some(Self {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -260,6 +286,8 @@ impl VastBroker {
             node_ids: Arc::new(node_ids),
             max_hourly_micros,
             credit_per_slot_micros,
+            min_inet_down_mbps,
+            min_disk_bw_mbps,
             gpu_models: Arc::new(gpu_models),
             min_gpu_ram_mib,
             disk_gb,
@@ -350,6 +378,8 @@ impl VastBroker {
             slots,
             &[],
             &[],
+            self.min_inet_down_mbps,
+            self.min_disk_bw_mbps,
         );
         Ok(survey)
     }
@@ -373,7 +403,15 @@ impl VastBroker {
             of_our_class,
             cheapest_of_class,
             ceiling: self.ceiling(ceiling),
-            hosts: rank_offers(admitted.clone(), self.ceiling(ceiling), 1, &[], &[]),
+            hosts: rank_offers(
+                admitted.clone(),
+                self.ceiling(ceiling),
+                1,
+                &[],
+                &[],
+                self.min_inet_down_mbps,
+                self.min_disk_bw_mbps,
+            ),
             admitted,
         })
     }
@@ -426,6 +464,8 @@ impl VastBroker {
             limit,
             rejected_machines,
             rejected_offers,
+            self.min_inet_down_mbps,
+            self.min_disk_bw_mbps,
         ))
     }
 
@@ -644,17 +684,31 @@ fn truncate(value: &str, limit: usize) -> &str {
     }
 }
 
+/// A host too slow to land the renter's image inside its boot budget is not
+/// cheap, it is a lost lease. Reported throughput is advisory, so a host that
+/// declines to report either figure is still allowed through; only a host that
+/// reports a number under the floor is refused.
+fn fast_enough(offer: &Offer, min_inet_down_mbps: u64, min_disk_bw_mbps: u64) -> bool {
+    let meets = |reported: Option<f64>, floor: u64| {
+        reported.is_none_or(|value| !value.is_finite() || value >= floor as f64)
+    };
+    meets(offer.inet_down, min_inet_down_mbps) && meets(offer.disk_bw, min_disk_bw_mbps)
+}
+
 fn rank_offers(
     offers: Vec<Offer>,
     max_hourly_micros: u64,
     limit: usize,
     rejected_machines: &[i64],
     rejected_offers: &[u64],
+    min_inet_down_mbps: u64,
+    min_disk_bw_mbps: u64,
 ) -> Vec<Offer> {
     let mut eligible: Vec<Offer> = offers
         .into_iter()
         .filter(|offer| {
             hourly_micros(offer.dph_total).is_ok_and(|cost| cost <= max_hourly_micros)
+                && fast_enough(offer, min_inet_down_mbps, min_disk_bw_mbps)
                 && i64::try_from(offer.machine_id)
                     .is_ok_and(|machine_id| !rejected_machines.contains(&machine_id))
                 && !rejected_offers.contains(&offer.id)
@@ -938,7 +992,7 @@ mod tests {
             .into_iter()
             .filter(|offer| broker.admits(&offer.gpu_name, offer.gpu_ram))
             .collect();
-        rank_offers(eligible, max_hourly_micros, 1, &[], &[])
+        rank_offers(eligible, max_hourly_micros, 1, &[], &[], 0, 0)
             .into_iter()
             .next()
     }
@@ -951,6 +1005,8 @@ mod tests {
             node_ids: Arc::new(vec!["0xabc".to_owned()]),
             max_hourly_micros,
             credit_per_slot_micros: DEFAULT_CREDIT_PER_SLOT_MICROS,
+            min_inet_down_mbps: DEFAULT_MIN_INET_DOWN_MBPS,
+            min_disk_bw_mbps: DEFAULT_MIN_DISK_BW_MBPS,
             gpu_models: Arc::new(models.iter().map(|model| (*model).to_owned()).collect()),
             min_gpu_ram_mib,
             disk_gb: 16,
@@ -964,6 +1020,16 @@ mod tests {
             gpu_name: gpu.to_owned(),
             gpu_ram: ram,
             dph_total: price,
+            inet_down: Some(2_000.0),
+            disk_bw: Some(2_000.0),
+        }
+    }
+
+    fn slow_offer(id: u64, price: f64, inet_down: f64, disk_bw: f64) -> Offer {
+        Offer {
+            inet_down: Some(inet_down),
+            disk_bw: Some(disk_bw),
+            ..offer(id, "A40", 46_068, price)
         }
     }
 
@@ -993,10 +1059,10 @@ mod tests {
             offer(3, "L40S", 46_068, 0.80),
         ];
 
-        let ranked = rank_offers(offers.clone(), 900_000, 8, &[], &[]);
+        let ranked = rank_offers(offers.clone(), 900_000, 8, &[], &[], 0, 0);
         assert_eq!(ranked[0].id, 1);
 
-        let ranked = rank_offers(offers, 900_000, 8, &[10, 20], &[]);
+        let ranked = rank_offers(offers, 900_000, 8, &[10, 20], &[], 0, 0);
         assert_eq!(
             ranked.iter().map(|offer| offer.id).collect::<Vec<_>>(),
             vec![3]
@@ -1011,7 +1077,7 @@ mod tests {
             offer(3, "L40S", 46_068, 0.55),
         ];
 
-        let ranked = rank_offers(offers, 900_000, 8, &[], &[1, 2]);
+        let ranked = rank_offers(offers, 900_000, 8, &[], &[1, 2], 0, 0);
         assert_eq!(
             ranked.iter().map(|offer| offer.id).collect::<Vec<_>>(),
             vec![3]
@@ -1028,7 +1094,7 @@ mod tests {
             offer(3, "L40S", 46_068, 0.55),
         ];
 
-        let ranked = rank_offers(offers, 900_000, 8, &[], &[]);
+        let ranked = rank_offers(offers, 900_000, 8, &[], &[], 0, 0);
         assert_eq!(
             ranked.iter().map(|offer| offer.id).collect::<Vec<_>>(),
             vec![1, 3]
@@ -1054,7 +1120,9 @@ mod tests {
                 broker.ceiling(799_200),
                 8,
                 &[],
-                &[]
+                &[],
+                0,
+                0
             )
             .is_empty()
         );
@@ -1164,13 +1232,16 @@ mod tests {
         ];
 
         // Four free slots, three hosts: three get advertised.
-        assert_eq!(rank_offers(hosts.clone(), 799_200, 4, &[], &[]).len(), 3);
+        assert_eq!(
+            rank_offers(hosts.clone(), 799_200, 4, &[], &[], 0, 0).len(),
+            3
+        );
         // Two free slots, three hosts: only two are sold, cheapest first.
-        let two = rank_offers(hosts.clone(), 799_200, 2, &[], &[]);
+        let two = rank_offers(hosts.clone(), 799_200, 2, &[], &[], 0, 0);
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].id, 1);
         // A ceiling that excludes everything sells nothing, however many slots.
-        assert!(rank_offers(hosts, 300_000, 8, &[], &[]).is_empty());
+        assert!(rank_offers(hosts, 300_000, 8, &[], &[], 0, 0).is_empty());
     }
 
     #[test]
@@ -1217,6 +1288,50 @@ mod tests {
         assert_eq!(balance_micros(0.000_001_9).unwrap(), 1);
         assert_eq!(balance_micros(-0.003_681_309).unwrap(), -3_682);
         assert!(balance_micros(f64::NAN).is_err());
+    }
+
+    /// The A40 in this test is the real one prod picked on 2026-08-30: cheapest
+    /// of eighteen offers, 180 Mbit down, and it lost the lease waiting for a
+    /// 1.4 GB image. The Delaware host is what should win instead.
+    #[test]
+    fn a_host_too_slow_for_the_image_is_not_the_cheapest_host() {
+        let vietnam = slow_offer(1, 0.3356, 180.5, 844.7);
+        let delaware = slow_offer(2, 0.4044, 8607.0, 1195.0);
+        let ranked = rank_offers(
+            vec![vietnam, delaware],
+            799_200,
+            4,
+            &[],
+            &[],
+            DEFAULT_MIN_INET_DOWN_MBPS,
+            DEFAULT_MIN_DISK_BW_MBPS,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].id, 2);
+    }
+
+    #[test]
+    fn a_host_that_reports_no_throughput_is_still_rentable() {
+        let unreported = Offer {
+            inet_down: None,
+            disk_bw: None,
+            ..offer(3, "A40", 46_068, 0.40)
+        };
+        assert!(fast_enough(
+            &unreported,
+            DEFAULT_MIN_INET_DOWN_MBPS,
+            DEFAULT_MIN_DISK_BW_MBPS
+        ));
+        assert!(!fast_enough(
+            &slow_offer(4, 0.40, 180.5, 5_000.0),
+            DEFAULT_MIN_INET_DOWN_MBPS,
+            DEFAULT_MIN_DISK_BW_MBPS
+        ));
+        assert!(!fast_enough(
+            &slow_offer(5, 0.40, 5_000.0, 100.0),
+            DEFAULT_MIN_INET_DOWN_MBPS,
+            DEFAULT_MIN_DISK_BW_MBPS
+        ));
     }
 
     #[test]
