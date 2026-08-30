@@ -7,5 +7,6 @@ Requires=docker.service
 Type=oneshot
 EnvironmentFile=/opt/prism/canary.env
 ExecStart=/usr/local/sbin/run-lease-canary.sh
+TimeoutStartSec=1230
 # A failed run is the point of the unit, not a fault of the unit.
 SuccessExitStatus=0 1

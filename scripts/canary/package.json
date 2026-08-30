@@ -7,10 +7,15 @@
   "license": "Apache-2.0",
   "scripts": {
     "start": "node canary.mjs",
-    "check": "node --test config.test.mjs && node canary.mjs --dry-run"
+    "repro:review": "node repro.mjs --review",
+    "repro:execute": "node repro.mjs --execute",
+    "repro:verify-cleanup": "node repro.mjs --verify-cleanup",
+    "repro:inspect": "node repro.mjs --inspect",
+    "test": "node --test config.test.mjs repro-core.test.mjs repro-runner.test.mjs",
+    "check": "npm test && node canary.mjs --dry-run"
   },
   "dependencies": {
-    "@prismnetwork/agent-sdk": "^0.3.1",
+    "@prismnetwork/agent-sdk": "0.7.2",
     "viem": "^2"
   }
 }

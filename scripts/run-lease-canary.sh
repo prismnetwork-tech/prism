@@ -35,7 +35,7 @@ write_result() {
 # out to ssh-keygen and ssh, and slim carries neither, which fails the run at
 # the point a renter would be handed their machine.
 image=${PRISM_CANARY_IMAGE:-node:24-bookworm}
-output=$(timeout 900 docker run --rm \
+output=$(timeout -k 15s 1200s docker run --rm \
   --env-file /opt/prism/canary.env \
   -v /opt/prism/canary:/canary:ro \
   -v /var/lib/prism/canary-modules:/canary/node_modules:ro \
@@ -53,18 +53,18 @@ if [[ $status -eq 0 && $output == *"preflight OK"* ]]; then
 fi
 
 if [[ $status -eq 0 ]]; then
-  write_result true complete ""
-  exit 0
+  write_result false settlement_pending "execution succeeded; settlement, proof publication, and provider destruction are not verified yet"
+  exit 1
 fi
 
 # Name the step that failed, so the alarm says what broke rather than that
 # something did. These strings are the canary's own.
 stage=unknown
 case "$output" in
-  *"no_match"*|*"quote"*)        stage=quote ;;
-  *"funding_mismatch"*|*"fund"*) stage=fund ;;
-  *"access_timeout"*|*provision*) stage=provision ;;
-  *"Permission denied"*|*ssh*)   stage=ssh ;;
+  *"Permission denied"*|*"ssh:"*) stage=ssh ;;
+  *"access_timeout"*|*"provision"*) stage=provision ;;
+  *"funding_mismatch"*|*"approve_reverted"*|*"lease_funding_reverted"*) stage=fund ;;
+  *"no_match"*|*"no GPU offers"*|*"quote has"*|*"quote exceeds"*) stage=quote ;;
 esac
 [[ $status -eq 124 ]] && stage=timeout
 

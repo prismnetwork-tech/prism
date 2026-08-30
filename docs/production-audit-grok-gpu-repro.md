@@ -226,9 +226,12 @@ database backup and restore path must be built and rehearsed before migration
   per-slot reserve, then require a fresh `healthy` provider state and available
   rows no greater than the funded-slot calculation.
 - [ ] **Paid canary:** after explicit human review of network, asset, executor,
-  duration, image digest and maximum escrow, run one paid pinned repro. Verify
-  GPU startup, report binding, immutable evidence, settlement finality, public
-  receipt identity and eventual provider destruction.
+  duration, image digest and maximum escrow, run one paid pinned repro. The
+  runner reaches `settled` once it has verified the CUDA success marker, the
+  gateway-signed report binding, immutable evidence, settlement finality and
+  public receipt identity. Provider destruction is not on the read-only MCP
+  surface, so the run reaches `complete` only after `repro:verify-cleanup`
+  proves the instance is absent from the lifecycle worker's Vast account.
 - [ ] **npm publication:** publish version 0.2.0 as `winterstacks` only after the
   paid canary passes, install it from npm into Grok Build and run the forward
   test against all six live MCP tools.

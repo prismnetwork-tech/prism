@@ -5,9 +5,9 @@ verifies `nvidia-smi` over SSH, and prints the on-chain funding transaction. Use
 to prove the whole lease path works before opening capacity.
 
 It spends real USDG. Duration is capped at 1 hour and spend at 5 USDG; the defaults
-lease for 600s under a 0.5 USDG ceiling (a few cents at L40S rates). A lease that
-funds but then fails is always reported by id and settles on-chain when its window
-ends, so nothing is left open silently.
+lease for 600s under a 0.5 USDG ceiling. The binding quote is printed before the
+funding gate. A lease that funds but then fails reports every available funding
+hash and lease id and settles on-chain when its window ends.
 
 ## Run
 
@@ -20,11 +20,17 @@ PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
 npm start
 ```
 
-Then fund the lease by adding `CANARY_CONFIRM=1`:
+For a manual production run, prompt on the exact quote and confirm its printed
+id only after reviewing the amount, network, node, image and expiry:
 
 ```sh
-CANARY_CONFIRM=1 PRISM_AGENT_KEY=0x... PRISM_ESCROW=0x71Df... npm start
+CANARY_CONFIRM=prompt PRISM_AGENT_KEY=0x... \
+PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
+npm start
 ```
+
+`CANARY_CONFIRM=1` is reserved for a pre-authorized automated run with the same
+hard caps. It still funds the single quote printed by that process.
 
 Optional: `CANARY_DURATION`, `CANARY_MAX_USDG`, `CANARY_MIN_VRAM`, `CANARY_NODE`.
 
@@ -44,4 +50,63 @@ npm start -- --dry-run
 - **Five minutes later:** `finalize()` becomes callable (`DISPUTE_WINDOW`), the escrow settles,
   and the receipt publishes to the public proof feed.
 
-Pre-production and unaudited. Run against a funded wallet you control.
+The process exits after the GPU command. Keep its result pending until separate
+checks prove the cloud instance was destroyed and the settlement receipt is
+finalized and published.
+
+Run against a funded wallet you control.
+
+## Paid repro run
+
+`repro.mjs` runs the pinned CUDA vector-add image through the public MCP surface
+and the audited escrow, then verifies the result end to end. It has three
+stages, and each one refuses to claim anything the stage before it did not
+prove. `REPRO_STATE_FILE` must be an absolute path outside the repository; one
+state file belongs to one run.
+
+Review the quote. This spends nothing and prints the exact price:
+
+```sh
+PRISM_AGENT_KEY=0x... PRISM_RPC_URL=https://... \
+REPRO_STATE_FILE=/absolute/path/run.json \
+npm run repro:review
+```
+
+Fund and execute the reviewed quote. The confirmation string names that one
+quote id, so an expired or replaced quote cannot be executed by rerunning the
+command:
+
+```sh
+REPRO_CONFIRM='CONFIRM <quote id>' PRISM_AGENT_KEY=0x... PRISM_RPC_URL=https://... \
+REPRO_STATE_FILE=/absolute/path/run.json \
+npm run repro:execute
+```
+
+Execution ends at `settled`: the CUDA success marker, the gateway-signed report,
+the onchain settlement and the public receipt are all verified, and the
+provider machine is not. Verify destruction against the Vast account that ran
+the lease to reach `complete`:
+
+```sh
+VAST_API_KEY=... VAST_ACCOUNT_ID=<lifecycle worker's Vast account> \
+REPRO_STATE_FILE=/absolute/path/run.json \
+npm run repro:verify-cleanup
+```
+
+`VAST_ACCOUNT_ID` is optional but worth setting, because absence from the wrong
+account proves nothing. The lifecycle worker rents from Vast account **675165**
+(`mika@prismnetwork.tech`), and its key lives on the control-plane host at
+`/run/secrets/vast_api_key`. The `VAST_API_KEY` in `~/.config/prism/keys.env`
+belongs to a different, empty account and will report every instance absent.
+
+`npm run repro:inspect` prints the current stage and every identifier the run
+has recorded so far.
+
+Guards worth knowing about:
+
+- An execution takes an exclusive `<state file>.lock`. A leftover lock means a
+  run died mid-flight; read the chain before another process reuses that nonce.
+- Every transaction is refused above `REPRO_MAX_FEE_WEI` (default 0.002 ETH of
+  maximum fee), on the prepared request and again on a resumed signed one.
+- The public receipt is matched on this run's token commitment and chain lease
+  id, so a repeated run against the same spec cannot adopt an earlier receipt.

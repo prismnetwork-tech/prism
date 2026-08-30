@@ -188,10 +188,11 @@ VAST_API_KEY=...
 
 ### The canary
 
-Everything above infers health from parts. The canary proves it by renting: it
-quotes, funds on chain, waits for a machine, logs in over SSH, runs a command
-and settles, then writes the verdict to `/var/lib/prism/canary.json`. The health
-check reads that file and alarms with the step that failed.
+Everything above infers health from parts. The canary rents, funds on chain,
+waits for a machine, logs in over SSH and runs a command. Its immediate verdict
+stays `settlement_pending`; promote it to complete only after independent checks
+prove settlement finality, proof publication and provider destruction. The
+health check reads `/var/lib/prism/canary.json` and alarms until that happens.
 
 This exists because inference kept missing real outages. A lease id that
 collided with a superseded escrow took every renter's money and started nothing;
@@ -212,6 +213,11 @@ PRISM_ESCROW=0x...
 CANARY_CONFIRM=1             # without this it only preflights and rents nothing
 CANARY_DURATION=600
 CANARY_MAX_USDG=0.5
+CANARY_MIN_VRAM=45000
+CANARY_IMAGE=pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+PRISM_API_BASE=https://prismnetwork.tech
+PRISM_RPC_URL=https://replace-with-rpc.example
+PRISM_CANARY_IMAGE=node@sha256:<pinned-arm64-digest>
 ```
 
 With no channel configured the run still prints its findings and exits non-zero,

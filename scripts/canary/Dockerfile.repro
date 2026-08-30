@@ -1,0 +1,10 @@
+FROM nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0@sha256:9855f4c8500addf185360474184b9efdaf4384284779aa9173dcd70164a4ae6f AS sample
+
+FROM vastai/base-image:stock-ubuntu24.04-2026-08-26@sha256:566dfc83f9e8683fbfe6867b0532e73f51d30bbbe2727388cc901a0e63d95da0
+
+COPY --from=sample --chmod=0555 /cuda-samples/vectorAdd /usr/local/bin/prism-vectoradd
+COPY --from=sample /licenses/LICENSE /usr/share/licenses/prism-cuda-vectoradd/NVIDIA-CUDA-Samples-LICENSE
+
+LABEL org.opencontainers.image.title="Prism CUDA vector-add canary" \
+      org.opencontainers.image.description="Vast-compatible image for a digest-pinned CUDA execution proof" \
+      org.opencontainers.image.source="https://prismnetwork.tech"
