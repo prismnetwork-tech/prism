@@ -67,6 +67,18 @@ export default function RoadmapPage() {
           honest key can be published, because a third-party cloud generated it, the lease says so
           and a client can refuse it, rather than being told a check happened that did not.
         </p>
+        <h3>An availability commitment on every lease</h3>
+        <p>
+          A machine that stops answering is billed only to the moment it was last observed. The
+          receipt names the lease interrupted and states the seconds held but not charged, publicly,
+          on the same receipt anyone can verify.
+        </p>
+        <h3>An encrypted vault that outlives a lease</h3>
+        <p>
+          Credentials and small artifacts persist across leases, encrypted to the owning wallet.
+          Each item names the weakest workspace class it may enter, and a release below that floor
+          is refused rather than logged.
+        </p>
         <h3>A stated trust class per offer</h3>
         <p>
           Every offer, quote, lease, and receipt carries what the supplier protects, derived by the
@@ -118,9 +130,15 @@ export default function RoadmapPage() {
           controls needs hardware the network does not have yet, not a software change.
         </p>
         <h3>Durable workspaces</h3>
-        <p>Persistent state and storage that survive across leases, beyond today&apos;s ephemeral containers.</p>
-        <h3>Service-level commitments</h3>
-        <p>Availability and performance guarantees suitable for production workloads.</p>
+        <p>
+          Workspace storage that survives across leases. The vault carries credentials and small
+          artifacts today; a full working disk that a new lease can resume is not built.
+        </p>
+        <h3>Stronger service-level remedies</h3>
+        <p>
+          The live commitment is not being charged for an interrupted machine. Performance
+          guarantees, and remedies beyond withholding payment, are not built.
+        </p>
         <h3>Wider settlement and framework reach</h3>
         <p>
           More agent frameworks and payment rails, so capacity is reachable from wherever an agent
