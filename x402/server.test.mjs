@@ -10,27 +10,31 @@ const server = fileURLToPath(new URL("./server.mjs", import.meta.url));
 const port = 18402;
 const payTo = "0xEcaaE714912C38fA7e0dAF78afa7C54DbeD11039";
 
-const child = spawn(process.execPath, [server], {
-  env: {
-    ...process.env,
-    PRISM_AGENT_KEY: `0x${"11".repeat(32)}`,
-    PRISM_ESCROW: payTo,
-    X402_PAY_TO: payTo,
-    X402_BASE_PAY_TO: payTo,
-    // Offering Base means being able to broadcast on it, so the server refuses
-    // to boot with a payTo and no key to settle with.
-    PRISM_X402_COLLECTOR_KEY: `0x${"22".repeat(32)}`,
-    X402_PORT: String(port),
-    X402_PAYMENTS_FILE: join(mkdtempSync(join(tmpdir(), "x402-")), "consumed.log"),
-  },
-  stdio: ["ignore", "ignore", "pipe"],
-});
+function start(extra) {
+  return spawn(process.execPath, [server], {
+    env: {
+      ...process.env,
+      PRISM_AGENT_KEY: `0x${"11".repeat(32)}`,
+      PRISM_ESCROW: payTo,
+      X402_PAY_TO: payTo,
+      X402_BASE_PAY_TO: payTo,
+      // Offering Base means being able to broadcast on it, so the server refuses
+      // to boot with a payTo and no key to settle with.
+      PRISM_X402_COLLECTOR_KEY: `0x${"22".repeat(32)}`,
+      X402_PAYMENTS_FILE: join(mkdtempSync(join(tmpdir(), "x402-")), "consumed.log"),
+      ...extra,
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+}
+
+const child = start({ X402_PORT: String(port) });
 after(() => child.kill());
 
-async function ready() {
+async function ready(on = port, headers = {}) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      const res = await fetch(`http://127.0.0.1:${on}/healthz`, { headers });
       if (res.ok) return;
     } catch {
       // The server is still binding.
@@ -163,4 +167,53 @@ test("GET never runs a job, whatever it carries", async () => {
   });
   assert.equal(res.status, 402);
   assert.equal((await res.json()).job_id, undefined);
+});
+
+/// The gate is exercised on loopback with a token set rather than by opening a
+/// port to the network, because the check is the same one either way and a test
+/// that binds 0.0.0.0 is a test that hands the machine's LAN a GPU wallet.
+const guardedPort = 18403;
+const guardToken = "n".repeat(32);
+const guarded = start({ X402_PORT: String(guardedPort), X402_TOKEN: guardToken });
+after(() => guarded.kill());
+
+test("a listener that would answer strangers refuses to start without a credential", async () => {
+  const wide = start({ X402_PORT: "18404", X402_HOST: "0.0.0.0" });
+  let said = "";
+  wide.stderr.on("data", (chunk) => {
+    said += chunk;
+  });
+  const code = await new Promise((resolve) => wide.on("exit", resolve));
+  assert.equal(code, 1, "the server bound a public address instead of refusing");
+  assert.match(said, /X402_HOST is 0\.0\.0\.0/);
+  assert.match(said, /X402_TOKEN/, "the refusal has to name the variable that fixes it");
+});
+
+test("a configured token covers every route, /healthz included", async () => {
+  await ready(guardedPort, { authorization: `Bearer ${guardToken}` });
+
+  const anonymous = await fetch(`http://127.0.0.1:${guardedPort}/healthz`);
+  assert.equal(anonymous.status, 401);
+  assert.equal((await anonymous.json()).error, "unauthorized");
+
+  const wrong = await fetch(`http://127.0.0.1:${guardedPort}/healthz`, {
+    headers: { authorization: `Bearer ${"z".repeat(32)}` },
+  });
+  assert.equal(wrong.status, 401);
+
+  // Not a 402: an unauthenticated caller is turned away before the endpoint
+  // quotes it a price it would have no way to pay here.
+  const unpaid = await fetch(`http://127.0.0.1:${guardedPort}/run`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ command: "nvidia-smi" }),
+  });
+  assert.equal(unpaid.status, 401);
+
+  const quoted = await fetch(`http://127.0.0.1:${guardedPort}/run`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${guardToken}` },
+    body: JSON.stringify({ command: "nvidia-smi" }),
+  });
+  assert.equal(quoted.status, 402);
 });

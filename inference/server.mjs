@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // Prism managed inference: a warm GPU lease running ollama behind an x402-paid
 // HTTP surface. POST /v1/inference with no payment answers 402 with the USDG
-// price; pay it on Robinhood Chain, sign the tx hash, retry with
-// X-PAYMENT: base64({txHash, signature}), get the generation back.
+// price; pay it on Robinhood Chain, sign the tx hash together with the request
+// it buys, retry with X-PAYMENT: base64({txHash, signature}), get the
+// generation back.
 //
 // The gateway leases from the network like any other renter: it holds the
 // operator's own funded wallet, pays per second into the same escrow, and its
 // leases settle with the same public receipts.
-import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -15,7 +15,8 @@ import { createPublicClient, getAddress, http, recoverMessageAddress } from "vie
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
 import { createExactEvm } from "@prismnetwork/x402/exact-evm";
 import { createCdpFacilitator, routeByNetwork } from "@prismnetwork/x402/cdp-facilitator";
-import { bazaar, detect } from "@prismnetwork/x402/codec";
+import { bazaar, boundMessage, detect, hashRequest } from "@prismnetwork/x402/codec";
+import { authorized, listener } from "@prismnetwork/x402/listen";
 import { base as baseChain } from "viem/chains";
 import {
   createGateway,
@@ -36,6 +37,7 @@ import {
   openApiDocument,
 } from "./openapi.mjs";
 import { providerModels } from "./provider.mjs";
+import { openTunnel } from "./tunnel.mjs";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONFIRMATIONS = 12;
@@ -66,6 +68,16 @@ function confidentialConfig() {
     dailyUsd: Number(process.env.INFERENCE_CONFIDENTIAL_DAILY_USD ?? cfg.daily_usd ?? 1),
     models: cfg.models,
   };
+}
+
+// Resolved before anything else: a listener that came up on the wrong address
+// has already been reachable by the time a later line of config fails.
+let listen;
+try {
+  listen = listener(process.env, "INFERENCE");
+} catch (err) {
+  console.error(`inference config error: ${err.message}`);
+  process.exit(1);
 }
 
 let config;
@@ -123,15 +135,31 @@ function decodeTransfer(log) {
   return { from: `0x${log.topics[1].slice(26)}`, to: `0x${log.topics[2].slice(26)}`, value: BigInt(log.data) };
 }
 
-// The caller signs the tx hash, and the Transfer's `from` must match that
-// signer, so a front-runner cannot claim someone else's payment.
-async function verify(txHash, signature, priceMicros) {
-  let signer;
-  try {
-    signer = await recoverMessageAddress({ message: txHash, signature });
-  } catch {
-    return { ok: false, reason: "bad_signature" };
+// A migration escape hatch: older clients signed the transaction alone, which
+// is the replay the binding below closes. Not safe to leave on.
+const ALLOW_UNBOUND = process.env.PRISM_X402_ALLOW_UNBOUND_PAYMENT === "1";
+
+// The caller signs the tx hash together with the request it buys, and the
+// Transfer's `from` must match that signer. The hash stops a front-runner from
+// claiming someone else's payment; the request stops anyone who read the header
+// in flight from spending it on their own prompt.
+//
+// One signature recovers a different address under each message, so which form
+// the payer used is decided by the transfer on chain rather than here.
+async function verify(txHash, signature, priceMicros, requestHash) {
+  const messages = ALLOW_UNBOUND
+    ? [boundMessage(txHash, requestHash), txHash]
+    : [boundMessage(txHash, requestHash)];
+  const signers = [];
+  for (const message of messages) {
+    try {
+      signers.push(await recoverMessageAddress({ message, signature }));
+    } catch {
+      // Nothing recovers from a signature that is not 65 bytes, under any message.
+    }
   }
+  if (!signers.length) return { ok: false, reason: "bad_signature" };
+
   let receipt;
   try {
     receipt = await chain.getTransactionReceipt({ hash: txHash });
@@ -143,38 +171,24 @@ async function verify(txHash, signature, priceMicros) {
   if (head - receipt.blockNumber < BigInt(CONFIRMATIONS)) {
     return { ok: false, reason: "insufficient_confirmations" };
   }
-  const paid = receipt.logs.some((log) => {
-    if (log.address.toLowerCase() !== USDG.toLowerCase()) return false;
-    const t = decodeTransfer(log);
-    return (
-      t &&
-      t.to.toLowerCase() === config.payTo.toLowerCase() &&
-      t.from.toLowerCase() === signer.toLowerCase() &&
-      t.value >= priceMicros
-    );
-  });
-  return paid ? { ok: true, payer: getAddress(signer) } : { ok: false, reason: "no_matching_payment" };
+  const payer = signers.find((signer) =>
+    receipt.logs.some((log) => {
+      if (log.address.toLowerCase() !== USDG.toLowerCase()) return false;
+      const t = decodeTransfer(log);
+      return (
+        t &&
+        t.to.toLowerCase() === config.payTo.toLowerCase() &&
+        t.from.toLowerCase() === signer.toLowerCase() &&
+        t.value >= priceMicros
+      );
+    }),
+  );
+  return payer ? { ok: true, payer: getAddress(payer) } : { ok: false, reason: "no_matching_payment" };
 }
 
-// ssh -N -L keeps the box's ollama reachable only from this process's host.
-// The child is restarted by the next warmup rather than in place; a dead
-// tunnel surfaces as a failed generation, which does not consume the payment.
-function spawnTunnel(lease, slot) {
-  const child = spawn("ssh", [
-    "-i", lease.keyPath,
-    "-p", String(lease.access.ssh_port),
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "BatchMode=yes",
-    "-o", "ServerAliveInterval=15",
-    "-o", "ExitOnForwardFailure=yes",
-    "-N",
-    "-L", `127.0.0.1:${config.tunnelPort + slot}:127.0.0.1:11434`,
-    `${lease.access.ssh_user ?? "root"}@${lease.access.ssh_host}`,
-  ]);
-  child.on("error", (err) => console.error(`tunnel error: ${err.message}`));
-  return { close: () => child.kill("SIGTERM") };
-}
+// The child is restarted by the next warmup rather than in place; a dead tunnel
+// surfaces as a failed generation, which does not consume the payment.
+const spawnTunnel = (lease, slot) => openTunnel(lease, config.tunnelPort + slot);
 
 const fetchOllama = (slot, path, init) => fetch(`http://127.0.0.1:${config.tunnelPort + slot}${path}`, init);
 
@@ -364,6 +378,20 @@ setInterval(() => {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${config.port}`);
+  // Only off loopback, and then on every route including /healthz: warming
+  // leases a GPU on the operator's own wallet and the free routes name the
+  // leases and the takings, so there is nothing here to answer for a stranger
+  // who found the port. A proxy in front holds the token for its callers.
+  const auth = authorized(req, listen.token);
+  if (auth !== "ok") {
+    return json(res, 401, {
+      error: "unauthorized",
+      detail:
+        auth === "missing"
+          ? "this listener is not on loopback, so every request needs an Authorization: Bearer header"
+          : "the bearer token does not match",
+    });
+  }
   if (req.method === "GET" && url.pathname === "/healthz") {
     return json(res, 200, { status: "ok", ...gateway.state() });
   }
@@ -491,14 +519,14 @@ const server = createServer(async (req, res) => {
     return json(res, out.status, out.body, out.headers);
   }
   if (req.method === "POST" && url.pathname === "/v1/batch") {
-    let body;
+    let read;
     try {
-      body = await readJson(req, MAX_BATCH_BODY_BYTES);
+      read = await readJson(req, MAX_BATCH_BODY_BYTES);
     } catch (err) {
       return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
     }
     const payment = detect(req.headers);
-    const out = await gateway.handleBatch(body, payment?.header, payment?.version ?? null);
+    const out = await gateway.handleBatch(read.body, payment?.header, payment?.version ?? null, hashRequest(read.bytes));
     return json(res, out.status, out.body, out.headers);
   }
   // The confidential class. The body goes upstream exactly as it arrived and
@@ -541,9 +569,9 @@ const server = createServer(async (req, res) => {
     return relayed(res, await gateway.receipt(segment(url.pathname, "/v1/receipts/")));
   }
   if (req.method === "POST" && url.pathname === "/v1/inference") {
-    let body;
+    let read;
     try {
-      body = await readJson(req);
+      read = await readJson(req);
     } catch (err) {
       return json(res, err.code === "too_large" ? 413 : 400, { error: err.code ?? "invalid_json" });
     }
@@ -551,7 +579,7 @@ const server = createServer(async (req, res) => {
     // sent. An unpaid request has neither, and answering v1 to those keeps
     // the reply readable to anything that just curls the endpoint.
     const payment = detect(req.headers);
-    const out = await gateway.handleInference(body, payment?.header, payment?.version ?? null);
+    const out = await gateway.handleInference(read.body, payment?.header, payment?.version ?? null, hashRequest(read.bytes));
     return json(res, out.status, out.body, out.headers);
   }
   json(res, 404, { error: "not_found" });
@@ -691,11 +719,13 @@ async function readRaw(req, limit) {
   return Buffer.concat(chunks);
 }
 
+// The bytes come back with the parsed body because the payment is signed over
+// them: re-serializing here would hash something the caller never sent.
 async function readJson(req, limit = MAX_BODY_BYTES) {
   const bytes = await readRaw(req, limit);
-  if (!bytes.length) return {};
+  if (!bytes.length) return { body: {}, bytes };
   try {
-    return JSON.parse(bytes.toString());
+    return { body: JSON.parse(bytes.toString()), bytes };
   } catch {
     throw Object.assign(new Error("invalid json"), { code: "invalid_json" });
   }
@@ -713,8 +743,13 @@ const rates = (pricing) =>
 const card = rates(gateway.models().pricing);
 const confidentialCard = gateway.confidential();
 
-server.listen(config.port, () => {
-  console.error(`prism inference gateway on :${config.port}, ${card} micros to ${config.payTo}`);
+server.listen(config.port, listen.host, () => {
+  console.error(`prism inference gateway on ${listen.host}:${config.port}, ${card} micros to ${config.payTo}`);
+  console.error(
+    listen.token
+      ? "callers must send a bearer token, /healthz included"
+      : "no token: any local caller can warm a lease on the operator's wallet",
+  );
   if (confidentialCard) {
     console.error(
       `confidential relay to ${confidentialCard.upstream}: ${rates(confidentialCard.models)} micros, ` +

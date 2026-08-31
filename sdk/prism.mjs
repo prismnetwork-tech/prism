@@ -1,7 +1,6 @@
 // Prism Network agent SDK: headless GPU leasing for wallet-holding agents.
 // No browser, no Privy. Authenticate with a wallet signature, pay on-chain, run.
 import { execFileSync, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,12 +16,16 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { appraiseWorkload, DEFAULT_CONFIDENTIAL_BASE, EXPECTED_WORKLOAD, verifyConfidential } from "./attest.mjs";
 import { decryptResponse, encryptChatRequest } from "./e2ee.mjs";
+import { hostKeyArgs, HostKeyError } from "./hostkey.mjs";
 import { openRelayForwarder } from "./relay.mjs";
 import { PrismVault } from "./vault.mjs";
 import { toHex, verifyComposeMeasurement, verifyQuote, verifyReportBinding } from "./vendor/aci-verifier/index.mjs";
+import { boundMessage, hashRequest } from "./x402.mjs";
 import { PrismWorkspace } from "./workspace.mjs";
 
 export { DEFAULT_CONFIDENTIAL_BASE, EXPECTED_WORKLOAD, renderChecks, verifyConfidential } from "./attest.mjs";
+export { hostKeyArgs, hostKeyPolicy, HostKeyError } from "./hostkey.mjs";
+export { boundMessage, hashRequest } from "./x402.mjs";
 export { PrismVault, VaultError, DEFAULT_TRUST_FLOOR, VAULT_KEY_STATEMENT } from "./vault.mjs";
 export {
   PrismWorkspace,
@@ -143,7 +146,7 @@ function decryptAnswer(bytes, clientKey, headers, receiptId) {
 }
 
 export class PrismAgent {
-  constructor({ privateKey, apiBase = "https://prismnetwork.tech", escrow, rpcUrl }) {
+  constructor({ privateKey, apiBase = "https://prismnetwork.tech", escrow, rpcUrl, requireHostKey = false }) {
     if (!escrow) throw new Error("escrow address is required");
     if (typeof privateKey !== "string" || privateKey.trim() === "") {
       throw new Error(
@@ -152,6 +155,11 @@ export class PrismAgent {
     }
     this.apiBase = apiBase.replace(/\/$/, "");
     this.escrow = escrow;
+    // Off by default because most capacity publishes no host key, and refusing
+    // those leases would take the network's own supply away from callers who
+    // never asked for the guarantee. On, nothing runs anywhere the grant cannot
+    // name.
+    this.requireHostKey = requireHostKey;
     const trimmed = privateKey.trim();
     try {
       this.account = privateKeyToAccount(trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`);
@@ -211,6 +219,7 @@ export class PrismAgent {
   }
 
   async transferUsdg(to, amountMicros) {
+    let broadcast = null;
     try {
       const hash = await this.#submit(() =>
         this.walletClient.writeContract({
@@ -220,12 +229,20 @@ export class PrismAgent {
           args: [to, BigInt(amountMicros)],
         }),
       );
+      broadcast = hash;
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status !== "success") throw new PrismError(502, "transfer_reverted", { hash });
       return hash;
     } catch (err) {
       if (err instanceof PrismError) throw err;
-      throw new PrismError(502, "chain_error", { cause: err?.shortMessage ?? err?.message ?? String(err) });
+      // A receipt that could not be read is not a transfer that never happened.
+      // The hash travels with the failure because it is the only thing that
+      // says the money left this wallet, and whatever is counting the day's
+      // spend has to be able to tell the two apart.
+      throw new PrismError(502, "chain_error", {
+        cause: err?.shortMessage ?? err?.message ?? String(err),
+        ...(broadcast ? { payment_tx: broadcast } : {}),
+      });
     }
   }
 
@@ -262,6 +279,7 @@ export class PrismAgent {
     const deposit = parseBaseUnits(quote.maximum_escrow, "maximum_escrow");
     const duration = parseDuration(quote.duration_seconds);
     const clientReference = keccak256(stringToBytes(quote.quote_id));
+    let broadcast = null;
     try {
       // Approving and spending are one indivisible step. The approval covers
       // exactly this deposit, so a second lease that read the allowance before
@@ -289,6 +307,7 @@ export class PrismAgent {
           functionName: "createLease",
           args: [quote.node_id, duration, clientReference],
         });
+        broadcast = funding;
         // One confirmation here, not for the control-plane's benefit but so the
         // allowance and the nonce are settled before the next lease reads them.
         await this.publicClient.waitForTransactionReceipt({ hash: funding });
@@ -300,7 +319,13 @@ export class PrismAgent {
       return { hash, clientReference };
     } catch (err) {
       if (err instanceof PrismError) throw err;
-      throw new PrismError(502, "chain_error", { cause: err?.shortMessage ?? err?.message ?? String(err) });
+      // The deposit is in the escrow the moment the chain accepts this, and
+      // waiting for confirmations is where a flaky rpc gives up. Losing the
+      // hash here would leave a funded lease nobody can name.
+      throw new PrismError(502, "chain_error", {
+        cause: err?.shortMessage ?? err?.message ?? String(err),
+        ...(broadcast ? { funding_hash: broadcast } : {}),
+      });
     }
   }
 
@@ -506,12 +531,14 @@ export class PrismAgent {
             port: forwarder.port,
             user: lease.access.ssh_user ?? "workspace",
             keyPath: lease.keyPath,
+            access: lease.access,
           }
         : {
             host: lease.access?.ssh_host,
             port: lease.access?.ssh_port,
             user: lease.access?.ssh_user ?? "root",
             keyPath: lease.keyPath,
+            access: lease.access,
           };
       if (!target.host || !target.port) {
         throw new PrismError(400, "invalid_lease_handle", {
@@ -522,7 +549,23 @@ export class PrismAgent {
       }
       let last;
       for (let attempt = 0; attempt <= connectRetries; attempt++) {
-        const res = await this.#ssh(target, command, timeoutMs, stdin);
+        let res;
+        try {
+          res = await this.#ssh(target, command, timeoutMs, stdin);
+        } catch (err) {
+          // A box that is still coming up has nothing listening to read a key
+          // from, which is the same wait the retry loop already exists for.
+          // Being answered by the wrong machine is not a wait.
+          if (!(err instanceof HostKeyError) || err.code !== "host_key_unavailable") {
+            // `host_key_unpublished` is this client refusing on the caller's
+            // own policy. Anything else is the far end failing the check.
+            throw new PrismError(err?.code === "host_key_unpublished" ? 400 : 502, err?.code ?? "ssh_failed", {
+              lease_id: lease.leaseId ?? null,
+              detail: err?.detail ?? err?.message ?? String(err),
+            });
+          }
+          res = { code: 255, stdout: "", stderr: `ssh: ${err.detail ?? err.code}`, timedOut: false };
+        }
         if (!isSshWarmup(res)) return res;
         last = res;
         if (attempt < connectRetries) await sleep(connectDelayMs);
@@ -588,33 +631,39 @@ export class PrismAgent {
     caller = "call",
   }) {
     let sent = seal ? seal() : { bytes: asBytes(body), headers };
-    const identity = createHash("sha256").update(fingerprint ?? sent.bytes).digest("hex");
+    const identity = hashRequest(fingerprint ?? sent.bytes);
     const key = `${base}${path}:${price}:${identity}`;
-    let pending = this.#pendingPayments.get(key);
-    if (!pending) {
-      const tx = await this.transferUsdg(payTo, price);
-      const signature = await this.account.signMessage({ message: tx });
-      pending = { tx, header: Buffer.from(JSON.stringify({ txHash: tx, signature })).toString("base64") };
-      this.#pendingPayments.set(key, pending);
+    let tx = this.#pendingPayments.get(key);
+    if (!tx) {
+      tx = await this.transferUsdg(payTo, price);
+      this.#pendingPayments.set(key, tx);
     }
-    // The transfer is on-chain and irreversible from here. The signed header is
-    // the only thing that redeems it, and it lives in this process.
-    const kept = {
-      payment_tx: pending.tx,
-      payment_header: pending.header,
-      hint:
-        `the payment (tx ${pending.tx}) settled on-chain and the endpoint did not serve. While this process lives, ` +
-        `the next ${caller} for this same request redeems it without paying again. payment_header is what redeems ` +
-        "it, so keep it to do that from anywhere else.",
-    };
     const deadline = Date.now() + PAID_CALL_DEADLINE_MS;
     for (;;) {
+      // The signature covers the transaction and the bytes it buys, so a header
+      // read off the wire cannot be spent on a different request. A resealed
+      // attempt carries different bytes and is signed again; the transfer, which
+      // is the half that costs money, is made once.
+      const header = Buffer.from(JSON.stringify({
+        txHash: tx,
+        signature: await this.account.signMessage({ message: boundMessage(tx, hashRequest(sent.bytes)) }),
+      })).toString("base64");
+      // The transfer is on-chain and irreversible from here. The signed header
+      // is the only thing that redeems it, and it lives in this process.
+      const kept = {
+        payment_tx: tx,
+        payment_header: header,
+        hint:
+          `the payment (tx ${tx}) settled on-chain and the endpoint did not serve. While this process lives, ` +
+          `the next ${caller} for this same request redeems it without paying again. payment_header redeems it ` +
+          "from anywhere else, and only for this request: the signature covers these exact bytes.",
+      };
       let res;
       let bytes;
       try {
         res = await fetch(`${base}${path}`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-payment": pending.header, ...sent.headers },
+          headers: { "content-type": "application/json", "x-payment": header, ...sent.headers },
           body: sent.bytes,
           signal: AbortSignal.timeout(PAID_CALL_TIMEOUT_MS),
         });
@@ -629,11 +678,11 @@ export class PrismAgent {
         // this one's, whatever the status line says.
         if (String(res.headers.get("x-prism-replayed") ?? "").toLowerCase() === "true") {
           throw new PrismError(409, "payment_replayed", {
-            cause: `the endpoint replayed an earlier answer for tx ${pending.tx}`,
+            cause: `the endpoint replayed an earlier answer for tx ${tx}`,
             hint: "this payment was already consumed by another call; pay again to have this request served",
           });
         }
-        return { status: 200, headers: res.headers, bytes, tx: pending.tx, sent };
+        return { status: 200, headers: res.headers, bytes, tx, sent };
       }
       const answered = (() => {
         try {
@@ -653,7 +702,7 @@ export class PrismAgent {
         const said = [answered?.detail, answered?.retry].filter(Boolean).join("; ");
         throw new PrismError(res.status, answered?.error ?? "generation_failed", {
           cause: said || answered?.error || `status ${res.status}`,
-          ...(this.#pendingPayments.has(key) ? kept : { payment_tx: pending.tx }),
+          ...(this.#pendingPayments.has(key) ? kept : { payment_tx: tx }),
         });
       }
       await sleep(retryDelayMs);
@@ -924,12 +973,11 @@ export class PrismAgent {
     }
   }
 
-  #ssh(target, command, timeoutMs, stdin = null) {
+  async #ssh(target, command, timeoutMs, stdin = null) {
     const args = [
       "-i", target.keyPath,
       "-p", String(target.port),
-      "-o", "StrictHostKeyChecking=no",
-      "-o", "UserKnownHostsFile=/dev/null",
+      ...(await hostKeyArgs(target, target.access, { requireHostKey: this.requireHostKey })),
       "-o", "BatchMode=yes",
       "-o", "ConnectTimeout=15",
       `${target.user}@${target.host}`,

@@ -13,16 +13,19 @@ services:
     environment:
       PRISM_DOMAIN: ${PRISM_DOMAIN:?set PRISM_DOMAIN}
       PRISM_ACME_EMAIL: ${PRISM_ACME_EMAIL:?set PRISM_ACME_EMAIL}
+      # The edge is what holds the inference gateway's credential, which is what
+      # leaves the front door as the only way to the paid routes.
+      PRISM_INFERENCE_TOKEN: ${PRISM_INFERENCE_TOKEN:?set PRISM_INFERENCE_TOKEN}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./proof-artifacts:/srv/proof:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      inference:
-        condition: service_started
       control-plane:
         condition: service_healthy
+      inference:
+        condition: service_started
 
   inference:
     image: node:22-alpine@sha256:9fcc1a6da2b9eba3037dc0d6e0a1a1fbc0f7d047b90aa9d3193b16f04b515821
@@ -31,12 +34,23 @@ services:
     # The gateway shells out to ssh for the ollama tunnel; the base image does
     # not carry a client.
     entrypoint: ["/bin/sh", "-c", "apk add --no-cache openssh-client >/dev/null && exec node server.mjs"]
-    env_file: ${PRISM_INFERENCE_ENV_FILE:-./inference.env}
+    # The wallet and the rate card live in a file on the host, which is not in
+    # this repository. Optional so the manifest still validates without it; the
+    # gateway names the variable it is missing and exits.
+    env_file:
+      - path: ./inference.env
+        required: false
     volumes:
       - ./inference:/app:ro
       - inference_state:/state
     environment:
       INFERENCE_PAYMENTS_FILE: /state/inference-consumed.log
+      # The edge reaches this across the compose network, so loopback is not an
+      # option here and the gateway refuses a wider address without a credential
+      # to guard it. It holds the operator's funded wallet and its free routes
+      # name the leases and the takings.
+      INFERENCE_HOST: 0.0.0.0
+      INFERENCE_TOKEN: ${PRISM_INFERENCE_TOKEN:?set PRISM_INFERENCE_TOKEN}
 
   control-plane:
     image: ${PRISM_CONTROL_PLANE_IMAGE:?set PRISM_CONTROL_PLANE_IMAGE}

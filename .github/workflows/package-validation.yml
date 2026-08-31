@@ -68,6 +68,8 @@ jobs:
             integrations/autogen/dist/*.whl
       - run: python -m pip check
       - run: python scripts/validate-python-packages.py
+      - run: python -m unittest discover -s tests -t .
+        working-directory: python-sdk
 
   mcp:
     runs-on: ubuntu-24.04
@@ -111,8 +113,18 @@ jobs:
       # before anything here can run.
       - run: npm install --no-save --no-audit --no-fund viem@2
         working-directory: x402
-      - run: mkdir -p inference/node_modules/@prismnetwork && ln -sfn ../../../x402 inference/node_modules/@prismnetwork/x402
-      - run: node --test sdk/vault.test.mjs sdk/workspace.test.mjs sdk/toolset.test.mjs sdk/nonce.test.mjs sdk/attest.test.mjs sdk/e2ee.test.mjs sdk/confidential.test.mjs inference/gateway.test.mjs inference/receipt.test.mjs inference/batch.test.mjs inference/openapi.test.mjs inference/confidential.test.mjs x402/exact-evm.test.mjs
+      # listen.test.mjs starts the gateway itself, so this directory has to be a
+      # working install and not just a source tree.
+      - run: npm install --no-save --no-audit --no-fund viem@2
+        working-directory: inference
+      # The x402 codec re-exports the payment binding from the client SDK, so
+      # anything importing the codec needs the SDK resolvable from x402.
+      - run: |
+          mkdir -p x402/node_modules/@prismnetwork inference/node_modules/@prismnetwork
+          ln -sfn ../../../sdk x402/node_modules/@prismnetwork/agent-sdk
+          ln -sfn ../../../sdk inference/node_modules/@prismnetwork/agent-sdk
+          ln -sfn ../../../x402 inference/node_modules/@prismnetwork/x402
+      - run: node --test sdk/vault.test.mjs sdk/workspace.test.mjs sdk/toolset.test.mjs sdk/nonce.test.mjs sdk/attest.test.mjs sdk/e2ee.test.mjs sdk/confidential.test.mjs sdk/x402.test.mjs inference/gateway.test.mjs inference/receipt.test.mjs inference/batch.test.mjs inference/openapi.test.mjs inference/confidential.test.mjs inference/listen.test.mjs x402/exact-evm.test.mjs x402/listen.test.mjs x402/payment-binding.test.mjs sdk/broadcast.test.mjs mcp/budget.test.mjs
       - run: node --check integrations/eliza/index.mjs integrations/virtuals/index.mjs
       - run: node --check inference/server.mjs
 

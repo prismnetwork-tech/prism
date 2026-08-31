@@ -17,6 +17,7 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 
 | Tool | Wallet |
 | --- | --- |
+| `prism_budget` | no |
 | `prism_list_gpus` | no |
 | `prism_price_index` | no |
 | `prism_receipts` | no |
@@ -37,6 +38,8 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 | `prism_vault_delete` | yes |
 | `prism_vault_release` | yes |
 
+- `prism_budget`: the spending limits this server enforces, what it has spent
+  in the last 24 hours, and the recent charges.
 - `prism_wallet`: the agent's address and USDG/ETH balances.
 - `prism_list_gpus`: GPUs available to lease, with price per second and per hour.
 - `prism_price_index`: sourced and settled pricing per GPU model, for cost estimates.
@@ -66,6 +69,9 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
   terminates.
 - `prism_lease_and_run`: lease a GPU, run a command, return the output (one shot).
 - `prism_lease`: lease a GPU and keep it; returns a `lease_id` and SSH access.
+  The SSH block carries `host_key_fingerprint` and `host_key_claim` when the
+  network can say which machine should answer, and says so plainly when it
+  cannot. Check it before connecting by hand; `prism_run` checks it for you.
 - `prism_run`: run a command on an existing lease.
 - `prism_batch_run`: fund a lease that runs one command with no interactive
   access; the node reports the signed output. Matches only suppliers at trust
@@ -76,6 +82,33 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 - `prism_vault_read`: decrypt one item in this process.
 - `prism_vault_delete`: permanently delete an item.
 - `prism_vault_release`: authorize an item into a lease that clears its trust floor.
+
+## Spending limits
+
+Two ceilings bound what this server can spend, and a refusal quotes both.
+
+| Variable | Default | What it bounds |
+| --- | --- | --- |
+| `PRISM_MAX_USDG` | 1 | Any single lease or generation. `max_usdg` on a call may lower it, never raise it past this. |
+| `PRISM_DAILY_BUDGET_USDG` | 5 | Everything in a rolling 24 hours. `0` removes the ceiling. |
+| `PRISM_LEDGER_PATH` | `~/.prism/spend.json` | Where the spend is recorded. |
+
+A `max_usdg` above `PRISM_MAX_USDG` is clamped back to it. The argument is
+written by the agent being bounded, so it is treated as a request for a lower
+ceiling and never as permission for a higher one.
+
+Spend is written before the money moves, so a crash between funding an escrow
+and answering is counted rather than forgiven, and a restart does not hand back
+a fresh day's allowance. Only an attempt that provably never reached the chain
+is reverted. Two clients pointed at one wallet share one ceiling, because they
+share the ledger file.
+
+None of this is the real limit. Fund a dedicated wallet with what you are
+willing to lose: that balance is what survives a bug in everything above.
+
+Tools that spend are annotated `destructiveHint` and carry
+`anthropic/requiresUserInteraction`, so Claude Code asks before every one of
+them even in modes that otherwise approve tools automatically.
 
 ## Vault
 

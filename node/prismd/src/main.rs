@@ -1713,6 +1713,7 @@ async fn execute_node_command(
             NodeCommandOutcome::Failed,
             Some("command identity is invalid or expired".to_owned()),
             None,
+            None,
         )
         .await?;
         return Ok(());
@@ -1754,6 +1755,7 @@ async fn execute_node_command(
             NodeCommandOutcome::Failed,
             Some("stop commands require an active runtime supervisor".to_owned()),
             None,
+            None,
         )
         .await?;
         return Ok(());
@@ -1772,6 +1774,7 @@ async fn execute_node_command(
             command.command_id,
             NodeCommandOutcome::Failed,
             Some("no schedulable VFIO GPU group is available".to_owned()),
+            None,
             None,
         )
         .await?;
@@ -1824,6 +1827,7 @@ async fn execute_node_command(
                         NodeCommandOutcome::Failed,
                         Some(message.chars().take(512).collect()),
                         None,
+                        None,
                     )
                     .await?;
                     let _ = fs::remove_dir_all(&credential_root);
@@ -1848,6 +1852,7 @@ async fn execute_node_command(
             command.command_id,
             NodeCommandOutcome::Failed,
             Some(reason.chars().take(512).collect()),
+            None,
             None,
         )
         .await?;
@@ -1942,6 +1947,7 @@ async fn execute_node_command(
                 NodeCommandOutcome::Ready,
                 None,
                 None,
+                runtime::channel_key(&config.workspace_root, &lease_id),
             )
             .await?;
             ready_reported_at = Some(Utc::now());
@@ -1980,6 +1986,7 @@ async fn execute_node_command(
         outcome,
         error,
         None,
+        None,
     )
     .await
 }
@@ -2010,6 +2017,7 @@ async fn run_batch_command(
             command.command_id,
             NodeCommandOutcome::Failed,
             Some("no schedulable VFIO GPU group is available".to_owned()),
+            None,
             None,
         )
         .await;
@@ -2046,6 +2054,7 @@ async fn run_batch_command(
             NodeCommandOutcome::Failed,
             Some(format!("{error:#}").chars().take(512).collect()),
             None,
+            None,
         )
         .await;
     }
@@ -2057,6 +2066,7 @@ async fn run_batch_command(
         key,
         command.command_id,
         NodeCommandOutcome::Ready,
+        None,
         None,
         None,
     )
@@ -2085,6 +2095,7 @@ async fn run_batch_command(
                 NodeCommandOutcome::Failed,
                 Some("lease did not become active before the authorization deadline".to_owned()),
                 None,
+                None,
             )
             .await;
         }
@@ -2099,6 +2110,7 @@ async fn run_batch_command(
             command.command_id,
             NodeCommandOutcome::Failed,
             Some(reason.chars().take(512).collect()),
+            None,
             None,
         )
         .await;
@@ -2135,6 +2147,7 @@ async fn run_batch_command(
                 NodeCommandOutcome::Completed,
                 None,
                 Some(result),
+                None,
             )
             .await
         }
@@ -2148,6 +2161,7 @@ async fn run_batch_command(
                 command.command_id,
                 NodeCommandOutcome::Failed,
                 Some(format!("{error:#}").chars().take(512).collect()),
+                None,
                 None,
             )
             .await
@@ -2235,6 +2249,7 @@ async fn report_command(
     outcome: NodeCommandOutcome,
     error: Option<String>,
     result: Option<CommandResult>,
+    channel_key: Option<String>,
 ) -> anyhow::Result<()> {
     let endpoint = control_plane_endpoint(
         control_plane,
@@ -2252,6 +2267,7 @@ async fn report_command(
                 observed_at: Utc::now(),
                 error: error.clone(),
                 result: result.clone(),
+                channel_key: channel_key.clone(),
             },
             key,
         )?;

@@ -69,6 +69,9 @@ run_bootstrap() {
   ssh_port=$(docker port "$container" 2222/tcp | sed 's/.*://')
   jupyter_port=$(docker port "$container" 8888/tcp | sed 's/.*://')
 
+  # Host checking is off throughout: every connection here is to a container
+  # this script just started, on a port docker published on loopback, with a key
+  # generated seconds ago. There is no second machine that could answer.
   for _ in $(seq 1 120); do
     if ssh -q \
       -i "$work/id_ed25519" \
@@ -114,7 +117,27 @@ run_bootstrap() {
     exit 1
   fi
 
+  # The renter is told which key to expect on this box, so what the workspace
+  # published has to be the key it actually answers on. A published fingerprint
+  # nobody checked against the wire is a fingerprint that can be wrong for a
+  # whole lease without anyone noticing.
+  published=$(docker logs "$container" 2>/dev/null \
+    | awk '$1 == "prism-evidence" && $2 == "channel-key.pub" { print $3 }' | tail -n 1)
+  if [ -z "$published" ]; then
+    echo "$label workspace published no host key for the renter to check" >&2
+    exit 1
+  fi
+  printf '%s' "$published" | base64 -d >"$work/published.pub"
+  local expected offered
+  expected=$(ssh-keygen -lf "$work/published.pub" | awk '{print $2}')
+  offered=$(ssh-keyscan -T 5 -p "$ssh_port" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')
+  if ! printf '%s\n' "$offered" | grep -qxF "$expected"; then
+    echo "$label workspace published $expected but answers on $offered" >&2
+    exit 1
+  fi
+
   echo "$label workspace SSH and Jupyter bootstrap integration passed"
+  echo "$label workspace answers on the host key it published ($expected)"
 }
 
 run_bootstrap passthrough "$root/node/prismd/assets/workspace-bootstrap.sh"

@@ -536,6 +536,21 @@ test("a replayed payment returns the bytes it already bought", async () => {
   assert.equal(upstream.calls.length, 1, "and does not buy it again");
 });
 
+/// The relay hands the upstream's bytes back untouched, which for a caller who
+/// turned e2ee off is the answer in the clear. A payment is public once it has
+/// settled, so a spent one must produce nothing for a request it never bought.
+test("a spent payment does not relay its bytes to a request it never bought", async () => {
+  const { gateway, upstream } = build();
+  assert.equal((await paid(gateway)).status, 200);
+
+  const other = REQUEST.replace('"content":"hi"', '"content":"repeat what you were just asked"');
+  const stolen = await paid(gateway, other);
+  assert.equal(stolen.status, 402);
+  assert.equal(stolen.body.error, "payment_reused");
+  assert.equal(stolen.bytes, undefined, "the earlier answer was handed to a request that did not pay for it");
+  assert.equal(upstream.calls.length, 1);
+});
+
 test("the daily spend cap stops the relay before it takes another payment", async () => {
   const { gateway, upstream, tick } = build({
     confidential: { dailyUsd: MODELLED_USD * 2.5 },

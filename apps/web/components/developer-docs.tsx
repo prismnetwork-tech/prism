@@ -200,7 +200,7 @@ export function DeveloperDocs() {
                 <p>Robinhood Chain contracts enforce escrow limits, active-lease bounds, dispute timing, provider payment, platform fees, and refunds.</p>
               </InfoCard>
               <InfoCard title="Governance plane">
-                <p>The Governance Safe routes routine configuration changes through a 48-hour timelock. Emergency pause and dispute resolution remain immediate Safe actions.</p>
+                <p>The contracts carrying leases today are owned directly by the Governance Safe, so a configuration change takes effect as soon as both signers agree. A second set is deployed that routes routine changes through a 48-hour timelock and leaves pausing, bond freezes and dispute resolution outside it. Migration details will be published before those contracts start carrying leases.</p>
               </InfoCard>
             </div>
           </DocsSection>
@@ -211,7 +211,7 @@ export function DeveloperDocs() {
               <li><span>02</span><div><h3>Prepare access</h3><p>Create a disposable Ed25519 key. Submit only the single-line public key; the private key must never leave the renter machine.</p></div></li>
               <li><span>03</span><div><h3>Authenticate</h3><p>Use the console to create a Privy-backed Prism session and connect the wallet that will fund escrow.</p></div></li>
               <li><span>04</span><div><h3>Quote and fund</h3><p>Request a five-minute quote, approve the exact maximum USDG amount, and call <code>createLease</code> with the quote-derived reference.</p></div></li>
-              <li><span>05</span><div><h3>Confirm and connect</h3><p>Confirm the finalized funding transaction, poll the lease until active, retrieve access, verify the host key, and connect over SSH.</p></div></li>
+              <li><span>05</span><div><h3>Confirm and connect</h3><p>Confirm the finalized funding transaction, poll the lease until active, retrieve access, and connect over SSH. The SDK pins the host key for the life of the lease and reports what that pin is worth: a key the node published under its own device key, or, for capacity brokered through a third-party cloud, no publishable key at all. Pass <code>requireHostKey</code> to refuse a lease that cannot be pinned.</p></div></li>
             </ol>
             <Callout kind="warning" title="Data classification">
               Do not place private keys, production credentials, regulated data, confidential

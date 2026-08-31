@@ -6,8 +6,10 @@ from ._agent import (
     Lease,
     PrismAgent,
     PrismError,
+    host_key_policy,
 )
 
+from ._x402 import bound_message, hash_request, payment_header
 from .toolkit import DEFAULT_ESCROW, PrismToolset, agent_from_env
 
 __all__ = [
@@ -21,5 +23,9 @@ __all__ = [
     "DEFAULT_IMAGE",
     "TRUST_CLASSES",
     "USDG",
+    "host_key_policy",
+    "bound_message",
+    "hash_request",
+    "payment_header",
 ]
 __version__ = "0.3.0"

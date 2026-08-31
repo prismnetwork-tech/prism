@@ -11,6 +11,7 @@
     "codec.mjs",
     "exact-evm.mjs",
     "facilitator.mjs",
+    "listen.mjs",
     "schemas.mjs",
     "server.mjs"
   ],
@@ -18,7 +19,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@prismnetwork/agent-sdk": "^0.2.0",
+    "@prismnetwork/agent-sdk": "^0.7.4",
     "viem": "^2"
   },
   "keywords": [
@@ -49,6 +50,7 @@
     ".": "./server.mjs",
     "./exact-evm": "./exact-evm.mjs",
     "./codec": "./codec.mjs",
+    "./listen": "./listen.mjs",
     "./schemas": "./schemas.mjs",
     "./facilitator": "./facilitator.mjs",
     "./cdp-facilitator": "./cdp-facilitator.mjs"

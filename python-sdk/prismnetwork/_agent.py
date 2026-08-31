@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -101,7 +104,8 @@ class PrismAgent:
     signature, pay on-chain in USDG, provision, and run over SSH."""
 
     def __init__(self, private_key: str, escrow: str,
-                 api_base: str = "https://prismnetwork.tech", rpc_url: str = ROBINHOOD_RPC):
+                 api_base: str = "https://prismnetwork.tech", rpc_url: str = ROBINHOOD_RPC,
+                 require_host_key: bool = False):
         if not escrow:
             raise ValueError("escrow address is required")
         if not isinstance(private_key, str) or not private_key.strip():
@@ -118,6 +122,11 @@ class PrismAgent:
         self._usdg = self.w3.eth.contract(address=USDG, abi=_ERC20)
         self._escrow = self.w3.eth.contract(address=self.escrow, abi=_ESCROW)
         self.session: str | None = None
+        # Off by default because most capacity publishes no host key, and
+        # refusing those leases would take the network's own supply away from
+        # callers who never asked for the guarantee. On, nothing runs anywhere
+        # the grant cannot name.
+        self.require_host_key = require_host_key
 
     @property
     def address(self) -> str:
@@ -288,18 +297,28 @@ class PrismAgent:
         if not a.get("ssh_host") or not a.get("ssh_port"):
             raise PrismError(400, "ssh_access_unavailable",
                              {"mode": a.get("mode"), "lease_id": lease.lease_id})
-        args = ["ssh", "-i", lease.key_path, "-p", str(a["ssh_port"]),
-                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-                f"{a.get('ssh_user', 'root')}@{a['ssh_host']}", command]
         last = None
         for attempt in range(connect_retries + 1):
             try:
-                p = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 20,
-                                   input=stdin if stdin is not None else "")
-                res = {"code": p.returncode, "stdout": p.stdout.strip(), "stderr": p.stderr.strip()}
-            except subprocess.TimeoutExpired:
-                res = {"code": -1, "stdout": "", "stderr": "timed out"}
+                host_key = _host_key_args(a["ssh_host"], a["ssh_port"], lease.key_path, a,
+                                          self.require_host_key)
+            except PrismError as e:
+                # A box that is still coming up has nothing listening to read a
+                # key from, which is the same wait this loop already exists for.
+                # Being answered by the wrong machine is not a wait.
+                if e.code != "host_key_unavailable":
+                    raise
+                res = {"code": 255, "stdout": "", "stderr": f"ssh: {e.code}"}
+            else:
+                args = ["ssh", "-i", lease.key_path, "-p", str(a["ssh_port"]), *host_key,
+                        "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                        f"{a.get('ssh_user', 'root')}@{a['ssh_host']}", command]
+                try:
+                    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 20,
+                                       input=stdin if stdin is not None else "")
+                    res = {"code": p.returncode, "stdout": p.stdout.strip(), "stderr": p.stderr.strip()}
+                except subprocess.TimeoutExpired:
+                    res = {"code": -1, "stdout": "", "stderr": "timed out"}
             if not _is_ssh_warmup(res):
                 return res
             last = res
@@ -399,6 +418,129 @@ def _safe_json(res):
         return res.json()
     except ValueError:
         return None
+
+
+# Checking which machine answered.
+#
+# A lease hands the renter an address and a private key. Until the host key on
+# the other end is checked, anything that can reach that address can take the
+# session, read the work and answer as if it were the GPU. What the network can
+# say about that key differs by where the capacity came from, so the decision is
+# made here rather than defaulted: a grant that names a fingerprint is checked
+# before the session opens, and a grant that names none has its key recorded on
+# first sight and held for the rest of the lease. The record lives beside the
+# lease's private key and goes when the lease does; the caller's own
+# ~/.ssh/known_hosts is never touched.
+
+_SCAN_TIMEOUT = 10
+
+
+def host_key_policy(access: dict | None) -> dict:
+    """What the network is willing to say about the machine behind a grant.
+
+    ``attested`` is the only one that survives a hostile operator: the
+    fingerprint comes out of a report the processor signed. ``reported`` is the
+    operator's word under their bonded device key, which rules out everyone
+    between them and the renter. ``unverified`` means nobody published a key and
+    the first connection decides.
+    """
+    fingerprint = (access or {}).get("channel_key_fingerprint")
+    if not fingerprint:
+        return {"mode": "unverified", "fingerprint": None, "source": None}
+    source = access.get("channel_key_source")
+    return {
+        "mode": "attested" if source == "snp_report" else "reported",
+        "fingerprint": fingerprint,
+        "source": source,
+    }
+
+
+def _known_hosts_path(key_path: str) -> str:
+    return os.path.join(os.path.dirname(key_path), "known_hosts")
+
+
+def _known_hosts_fingerprint(line: str) -> str | None:
+    """The ``ssh-keygen -lf`` form of the key in a known_hosts line. The control
+    plane publishes fingerprints in exactly this form, so the two are compared
+    as strings."""
+    fields = line.strip().split()
+    if len(fields) < 3:
+        return None
+    try:
+        raw = base64.b64decode(fields[2], validate=True)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+
+
+def _host_field(host: str, port) -> str:
+    return str(host) if int(port) == 22 else f"[{host}]:{port}"
+
+
+def _already_pinned(path: str, host: str, port, fingerprint: str) -> bool:
+    # The relay hands out a fresh local port for every session, so a record that
+    # names the right key under the wrong address is a record ssh will refuse to
+    # use. Both halves have to match for the scan to be worth skipping.
+    try:
+        with open(path) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return False
+    return any(line.split()[:1] == [_host_field(host, port)]
+               and _known_hosts_fingerprint(line) == fingerprint for line in lines if line.strip())
+
+
+def _pin_host_key(host: str, port, fingerprint: str, path: str) -> None:
+    """Read the host key off the wire and record it only if it is the one the
+    grant named.
+
+    Done as a separate exchange before ssh runs, because a fingerprint cannot be
+    turned into a known_hosts entry without the key itself, and letting ssh learn
+    the key first would mean trusting it to find out whether it should have.
+    ``ssh-keyscan`` reads the key the server offers and hangs up, so nothing the
+    machine could use is sent.
+    """
+    if _already_pinned(path, host, port, fingerprint):
+        return
+    try:
+        scan = subprocess.run(["ssh-keyscan", "-T", str(_SCAN_TIMEOUT), "-p", str(port), str(host)],
+                              capture_output=True, text=True, timeout=_SCAN_TIMEOUT + 5)
+        offered = [l for l in scan.stdout.splitlines() if l and not l.startswith("#")]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise PrismError(503, "host_key_unavailable", {"host": host, "port": port, "cause": str(e)}) from e
+    if not offered:
+        raise PrismError(503, "host_key_unavailable",
+                         {"host": host, "port": port, "cause": (scan.stderr or "").strip()[:200]})
+    for line in offered:
+        if _known_hosts_fingerprint(line) == fingerprint:
+            # Only the key that matched. Writing everything the machine offered
+            # would pin keys nobody vouched for alongside the one that was
+            # checked.
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+                handle.write(line + "\n")
+            return
+    raise PrismError(502, "host_key_mismatch", {
+        "expected": fingerprint,
+        "offered": [f for f in (_known_hosts_fingerprint(l) for l in offered) if f],
+        "hint": "the machine answering is not the one the lease names; nothing was sent to it",
+    })
+
+
+def _host_key_args(host, port, key_path: str, access: dict | None, require_host_key: bool) -> list:
+    """The ssh options that make the connection check the machine it reaches."""
+    path = _known_hosts_path(key_path)
+    policy = host_key_policy(access)
+    if policy["fingerprint"] is None:
+        if require_host_key:
+            raise PrismError(400, "host_key_unpublished", {
+                "mode": (access or {}).get("mode"),
+                "hint": "this lease publishes no host key, so which machine answers cannot be checked",
+            })
+        return ["-o", f"UserKnownHostsFile={path}", "-o", "StrictHostKeyChecking=accept-new"]
+    _pin_host_key(host, port, policy["fingerprint"], path)
+    return ["-o", f"UserKnownHostsFile={path}", "-o", "StrictHostKeyChecking=yes"]
 
 
 def _is_ssh_warmup(res: dict) -> bool:

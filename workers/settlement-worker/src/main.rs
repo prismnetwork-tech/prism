@@ -3456,6 +3456,7 @@ mod tests {
                 outcome: NodeCommandOutcome::Completed,
                 observed_at: Utc.timestamp_opt(100, 0).unwrap(),
                 error: None,
+                channel_key: None,
                 result: Some(CommandResult {
                     exit_code,
                     stdout: "42\n".to_owned(),

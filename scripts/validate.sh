@@ -29,6 +29,7 @@ cargo build --workspace
 PRISM_INFERENCE_ENV_FILE=/dev/null \
   docker compose --env-file deploy/ec2/.env.example -f deploy/ec2/compose.yml config --quiet
 ./scripts/test-compose-env.sh
+./scripts/test-inference-edge.sh
 ./scripts/test-web-build-env.sh
 ./scripts/test-observability.sh
 forge fmt --check

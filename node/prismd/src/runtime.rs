@@ -566,10 +566,9 @@ fn workspace_command(
         "--hostname",
         config.lease_id,
     ]);
-    if policy_digest.is_some() {
-        // The only launch that prints anything the node needs to read back.
-        command.stdout(Stdio::piped());
-    }
+    // Every workspace prints its SSH host key on the way up, and a confidential
+    // one prints its report as well, so the pipe is not optional any more.
+    command.stdout(Stdio::piped());
     if let Some(initdata) = &initdata {
         // The rootfs is pulled by the guest rather than unpacked on the host,
         // so the image the report measures is the one the renter named.
@@ -958,12 +957,40 @@ fn collect_printed_evidence(
     stdout: std::process::ChildStdout,
     evidence_directory: PathBuf,
 ) -> thread::JoinHandle<()> {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
 
     thread::spawn(move || {
         // Drained continuously whether or not anything is wanted from it: a
         // full pipe stops the workspace.
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        let mut reader = BufReader::new(stdout);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            // Every workspace prints on this pipe, including the shared ones the
+            // renter logs into, so the length of a line is the renter's to
+            // choose. Reading one without a ceiling grows a buffer in this
+            // thread, outside the container's own limits, until the node dies
+            // and takes every other lease on it with it.
+            let read = match (&mut reader)
+                .take(MAX_EVIDENCE_LINE_BYTES as u64)
+                .read_until(b'\n', &mut line)
+            {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            if read == MAX_EVIDENCE_LINE_BYTES && line.last() != Some(&b'\n') {
+                tracing::warn!("discarding an over-long line printed by the workspace");
+                if !discard_line(&mut reader) {
+                    break;
+                }
+                continue;
+            }
+            // Nothing the guest prints is trusted to be text, and one line that
+            // is not must not end the collection: the report may still be
+            // coming.
+            let Ok(line) = std::str::from_utf8(&line) else {
+                continue;
+            };
             let mut fields = line.split_whitespace();
             if fields.next() != Some("prism-evidence") {
                 continue;
@@ -994,13 +1021,65 @@ fn collect_printed_evidence(
     })
 }
 
+/// The longest line the collector will hold. The largest artifact is the
+/// certificate chain, which the protocol caps at eight certificates of 16 KiB
+/// of base64 each and which the guest encodes once more to print, so 256 KiB
+/// clears anything the control plane would accept and nothing else.
+const MAX_EVIDENCE_LINE_BYTES: usize = 256 * 1024;
+
+/// Drops the rest of a line that was too long to keep, without holding any of
+/// it. False once the pipe has closed and there is nothing left to read.
+fn discard_line(reader: &mut impl std::io::BufRead) -> bool {
+    loop {
+        let Ok(buffer) = reader.fill_buf() else {
+            return false;
+        };
+        if buffer.is_empty() {
+            return false;
+        }
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(index) => {
+                reader.consume(index + 1);
+                return true;
+            }
+            None => {
+                let read = buffer.len();
+                reader.consume(read);
+            }
+        }
+    }
+}
+
 /// Exactly what a guest may hand back, so a name it chooses cannot decide a
 /// path outside the evidence directory.
-const EVIDENCE_ARTIFACTS: [&str; 3] = [
+const EVIDENCE_ARTIFACTS: [&str; 4] = [
     "guest-report.bin",
     "guest-chain.b64",
     "guest-channel-key.pub",
+    CHANNEL_KEY_ARTIFACT,
 ];
+
+/// The workspace's SSH host key, as the workspace itself printed it. Named
+/// apart from `guest-channel-key.pub` because that one arrives with a report
+/// that commits to it and this one arrives on the node's word alone.
+const CHANNEL_KEY_ARTIFACT: &str = "channel-key.pub";
+
+/// The OpenSSH public key line the workspace serving this lease is listening
+/// on, or `None` while it is still coming up or if the image never printed one.
+///
+/// A renter cannot recognise a box nobody names, so this is what the node
+/// forwards to the control plane for the classes that produce no report. The
+/// key is public and the node had every chance to substitute one before it got
+/// here; what the renter gains is that the substitution has to happen on a
+/// bonded node under a signature, not anywhere along the path afterwards.
+pub fn channel_key(workspace_root: &Path, lease_id: &str) -> Option<String> {
+    let workspace = workspace_path(workspace_root, lease_id).ok()?;
+    let line =
+        fs::read_to_string(crate::snp::evidence_directory(&workspace).join(CHANNEL_KEY_ARTIFACT))
+            .ok()?;
+    let line = line.trim().to_owned();
+    (!line.is_empty()).then_some(line)
+}
 
 fn base64_standard(value: &str) -> anyhow::Result<Vec<u8>> {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -2673,6 +2752,118 @@ mod tests {
             "a guest must not be able to name a path outside the evidence directory"
         );
         let _ = fs::write(root.join("emit.sh"), "");
+    }
+
+    /// The pipe carries the output of a shared workspace as well as a
+    /// confidential one, and a renter logs into a shared one. Nothing they can
+    /// print may cost this process more memory than the evidence it is here
+    /// for, and nothing they can print may stop it reading the rest.
+    #[test]
+    fn a_workspace_cannot_spend_the_node_s_memory_on_one_line() {
+        let root = temporary_directory("flood-evidence");
+        let evidence = root.join("evidence");
+        let script = root.join("emit.sh");
+        let flood = MAX_EVIDENCE_LINE_BYTES * 4;
+        fs::write(
+            &script,
+            format!(
+                "printf 'prism-evidence guest-report.bin '\n\
+                 awk 'BEGIN {{ while (i++ < {flood}) printf \"A\" }}'\n\
+                 printf '\\n'\n\
+                 printf 'prism-evidence guest-chain.b64 %s\\n' \"$(printf 'chain' | base64)\"\n"
+            ),
+        )
+        .unwrap();
+
+        let mut child = Command::new("sh")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        collect_printed_evidence(child.stdout.take().unwrap(), evidence.clone())
+            .join()
+            .unwrap();
+        let _ = child.wait();
+
+        assert!(
+            !evidence.join("guest-report.bin").exists(),
+            "a line too long to hold was assembled and written to disk anyway"
+        );
+        assert_eq!(
+            fs::read(evidence.join("guest-chain.b64")).unwrap(),
+            b"chain",
+            "the flood ended the collection instead of being dropped"
+        );
+    }
+
+    /// A renter cannot recognise a box nobody names. Every workspace prints the
+    /// key it listens on, and the node has to be able to read it back to put it
+    /// on the report that opens access.
+    #[test]
+    fn a_printed_host_key_comes_back_for_the_ready_report() {
+        let root = temporary_directory("channel-key");
+        let workspace = workspace_path(&root, "4711").unwrap();
+        let line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9 root@workspace";
+        let script = root.join("emit.sh");
+        fs::write(
+            &script,
+            format!(
+                "printf 'prism-evidence channel-key.pub %s\\n' \"$(printf '{line}' | base64)\"\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(channel_key(&root, "4711").is_none());
+
+        let mut child = Command::new("sh")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        collect_printed_evidence(
+            child.stdout.take().unwrap(),
+            crate::snp::evidence_directory(&workspace),
+        )
+        .join()
+        .unwrap();
+        let _ = child.wait();
+
+        assert_eq!(channel_key(&root, "4711").as_deref(), Some(line));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The two bootstraps publish the same key by different routes. A guest
+    /// that takes a report commits to it there; anything else has only the
+    /// node's word, and a workspace that printed nothing would leave the renter
+    /// nothing to check.
+    #[test]
+    fn every_workspace_publishes_the_key_it_listens_on() {
+        assert!(WORKSPACE_BOOTSTRAP_SHARED.contains("prism-evidence channel-key.pub"));
+        assert!(WORKSPACE_BOOTSTRAP.contains("prism-evidence channel-key.pub"));
+
+        let keygen = WORKSPACE_BOOTSTRAP_SHARED
+            .find("ssh-keygen")
+            .expect("the workspace generates its own host key");
+        let publish = WORKSPACE_BOOTSTRAP_SHARED
+            .find("prism-evidence channel-key.pub")
+            .expect("and says which one");
+        let sshd = WORKSPACE_BOOTSTRAP_SHARED
+            .find("\"$sshd_path\" -D")
+            .expect("sshd is what starts listening");
+        assert!(keygen < publish);
+        assert!(publish < sshd);
+
+        // A guest that reported cannot also claim the key on its own account:
+        // the report is the stronger statement about the same key, and two
+        // claims invite the weaker one being read as the answer.
+        let report = WORKSPACE_BOOTSTRAP
+            .find("prism-evidence %s %s")
+            .expect("the guest forwards its report artifacts");
+        let claim = WORKSPACE_BOOTSTRAP
+            .find("prism-evidence channel-key.pub")
+            .expect("and falls back to naming the key itself");
+        assert!(report < claim);
+        assert!(WORKSPACE_BOOTSTRAP[report..claim].contains("\nelse\n"));
     }
 
     #[test]

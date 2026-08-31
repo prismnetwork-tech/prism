@@ -47,13 +47,20 @@
 		file_server
 	}
 
+	# The gateway answers only what carries its credential, and the edge is
+	# what holds it: the paid routes stay open to anyone who pays, and the free
+	# ones that name the leases and the takings are reachable only through here.
 	handle /.well-known/x402.json {
-		reverse_proxy inference:8500
+		reverse_proxy inference:8500 {
+			header_up Authorization "Bearer {$PRISM_INFERENCE_TOKEN}"
+		}
 	}
 
 	handle /inference/* {
 		uri strip_prefix /inference
-		reverse_proxy inference:8500
+		reverse_proxy inference:8500 {
+			header_up Authorization "Bearer {$PRISM_INFERENCE_TOKEN}"
+		}
 	}
 
 	handle {

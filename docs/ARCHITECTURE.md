@@ -137,11 +137,16 @@ after, money moves. See [integrity monitoring](#integrity-monitoring).
   and queues exactly that physical-node or managed-cloud path.
 - `GET /v1/leases` returns the authenticated account's indexed leases.
 - `GET /v1/leases/{lease_id}/access` returns either the active account-owned
-  gateway grant or the direct cloud SSH endpoint.
+  gateway grant or the direct cloud SSH endpoint, plus
+  `channel_key_fingerprint` and `channel_key_source` where the network can say
+  which SSH host key the session should terminate on.
 - `POST /v1/nodes/{node_id}/commands/next` leases a launch command to the device
   after verifying a fresh device signature.
 - `POST /v1/nodes/{node_id}/commands/{command_id}/report` records signed
-  readiness, completion, or failure without accepting replayed requests.
+  readiness, completion, or failure without accepting replayed requests. A
+  readiness report may carry the workspace's SSH host key, which is what a
+  renter on a class that produces no guest report is given to check the machine
+  against.
 - `POST /v1/grants` is internal-only and creates a bounded SSH/Jupyter grant.
 - `POST /v1/probes` is internal-only and confirms both workspace access paths
   through fresh node tunnels.

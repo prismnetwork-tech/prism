@@ -70,6 +70,13 @@ The gateway additionally needs `PRISM_ACCESS_GATEWAY_IMAGE`,
 value inline on the `docker compose` command line survives exactly one
 `up`, and the next plain `restart` silently drops it.
 
+`PRISM_INFERENCE_TOKEN` is at least 16 random characters and is the only way to
+the inference gateway. The gateway answers the compose network rather than
+loopback, so it demands the credential on every route, and the edge is what
+holds it: paid inference stays open to anyone who pays, and the free routes
+naming the leases and the takings are reachable only through the front door. The
+gateway's own wallet and rate card go in `deploy/ec2/inference.env`.
+
 ### Images
 
 Service images are **linux/arm64**, matching the host: `aws-lc-sys` reliably

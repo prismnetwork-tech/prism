@@ -60,6 +60,7 @@ jobs:
           PRISM_INFERENCE_ENV_FILE=/dev/null \
             docker compose --env-file deploy/lightsail/.env.example -f deploy/ec2/compose.yml config --quiet
           ./scripts/test-compose-env.sh
+          ./scripts/test-inference-edge.sh
           ./scripts/test-web-build-env.sh
       - name: Build service images
         run: |
