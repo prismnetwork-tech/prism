@@ -5,7 +5,7 @@ import { CHAIN } from "../../helpers/chains";
 // the escrow finalises the lease onchain, splitting what was actually consumed
 // between the protocol and the operator whose machine served it. Unused deposit
 // is refunded in the same transaction and is not a fee.
-const ESCROW = "0x62C042265991bEa17B07229322A01850974626dA";
+const ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD";
 const USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
 
 // `charged` is what the renter paid for the time consumed, and it is exactly

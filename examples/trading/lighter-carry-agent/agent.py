@@ -128,7 +128,7 @@ def analyze_on_gpu(dataset):
         sys.exit("--gpu needs the Prism SDK: pip install prismnetwork (Python 3.10+)")
 
     agent = PrismAgent(os.environ["PRISM_AGENT_KEY"],
-                       os.environ.get("PRISM_ESCROW", "0x62C042265991bEa17B07229322A01850974626dA"))
+                       os.environ.get("PRISM_ESCROW", "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD"))
     agent.authenticate()
     print("\nleasing a GPU on Prism (provisioning usually takes 1-4 minutes)...")
     lease = agent.lease(image=os.environ["PRISM_IMAGE"], duration_seconds=1200, min_vram_mib=16000)

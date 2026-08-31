@@ -17,7 +17,7 @@ because the machine it was made on is about to stop existing.
 ```sh
 npm install
 PRISM_AGENT_KEY=0x<agent wallet private key> \
-PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
+PRISM_ESCROW=0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD \
 PRISM_IMAGE=<repo@sha256:...> \
 node lease-and-render.mjs "a glass prism splitting light"
 ```

@@ -50,7 +50,7 @@ Set the Prism agent's wallet:
 
 ```bash
 export PRISM_AGENT_KEY=0x...   # agent wallet private key, funded with USDG + gas on Robinhood Chain
-export PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA   # optional, this is the default
+export PRISM_ESCROW=0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD   # optional, this is the default
 ```
 
 The wallet needs USDG (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`) and Robinhood-Chain ETH for gas. See the [Prism SDK](https://github.com/winter0x/prism) for how to fund a fresh wallet.

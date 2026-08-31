@@ -99,7 +99,7 @@ costs before committing to one:
 prismd register \
   --identity /var/lib/prismd/device.json \
   --rpc-url https://rpc.mainnet.chain.robinhood.com \
-  --registry 0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc \
+  --registry 0xa7Ca8e43c599b978095c391bd018A35BA6e7B71D \
   --rate-per-second 222 \
   --dry-run
 ```
@@ -117,7 +117,7 @@ where it would land in shell history:
 PRISM_OPERATOR_KEY=0x… prismd register \
   --identity /var/lib/prismd/device.json \
   --rpc-url https://rpc.mainnet.chain.robinhood.com \
-  --registry 0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc \
+  --registry 0xa7Ca8e43c599b978095c391bd018A35BA6e7B71D \
   --payout-wallet 0x… \
   --rate-per-second 222
 ```

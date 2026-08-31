@@ -12,7 +12,7 @@ pip install prismnetwork
 ```python
 from prismnetwork import PrismAgent, DEFAULT_IMAGE
 
-agent = PrismAgent(private_key=AGENT_KEY, escrow="0x62C042265991bEa17B07229322A01850974626dA")
+agent = PrismAgent(private_key=AGENT_KEY, escrow="0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD")
 agent.authenticate()
 
 lease = agent.lease(image=DEFAULT_IMAGE, duration_seconds=600, min_vram_mib=16000)

@@ -12,7 +12,7 @@
 // to 0 to run flat out.
 import { PrismAgent } from "../../sdk/prism.mjs";
 
-const ESCROW = "0x62C042265991bEa17B07229322A01850974626dA";
+const ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD";
 const MAX_USDG = Number(process.env.PRISM_MAX_USDG ?? 0.05);
 const PACE = Number(process.env.PRISM_DEMO_PACE ?? 1200);
 

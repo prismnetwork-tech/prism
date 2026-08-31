@@ -23,7 +23,7 @@ const IMAGE = process.env.PRISM_DEFAULT_IMAGE ?? DEFAULT_IMAGE;
 const PUBLIC_API = process.env.PRISM_PUBLIC_API ?? "https://api.prismnetwork.tech";
 // The live lease escrow. Overridable, but its absence must not silently
 // disable the wallet the way a missing key does.
-const DEFAULT_ESCROW = "0x62C042265991bEa17B07229322A01850974626dA";
+const DEFAULT_ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD";
 // Matches the limit the SDK and the control plane enforce, so a command that
 // cannot run is rejected before an escrow is funded.
 const MAX_COMMAND_BYTES = 8 * 1024;

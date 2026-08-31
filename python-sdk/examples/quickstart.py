@@ -1,7 +1,7 @@
 """Authenticate a wallet, list GPUs, and optionally lease one and run a command.
 
     PRISM_AGENT_KEY=0x<agent wallet private key> \\
-    PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \\
+    PRISM_ESCROW=0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD \\
     python quickstart.py
 
 By default this authenticates and lists GPUs without spending. Set PRISM_RUN_LEASE=1

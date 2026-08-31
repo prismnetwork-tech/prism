@@ -39,7 +39,9 @@ export default function RoadmapPage() {
         <h3>Onchain lease escrow and settlement</h3>
         <p>
           Funding, metered billing, and refunds execute through deployed contracts, bounded by a
-          maximum deposit, a maximum duration, and a dispute window.
+          maximum deposit, a maximum duration, and a dispute window. Routine administration of
+          those contracts sits behind an enforced 48-hour timelock, so a change to who signs
+          settlements or where fees go is scheduled in public two days before it can execute.
         </p>
         <h3>Verifiable receipts</h3>
         <p>
@@ -49,8 +51,21 @@ export default function RoadmapPage() {
         <h3>Concurrent multi-class GPU capacity</h3>
         <p>
           Supply sourced from vetted providers across several NVIDIA classes, including L40S, RTX
-          A6000, RTX 6000 Ada and RTX 5880 Ada, and matched to a lease on demand. The network serves
-          nine leases at once rather than one at a time.
+          A6000, RTX 6000 Ada and RTX 5880 Ada, and matched to a lease on demand. The network
+          carries up to eighteen leases at once rather than one at a time.
+        </p>
+        <h3>Managed and confidential inference</h3>
+        <p>
+          Text generation paid per call over x402, in USDG on Robinhood Chain or USDC on Base, with
+          no account or API key. The confidential tier runs the model inside a hardware enclave
+          with an attested GPU: the client checks the enclave&apos;s attestation before the prompt
+          is sent, so the prompt is readable only inside the enclave.
+        </p>
+        <h3>A pinned session key per lease</h3>
+        <p>
+          Clients pin the SSH host key of the machine they rent for the life of the lease. Where no
+          honest key can be published, because a third-party cloud generated it, the lease says so
+          and a client can refuse it, rather than being told a check happened that did not.
         </p>
         <h3>A stated trust class per offer</h3>
         <p>
@@ -71,7 +86,7 @@ export default function RoadmapPage() {
         <p>
           The Prism action provider is published and installable today, so an agent built on
           AgentKit, LangGraph, or the Vercel AI SDK can rent a GPU with no custom integration.
-          Inclusion in AgentKit itself is in review upstream.
+          Contribution of the provider to AgentKit itself is the remaining step.
         </p>
         <h3>Dependable on-demand provisioning</h3>
         <p>
@@ -82,9 +97,10 @@ export default function RoadmapPage() {
         </p>
         <h3>Independent node operators</h3>
         <p>
-          The relay a self-hosted machine reaches renters through now runs, so an operator&apos;s own
-          GPU can be leased rather than only registered. What remains is the hardware validation that
-          lets such a node advertise a stronger trust class than brokered capacity.
+          The relay a self-hosted machine reaches renters through now runs, and a self-hosted node
+          publishes the host key it generates so its leases verify end to end. What remains is the
+          hardware validation that lets such a node advertise a stronger trust class than brokered
+          capacity, and an operator fleet to carry it.
         </p>
       </InformationSection>
 
@@ -93,12 +109,13 @@ export default function RoadmapPage() {
           Directional commitments that widen what the network can be trusted to run. Each ships only
           when it meets the same onchain, verifiable standard as the rest of Prism.
         </p>
-        <h3>Attested and confidential capacity</h3>
+        <h3>Attested and confidential workspaces</h3>
         <p>
-          The two classes above what the network can verify today: a launch measurement checked
-          against vendor roots, then hardware-backed trusted execution with encrypted GPU memory, so
-          a workload and its data stay private from the infrastructure provider. Both need hardware
-          the network does not have yet, not a software change.
+          The two classes above what rented workspaces can verify today: a launch measurement
+          checked against vendor roots, then hardware-backed trusted execution with encrypted GPU
+          memory, so a workload and its data stay private from the infrastructure provider.
+          Confidential inference already runs this way; extending it to a workspace a renter
+          controls needs hardware the network does not have yet, not a software change.
         </p>
         <h3>Durable workspaces</h3>
         <p>Persistent state and storage that survive across leases, beyond today&apos;s ephemeral containers.</p>

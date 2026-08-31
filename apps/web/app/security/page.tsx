@@ -56,11 +56,14 @@ export default function SecurityPage() {
       <InformationSection index="03" title="Contracts and governance">
         <p>
           Lease funding and settlement execute through deployed Robinhood Chain contracts, which are
-          unaudited software. The contracts carrying live leases today are governed directly by a
-          two-of-two Safe, so an administrative change takes effect as soon as both signers agree.
-          A second set is deployed that places routine changes behind a 48-hour timelock and leaves
-          only pausing, bond freezes and dispute resolution outside it. Migration details will be
-          published before those contracts start carrying leases.
+          unaudited software. The contracts carrying live leases place every routine administrative
+          change behind an enforced 48-hour timelock: changing the settlement signer, the attestor
+          or the treasury is scheduled in public and cannot execute for two days. Only halting the
+          market, freezing a bond under investigation, resuming service and resolving a disputed
+          lease act without delay. Of those, only dispute resolution touches money, and it decides
+          the split of a single contested lease within what that lease already escrowed.
+          The earlier contracts, which were governed directly by a two-of-two Safe, are paused and
+          hold no open leases.
         </p>
         <p>
           Contract addresses, roles, state transitions, settlement calculations, and operational

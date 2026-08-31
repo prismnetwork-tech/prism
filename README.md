@@ -108,8 +108,8 @@ LeaseEscrowV1  0x71Df…cDeD: executable code matches, metadata differs
 | Contract | Address |
 | --- | --- |
 | Canonical USDG | [`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`](https://robinhoodchain.blockscout.com/address/0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168) |
-| `NodeRegistryV1` | [`0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc`](https://robinhoodchain.blockscout.com/address/0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc) |
-| `LeaseEscrowV1` | [`0x62C042265991bEa17B07229322A01850974626dA`](https://robinhoodchain.blockscout.com/address/0x62C042265991bEa17B07229322A01850974626dA) |
+| `NodeRegistryV1` | [`0xa7Ca8e43c599b978095c391bd018A35BA6e7B71D`](https://robinhoodchain.blockscout.com/address/0xa7Ca8e43c599b978095c391bd018A35BA6e7B71D) |
+| `LeaseEscrowV1` | [`0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD`](https://robinhoodchain.blockscout.com/address/0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD) |
 | Governance Safe | [`0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a`](https://robinhoodchain.blockscout.com/address/0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a) |
 
 Administration, emergency pause and dispute resolution are held by a 2-of-2

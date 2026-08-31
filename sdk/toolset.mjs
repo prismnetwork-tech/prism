@@ -12,7 +12,7 @@
 import { rmSync } from "node:fs";
 import { DEFAULT_IMAGE, MAX_COMMAND_BYTES, PrismAgent, PrismError, TRUST_CLASSES } from "./prism.mjs";
 
-export const DEFAULT_ESCROW = "0x62C042265991bEa17B07229322A01850974626dA";
+export const DEFAULT_ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD";
 export const PUBLIC_API = "https://api.prismnetwork.tech";
 
 export const NO_WALLET =

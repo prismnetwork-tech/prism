@@ -155,7 +155,7 @@ function stubGateway({ price = PRICE, quoteReport = null, answer = null, confide
 function stubAgent() {
   const agent = new PrismAgent({
     privateKey: `0x${"22".repeat(32)}`,
-    escrow: "0x62C042265991bEa17B07229322A01850974626dA",
+    escrow: "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD",
   });
   const transfers = [];
   agent.transferUsdg = async (to, micros) => {

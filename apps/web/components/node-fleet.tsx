@@ -11,7 +11,7 @@ const checks = [
   "Outbound mTLS tunnel",
 ];
 
-const REGISTRY = "0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc";
+const REGISTRY = "0xa7Ca8e43c599b978095c391bd018A35BA6e7B71D";
 const RPC = "https://rpc.mainnet.chain.robinhood.com";
 const GUIDE = "https://docs.prismnetwork.tech";
 

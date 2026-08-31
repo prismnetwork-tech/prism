@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.winter0x/mcp",
   "description": "Rent real NVIDIA GPUs from your agent. Browse with no wallet; pay per second onchain.",
-  "version": "0.9.0",
+  "version": "0.9.2",
   "websiteUrl": "https://prismnetwork.tech",
   "repository": {
     "url": "https://github.com/winter0x/prism",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@prismnetwork/mcp",
-      "version": "0.9.0",
+      "version": "0.9.2",
       "transport": {
         "type": "stdio"
       },
@@ -29,7 +29,7 @@
           "name": "PRISM_ESCROW",
           "description": "Prism LeaseEscrow contract address",
           "isRequired": false,
-          "default": "0x62C042265991bEa17B07229322A01850974626dA"
+          "default": "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD"
         },
         {
           "name": "PRISM_DAILY_BUDGET_USDG",

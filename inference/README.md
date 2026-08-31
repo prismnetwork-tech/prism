@@ -22,7 +22,7 @@ ciphertext. See [Confidential generations](#confidential-generations).
 
 ```sh
 PRISM_AGENT_KEY=0x... \
-PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
+PRISM_ESCROW=0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD \
 INFERENCE_PAY_TO=0x... \
 npx -y @prismnetwork/inference-gateway
 ```

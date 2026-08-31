@@ -23,8 +23,8 @@ const sections = [
 const contracts = [
   ["USDG", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "Compute settlement, 6 decimals"],
   ["PRISM", "0x0A1e0Cc751f77C2C93760FC957CC8E4E779b2bC8", "Supplier bond asset, 18 decimals"],
-  ["NodeRegistryV1", "0xDaE90914CCb3601ABdfAEf994CD07eE7676519Dc", "Supplier bonds and offers"],
-  ["LeaseEscrowV1", "0x62C042265991bEa17B07229322A01850974626dA", "Lease funding and settlement"],
+  ["NodeRegistryV1", "0xa7Ca8e43c599b978095c391bd018A35BA6e7B71D", "Supplier bonds and offers"],
+  ["LeaseEscrowV1", "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD", "Lease funding and settlement"],
   ["Governance Safe", "0xAF1113cE9E65D79daA87005A729Ab9Bc1A9fc60a", "Administration, emergency and dispute authority"],
 ] as const;
 
@@ -102,7 +102,7 @@ const agentExample = `import { PrismAgent, DEFAULT_IMAGE } from "@prismnetwork/a
 
 const agent = new PrismAgent({
   privateKey: process.env.AGENT_KEY,
-  escrow: "0x62C042265991bEa17B07229322A01850974626dA",
+  escrow: "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD",
 });
 
 await agent.authenticate();

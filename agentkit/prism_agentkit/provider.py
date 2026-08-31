@@ -6,7 +6,7 @@ from coinbase_agentkit.network import Network
 from prismnetwork import DEFAULT_IMAGE, Lease, PrismAgent
 from pydantic import BaseModel, Field
 
-DEFAULT_ESCROW = "0x62C042265991bEa17B07229322A01850974626dA"
+DEFAULT_ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD"
 
 
 class NoArgs(BaseModel):

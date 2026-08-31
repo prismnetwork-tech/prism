@@ -22,7 +22,7 @@ import requests
 
 from ._agent import DEFAULT_IMAGE, MAX_COMMAND_BYTES, TRUST_CLASSES, Lease, PrismAgent, PrismError
 
-DEFAULT_ESCROW = "0x62C042265991bEa17B07229322A01850974626dA"
+DEFAULT_ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD"
 PUBLIC_API = "https://api.prismnetwork.tech"
 
 NO_WALLET = (

@@ -16,7 +16,7 @@ Preflight first (authenticates, checks balances and a live offer, spends nothing
 ```sh
 npm install
 PRISM_AGENT_KEY=0x<funded agent wallet> \
-PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
+PRISM_ESCROW=0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD \
 npm start
 ```
 
@@ -25,7 +25,7 @@ id only after reviewing the amount, network, node, image and expiry:
 
 ```sh
 CANARY_CONFIRM=prompt PRISM_AGENT_KEY=0x... \
-PRISM_ESCROW=0x62C042265991bEa17B07229322A01850974626dA \
+PRISM_ESCROW=0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD \
 npm start
 ```
 

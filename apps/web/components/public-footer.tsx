@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { docsUrl, siteUrl } from "@/lib/site";
 
-const escrowAddress = "0x62C042265991bEa17B07229322A01850974626dA";
+const escrowAddress = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD";
 const tokenAddress = "0x0A1e0Cc751f77C2C93760FC957CC8E4E779b2bC8";
 
 const explorer = (address: string) =>

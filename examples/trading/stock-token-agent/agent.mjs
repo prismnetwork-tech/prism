@@ -230,7 +230,7 @@ async function gatherMarketData() {
 async function analyzeOnGpu(dataset) {
   const prism = new PrismAgent({
     privateKey: process.env.PRISM_AGENT_KEY,
-    escrow: process.env.PRISM_ESCROW ?? "0x62C042265991bEa17B07229322A01850974626dA",
+    escrow: process.env.PRISM_ESCROW ?? "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD",
   });
   await prism.authenticate();
   console.log("\nleasing a GPU on Prism (provisioning usually takes 1-4 minutes)...");
