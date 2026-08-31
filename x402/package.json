@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/x402",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Pay-per-job GPU compute on Prism Network over HTTP 402, payable in USDC on Base.",
   "type": "module",
   "bin": {
@@ -8,6 +8,7 @@
   },
   "files": [
     "README.md",
+    "cdp-facilitator.mjs",
     "codec.mjs",
     "exact-evm.mjs",
     "facilitator.mjs",
