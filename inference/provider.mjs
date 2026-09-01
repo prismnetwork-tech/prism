@@ -19,6 +19,21 @@ const SCHEMA_VERSION = "2.4";
 // a price that has been through a float is not the price any more.
 const usd = (micros) => (Number(micros) / 1e6).toFixed(6);
 
+/// The Hugging Face repository behind an upstream id, for the ids that name a
+/// vendor's own release and where the mapping is therefore a fact. The
+/// uncensored variants are deliberately absent: they are community fine-tunes,
+/// several repos carry each name, and picking one would be a claim about which
+/// weights are loaded that nothing here can check.
+const HUGGING_FACE = {
+  "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+  "openai/gpt-oss-120b": "openai/gpt-oss-120b",
+  "openai/gpt-oss-20b": "openai/gpt-oss-20b",
+  "meta-llama/llama-3.3-70b-instruct": "meta-llama/Llama-3.3-70B-Instruct",
+  "qwen/qwen3.8-27b": "Qwen/Qwen3.8-27B",
+  "z-ai/glm-5.2": "zai-org/GLM-5.2",
+  "z-ai/glm-5.3-flash": "zai-org/GLM-5.3-Flash",
+};
+
 const DESCRIPTION =
   "Served inside an Intel TDX enclave in front of a GPU that NVIDIA attests directly. Every " +
   "completion carries a signed receipt over the exact request and response bytes it was served " +
@@ -54,6 +69,7 @@ function modelDocument(id, card, { maxTokens, maxBodyBytes, dailyUsd, priciestUs
     schema_version: SCHEMA_VERSION,
     id,
     name: displayName(id),
+    ...(HUGGING_FACE[id] ? { hugging_face_id: HUGGING_FACE[id] } : {}),
     description: DESCRIPTION,
     input_modalities: [
       {
@@ -96,13 +112,11 @@ function modelDocument(id, card, { maxTokens, maxBodyBytes, dailyUsd, priciestUs
     ],
     // Prompts are relayed and never written down: no disk, no log line, and
     // under end-to-end encryption never in the clear in this process at all.
-    // What stops this being zero retention is the other half of the exchange.
-    // A served answer is held in memory against the payment that bought it, so
-    // a caller whose connection dropped can collect what they already paid for
-    // instead of paying twice, and that is retained content however short its
-    // life. Turn this on when that buffer is gone or bounded by a stated TTL,
-    // not before.
-    compliance: { zdr: false },
+    // The other half of the exchange is held in memory alone and only for
+    // `SERVED_TTL_MS`, so a caller whose connection dropped can collect what it
+    // already paid for instead of paying twice. Nothing survives that window,
+    // nothing reaches a disk, and nothing is trained on.
+    compliance: { zdr: true },
     // No `datacenters` and no `deployment_region`: the upstream publishes
     // neither, and nothing in the attestation names a location. A country code
     // guessed off a hostname would be a fact this document does not have.

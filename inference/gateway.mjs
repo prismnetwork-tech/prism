@@ -68,6 +68,14 @@ export const GPU_EVIDENCE_ATTEMPTS = 8;
 /// NVIDIA attestation token's own validity.
 export const GPU_EVIDENCE_TTL_MS = 15 * 60_000;
 export const GPU_EVIDENCE_HELD = 16;
+
+/// How long a paid answer stays collectable after it was served. A caller whose
+/// connection dropped has this long to fetch what it already paid for, and then
+/// the bytes are dropped whether it came back or not. Bounding the hold in time
+/// rather than only in count is what makes the catalogue's zero-retention
+/// declaration true: nothing outlives the reconnect it exists for.
+export const SERVED_TTL_MS = 10 * 60_000;
+const SERVED_SWEEP_MS = 60_000;
 const KEYSET_DIGEST = /^sha256:[0-9a-f]{64}$/;
 
 /// Which instance a relayed evidence response came from. The relay passes the
@@ -436,10 +444,30 @@ export function createGateway({
     consumed.delete(key);
   }
   const servedKey = (key, requestHash) => `${key}:${requestHash ?? ""}`;
+  /// Oldest first, so the sweep can stop at the first entry still inside its
+  /// window. Deleting before setting is what keeps that order true when the
+  /// same payment commits twice.
   function rememberServed(key, requestHash, result) {
-    served.set(servedKey(key, requestHash), result);
+    const k = servedKey(key, requestHash);
+    served.delete(k);
+    served.set(k, { at: now(), result });
+    sweepServed();
     if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
   }
+  function sweepServed() {
+    for (const [k, held] of served) {
+      if (now() - held.at < SERVED_TTL_MS) break;
+      served.delete(k);
+    }
+  }
+  function servedResult(key, requestHash) {
+    sweepServed();
+    return served.get(servedKey(key, requestHash))?.result ?? null;
+  }
+  // Nothing else in here runs on a clock, so an idle gateway would hold its
+  // last answer until the next caller arrived. Unref'd: expiring a buffer is
+  // not a reason to keep the process alive.
+  setInterval(sweepServed, SERVED_SWEEP_MS).unref?.();
   // Append-only and rebuilt on restart; the line is reassembled from validated
   // parts rather than trusting a string built elsewhere.
   function commitPayment(txHash) {
@@ -802,7 +830,7 @@ export function createGateway({
     if (!verdict.isValid) return { ok: false, reason: verdict.invalidReason };
 
     if (!reservePayment(key)) {
-      const replay = served.get(servedKey(key, requestHash));
+      const replay = servedResult(key, requestHash);
       return { ok: false, reason: "payment_reused", ...(replay ? { replay } : {}) };
     }
 
@@ -841,7 +869,7 @@ export function createGateway({
     const outcome = await verify(txHash, signature, quotedMicros, requestHash);
     if (!outcome.ok) return outcome;
     if (!reservePayment(key)) {
-      const replay = served.get(servedKey(key, requestHash));
+      const replay = servedResult(key, requestHash);
       return { ok: false, reason: "payment_reused", ...(replay ? { replay } : {}) };
     }
     return {

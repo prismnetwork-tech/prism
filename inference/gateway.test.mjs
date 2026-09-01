@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { recoverMessageAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { boundMessage, hashRequest } from "@prismnetwork/x402/codec";
-import { createGateway, DEFAULT_PRICING, priceFor } from "./gateway.mjs";
+import { createGateway, DEFAULT_PRICING, priceFor, SERVED_TTL_MS } from "./gateway.mjs";
 
 // What a lease costs and what it produces. The rate is the network's, read off
 // /v1/offers and confirmed by settled receipts (900s billed 199,800 micros).
@@ -233,6 +233,19 @@ test("a replayed tx hash answers with the result it already bought", async () =>
   assert.equal(replay.status, 200);
   assert.equal(replay.body.replayed, true);
   assert.equal(replay.body.response, "hello");
+  assert.equal(deps.calls.generations.length, 1);
+});
+
+test("a bought answer stops being collectable once its window closes", async () => {
+  const deps = fakeDeps();
+  const gateway = build(deps);
+  assert.equal((await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment)).status, 200);
+  deps.tick(SERVED_TTL_MS + 1);
+  // The payment stays spent. What expires is the copy of the answer, so the
+  // refusal is a refusal rather than a second generation on one payment.
+  const late = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, payment);
+  assert.equal(late.status, 402);
+  assert.equal(late.body.error, "payment_reused");
   assert.equal(deps.calls.generations.length, 1);
 });
 

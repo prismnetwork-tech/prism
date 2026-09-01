@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createGateway, DEFAULT_CONFIDENTIAL_PRICING, MAX_PREDICT_TOKENS } from "./gateway.mjs";
+import {
+  createGateway,
+  DEFAULT_CONFIDENTIAL_PRICING,
+  MAX_PREDICT_TOKENS,
+  SERVED_TTL_MS,
+} from "./gateway.mjs";
 import { providerModels } from "./provider.mjs";
 
 const GEMMA = "phala/gemma-4-26b-a4b-uncensored";
@@ -153,11 +158,30 @@ test("one budget across two models is not two budgets", () => {
   }
 });
 
-test("zero data retention is declared, and it is declared false", () => {
-  // A served answer is held against the payment that bought it so a dropped
-  // connection can collect it. Claiming zero retention over a buffer that
-  // exists is the kind of claim a compliance filter is built to catch.
-  assert.deepEqual(only().compliance, { zdr: false });
+test("zero data retention is declared, and the buffer behind it is bounded", () => {
+  // The claim rests on `SERVED_TTL_MS`: the answer a dropped connection can
+  // collect lives in memory for that window and nowhere else. If the window
+  // ever stops bounding it, this stops being true before it stops being
+  // declared, so the constant is asserted here rather than trusted.
+  assert.deepEqual(only().compliance, { zdr: true });
+  assert.ok(SERVED_TTL_MS > 0 && Number.isFinite(SERVED_TTL_MS));
+});
+
+test("a hugging face id is published only where the weights are named upstream", () => {
+  // The uncensored variants are community fine-tunes served under a vendor
+  // namespace that does not exist on Hugging Face. Several repos carry each
+  // name, so naming one would be a guess about which weights answer.
+  for (const doc of catalogue({ confidential: confidential([GEMMA, QWEN]) }).data) {
+    assert.equal(doc.hugging_face_id, undefined, `${doc.id} names weights it cannot check`);
+  }
+  const vendor = providerModels({
+    confidential: {
+      ...confidential(),
+      models: { "openai/gpt-oss-20b": { base_micros: 1, per_token_micros: 1, full_cap_micros: "2" } },
+    },
+    dailyUsd: 2,
+  }).data[0];
+  assert.equal(vendor.hugging_face_id, "openai/gpt-oss-20b");
 });
 
 test("nothing is invented where the upstream publishes nothing", () => {
