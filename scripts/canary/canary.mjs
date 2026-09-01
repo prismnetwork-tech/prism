@@ -110,11 +110,26 @@ try {
   };
   log(`access mode: ${access.mode || "direct_ssh"}`);
 
-  const smi = await agent.run(
-    lease,
-    "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader",
-  );
-  if (smi.code !== 0) throw new Error(`nvidia-smi exited ${smi.code}: ${smi.stderr || smi.stdout}`);
+  // A machine is handed over when its port is allocated, not when sshd inside
+  // it has finished starting, so the first probe of a healthy lease can be
+  // refused. That warmup is not a failure; a real fault is still refused two
+  // minutes in.
+  const deadline = Date.now() + 120_000;
+  let smi;
+  for (;;) {
+    smi = await agent.run(
+      lease,
+      "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader",
+    );
+    if (smi.code === 0) break;
+    const text = `${smi.stderr || ""}${smi.stdout || ""}`;
+    const warming = /Connection refused|Connection reset|Connection timed out|Connection closed by remote host/i.test(text);
+    if (!warming || Date.now() >= deadline) {
+      throw new Error(`nvidia-smi exited ${smi.code}: ${smi.stderr || smi.stdout}`);
+    }
+    log("ssh not up yet; retrying");
+    await new Promise((resolve) => setTimeout(resolve, 10_000));
+  }
   log(`GPU verified: ${smi.stdout}`);
 } catch (err) {
   failure = err;
