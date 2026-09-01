@@ -210,6 +210,48 @@ def check_provider_credit(alarms, api_key, floor_dollars):
         )
 
 
+def check_confidential_upstream(alarms, api_key, upstream, model):
+    """The confidential relay's prepaid upstream balance cannot be queried:
+    every account endpoint on the provider 404s. A dry balance answers 503,
+    which is the one capacity failure that counts against a router's uptime
+    score. The only reading that proves the balance is alive is a paid
+    generation, so this spends one token on the cheapest model."""
+    if not api_key:
+        alarms.append(
+            Alarm(
+                "confidential_upstream_config",
+                "PHALA_API_KEY is empty, so the confidential upstream is not monitored",
+            )
+        )
+        return
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ok"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    try:
+        answer = json.loads(
+            post(
+                f"{upstream}/chat/completions",
+                body,
+                {"Authorization": f"Bearer {api_key}"},
+            )
+        )
+    except urllib.error.HTTPError as error:
+        alarms.append(
+            Alarm(
+                "confidential_upstream",
+                f"confidential upstream answered {error.code} to a paid probe; "
+                "if the prepaid balance is dry the relay serves 503s that count "
+                "against the uptime score",
+            )
+        )
+        return
+    if not answer.get("choices"):
+        raise RuntimeError("confidential upstream returned no choices")
+
+
 def check_canary(alarms, path, stale_seconds):
     """Everything else here infers health. This reads the result of actually
     renting a GPU: quote, fund, provision, log in, run something, settle.
@@ -353,6 +395,15 @@ def main():
         ("unconfirmed", lambda: check_unconfirmed(alarms, rpc_url, escrow, unconfirmed_seconds, unconfirmed_depth)),
         ("signers", lambda: check_signers(alarms, rpc_url, signers, gas_floor)),
         ("credit", lambda: check_provider_credit(alarms, os.environ.get("VAST_API_KEY"), credit_floor)),
+        (
+            "confidential",
+            lambda: check_confidential_upstream(
+                alarms,
+                os.environ.get("PHALA_API_KEY"),
+                os.environ.get("PRISM_CONFIDENTIAL_UPSTREAM", "https://tee.redpill.ai/v1"),
+                os.environ.get("PRISM_CONFIDENTIAL_PROBE_MODEL", "openai/gpt-oss-20b"),
+            ),
+        ),
         ("reconcile", lambda: check_reconciliation(alarms, metrics_url)),
         ("canary", lambda: check_canary(alarms, canary_path, canary_stale)),
     )
