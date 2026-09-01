@@ -533,7 +533,14 @@ impl Report {
                 "deployed services are running different builds"
             );
         }
-        if !self.solvency_ok() {
+        if self.chain_configured && !self.chain_reachable {
+            // The money invariants fail closed on a blind pass, but saying
+            // "insolvent" when the truth is "could not look" sends whoever is
+            // paged chasing the wrong emergency.
+            tracing::error!(
+                "chain is unreachable, so the money invariants fail closed until a pass lands"
+            );
+        } else if !self.solvency_ok() {
             tracing::error!(
                 balance = self.escrow_usdg_balance,
                 open_deposits = self.open_lease_deposit_sum,
@@ -558,7 +565,7 @@ impl Report {
                 "control-plane leases have no matching on-chain escrow"
             );
         }
-        if !self.active_bound_ok() {
+        if (!self.chain_configured || self.chain_reachable) && !self.active_bound_ok() {
             tracing::error!(
                 active = self.chain_active_leases,
                 cap = MAX_NETWORK_LEASES,

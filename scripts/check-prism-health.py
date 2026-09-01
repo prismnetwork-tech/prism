@@ -196,16 +196,21 @@ def check_provider_credit(alarms, api_key, floor_dollars):
             {"Authorization": f"Bearer {api_key}"},
         )
     )
-    if "balance" not in account:
+    if "balance" not in account and "credit" not in account:
         raise RuntimeError("Vast account response has no balance")
-    balance = float(account["balance"])
-    if not math.isfinite(balance):
+    # A prepaid account carries its spendable money in `credit`; `balance` is
+    # earnings and reads 0 on the renting account, which is exactly the reading
+    # that once made a funded account look dry.
+    spendable = max(
+        float(account.get("balance") or 0), float(account.get("credit") or 0)
+    )
+    if not math.isfinite(spendable):
         raise RuntimeError("Vast account balance is invalid")
-    if balance < floor_dollars:
+    if spendable < floor_dollars:
         alarms.append(
             Alarm(
                 "provider_credit",
-                f"Vast balance is ${balance:.2f}, under the ${floor_dollars:.2f} floor",
+                f"Vast credit is ${spendable:.2f}, under the ${floor_dollars:.2f} floor",
             )
         )
 
@@ -239,14 +244,26 @@ def check_confidential_upstream(alarms, api_key, upstream, model):
             )
         )
     except urllib.error.HTTPError as error:
-        alarms.append(
-            Alarm(
-                "confidential_upstream",
-                f"confidential upstream answered {error.code} to a paid probe; "
-                "if the prepaid balance is dry the relay serves 503s that count "
-                "against the uptime score",
+        if error.code == 429:
+            # Throttled, not broke: the upstream answered, so the balance is
+            # alive. At one probe per five minutes a 429 is load, not us.
+            alarms.append(
+                Alarm(
+                    "confidential_throttled",
+                    "confidential upstream answered 429 to a one-token probe; "
+                    "the relay maps that to 503, which counts against the "
+                    "uptime score if it persists",
+                )
             )
-        )
+        else:
+            alarms.append(
+                Alarm(
+                    "confidential_upstream",
+                    f"confidential upstream answered {error.code} to a paid "
+                    "probe; a dry prepaid balance or a revoked key serves "
+                    "503s that count against the uptime score",
+                )
+            )
         return
     if not answer.get("choices"):
         raise RuntimeError("confidential upstream returned no choices")
@@ -314,7 +331,17 @@ def check_reconciliation(alarms, url):
 
     if readings.get("prism_reconcile_up", 0) != 1:
         alarms.append(Alarm("reconcile", "reconciliation monitor cannot read its own inputs"))
-    if readings.get("prism_reconcile_solvency_ok", 1) != 1:
+    blind = (
+        readings.get("prism_reconcile_chain_configured", 0) == 1
+        and readings.get("prism_reconcile_chain_reachable", 1) != 1
+    )
+    if blind:
+        # The money invariants fail closed on a blind pass; report the blindness
+        # rather than an insolvency nobody has measured.
+        alarms.append(
+            Alarm("chain_blind", "reconciliation monitor cannot reach the RPC; money invariants unchecked")
+        )
+    elif readings.get("prism_reconcile_solvency_ok", 1) != 1:
         alarms.append(Alarm("solvency", "escrow USDG no longer covers the open lease deposits"))
     violations = readings.get("prism_reconcile_conservation_violations_total", 0)
     if violations:

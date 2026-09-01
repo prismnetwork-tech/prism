@@ -22,6 +22,14 @@ const RPC_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const RPC_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const RPC_RETRY_AFTER_LIMIT: Duration = Duration::from_secs(10);
 const RPC_ERROR_BODY_LIMIT: usize = 1_024;
+
+fn env_number(name: &str) -> Option<u64> {
+    let raw = env::var(name).ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => None,
+    }
+}
 const TRANSACTION_RECONCILIATION_ATTEMPTS: usize = 3;
 const TRANSACTION_RECONCILIATION_DELAY: Duration = Duration::from_millis(200);
 
@@ -313,12 +321,20 @@ struct BlockHeader {
 
 impl RpcClient {
     pub fn new(value: &str) -> anyhow::Result<Self> {
-        Self::with_policy(
-            value,
-            RPC_REQUEST_TIMEOUT,
-            RPC_CONNECT_TIMEOUT,
-            RetryPolicy::default(),
-        )
+        // Every service shares one egress IP and one provider rate limit, so a
+        // read-only service can afford to wait out a 429 that a signer cannot.
+        // The defaults stay put; a deployment opts one service into patience.
+        let mut retry = RetryPolicy::default();
+        if let Some(attempts) = env_number("PRISM_RPC_MAX_ATTEMPTS") {
+            retry.max_attempts = attempts as usize;
+        }
+        if let Some(millis) = env_number("PRISM_RPC_RETRY_BASE_MS") {
+            retry.base_delay = Duration::from_millis(millis);
+        }
+        if let Some(millis) = env_number("PRISM_RPC_RETRY_MAX_MS") {
+            retry.max_delay = Duration::from_millis(millis);
+        }
+        Self::with_policy(value, RPC_REQUEST_TIMEOUT, RPC_CONNECT_TIMEOUT, retry)
     }
 
     fn with_policy(
