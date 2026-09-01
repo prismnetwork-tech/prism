@@ -15,7 +15,7 @@
     "check": "npm test && node canary.mjs --dry-run"
   },
   "dependencies": {
-    "@prismnetwork/agent-sdk": "0.7.2",
+    "@prismnetwork/agent-sdk": "^0.7.6",
     "viem": "^2"
   }
 }
