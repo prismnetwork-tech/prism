@@ -78,7 +78,19 @@ jobs:
           while IFS= read -r line; do args+=(--build-arg "$line"); done < public-build-args.env
           docker build --platform linux/amd64 -f deploy/Dockerfile.web "${args[@]}" -t "$tag" .
           docker push "$tag"
-          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          # A push that has returned is not yet a tag the registry will serve.
+          # Render pulled 18 seconds after one such push, got nothing, and
+          # failed a deploy whose image was fine. Wait for the tag to answer
+          # before anyone is told to fetch it.
+          for attempt in $(seq 1 30); do
+            if docker manifest inspect "$tag" >/dev/null 2>&1; then
+              printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 5
+          done
+          printf '%s is not resolvable %s after the push\n' "$tag" "150 seconds"
+          exit 1
 
       # Pinning the tag is what makes the deploy carry this commit. Without it
       # the request below redeploys the previous image.
