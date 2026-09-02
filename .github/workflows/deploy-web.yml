@@ -78,18 +78,29 @@ jobs:
           while IFS= read -r line; do args+=(--build-arg "$line"); done < public-build-args.env
           docker build --platform linux/amd64 -f deploy/Dockerfile.web "${args[@]}" -t "$tag" .
           docker push "$tag"
-          # A push that has returned is not yet a tag the registry will serve.
-          # Render pulled 18 seconds after one such push, got nothing, and
-          # failed a deploy whose image was fine. Wait for the tag to answer
-          # before anyone is told to fetch it.
-          for attempt in $(seq 1 30); do
-            if docker manifest inspect "$tag" >/dev/null 2>&1; then
+          # A push that has returned is not yet a tag the world can fetch.
+          # Render pulls anonymously, and public visibility lags the push by
+          # up to a minute, so two deploys failed on images that were built,
+          # pushed and public. Checking with this job's credentials answers
+          # the wrong question: it can see the tag immediately. Ask the way
+          # the puller asks, with a token that carries no account.
+          manifests="https://ghcr.io/v2/${GITHUB_REPOSITORY}/web/manifests/${GITHUB_SHA::7}"
+          anonymous="https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}/web:pull&service=ghcr.io"
+          for _ in $(seq 1 40); do
+            token=$(curl --silent --fail "$anonymous" | jq -r .token)
+            code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --header "Authorization: Bearer $token" \
+              --header 'Accept: application/vnd.oci.image.index.v1+json' \
+              --header 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+              --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+              "$manifests")
+            if [ "$code" = "200" ]; then
               printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             sleep 5
           done
-          printf '%s is not resolvable %s after the push\n' "$tag" "150 seconds"
+          printf '%s is still not anonymously pullable after 200 seconds\n' "$tag"
           exit 1
 
       # Pinning the tag is what makes the deploy carry this commit. Without it
