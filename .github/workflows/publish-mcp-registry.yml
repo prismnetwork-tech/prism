@@ -1,0 +1,72 @@
+name: publish mcp registry
+
+# The MCP registry is what Smithery, Glama and PulseMCP ingest, so a stale
+# entry there is a stale listing everywhere downstream. Ours sat several
+# versions behind because publishing it was a thing someone had to remember.
+#
+# The registry proves ownership of an npm package by matching the `mcpName`
+# field inside the published tarball to the server name being registered, so
+# this can only run after the matching version is on npm. It is deliberately
+# manual: the version to publish is the one npm actually serves, which is not
+# always the version in the working tree.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version already published to npm
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      # Registering a version npm does not serve leaves the registry pointing
+      # at nothing, which is worse than the stale entry it replaced.
+      - name: Check npm serves this version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          name=$(jq -r .name mcp/package.json)
+          published=$(npm view "$name@$VERSION" version)
+          [ "$published" = "$VERSION" ]
+          mcp_name=$(npm view "$name@$VERSION" mcpName)
+          declared=$(jq -r .name mcp/server.json)
+          if [ "$mcp_name" != "$declared" ]; then
+            printf 'npm carries mcpName %s but server.json registers %s\n' "$mcp_name" "$declared"
+            printf 'the registry checks these match, so publish npm again first\n'
+            exit 1
+          fi
+
+      - name: Install MCP publisher
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/mcp-publisher.tar.gz"
+          curl --fail --location --silent --show-error \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.8.0/mcp-publisher_linux_amd64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            1370446bbe74d562608e8005a6ccce02d146a661fbd78674e11cc70b9618d6cf \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" mcp-publisher
+
+      - name: Publish
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/server.json"
+          jq --arg v "$VERSION" '.version = $v | .packages[].version = $v' mcp/server.json > "$manifest"
+          "$RUNNER_TEMP/mcp-publisher" validate "$manifest"
+          "$RUNNER_TEMP/mcp-publisher" login github-oidc
+          "$RUNNER_TEMP/mcp-publisher" publish "$manifest"
