@@ -13,7 +13,7 @@ export const MCP_SERVER_VERSION = "0.2.0";
 export const CHAIN_ID = 4663;
 export const CHAIN_NAME = "Robinhood Chain";
 export const USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
-export const CURRENT_ESCROW = "0x62c042265991bea17b07229322a01850974626da";
+export const CURRENT_ESCROW = "0xfd4228eeefc49e4b76a0cd40af9fdd546220b2fd";
 export const CAP_MICROS = 500_000n;
 export const CONFIRMATIONS = 12;
 // Asserted by the runner as well as the container command, so an exit-zero

@@ -1805,9 +1805,17 @@ impl Worker {
                 survey.listed,
                 vast.policy()
             ),
-            (None, Some(cheapest)) => format!(
+            // Saying "over the ceiling" about a host that is under it sends the
+            // next reader to the price policy, which is the one thing that is
+            // not wrong. Only price gets blamed for price.
+            (None, Some(cheapest)) if survey.affordable == 0 => format!(
                 "no capacity: cheapest of {} eligible hosts is {} micros/hr, over the {} ceiling",
                 survey.of_our_class, cheapest, survey.ceiling
+            ),
+            (None, Some(cheapest)) => format!(
+                "no capacity: {} of {} eligible hosts are within the {} ceiling (cheapest {} micros/hr), \
+                 but none passed the throughput floor or the rejected-machine list",
+                survey.affordable, survey.of_our_class, survey.ceiling, cheapest
             ),
         };
         if last.as_deref() != Some(note.as_str()) {

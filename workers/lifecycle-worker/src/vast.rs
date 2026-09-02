@@ -73,6 +73,8 @@ pub(crate) struct Survey {
     /// Of those, the ones in a class and memory size this broker rents.
     pub(crate) of_our_class: usize,
     pub(crate) cheapest_of_class: Option<u64>,
+    /// Of `of_our_class`, how many sit under the price ceiling.
+    pub(crate) affordable: usize,
     pub(crate) ceiling: u64,
     /// One host per slot we are willing to advertise, cheapest first.
     pub(crate) hosts: Vec<Offer>,
@@ -408,10 +410,20 @@ impl VastBroker {
             .iter()
             .filter_map(|offer| hourly_micros(offer.dph_total).ok())
             .min();
+        // Price is only one of the reasons ranking drops a host. Counting the
+        // affordable ones separately is what lets the report say "too slow"
+        // instead of blaming a ceiling the host is comfortably under.
+        let affordable = admitted
+            .iter()
+            .filter(|offer| {
+                hourly_micros(offer.dph_total).is_ok_and(|cost| cost <= self.ceiling(ceiling))
+            })
+            .count();
         Ok(Survey {
             listed,
             of_our_class,
             cheapest_of_class,
+            affordable,
             ceiling: self.ceiling(ceiling),
             hosts: rank_offers(
                 admitted.clone(),
