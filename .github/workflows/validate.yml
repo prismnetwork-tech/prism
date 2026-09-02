@@ -43,11 +43,17 @@ jobs:
             contact@prismnetwork.tech
             dev@prismnetwork.tech
             mika@prismnetwork.tech
+            release@prismnetwork.tech
             noreply@github.com
+            winterstacks@users.noreply.github.com
+            320915661+winter0x@users.noreply.github.com
+            kamiyo-ai@users.noreply.github.com
           PRISM_ALLOWED_GIT_NAMES: |-
             Prism Network
             useprismnetwork
             winterstacks
             Mika Winter
             ianklemm
+            winter0x
+            mizuki0x
             GitHub

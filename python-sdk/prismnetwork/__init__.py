@@ -28,4 +28,4 @@ __all__ = [
     "hash_request",
     "payment_header",
 ]
-__version__ = "0.3.0"
+__version__ = "0.3.2"

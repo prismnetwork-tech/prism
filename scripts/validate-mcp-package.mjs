@@ -34,9 +34,12 @@ const packed = JSON.parse(
 assert.equal(packed.length, 1, "npm pack must produce one archive");
 assert.equal(packed[0].name, packageJson.name);
 assert.equal(packed[0].version, packageJson.version);
+// Every file the server imports has to be in the archive. `budget.mjs` carries
+// the spend ledger, so shipping without it leaves a package that installs and
+// then throws on first import, which is the failure this check exists to catch.
 assert.deepEqual(
   packed[0].files.map(({ path }) => path).sort(),
-  ["README.md", "package.json", "server.mjs"],
+  ["README.md", "budget.mjs", "package.json", "server.mjs"],
   "npm archive contents changed",
 );
 
