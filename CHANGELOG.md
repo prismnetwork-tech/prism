@@ -4,6 +4,13 @@ All notable changes will be documented here.
 
 The project follows semantic versioning after its first stable release.
 
+## 2026-09-02
+
+- The project's home returns to `github.com/prismnetwork-tech`. Repository
+  links, package metadata, the MCP registry namespace
+  (`io.github.prismnetwork-tech/mcp`) and the image path
+  (`ghcr.io/prismnetwork-tech/prism`) all point at the organization again.
+
 ## Unreleased
 
 ### Changed

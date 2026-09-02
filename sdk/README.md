@@ -156,7 +156,7 @@ it.
 The chain walk runs in our control plane, so `attested` says we checked the
 report. The SDK holds the session to the fingerprint we published and never sees
 the report itself, which leaves us in the set you are trusting.
-[ATTESTATION.md](https://github.com/winter0x/prism/blob/main/docs/ATTESTATION.md)
+[ATTESTATION.md](https://github.com/prismnetwork-tech/prism/blob/main/docs/ATTESTATION.md)
 says what the report covers and what it does not.
 
 `reported` means the node named the key on the signed report that opened access.
@@ -198,4 +198,4 @@ The wallet needs two balances on Robinhood Chain (id 4663): USDG (`0x5fc5360D040
 Node >= 20, `viem` ^2 (peer), and `ssh`, `ssh-keygen` and `ssh-keyscan` on PATH
 for `run()` and for workspace save and restore.
 
-See [example.mjs](https://github.com/winter0x/prism/blob/main/sdk/example.mjs) for a full run.
+See [example.mjs](https://github.com/prismnetwork-tech/prism/blob/main/sdk/example.mjs) for a full run.

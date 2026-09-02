@@ -2,7 +2,7 @@
   "name": "@prismnetwork/mcp",
   "version": "0.9.2",
   "description": "MCP server for leasing and running on Prism Network GPUs.",
-  "mcpName": "io.github.winter0x/mcp",
+  "mcpName": "io.github.prismnetwork-tech/mcp",
   "type": "module",
   "bin": {
     "prism-mcp": "server.mjs"
@@ -33,11 +33,11 @@
   "homepage": "https://prismnetwork.tech",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/winter0x/prism.git",
+    "url": "git+https://github.com/prismnetwork-tech/prism.git",
     "directory": "mcp"
   },
   "bugs": {
-    "url": "https://github.com/winter0x/prism/issues"
+    "url": "https://github.com/prismnetwork-tech/prism/issues"
   },
   "license": "Apache-2.0",
   "publishConfig": {

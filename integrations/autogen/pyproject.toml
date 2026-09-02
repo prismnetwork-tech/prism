@@ -16,7 +16,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://prismnetwork.tech"
-Repository = "https://github.com/winter0x/prism"
+Repository = "https://github.com/prismnetwork-tech/prism"
 
 [tool.hatch.build.targets.wheel]
 packages = ["prism_autogen"]

@@ -601,7 +601,7 @@ fn workspace_command(
 /// produce evidence of whatever it likes. The digest is filled in from the
 /// published reporter build, and an unset one fails the pull rather than
 /// resolving to a moving tag.
-const ATTESTATION_IMAGE: &str = "ghcr.io/winter0x/prism/gpu-attest@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const ATTESTATION_IMAGE: &str = "ghcr.io/prismnetwork-tech/prism/gpu-attest@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Same isolation a lease gets, with the workspace ports and credentials
 /// removed and one writable directory added. The lease control mount is
