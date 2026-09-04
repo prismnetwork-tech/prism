@@ -492,6 +492,23 @@ fn candidate_refusal(
     if stalled { timed_out() } else { None }
 }
 
+/// Whether an SSH server is listening at the address a host advertises. Only
+/// the banner is read; nothing is sent, so a host that answers has been given
+/// nothing it could use.
+async fn sshd_answers(host: &str, port: u16) -> bool {
+    use tokio::io::AsyncReadExt;
+
+    let connect = tokio::net::TcpStream::connect((host, port));
+    let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_secs(5), connect).await else {
+        return false;
+    };
+    let mut banner = [0u8; 4];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut banner)).await,
+        Ok(Ok(_)) if &banner == b"SSH-"
+    )
+}
+
 fn boot_budget_exhausted(attached_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     attached_at.is_some_and(|attached| {
         now.signed_duration_since(attached).num_seconds() > HOST_BOOT_BUDGET_SECONDS
@@ -2744,7 +2761,7 @@ impl Worker {
             // Out of boot budget. Fall through so this machine is destroyed,
             // blacklisted for this lease and replaced, exactly as a refusal is.
         }
-        let refusal = candidate_refusal(
+        let mut refusal = candidate_refusal(
             &instance,
             vast.admits(&instance.gpu_name, instance.gpu_ram),
             context.min_vram_mib,
@@ -2752,6 +2769,25 @@ impl Worker {
             &rejected,
             stalled,
         );
+        // A forwarded port Vast reports is a promise, not a listener: hosts
+        // have answered "running" with a port that refused every connection
+        // for the whole window, and a renter handed that address pays for a
+        // machine they cannot enter. Access opens only once something speaks
+        // SSH on it, and a host that never does is refused inside the boot
+        // budget and replaced like any other.
+        if refusal.is_none()
+            && instance.status == "running"
+            && instance.direct_port_start > 0
+            && let (Some(host), Some(port)) = (instance.ssh_host.as_deref(), instance.ssh_port)
+            && !sshd_answers(host, port).await
+        {
+            if !stalled {
+                return Err(StillProvisioning.into());
+            }
+            refusal = Some(format!(
+                "nothing answered on {host}:{port} after {HOST_BOOT_BUDGET_SECONDS}s of boot budget"
+            ));
+        }
         if let Some(refusal) = refusal {
             let refusal = self
                 .stage_refused_cloud_instance(
@@ -5456,6 +5492,35 @@ fn validate_lifecycle_transaction_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a listener that speaks SSH counts. A port that accepts and says
+    /// nothing is exactly the Vast relay a renter waits out, and a closed port
+    /// is the host that never started sshd.
+    #[tokio::test]
+    async fn an_ssh_banner_is_the_only_answer_that_opens_access() {
+        use tokio::io::AsyncWriteExt;
+
+        let speaks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let speaking_port = speaks.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = speaks.accept().await.unwrap();
+            stream.write_all(b"SSH-2.0-OpenSSH_9.6\r\n").await.unwrap();
+        });
+        assert!(sshd_answers("127.0.0.1", speaking_port).await);
+
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_stream, _) = silent.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        assert!(!sshd_answers("127.0.0.1", silent_port).await);
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        assert!(!sshd_answers("127.0.0.1", closed_port).await);
+    }
 
     async fn signed_lifecycle_transaction(
         key: &str,
