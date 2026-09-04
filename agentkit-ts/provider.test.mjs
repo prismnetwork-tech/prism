@@ -80,7 +80,7 @@ test("follow-up commands and release only work on a lease this session opened", 
   await named.prism_lease_and_run.invoke(named.prism_lease_and_run.schema.parse({ command: "nvidia-smi" }));
 
   assert.match(await named.prism_run.invoke({ leaseId: 31, command: "echo hi" }), /31:echo hi/);
-  assert.equal(await named.prism_end_lease.invoke({ leaseId: 31 }), "released lease 31");
+  assert.match(await named.prism_end_lease.invoke({ leaseId: 31 }), /^released lease 31/);
   assert.deepEqual(agent.released, [31]);
   assert.match(await named.prism_run.invoke({ leaseId: 31, command: "echo hi" }), /not open in this session/);
 });

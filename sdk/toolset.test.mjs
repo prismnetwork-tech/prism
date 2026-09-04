@@ -31,8 +31,9 @@ function fakeAgent(overrides = {}) {
       this.ran.push(command);
       return { code: 0, stdout: `${lease.leaseId}:${command}`, stderr: "", timedOut: false };
     },
-    endLease(lease) {
+    async endLease(lease) {
       this.ended.push(lease.leaseId);
+      return { lease_id: lease.leaseId, state: "active", release: "queued" };
     },
     ...overrides,
   };
@@ -117,9 +118,22 @@ test("lease ids coerce from strings and unknown ids read as such", async () => {
   await toolset.leaseAndRun({ command: "nvidia-smi" });
   assert.match(await toolset.run("7", "echo hi"), /7:echo hi/);
   assert.match(await toolset.run("seven", "echo hi"), /positive integer/);
-  assert.match(toolset.endLease(99), /No active lease 99/);
-  assert.match(toolset.endLease("7"), /released lease 7/);
+  assert.match(await toolset.endLease(99), /No active lease 99/);
+  assert.match(await toolset.endLease("7"), /released lease 7/);
   assert.deepEqual(agent.ended, [7]);
+});
+
+test("a release the network refuses is reported, not hidden", async () => {
+  const agent = fakeAgent({
+    async endLease(lease) {
+      this.ended.push(lease.leaseId);
+      return { lease_id: lease.leaseId, state: null, release: "failed", error: "prism 503: service_unavailable" };
+    },
+  });
+  const toolset = new PrismToolset({ agent });
+  await toolset.leaseAndRun({ command: "nvidia-smi" });
+  assert.match(await toolset.endLease(7), /could not be released.*meter may still be running/);
+  assert.match(await toolset.endLease(7), /No active lease 7/);
 });
 
 test("an expired lease is swept before the next lease call", async () => {

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prismnetwork"
-version = "0.3.2"
-description = "Headless GPU leasing on Prism Network for autonomous agents. Wallet-signature auth, on-chain USDG payment, SSH."
+version = "0.4.0"
+description = "Headless GPU leasing and metered confidential inference on Prism Network for autonomous agents. Wallet-signature auth, on-chain USDG payment, SSH."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -14,7 +14,16 @@ dependencies = [
     "requests>=2.31",
     "web3>=6.0",
     "eth-account>=0.11",
+    "cryptography>=42.0",
 ]
+
+# Verifying a TDX quote to Intel's root needs the DCAP verifier, and checking
+# NVIDIA's attestation tokens needs a JWT reader. Without the first, a
+# confidential call refuses rather than sending a prompt to an enclave whose
+# hardware evidence nothing has checked; without the second, verifying an answer
+# after the fact reports the GPU check as one it could not run.
+[project.optional-dependencies]
+confidential = ["dcap-qvl>=0.6.3", "pyjwt[crypto]>=2.8"]
 
 [project.urls]
 Homepage = "https://prismnetwork.tech"

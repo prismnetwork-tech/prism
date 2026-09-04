@@ -26,5 +26,5 @@ export declare class PrismToolset {
   listGpus(minTrustClass?: string): Promise<string>;
   leaseAndRun(options: LeaseAndRunOptions): Promise<string>;
   run(leaseId: number, command: string): Promise<string>;
-  endLease(leaseId: number): string;
+  endLease(leaseId: number): Promise<string>;
 }

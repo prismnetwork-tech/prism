@@ -140,6 +140,16 @@ after, money moves. See [integrity monitoring](#integrity-monitoring).
   gateway grant or the direct cloud SSH endpoint, plus
   `channel_key_fingerprint` and `channel_key_source` where the network can say
   which SSH host key the session should terminate on.
+- `POST /v1/leases/{lease_id}/release` ends a running lease early. Access is
+  revoked and the escrow's access window is closed, so settlement charges only
+  the seconds used and the remainder returns on the contract's own schedule. A
+  lease that has not opened access yet is refused, as is a batch lease, which
+  ends when its command reports; a lease already closing or settled answers the
+  same way twice. A physical node learns of the release from the answer to its
+  next command report and stops the container; until it reports that, the node
+  is not offered again. A node that restarts instead of reporting has the
+  command closed out on its next poll, so the released workspace does not start
+  again and the node returns to the market.
 - `POST /v1/nodes/{node_id}/commands/next` leases a launch command to the device
   after verifying a fresh device signature.
 - `POST /v1/nodes/{node_id}/commands/{command_id}/report` records signed

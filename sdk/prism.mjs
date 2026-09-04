@@ -239,10 +239,12 @@ export class PrismAgent {
       // The hash travels with the failure because it is the only thing that
       // says the money left this wallet, and whatever is counting the day's
       // spend has to be able to tell the two apart.
-      throw new PrismError(502, "chain_error", {
-        cause: err?.shortMessage ?? err?.message ?? String(err),
-        ...(broadcast ? { payment_tx: broadcast } : {}),
-      });
+      throw new PrismError(
+        502,
+        "chain_error",
+        { cause: err?.shortMessage ?? err?.message ?? String(err), ...(broadcast ? { payment_tx: broadcast } : {}) },
+        broadcast,
+      );
     }
   }
 
@@ -322,10 +324,12 @@ export class PrismAgent {
       // The deposit is in the escrow the moment the chain accepts this, and
       // waiting for confirmations is where a flaky rpc gives up. Losing the
       // hash here would leave a funded lease nobody can name.
-      throw new PrismError(502, "chain_error", {
-        cause: err?.shortMessage ?? err?.message ?? String(err),
-        ...(broadcast ? { funding_hash: broadcast } : {}),
-      });
+      throw new PrismError(
+        502,
+        "chain_error",
+        { cause: err?.shortMessage ?? err?.message ?? String(err), ...(broadcast ? { funding_hash: broadcast } : {}) },
+        broadcast,
+      );
     }
   }
 
@@ -498,9 +502,15 @@ export class PrismAgent {
       const detail = { funding_hash: funded.hash, lease_id: leaseId, key_path: key.keyPath };
       if (err instanceof PrismError) {
         err.body = { ...(err.body ?? {}), ...detail };
+        err.broadcast = funded.hash;
         throw err;
       }
-      throw new PrismError(502, "lease_failed_after_funding", { ...detail, cause: err?.message ?? String(err) });
+      throw new PrismError(
+        502,
+        "lease_failed_after_funding",
+        { ...detail, cause: err?.message ?? String(err) },
+        funded.hash,
+      );
     }
   }
 
@@ -589,14 +599,33 @@ export class PrismAgent {
     return openRelayForwarder(lease.access, { service });
   }
 
-  // Releases local key material. The on-chain lease settles at the end of its duration.
-  endLease(lease) {
+  // Releases the lease on the network, which is what stops the meter: settlement
+  // charges the seconds between access opening and this call and returns the
+  // rest of the deposit. Key material goes either way. Never rejects, because
+  // most callers fire it from cleanup paths; a refused release comes back in
+  // the result so a caller that cares can tell the operator the meter is still
+  // running.
+  // Releases a lease by id, for one this process holds no handle to (the id a
+  // failed fund names, a lease listed by leases()). Rejects when the network
+  // refuses, because the wallet is still paying for the machine.
+  async release(leaseId) {
+    return this.#proxy("POST", ["leases", String(leaseId), "release"]);
+  }
+
+  async endLease(lease) {
     if (lease?.keyDir) {
       try {
         rmSync(lease.keyDir, { recursive: true, force: true });
       } catch {
         /* best effort */
       }
+    }
+    if (lease?.leaseId === undefined || lease?.leaseId === null) return { lease_id: null, release: "failed", error: "no lease id" };
+    try {
+      const out = await this.release(lease.leaseId);
+      return { lease_id: Number(lease.leaseId), state: out?.state ?? null, release: out?.release ?? "queued" };
+    } catch (error) {
+      return { lease_id: Number(lease.leaseId), state: null, release: "failed", error: error?.message ?? String(error) };
     }
   }
 
@@ -669,7 +698,7 @@ export class PrismAgent {
         });
         bytes = Buffer.from(await res.arrayBuffer());
       } catch (err) {
-        throw new PrismError(504, "endpoint_unreachable", { cause: err?.message ?? String(err), ...kept });
+        throw new PrismError(504, "endpoint_unreachable", { cause: err?.message ?? String(err), ...kept }, tx);
       }
       if (res.status === 200) {
         this.#pendingPayments.delete(key);
@@ -677,10 +706,15 @@ export class PrismAgent {
         // already consumed. That is an answer to an earlier call, so it is not
         // this one's, whatever the status line says.
         if (String(res.headers.get("x-prism-replayed") ?? "").toLowerCase() === "true") {
-          throw new PrismError(409, "payment_replayed", {
-            cause: `the endpoint replayed an earlier answer for tx ${tx}`,
-            hint: "this payment was already consumed by another call; pay again to have this request served",
-          });
+          throw new PrismError(
+            409,
+            "payment_replayed",
+            {
+              cause: `the endpoint replayed an earlier answer for tx ${tx}`,
+              hint: "this payment was already consumed by another call; pay again to have this request served",
+            },
+            tx,
+          );
         }
         return { status: 200, headers: res.headers, bytes, tx, sent };
       }
@@ -700,10 +734,15 @@ export class PrismAgent {
         (res.status === 402 && ["insufficient_confirmations", "tx_not_found"].includes(answered?.error));
       if (!retryable || Date.now() > deadline) {
         const said = [answered?.detail, answered?.retry].filter(Boolean).join("; ");
-        throw new PrismError(res.status, answered?.error ?? "generation_failed", {
-          cause: said || answered?.error || `status ${res.status}`,
-          ...(this.#pendingPayments.has(key) ? kept : { payment_tx: tx }),
-        });
+        throw new PrismError(
+          res.status,
+          answered?.error ?? "generation_failed",
+          {
+            cause: said || answered?.error || `status ${res.status}`,
+            ...(this.#pendingPayments.has(key) ? kept : { payment_tx: tx }),
+          },
+          tx,
+        );
       }
       await sleep(retryDelayMs);
       if (seal) sent = seal();
@@ -1055,11 +1094,15 @@ export class PrismAgent {
 }
 
 export class PrismError extends Error {
-  constructor(status, code, body) {
+  constructor(status, code, body, broadcast = null) {
     super(`prism ${status}: ${code}`);
     this.name = "PrismError";
     this.status = status;
     this.code = code;
     this.body = body;
+    // The transaction this process put on the wire before the failure, when
+    // there was one. `body` is whatever the far side sent back and can say
+    // anything; this is the only field that says the money left this wallet.
+    this.broadcast = broadcast;
   }
 }

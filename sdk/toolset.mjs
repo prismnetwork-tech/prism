@@ -210,14 +210,17 @@ export class PrismToolset {
     return `exit ${res.code}:\n${res.stdout || res.stderr || ""}`;
   }
 
-  endLease(leaseId) {
+  async endLease(leaseId) {
     if (!this.#agent) return NO_WALLET;
     leaseId = Number(leaseId);
     if (!Number.isInteger(leaseId) || leaseId <= 0) return "lease_id must be a positive integer.";
     const lease = this.#leases.get(leaseId);
     if (!lease) return `No active lease ${leaseId} in this session.`;
-    this.#agent.endLease(lease);
     this.#leases.delete(leaseId);
-    return `released lease ${leaseId}`;
+    const out = await this.#agent.endLease(lease);
+    if (out.release === "failed") {
+      return `Lease ${leaseId} could not be released: ${out.error}. Its access key is gone but the meter may still be running; check receipts for the settled charge.`;
+    }
+    return `released lease ${leaseId}; billing stopped here and the unused deposit returns after settlement`;
   }
 }

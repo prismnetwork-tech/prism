@@ -606,6 +606,28 @@ fn should_issue_gateway_access(cloud: bool, batch: bool) -> bool {
     !cloud && !batch
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshDecision {
+    /// The gateway is shut on this lease: the meter stopped with it, and a
+    /// fresh hour of access minted now is compute nobody pays for. A refresh
+    /// queued before the close, or claimed alongside it by a second worker,
+    /// arrives here.
+    Drop,
+    Rotate,
+    /// Cloud and batch leases carry no gateway session to rotate.
+    Nothing,
+}
+
+fn refresh_decision(access_closed: bool, cloud: bool, batch: bool) -> RefreshDecision {
+    if access_closed {
+        RefreshDecision::Drop
+    } else if should_issue_gateway_access(cloud, batch) {
+        RefreshDecision::Rotate
+    } else {
+        RefreshDecision::Nothing
+    }
+}
+
 /// `getLease` returns the struct as fourteen words. `createdAt` is the seventh
 /// and `status` the last, both right aligned in their word.
 fn decode_lease(bytes: &[u8]) -> anyhow::Result<OnchainLease> {
@@ -1110,6 +1132,10 @@ impl Worker {
         .bind(self.escrow_address())
         .execute(&self.pool)
         .await?;
+        // A lease with a close queued keeps `state = 'active'` until that close
+        // confirms, and a renter can queue one at any point in the window. The
+        // grant is not extended past that: the meter stops at the close, and a
+        // fresh hour of access minted after it is compute nobody pays for.
         query(
             "INSERT INTO lifecycle_outbox (action_id, lease_id, kind) \
              SELECT md5(l.lease_id::text || ':refresh_grant')::uuid, l.lease_id, 'refresh_grant' \
@@ -1120,6 +1146,9 @@ impl Worker {
                AND lc.access_started_at + \
                    make_interval(secs => (l.document->>'duration_seconds')::int) \
                    > NOW() + INTERVAL '10 minutes' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM lifecycle_outbox c \
+                   WHERE c.lease_id = l.lease_id AND c.kind = 'close_access') \
              ON CONFLICT (lease_id, kind) DO UPDATE \
                SET status = 'queued', available_at = NOW(), lease_until = NULL, \
                    last_error = NULL, document = '{}'::jsonb, updated_at = NOW() \
@@ -3648,10 +3677,15 @@ impl Worker {
     }
 
     async fn refresh_grant(&self, action: &Action) -> anyhow::Result<()> {
-        let cloud = self.is_cloud_lease(action.lease_id).await?;
-        let batch = self.is_batch_lease(action.lease_id).await?;
-        if should_issue_gateway_access(cloud, batch) {
-            self.issue_grant(action.lease_id, true).await?;
+        let decision = refresh_decision(
+            self.access_is_closed(action.lease_id).await?,
+            self.is_cloud_lease(action.lease_id).await?,
+            self.is_batch_lease(action.lease_id).await?,
+        );
+        match decision {
+            RefreshDecision::Drop => return self.skip_action(action).await,
+            RefreshDecision::Rotate => self.issue_grant(action.lease_id, true).await?,
+            RefreshDecision::Nothing => {}
         }
         let completed = query(
             "UPDATE lifecycle_outbox SET status = 'completed', lease_until = NULL, \
@@ -3686,6 +3720,20 @@ impl Worker {
         Ok(row.map(|SqlJson(verdict)| verdict))
     }
 
+    /// Whether the gateway has already been shut on this lease. Set once, by
+    /// `revoke_access`, and never cleared: the close it belongs to is what stops
+    /// the meter.
+    async fn access_is_closed(&self, lease_id: u64) -> anyhow::Result<bool> {
+        query_scalar(
+            "SELECT COALESCE((SELECT gateway_closed_at IS NOT NULL FROM lease_lifecycle \
+                              WHERE lease_id = $1), FALSE)",
+        )
+        .bind(lease_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     async fn issue_grant(&self, lease_id: u64, rotate: bool) -> anyhow::Result<()> {
         if !should_issue_gateway_access(
             self.is_cloud_lease(lease_id).await?,
@@ -3694,6 +3742,9 @@ impl Worker {
             anyhow::bail!("gateway access is unavailable for cloud and batch leases");
         }
         let context = self.lease_context(lease_id).await?;
+        if context.gateway_closed_at.is_some() {
+            anyhow::bail!("access for this lease has already been closed");
+        }
         let connection_id = context
             .connection_id
             .as_deref()
@@ -5662,6 +5713,34 @@ mod tests {
         let error = anyhow::Error::from(AccessReadinessPending)
             .context("adopt onchain access for lease 39");
         assert!(error.downcast_ref::<AccessReadinessPending>().is_some());
+    }
+
+    /// A renter can release at any point in the window, and the close that
+    /// follows stops the meter. A refresh that still ran after it would hand
+    /// back an hour of session on compute settlement will not bill.
+    #[test]
+    fn a_refresh_after_the_gateway_closed_is_dropped() {
+        for cloud in [false, true] {
+            for batch in [false, true] {
+                assert_eq!(
+                    refresh_decision(true, cloud, batch),
+                    RefreshDecision::Drop,
+                    "cloud {cloud} batch {batch}"
+                );
+            }
+        }
+        assert_eq!(
+            refresh_decision(false, false, false),
+            RefreshDecision::Rotate
+        );
+        assert_eq!(
+            refresh_decision(false, true, false),
+            RefreshDecision::Nothing
+        );
+        assert_eq!(
+            refresh_decision(false, false, true),
+            RefreshDecision::Nothing
+        );
     }
 
     #[test]

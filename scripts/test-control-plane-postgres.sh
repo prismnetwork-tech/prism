@@ -344,6 +344,77 @@ docker exec -e PGPASSWORD=integration-secret "$container" \
    DELETE FROM lease_quotes WHERE subject = 'did:privy:historical';
    DELETE FROM accounts WHERE subject = 'did:privy:historical';" >/dev/null
 
+# An early release is refused before access opens and queues exactly one close
+# once the lease is running. The lease is moved by hand because the node here
+# never gets far enough to open a session, and moved back so the rest of the run
+# starts where it expects to.
+release_headers=(
+  -H "Content-Type: application/json"
+  -H "x-prism-development-subject: did:privy:integration"
+  -H "x-prism-development-session: session-integration"
+)
+funded_release=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "${release_headers[@]}" -H "x-request-id: release-funded-integration" \
+  -X POST -d '{}' "http://127.0.0.1:$port/v1/leases/$internal_lease_id/release")
+[[ $funded_release == 409 ]]
+missing_release=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "${release_headers[@]}" -H "x-request-id: release-missing-integration" \
+  -X POST -d '{}' "http://127.0.0.1:$port/v1/leases/999999/release")
+[[ $missing_release == 404 ]]
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "UPDATE leases SET state = 'active', document = jsonb_set(document, '{state}', '\"active\"'),
+     updated_at = NOW() WHERE lease_id = $internal_lease_id;" >/dev/null
+active_release=$(curl --fail --silent \
+  "${release_headers[@]}" -H "x-request-id: release-active-integration" \
+  -X POST -d '{}' "http://127.0.0.1:$port/v1/leases/$internal_lease_id/release")
+node -e '
+  const release = JSON.parse(process.argv[1]);
+  if (release.lease_id !== Number(process.argv[2])) process.exit(1);
+  if (release.state !== "closing" || release.release !== "queued") process.exit(1);
+' "$active_release" "$internal_lease_id"
+released_state=$(docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -U prism -d prism -Atc \
+  "SELECT state || ':' || (document->>'state') FROM leases WHERE lease_id = $internal_lease_id;")
+[[ $released_state == closing:closing ]]
+repeat_release=$(curl --fail --silent \
+  "${release_headers[@]}" -H "x-request-id: release-repeat-integration" \
+  -X POST -d '{}' "http://127.0.0.1:$port/v1/leases/$internal_lease_id/release")
+node -e '
+  const release = JSON.parse(process.argv[1]);
+  if (release.state !== "closing" || release.release !== "already_closed") process.exit(1);
+' "$repeat_release"
+# A released lease serves no more credentials, whatever the grant says.
+released_access=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -H "x-prism-development-subject: did:privy:integration" \
+  -H "x-prism-development-session: session-integration" \
+  -H "x-request-id: access-released-integration" \
+  "http://127.0.0.1:$port/v1/leases/$internal_lease_id/access")
+[[ $released_access == 409 ]]
+queued_closes=$(docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -U prism -d prism -Atc \
+  "SELECT count(*) FROM lifecycle_outbox
+   WHERE lease_id = $internal_lease_id AND kind = 'close_access';")
+[[ $queued_closes == 1 ]]
+# A batch lease is refused: its command is what ends it.
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "UPDATE leases SET state = 'active', document = jsonb_set(document, '{state}', '\"active\"') || '{\"command\": \"nvidia-smi\"}'::jsonb,
+     updated_at = NOW() WHERE lease_id = $internal_lease_id;
+   DELETE FROM lifecycle_outbox WHERE lease_id = $internal_lease_id;" >/dev/null
+batch_release=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "${release_headers[@]}" -H "x-request-id: release-batch-integration" \
+  -X POST -d '{}' "http://127.0.0.1:$port/v1/leases/$internal_lease_id/release")
+[[ $batch_release == 409 ]]
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "UPDATE leases SET document = document - 'command' WHERE lease_id = $internal_lease_id;" >/dev/null
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "DELETE FROM lifecycle_outbox WHERE lease_id = $internal_lease_id;
+   UPDATE leases SET state = 'funded', document = jsonb_set(document, '{state}', '\"funded\"'),
+     updated_at = NOW() WHERE lease_id = $internal_lease_id;" >/dev/null
+
 leases=$(curl --fail --silent \
   -H "x-prism-development-subject: did:privy:integration" \
   -H "x-prism-development-session: session-integration" \
@@ -380,6 +451,45 @@ lease_state=$(docker exec -e PGPASSWORD=integration-secret "$container" \
 lifecycle_action=$(docker exec -e PGPASSWORD=integration-secret "$container" \
   psql -U prism -d prism -Atc "SELECT kind FROM lifecycle_outbox LIMIT 1;")
 [[ $lifecycle_action == expire_provision ]]
+closed_release=$(curl --fail --silent \
+  "${release_headers[@]}" -H "x-request-id: release-closed-integration" \
+  -X POST -d '{}' "http://127.0.0.1:$port/v1/leases/$internal_lease_id/release")
+node -e '
+  const release = JSON.parse(process.argv[1]);
+  if (release.state !== "closing" || release.release !== "already_closed") process.exit(1);
+' "$closed_release"
+kill "$command_pid"
+wait "$command_pid" 2>/dev/null || true
+command_pid=
+
+# A node coming back to a command whose lease has ended is not handed it again:
+# the workspace would start on compute nobody is billed for. The command is
+# closed out on the poll instead, which is what returns the node to the market.
+docker exec -e PGPASSWORD=integration-secret "$container" \
+  psql -v ON_ERROR_STOP=1 -U prism -d prism -c \
+  "UPDATE node_commands SET status = 'ready', attempts = 0, lease_until = NULL,
+     last_error = NULL, updated_at = NOW() - INTERVAL '5 minutes';" >/dev/null
+target/debug/prismd commands \
+  --identity "$root/device.json" \
+  --control-plane "http://127.0.0.1:$port" \
+  --workspace-root "$root/workspaces" \
+  --state-root "$root/leases" \
+  --poll-seconds 1 >"$root/commands-released.log" 2>&1 &
+command_pid=$!
+for _ in $(seq 1 20); do
+  command_row=$(docker exec -e PGPASSWORD=integration-secret "$container" \
+    psql -U prism -d prism -Atc \
+    "SELECT status || ':' || COALESCE(last_error, '') FROM node_commands LIMIT 1;")
+  if [[ $command_row == "failed:the lease ended before the command finished" ]]; then
+    break
+  fi
+  if ! kill -0 "$command_pid" 2>/dev/null; then
+    cat "$root/commands-released.log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+[[ $command_row == "failed:the lease ended before the command finished" ]]
 kill "$command_pid"
 wait "$command_pid" 2>/dev/null || true
 command_pid=

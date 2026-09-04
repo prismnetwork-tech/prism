@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from urllib.parse import urlencode
@@ -15,6 +16,7 @@ from urllib.parse import urlencode
 import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from hexbytes import HexBytes
 from web3 import Web3
 
 ROBINHOOD_RPC = "https://rpc.mainnet.chain.robinhood.com"
@@ -48,11 +50,42 @@ _ESCROW = [
      "outputs": [{"type": "uint256"}]},
 ]
 
+# LeaseFunded(uint256 leaseId, bytes32 nodeId, address renter, uint256 deposit,
+#             uint32 duration, bytes32 clientReference)
+# The first three are indexed and travel in the topics, so `deposit` is the
+# first word of the data.
+_LEASE_FUNDED = bytes(Web3.keccak(text="LeaseFunded(uint256,bytes32,address,uint256,uint32,bytes32)"))
+
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 
 # Matches the limit the control plane and the node both enforce, so a command
 # that cannot run is rejected here rather than after an escrow is funded.
 MAX_COMMAND_BYTES = 8 * 1024
+
+
+def _deposit_from_receipt(receipt, escrow: str, node_id: bytes) -> int | None:
+    """What the escrow pulled out of the wallet, read off the funding
+    transaction's own LeaseFunded log.
+
+    None when the receipt carries no such log, which is the only case the
+    quote's ceiling stands in for. Erring that way over-states the deposit
+    rather than under-stating it, so a budget settled against it is never short.
+    Topics and data are spelled as bytes by some rpcs and as hex by others, so
+    both are normalised before they are compared.
+    """
+    for log in getattr(receipt, "logs", None) or []:
+        if not isinstance(log, Mapping):
+            continue
+        if str(log.get("address") or "").lower() != escrow.lower():
+            continue
+        topics = [bytes(HexBytes(t)) for t in log.get("topics") or []]
+        if len(topics) != 4 or topics[0] != _LEASE_FUNDED or topics[2] != node_id:
+            continue
+        data = bytes(HexBytes(log.get("data") or b""))
+        if len(data) < 32:
+            continue
+        return int.from_bytes(data[:32], "big")
+    return None
 
 
 def _command(value: str) -> str:
@@ -70,11 +103,22 @@ def _trust_class(value: str) -> str:
 
 
 class PrismError(Exception):
-    def __init__(self, status: int, code: str, body=None):
+    """A failure, and which side of the wire it happened on.
+
+    ``broadcast`` says what the chain saw. It is the hash of the transaction
+    that committed this call's spend when one was sent, ``False`` when the
+    failure came before anything was signed onto the wire, and ``None`` only
+    where nothing established which of the two it was. ``body`` is whatever the
+    far side sent back and can say anything; this is the only field that says
+    the money left this wallet.
+    """
+
+    def __init__(self, status: int, code: str, body=None, broadcast: str | bool | None = None):
         super().__init__(f"prism {status}: {code}")
         self.status = status
         self.code = code
         self.body = body
+        self.broadcast = broadcast
 
 
 @dataclass
@@ -86,6 +130,13 @@ class Lease:
     public_key: str
     funding_hash: str
     quote: dict
+    # What the escrow pulled out of this wallet, in USDG micros, and where that
+    # figure came from. "receipt" is the LeaseFunded log of the funding
+    # transaction itself. "quote" is the maximum the quote named, which is what
+    # is left when the log cannot be read, and is an upper bound rather than the
+    # amount charged.
+    deposit_micros: int | None = None
+    deposit_source: str | None = None
 
 
 @dataclass
@@ -97,11 +148,19 @@ class BatchLease:
     result: dict
     funding_hash: str
     quote: dict
+    deposit_micros: int | None = None
+    deposit_source: str | None = None
 
 
-class PrismAgent:
-    """Headless GPU leasing for a wallet-holding agent. Authenticate with a wallet
-    signature, pay on-chain in USDG, provision, and run over SSH."""
+# Imported here rather than at the top because the inference half raises errors
+# that derive from PrismError above.
+from ._inference import InferenceMixin  # noqa: E402
+
+
+class PrismAgent(InferenceMixin):
+    """Headless GPU leasing and metered inference for a wallet-holding agent.
+    Authenticate with a wallet signature, pay on-chain in USDG, provision, and
+    run over SSH; or pay per generation and let the endpoint own the GPU."""
 
     def __init__(self, private_key: str, escrow: str,
                  api_base: str = "https://prismnetwork.tech", rpc_url: str = ROBINHOOD_RPC,
@@ -239,28 +298,63 @@ class PrismAgent:
     def lease(self, image: str, duration_seconds: int, min_vram_mib: int = 16000,
               preferred_node_id: str | None = None, max_deposit: int | None = None,
               min_trust_class: str = "open", command: str | None = None) -> Lease | BatchLease:
-        if not self.session:
-            self.authenticate()
-        # A wallet with no balance at all cannot fund anything, and a doomed
-        # quote still holds capacity against other renters until it expires.
-        # Refuse before quoting.
-        b = self.balances()
-        if int(b["usdg"]) == 0 or int(b["eth"]) == 0:
-            raise PrismError(402, "wallet_unfunded", {
-                "address": self.address, "usdg": int(b["usdg"]), "eth_wei": int(b["eth"]),
-                "hint": "the wallet needs USDG for the deposit and native ETH for gas "
-                        "on Robinhood Chain (id 4663) before it can lease",
-            })
-        quote = self.quote(image, duration_seconds, min_vram_mib, preferred_node_id,
-                           min_trust_class, command)
-        if max_deposit is not None and int(quote["maximum_escrow"]) > int(max_deposit):
-            raise PrismError(402, "cost_exceeds_max",
-                             {"required": quote["maximum_escrow"], "max": str(max_deposit)})
-        key = self._generate_ssh_key()
+        # Everything up to the deposit is preparation, and a failure in it costs
+        # nothing. Saying so is what lets a caller's spend ledger hand the
+        # reservation back rather than count money that never moved.
+        try:
+            if not self.session:
+                self.authenticate()
+            # A wallet with no balance at all cannot fund anything, and a doomed
+            # quote still holds capacity against other renters until it expires.
+            # Refuse before quoting.
+            b = self.balances()
+            if int(b["usdg"]) == 0 or int(b["eth"]) == 0:
+                raise PrismError(402, "wallet_unfunded", {
+                    "address": self.address, "usdg": int(b["usdg"]), "eth_wei": int(b["eth"]),
+                    "hint": "the wallet needs USDG for the deposit and native ETH for gas "
+                            "on Robinhood Chain (id 4663) before it can lease",
+                }, broadcast=False)
+            quote = self.quote(image, duration_seconds, min_vram_mib, preferred_node_id,
+                               min_trust_class, command)
+            if max_deposit is not None and int(quote["maximum_escrow"]) > int(max_deposit):
+                raise PrismError(402, "cost_exceeds_max",
+                                 {"required": quote["maximum_escrow"], "max": str(max_deposit)},
+                                 broadcast=False)
+        except PrismError as e:
+            if e.broadcast is None:
+                e.broadcast = False
+            raise
+        except Exception as e:
+            raise PrismError(502, "pre_broadcast_failure", {"cause": str(e)}, broadcast=False) from e
+        return self.fund_quote(quote)
+
+    def fund_quote(self, quote: dict) -> Lease | BatchLease:
+        """Fund a quote from ``quote()`` and wait for what it bought.
+
+        This is the second half of ``lease()``, split out for callers that show
+        the quote to a human first: the price and machine approved are the ones
+        funded, and a quote that has expired in the meantime is refused by the
+        control plane at ``confirm`` rather than replaced. A quote carrying a
+        ``command`` is a batch lease and returns its output; any other returns
+        an interactive ``Lease`` once access is open.
+
+        A failure before the deposit is broadcast raises with ``broadcast``
+        ``False`` and costs nothing. After it, the error names the funding
+        transaction, the lease id when one was assigned, and the key that opens
+        the machine, which stays on disk because it is the only way in.
+        """
+        try:
+            key = self._generate_ssh_key()
+        except PrismError as e:
+            if e.broadcast is None:
+                e.broadcast = False
+            raise
         funding = None
+        deposited = None
+        source = None
         lease_id = None
         try:
-            funding = self._fund(quote)
+            funding, deposited, source = self._fund(quote)
             record = self.confirm(quote["quote_id"], funding, key["public_key"])
             lease_id = record.get("lease_id")
             if not isinstance(lease_id, int):
@@ -268,24 +362,33 @@ class PrismAgent:
             # A batch lease never hands out access, so waiting for it would block
             # until the timeout and then report a failure that never happened.
             # Wait for what the command printed instead.
-            if command is not None:
-                result = self.wait_for_result(lease_id, timeout=duration_seconds + 900)
+            if quote.get("command") is not None:
+                result = self.wait_for_result(lease_id, timeout=int(quote["duration_seconds"]) + 900)
                 shutil.rmtree(key["dir"], ignore_errors=True)
-                return BatchLease(lease_id, result, funding, quote)
-            return Lease(lease_id, self.wait_for_access(lease_id),
-                         key["key_path"], key["dir"], key["public_key"], funding, quote)
+                return BatchLease(lease_id, result, funding, quote, deposited, source)
+            return Lease(lease_id, self.wait_for_access(lease_id), key["key_path"], key["dir"],
+                         key["public_key"], funding, quote, deposited, source)
         except Exception as e:
-            # Before funding, the key opens nothing; discard it. After funding
-            # it is the only way into a machine that is being paid for, so it
-            # stays on disk and the error says where everything is.
-            if funding is None:
+            sent = e.broadcast if isinstance(e, PrismError) else None
+            paid = funding or (sent if isinstance(sent, str) else None)
+            if paid is None:
+                # Nothing reached the chain, so the key opens nothing and the
+                # deposit is still in the wallet.
                 shutil.rmtree(key["dir"], ignore_errors=True)
-                raise
-            detail = {"funding_hash": funding, "lease_id": lease_id, "key_path": key["key_path"]}
+                if isinstance(e, PrismError):
+                    if e.broadcast is None:
+                        e.broadcast = False
+                    raise
+                raise PrismError(502, "pre_broadcast_failure", {"cause": str(e)}, broadcast=False) from e
+            # The deposit is on chain. The key is now the only way into a machine
+            # that is being paid for, so it stays on disk and the error says
+            # where everything is.
+            detail = {"funding_hash": paid, "lease_id": lease_id, "key_path": key["key_path"]}
             if isinstance(e, PrismError):
                 e.body = {**(e.body or {}), **detail}
+                e.broadcast = paid
                 raise
-            raise PrismError(502, "lease_failed_after_funding", {**detail, "cause": str(e)}) from e
+            raise PrismError(502, "lease_failed_after_funding", {**detail, "cause": str(e)}, paid) from e
 
     def run(self, lease: Lease, command: str, timeout: int = 120,
             connect_retries: int = 24, connect_delay: int = 10,
@@ -326,46 +429,100 @@ class PrismAgent:
                 time.sleep(connect_delay)
         return last
 
-    def end_lease(self, lease: Lease) -> None:
-        """Release local key material. The on-chain lease settles at the end of its duration."""
-        if lease and lease.key_dir:
-            shutil.rmtree(lease.key_dir, ignore_errors=True)
+    def release(self, lease_id) -> dict:
+        """Release a lease by id. Access closes and the meter stops here:
+        settlement charges the seconds between access opening and this call
+        and the rest of the deposit returns on the escrow's schedule. Use it
+        for a lease this process holds no handle to, such as one named by the
+        error of a failed ``fund_quote``. A refused release is raised, because
+        the wallet is still paying for the machine."""
+        return self._proxy("POST", ["leases", str(lease_id), "release"])
 
-    def _fund(self, quote: dict) -> str:
-        deposit = int(quote["maximum_escrow"])
+    def end_lease(self, lease: Lease) -> dict | None:
+        """``release()`` for a held lease. Local key material goes whether or
+        not the network accepts the release."""
+        if lease is None:
+            return None
+        try:
+            return self.release(lease.lease_id)
+        finally:
+            if lease.key_dir:
+                shutil.rmtree(lease.key_dir, ignore_errors=True)
+
+    def _fund(self, quote: dict) -> tuple[str, int, str]:
+        """Deposit against the quote and return the transaction that did it,
+        what the escrow pulled, and where that figure was read from."""
+        quoted = int(quote["maximum_escrow"])
         duration = int(quote["duration_seconds"])
         client_ref = Web3.keccak(text=quote["quote_id"])
         node_id = bytes.fromhex(quote["node_id"].removeprefix("0x"))
         allowance = self._usdg.functions.allowance(self.address, self.escrow).call()
-        if allowance < deposit:
-            self._send(self._usdg.functions.approve(self.escrow, deposit))
-        return self._send(self._escrow.functions.createLease(node_id, duration, client_ref),
-                          confirmations=CONFIRMATIONS)
+        if allowance < quoted:
+            try:
+                self._send(self._usdg.functions.approve(self.escrow, quoted))
+            except PrismError as e:
+                # An approval moves no USDG, however far it got, so a failure
+                # here leaves the deposit in the wallet. Its hash stays in the
+                # body for a human to look up and out of `broadcast`, which
+                # names the transaction a spend is settled against.
+                raise PrismError(e.status, "approval_failed",
+                                 {**(e.body or {}), "cause": e.code}, broadcast=False) from e
+        funding, receipt = self._commit(
+            self._escrow.functions.createLease(node_id, duration, client_ref), CONFIRMATIONS)
+        # `maximum_escrow` is a ceiling. The escrow pulls rate per second times
+        # duration and leaves the rest in the wallet, so the deposit is read off
+        # the transaction's own log and the quote is only what is left when
+        # there is no log to read.
+        deposit = _deposit_from_receipt(receipt, self.escrow, node_id)
+        if deposit is None:
+            return funding, quoted, "quote"
+        return funding, deposit, "receipt"
 
     def _send(self, call, confirmations: int = 1) -> str:
-        tx = call.build_transaction({
-            "from": self.address,
-            "nonce": self.w3.eth.get_transaction_count(self.address),
-            "chainId": CHAIN_ID,
-        })
-        signed = self.account.sign_transaction(tx)
-        h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        # Once broadcast, the hash is the one thing the caller must not lose.
+        return self._commit(call, confirmations)[0]
+
+    def _commit(self, call, confirmations: int = 1):
+        """Sign one call, broadcast it, and wait. Returns the hash and the
+        receipt that was waited on, so a caller needing the transaction's own
+        logs does not go back to the rpc for them."""
+        try:
+            tx = call.build_transaction({
+                "from": self.address,
+                "nonce": self.w3.eth.get_transaction_count(self.address),
+                "chainId": CHAIN_ID,
+            })
+            signed = self.account.sign_transaction(tx)
+            h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        except Exception as e:
+            # The gas estimate, the nonce, the signature or the node itself:
+            # whichever refused, nothing was put on the wire and the wallet is
+            # untouched.
+            raise PrismError(502, "pre_broadcast_failure", {"cause": str(e)}, broadcast=False) from e
+        # Once broadcast, the hash is the one thing the caller must not lose. A
+        # receipt that could not be read is not a transaction that never
+        # happened, and everything below says which of the two this is.
+        #
+        # Prefixed once, here: hexbytes has printed this both ways across its
+        # own major versions, and a spend ledger that reads one form from a
+        # success and the other from a failure counts one payment twice.
+        sent = h.hex()
+        sent = sent if sent.startswith("0x") else f"0x{sent}"
         try:
             receipt = self.w3.eth.wait_for_transaction_receipt(h, timeout=180)
+            if receipt.status != 1:
+                raise PrismError(402, "tx_reverted", {"hash": sent}, sent)
+            if confirmations > 1:
+                target = receipt.blockNumber + confirmations - 1
+                deadline = time.time() + 180
+                while self.w3.eth.block_number < target:
+                    if time.time() > deadline:
+                        raise PrismError(504, "confirmation_timeout", {"hash": sent}, sent)
+                    time.sleep(2)
+        except PrismError:
+            raise
         except Exception as e:
-            raise PrismError(504, "confirmation_timeout",
-                             {"hash": h.hex(), "cause": str(e)}) from e
-        if receipt.status != 1:
-            raise PrismError(402, "tx_reverted", {"hash": h.hex()})
-        if confirmations > 1:
-            target = receipt.blockNumber + confirmations - 1
-            deadline = time.time() + 180
-            while self.w3.eth.block_number < target:
-                if time.time() > deadline:
-                    raise PrismError(504, "confirmation_timeout", {"hash": h.hex()})
-                time.sleep(2)
-        return h.hex()
+            raise PrismError(504, "confirmation_timeout", {"hash": sent, "cause": str(e)}, sent) from e
+        return sent, receipt
 
     def _proxy(self, method: str, segments: list, body=None, raw: bool = False,
                reauthed: bool = False, query: dict | None = None):
@@ -418,6 +575,47 @@ def _safe_json(res):
         return res.json()
     except ValueError:
         return None
+
+
+def _field(entry, name):
+    """One member of a receipt or a log, whichever shape the rpc layer handed
+    back. web3 returns attribute dicts, a raw json rpc client returns plain
+    ones, and both reach here."""
+    if isinstance(entry, dict):
+        return entry.get(name)
+    return getattr(entry, name, None)
+
+
+def _raw(value) -> bytes:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        try:
+            return bytes.fromhex(value.removeprefix("0x"))
+        except ValueError:
+            return b""
+    return b""
+
+
+def _funded_deposit(receipt, escrow: str) -> int | None:
+    """What the escrow charged, off the funding transaction's own LeaseFunded
+    log, or ``None`` where the transaction carries no such log to read.
+
+    Every other party's account of the deposit is a document they wrote. This
+    one is the event the escrow emitted while taking the money.
+    """
+    for entry in _field(receipt, "logs") or []:
+        topics = [_raw(t) for t in (_field(entry, "topics") or [])]
+        if not topics or topics[0] != _LEASE_FUNDED:
+            continue
+        emitter = _field(entry, "address")
+        if isinstance(emitter, str) and emitter.lower() != escrow.lower():
+            continue
+        data = _raw(_field(entry, "data"))
+        if len(data) < 32:
+            continue
+        return int.from_bytes(data[:32], "big")
+    return None
 
 
 # Checking which machine answered.

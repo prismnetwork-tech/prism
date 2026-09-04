@@ -10,17 +10,23 @@ Every method returns a string, including on failure. These tools are driven by
 language models, and a model can act on "the lease could not be funded: the
 wallet holds 0 USDG" where a traceback ends the conversation. Without a wallet
 the read-only questions still answer from the public API.
+
+Spending goes through the same ledger the MCP server writes, so ``max_usdg`` is
+the model's request rather than the limit: the operator's ``PRISM_MAX_USDG`` and
+``PRISM_DAILY_BUDGET_USDG`` bound every lease, and one wallet has one daily
+ceiling however many clients are holding it.
 """
 
 from __future__ import annotations
 
 import atexit
 import os
-import shutil
+from contextlib import suppress
 
 import requests
 
 from ._agent import DEFAULT_IMAGE, MAX_COMMAND_BYTES, TRUST_CLASSES, Lease, PrismAgent, PrismError
+from ._budget import Budget, BudgetError, SpendLedger, call_ceiling, read_budget, record_spend
 
 DEFAULT_ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD"
 PUBLIC_API = "https://api.prismnetwork.tech"
@@ -30,7 +36,13 @@ NO_WALLET = (
     "Robinhood Chain). Looking at capacity and prices works without one."
 )
 
+NO_BUDGET = "No spending limits are configured, so nothing here may spend."
+
 _MICROS = 1_000_000
+
+# Left unset, agent and budget read the environment. None is a different
+# instruction: no wallet, or no limits and so no spending.
+UNSET = object()
 
 
 def _usdg(micros) -> str:
@@ -49,6 +61,22 @@ def agent_from_env() -> PrismAgent | None:
     )
 
 
+# What the escrow actually holds, which is what the day should be charged.
+# Booking the caller's ceiling instead charges a 0.2 USDG lease against a 0.5
+# USDG cap, and a 5 USDG day then buys ten leases where it could afford
+# twenty-five.
+#
+# The figure is the one this wallet signed for, not the one the quote states:
+# the quote is the other side's document, and settling against it would let the
+# far side decide what the day is charged. It cannot exceed the reservation
+# either, which is the ceiling the lease was funded against.
+def _deposited(lease, ceiling: int) -> int | None:
+    held = getattr(lease, "deposit_micros", None)
+    if not isinstance(held, int) or isinstance(held, bool) or held <= 0:
+        return None
+    return min(held, ceiling)
+
+
 def _describe(e: Exception) -> str:
     if isinstance(e, PrismError):
         body = e.body or {}
@@ -65,27 +93,87 @@ def _describe(e: Exception) -> str:
 
 
 class PrismToolset:
-    """The five Prism tools every framework adapter exposes.
+    """The Prism tools every framework adapter exposes.
 
-    Leases opened here stay open until ``end_lease`` or process exit (an atexit
-    hook discards leftover key material); the on-chain escrow settles at the
-    end of its paid window either way.
+    Leases opened here stay open until ``end_lease`` or process exit. Both
+    release the lease on the network, which is what stops the meter: settlement
+    charges the seconds the lease was open and returns the rest of the deposit.
+    A process killed before its atexit hook runs leaves the lease billing until
+    its window ends.
+
+    ``budget`` takes a :class:`Budget` or :class:`SpendLedger` for a caller that
+    wants its own limits; left alone it reads the operator's environment.
     """
 
-    _UNSET = object()
-
-    def __init__(self, agent: PrismAgent | None = _UNSET, public_api: str = PUBLIC_API):
+    def __init__(
+        self,
+        agent: PrismAgent | None = UNSET,
+        public_api: str = PUBLIC_API,
+        budget: Budget | SpendLedger | None = UNSET,
+    ):
         # Passing agent=None means deliberately keyless; leaving it unset reads
         # the environment.
-        self.agent = agent_from_env() if agent is PrismToolset._UNSET else agent
+        self.agent = agent_from_env() if agent is UNSET else agent
         self.public_api = os.environ.get("PRISM_PUBLIC_API", public_api).rstrip("/")
+        self.ledger: SpendLedger | None = None
+        self.budget_problem = NO_BUDGET
+        # Limits the operator got wrong stop the spending tools rather than
+        # falling back to no limits at all. Capacity and prices still read, so a
+        # typo in PRISM_MAX_USDG is discoverable instead of fatal.
+        try:
+            book = read_budget() if budget is UNSET else budget
+        except BudgetError as e:
+            self.budget_problem = str(e)
+        else:
+            if isinstance(book, Budget):
+                book = SpendLedger(book.ledger_path, book.daily_micros, book.max_per_call_micros)
+            if isinstance(book, SpendLedger):
+                self.ledger = book
+                self.budget_problem = None
         self._leases: dict[int, Lease] = {}
         atexit.register(self._cleanup)
 
     def _cleanup(self) -> None:
-        for lease in self._leases.values():
-            shutil.rmtree(lease.key_dir, ignore_errors=True)
-        self._leases.clear()
+        leases, self._leases = list(self._leases.values()), {}
+        for lease in leases:
+            with suppress(Exception):
+                self.agent.end_lease(lease)
+
+    # The per-call ceiling is the operator's, not the model's: an omitted
+    # max_usdg takes PRISM_MAX_USDG, and a stated one above it is clamped back
+    # down to it.
+    def _ceiling(self, max_usdg) -> int:
+        if self.ledger is None:
+            raise BudgetError(f"This spends money and the spend limits are unusable: {self.budget_problem}")
+        return call_ceiling(max_usdg, self.ledger.max_per_call_micros)
+
+    def budget_status(self) -> str:
+        """Show the spending limits in force and what has already been spent in the last 24 hours.
+
+        Needs no wallet. Worth checking before a long job; a lease refused for
+        budget reports the same numbers.
+        """
+        if self.ledger is None:
+            return self.budget_problem
+        try:
+            status = self.ledger.status()
+        except BudgetError as e:
+            return str(e)
+        lines = [
+            f"daily budget: {status['daily_budget']}",
+            f"spent in the last 24h: {status['spent_last_24h']}",
+            f"remaining today: {status['remaining_today']}",
+            f"max per call: {status['max_per_call']}",
+            f"ledger: {status['ledger']}",
+        ]
+        charges = status["charges_last_24h"]
+        if not charges:
+            return "\n".join(lines + ["charges in the last 24h: none"])
+        lines.append("charges in the last 24h:")
+        for c in charges:
+            reference = f" ({c['reference']})" if c.get("reference") else ""
+            lines.append(f"  {c['at']} {c.get('tool', 'prism')} {c['amount']}{reference}")
+        return "\n".join(lines)
 
     def wallet(self) -> str:
         """Show the Prism wallet address and its USDG and gas balances on Robinhood Chain."""
@@ -141,14 +229,17 @@ class PrismToolset:
         duration_seconds: int = 600,
         min_vram_mib: int = 16000,
         image: str = DEFAULT_IMAGE,
-        max_usdg: float = 1.0,
+        max_usdg: float | None = None,
         min_trust_class: str = "open",
     ) -> str:
         """Rent a GPU, run one shell command on it over SSH, and return the output.
 
-        Funds an on-chain USDG escrow up to max_usdg and blocks while the machine
-        provisions, usually one to four minutes. The lease stays open for
-        follow-up commands with run(); release it with end_lease().
+        Funds an on-chain USDG escrow and blocks while the machine provisions,
+        usually one to four minutes. max_usdg lowers the operator's per-call
+        ceiling for this lease and cannot raise it; omitted, that ceiling
+        applies. The day's budget is charged before the escrow is funded. The
+        lease stays open for follow-up commands with run(); release it with
+        end_lease().
         """
         if self.agent is None:
             return NO_WALLET
@@ -160,13 +251,28 @@ class PrismToolset:
         if min_trust_class not in TRUST_CLASSES:
             return f"min_trust_class must be one of {', '.join(TRUST_CLASSES)}."
         try:
-            lease = self.agent.lease(
+            cap = self._ceiling(max_usdg)
+        except BudgetError as e:
+            return str(e)
+
+        def fund():
+            funded = self.agent.lease(
                 image=image,
                 duration_seconds=duration_seconds,
                 min_vram_mib=min_vram_mib,
-                max_deposit=round(max_usdg * _MICROS),
+                max_deposit=cap,
                 min_trust_class=min_trust_class,
             )
+            return {
+                "value": funded,
+                "settled_micros": _deposited(funded, cap),
+                "reference": funded.funding_hash,
+            }
+
+        try:
+            lease = record_spend(self.ledger, "prism_lease_and_run", cap, fund)
+        except BudgetError as e:
+            return str(e)
         except Exception as e:
             return f"The lease did not go through: {_describe(e)}"
         self._leases[lease.lease_id] = lease
@@ -204,7 +310,8 @@ class PrismToolset:
         return f"exit {res.get('code')}:\n{res.get('stdout') or res.get('stderr') or ''}"
 
     def end_lease(self, lease_id: int) -> str:
-        """Release a leased GPU. The on-chain lease settles when its paid window ends."""
+        """Release a leased GPU. Access closes and the meter stops here; settlement
+        charges the seconds it was open and returns the rest of the deposit."""
         if self.agent is None:
             return NO_WALLET
         try:
@@ -214,5 +321,11 @@ class PrismToolset:
         lease = self._leases.pop(lease_id, None)
         if lease is None:
             return f"No active lease {lease_id} in this session."
-        self.agent.end_lease(lease)
-        return f"released lease {lease_id}"
+        try:
+            self.agent.end_lease(lease)
+        except Exception as e:
+            return (
+                f"Lease {lease_id} could not be released: {_describe(e)}. Its access key is gone "
+                "but the meter may still be running; check receipts() for the settled charge."
+            )
+        return f"released lease {lease_id}; billing stopped here and the unused deposit returns after settlement"

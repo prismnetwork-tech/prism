@@ -67,6 +67,13 @@ export interface RelayForwarder {
   close(): Promise<void>;
 }
 
+export interface LeaseRelease {
+  lease_id: number | null;
+  state: string | null;
+  release: "queued" | "already_closed" | "failed";
+  error?: string;
+}
+
 export interface LeaseHandle {
   leaseId: number;
   access: LeaseAccess;
@@ -169,7 +176,14 @@ export declare class PrismAgent {
   /// Only for a lease reached through the gateway. Use it for anything that is
   /// not a one-shot command: scp, a notebook client, an interactive shell.
   forward(lease: LeaseHandle, options?: { service?: "ssh" | "jupyter" }): Promise<RelayForwarder>;
-  endLease(lease: LeaseHandle): void;
+  /// Releases the lease on the network and removes its key material. This is
+  /// what stops the meter: settlement charges the seconds the lease was open and
+  /// returns the rest of the deposit. Never rejects; `release` is "queued",
+  /// "already_closed" or "failed" (with `error`), and a failed release means the
+  /// machine is still billing until its window ends.
+  endLease(lease: LeaseHandle): Promise<LeaseRelease>;
+  /// Releases a lease by id. Rejects when the network refuses.
+  release(leaseId: number): Promise<{ lease_id: number; state: string; release: "queued" | "already_closed" }>;
   /// Pay for one call to a metered endpoint, keeping the payment until the
   /// endpoint serves. Bytes are sent verbatim. Pass `seal` instead of `body` for
   /// a request that has to be rebuilt per attempt, with `fingerprint` so the

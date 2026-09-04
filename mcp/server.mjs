@@ -412,7 +412,7 @@ const TOOLS = [
   },
   {
     name: "prism_end_lease",
-    description: "Release a lease's local access. The on-chain lease settles at the end of its paid duration.",
+    description: "Release a lease. Access closes and billing stops here: settlement charges the seconds the lease was open and returns the rest of the deposit. A lease nobody releases bills until its window ends.",
     inputSchema: {
       type: "object",
       properties: { lease_id: { type: "integer" } },
@@ -789,11 +789,13 @@ async function handle(name, args) {
   if (name === "prism_end_lease") {
     const id = leaseId(args.lease_id);
     const lease = leases.get(id);
-    if (lease) {
-      agent.endLease(lease);
-      leases.delete(id);
+    if (!lease) return { lease_id: id, released: false, next: "no lease with this id is open in this session; prism_leases lists the wallet's leases" };
+    leases.delete(id);
+    const out = await agent.endLease(lease);
+    if (out.release === "failed") {
+      return { lease_id: id, released: false, error: out.error, next: "the access key is gone but the meter may still be running; check prism_receipts for the settled charge" };
     }
-    return { lease_id: id, released: Boolean(lease) };
+    return { lease_id: id, released: true, release: out.release, next: "billing stopped here; the unused deposit returns after settlement and prism_receipts shows the charge" };
   }
   if (name.startsWith("prism_vault_")) return handleVault(name, args);
   throw new Error(`unknown tool ${name}. Valid tools: ${TOOLS.map((t) => t.name).join(", ")}`);

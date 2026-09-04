@@ -4,6 +4,10 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -16,10 +20,11 @@ use prism_chain::{
     EthereumSigner, Finality, RpcClient, address as chain_address, selector, word_u128,
 };
 use prism_protocol::{
-    CommandResult, GpuSpec, HostTeeCapability, IsolationMode, NodeCertificateBundle,
+    CommandResult, GpuSpec, HostTeeCapability, IsolationMode, LeaseState, NodeCertificateBundle,
     NodeCertificateRequest, NodeCommand, NodeCommandKind, NodeCommandOutcome, NodeCommandPoll,
-    NodeCommandReport, NodeCommandReportPayload, NodeEnrollment, NodePosture, NodeTelemetry,
-    UnsignedNodeCertificateRequest, UnsignedNodeEnrollment, UnsignedTelemetry, node_id,
+    NodeCommandReport, NodeCommandReportAck, NodeCommandReportPayload, NodeEnrollment, NodePosture,
+    NodeTelemetry, UnsignedNodeCertificateRequest, UnsignedNodeEnrollment, UnsignedTelemetry,
+    node_id,
 };
 use rand::RngCore;
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
@@ -879,6 +884,7 @@ async fn main() -> anyhow::Result<()> {
                 jupyter_port,
                 attestation_challenge: None,
                 agent_policy_digest: None,
+                released: None,
             };
             let control_directory = workspace_root.join(&lease_id);
             let command = match &isolation {
@@ -1869,6 +1875,8 @@ async fn execute_node_command(
     let launch_jupyter_token = jupyter_token_path.clone();
     let launch_challenge = challenge.as_ref().map(|challenge| challenge.nonce.clone());
     let launch_policy_digest = config.agent_policy_digest.clone();
+    let released = Arc::new(AtomicBool::new(false));
+    let launch_released = released.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         runtime::launch(runtime::LaunchConfig {
             image: &image,
@@ -1884,6 +1892,7 @@ async fn execute_node_command(
             jupyter_port,
             attestation_challenge: launch_challenge.as_deref(),
             agent_policy_digest: launch_policy_digest.as_deref(),
+            released: Some(&launch_released),
         })
     });
     let mut ready_reported_at = None;
@@ -1937,7 +1946,7 @@ async fn execute_node_command(
                 Utc::now().signed_duration_since(last) >= chrono::Duration::seconds(30)
             })
         {
-            report_command(
+            let ack = report_command_acked(
                 client,
                 &config.control_plane,
                 node,
@@ -1951,6 +1960,9 @@ async fn execute_node_command(
             )
             .await?;
             ready_reported_at = Some(Utc::now());
+            if note_release(&ack, &released) {
+                tracing::info!(lease_id = %lease_id, state = ?ack.lease_state, "lease ended early; stopping the workload");
+            }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -2251,6 +2263,37 @@ async fn report_command(
     result: Option<CommandResult>,
     channel_key: Option<String>,
 ) -> anyhow::Result<()> {
+    report_command_acked(
+        client,
+        control_plane,
+        node,
+        public_key,
+        key,
+        command_id,
+        outcome,
+        error,
+        result,
+        channel_key,
+    )
+    .await
+    .map(drop)
+}
+
+/// Reports and returns what the control plane said back, which only the ready
+/// loop reads: it is where an early release reaches the node.
+#[allow(clippy::too_many_arguments)]
+async fn report_command_acked(
+    client: &reqwest::Client,
+    control_plane: &str,
+    node: &str,
+    public_key: &str,
+    key: &SigningKey,
+    command_id: uuid::Uuid,
+    outcome: NodeCommandOutcome,
+    error: Option<String>,
+    result: Option<CommandResult>,
+    channel_key: Option<String>,
+) -> anyhow::Result<NodeCommandReportAck> {
     let endpoint = control_plane_endpoint(
         control_plane,
         &format!("v1/nodes/{node}/commands/{command_id}/report"),
@@ -2272,11 +2315,11 @@ async fn report_command(
             key,
         )?;
         let result = match client.post(endpoint.clone()).json(&report).send().await {
-            Ok(response) => require_success(response).await,
+            Ok(response) => report_ack(response).await,
             Err(error) => Err(error.into()),
         };
         match result {
-            Ok(()) => return Ok(()),
+            Ok(ack) => return Ok(ack),
             Err(error) => {
                 tracing::warn!(%command_id, %error, "node command report failed; retrying");
                 tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -2599,6 +2642,37 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
         .context("build control-plane client")
 }
 
+/// A released lease is closing or already settled. Anything that can still open
+/// access is a lease the node keeps serving.
+fn lease_ended_early(state: Option<&LeaseState>) -> bool {
+    state.is_some_and(|state| !state.can_still_open_access())
+}
+
+/// Records what the control plane said about the lease under a running command.
+/// True for the answer that ends the workload, so it is logged once.
+fn note_release(ack: &NodeCommandReportAck, released: &AtomicBool) -> bool {
+    lease_ended_early(ack.lease_state.as_ref()) && !released.swap(true, Ordering::AcqRel)
+}
+
+async fn report_ack(response: reqwest::Response) -> anyhow::Result<NodeCommandReportAck> {
+    let status = response.status();
+    let body = response.bytes().await?;
+    decode_ack(status, &body)
+}
+
+/// A control plane from before the acknowledgement answers with no body, which
+/// reads as "nothing to say" rather than as a failed report.
+fn decode_ack(status: reqwest::StatusCode, body: &[u8]) -> anyhow::Result<NodeCommandReportAck> {
+    if !status.is_success() {
+        let message: String = String::from_utf8_lossy(body).chars().take(512).collect();
+        anyhow::bail!("control plane returned {status}: {message}")
+    }
+    if body.is_empty() {
+        return Ok(NodeCommandReportAck::default());
+    }
+    serde_json::from_slice(body).context("decode command report acknowledgement")
+}
+
 async fn require_success(response: reqwest::Response) -> anyhow::Result<()> {
     let status = response.status();
     if status.is_success() {
@@ -2612,6 +2686,71 @@ async fn require_success(response: reqwest::Response) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lease_past_active_ends_the_workload_and_nothing_else_does() {
+        for state in [
+            LeaseState::Closing,
+            LeaseState::SettlementPending,
+            LeaseState::Finalized,
+            LeaseState::Refunded,
+            LeaseState::Failed,
+        ] {
+            assert!(lease_ended_early(Some(&state)), "{state:?}");
+        }
+        for state in [
+            LeaseState::Funded,
+            LeaseState::Provisioning,
+            LeaseState::Ready,
+            LeaseState::Active,
+        ] {
+            assert!(!lease_ended_early(Some(&state)), "{state:?}");
+        }
+        assert!(
+            !lease_ended_early(None),
+            "an older control plane says nothing"
+        );
+    }
+
+    /// The acknowledgement to a ready report is how a renter's release reaches
+    /// the node. Missing it holds the GPU for the rest of a window nobody is
+    /// billed for.
+    #[test]
+    fn a_release_reaches_the_running_workload_once() {
+        let released = AtomicBool::new(false);
+        let ack = NodeCommandReportAck {
+            lease_state: Some(LeaseState::Active),
+        };
+        assert!(!note_release(&ack, &released));
+        assert!(!released.load(Ordering::Acquire));
+
+        assert!(!note_release(&NodeCommandReportAck::default(), &released));
+        assert!(!released.load(Ordering::Acquire));
+
+        let ack = NodeCommandReportAck {
+            lease_state: Some(LeaseState::Closing),
+        };
+        assert!(note_release(&ack, &released));
+        assert!(released.load(Ordering::Acquire));
+        assert!(!note_release(&ack, &released), "logged once");
+        assert!(released.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_report_answered_with_nothing_is_still_a_report() {
+        assert_eq!(
+            decode_ack(reqwest::StatusCode::NO_CONTENT, b"").unwrap(),
+            NodeCommandReportAck::default()
+        );
+        assert_eq!(
+            decode_ack(reqwest::StatusCode::OK, br#"{"lease_state":"closing"}"#).unwrap(),
+            NodeCommandReportAck {
+                lease_state: Some(LeaseState::Closing),
+            }
+        );
+        assert!(decode_ack(reqwest::StatusCode::NOT_FOUND, b"unknown command").is_err());
+        assert!(decode_ack(reqwest::StatusCode::OK, b"not json").is_err());
+    }
 
     /// Fixture from `cast calldata "register(bytes32,bytes32,address,uint128,
     /// bytes32,uint256,bytes)" …`. A dynamic argument encoded with the wrong
