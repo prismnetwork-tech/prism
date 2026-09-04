@@ -55,6 +55,7 @@ class FakeAgent:
 
     def end_lease(self, lease):
         self.ended.append(lease.lease_id)
+        return {"lease_id": lease.lease_id, "state": "closing", "release": "queued"}
 
 
 assert version("prismnetwork") == prismnetwork.__version__
@@ -89,7 +90,7 @@ with patch("coinbase_agentkit.action_providers.action_decorator.send_analytics_e
         "min_trust_class": "isolated",
     }
     assert actions["run"].invoke({"lease_id": 7, "command": "echo ready"}).endswith("7:echo ready")
-    assert actions["end_lease"].invoke({"lease_id": 7}) == "released lease 7"
+    assert actions["end_lease"].invoke({"lease_id": 7}).startswith("released lease 7")
     budget = actions["budget"].invoke({})
     assert "daily budget: 5.000000 USDG" in budget and "prism_lease_and_run 0.250000 USDG" in budget
 assert agent.ended == [7]
@@ -119,7 +120,7 @@ listed = toolset.list_gpus()
 assert "Test GPU" in listed and "isolated" in listed
 assert "lease 7 funded onchain" in toolset.lease_and_run("nvidia-smi", max_usdg=0.25)
 assert toolset.run(7, "echo ready").endswith("7:echo ready")
-assert toolset.end_lease(7) == "released lease 7"
+assert toolset.end_lease(7).startswith("released lease 7")
 
 guard = PrismToolset(agent=FakeAgent())
 assert "command is required" in guard.lease_and_run("")
