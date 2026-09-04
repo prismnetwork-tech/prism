@@ -49,9 +49,16 @@ const DECIMAL = /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/;
 // The two languages also disagree about what padding is: trim() takes U+FEFF
 // where Python's strip does not, and Python's takes U+001C where trim() does
 // not. Trimming these four leaves one answer on both sides.
-const PADDING = /^[ \t\r\n]+|[ \t\r\n]+$/g;
+const PADDING = new Set([" ", "\t", "\r", "\n"]);
 
-const trim = (value) => String(value).replace(PADDING, "");
+function trim(value) {
+  const text = String(value);
+  let start = 0;
+  let end = text.length;
+  while (start < end && PADDING.has(text[start])) start += 1;
+  while (end > start && PADDING.has(text[end - 1])) end -= 1;
+  return text.slice(start, end);
+}
 
 export class BudgetError extends Error {
   constructor(message, detail = {}) {
