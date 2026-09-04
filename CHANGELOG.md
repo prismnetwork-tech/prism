@@ -15,6 +15,28 @@ The project follows semantic versioning after its first stable release.
 
 ### Changed
 
+- A renter can now end a lease early. `POST /v1/leases/{id}/release` closes
+  access and stops the meter; settlement charges the seconds between access
+  opening and the release and returns the rest of the deposit. Before this an
+  interactive lease billed for its whole window however soon the work finished,
+  and `end_lease()` / `endLease()` only deleted the local key. Both SDKs, the
+  MCP server's `prism_end_lease`, the toolsets and both AgentKit providers now
+  release on the network. The JavaScript `endLease()` returns a promise that
+  never rejects and reports `release: "failed"` when the network refuses, so
+  cleanup paths that fire it without awaiting keep working. A batch lease
+  cannot be released early; its command is what ends it. A physical node is
+  told about the release in the answer to its next command report and stops
+  the container, and is not offered again until it has.
+- Every surface that can spend now shares one daily limit. `PRISM_MAX_USDG`
+  caps a single lease or generation and `PRISM_DAILY_BUDGET_USDG` caps the day,
+  and the MCP server, the Python SDK toolset and the AgentKit action provider
+  all write the same ledger at `~/.prism/spend.json`, so one wallet has one
+  ceiling however many clients are holding it. A `max_usdg` supplied by the
+  model can lower that ceiling for one call and can never raise it. Without
+  configuration the limits are 1 USDG per call and 5 USDG a day. The AgentKit
+  provider gains a `budget` action that reports the limits and the last 24
+  hours of charges.
+
 - The repository moved to `winter0x`, and every link across the site, the
   packages and the docs points there. The previous two homes are abandoned
   rather than mirrored: one is hidden from the public by an account

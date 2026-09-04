@@ -9,6 +9,41 @@ from ._agent import (
     host_key_policy,
 )
 
+from ._budget import (
+    Budget,
+    BudgetError,
+    SpendLedger,
+    call_ceiling,
+    default_ledger_path,
+    read_budget,
+    record_spend,
+    spent_in_window,
+    strip_unexpanded,
+    usdg,
+)
+from ._e2ee import (
+    E2EE_VERSION,
+    X25519_SUITE,
+    E2eeError,
+    decrypt_response,
+    encrypt_chat_request,
+)
+from ._inference import (
+    DEFAULT_CONFIDENTIAL_BASE,
+    DEFAULT_INFERENCE_BASE,
+    DEFAULT_MAX_TOKENS,
+    EXPECTED_WORKLOAD,
+    ConfidentialError,
+    PaymentError,
+    appraise_workload,
+    default_quote_verifier,
+    keyset_digest,
+    render_checks,
+    report_data,
+    same_td,
+    verify_confidential,
+    verify_quote,
+)
 from ._x402 import bound_message, hash_request, payment_header
 from .toolkit import DEFAULT_ESCROW, PrismToolset, agent_from_env
 
@@ -27,5 +62,34 @@ __all__ = [
     "bound_message",
     "hash_request",
     "payment_header",
+    "Budget",
+    "BudgetError",
+    "SpendLedger",
+    "call_ceiling",
+    "default_ledger_path",
+    "read_budget",
+    "record_spend",
+    "spent_in_window",
+    "strip_unexpanded",
+    "usdg",
+    "ConfidentialError",
+    "PaymentError",
+    "E2eeError",
+    "EXPECTED_WORKLOAD",
+    "DEFAULT_INFERENCE_BASE",
+    "DEFAULT_CONFIDENTIAL_BASE",
+    "DEFAULT_MAX_TOKENS",
+    "X25519_SUITE",
+    "E2EE_VERSION",
+    "encrypt_chat_request",
+    "decrypt_response",
+    "default_quote_verifier",
+    "verify_quote",
+    "verify_confidential",
+    "render_checks",
+    "appraise_workload",
+    "same_td",
+    "keyset_digest",
+    "report_data",
 ]
-__version__ = "0.3.2"
+__version__ = "0.4.0"

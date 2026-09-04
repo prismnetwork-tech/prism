@@ -3,7 +3,8 @@ from typing import Any
 
 from coinbase_agentkit import ActionProvider, WalletProvider, create_action
 from coinbase_agentkit.network import Network
-from prismnetwork import DEFAULT_IMAGE, Lease, PrismAgent
+from prismnetwork import DEFAULT_IMAGE, PrismAgent, PrismToolset
+from prismnetwork.toolkit import UNSET
 from pydantic import BaseModel, Field
 
 DEFAULT_ESCROW = "0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD"
@@ -18,7 +19,13 @@ class LeaseAndRunArgs(BaseModel):
     duration_seconds: int = Field(600, description="How long to hold the lease, in seconds")
     min_vram_mib: int = Field(16000, description="Minimum GPU memory in MiB")
     image: str = Field(DEFAULT_IMAGE, description="Digest-pinned container image to boot")
-    max_usdg: float = Field(1.0, description="Hard cap on the USDG this lease may cost")
+    max_usdg: float | None = Field(
+        None,
+        description=(
+            "Lower the operator's per-call spending cap for this one lease. It cannot raise it; "
+            "left out, the operator's cap applies."
+        ),
+    )
     min_trust_class: str = Field(
         "open",
         description=(
@@ -37,19 +44,22 @@ class LeaseIdArgs(BaseModel):
     lease_id: int = Field(description="A lease id from this session")
 
 
-def _usdg(micros: int) -> str:
-    return f"{int(micros) / 1_000_000:.6f} USDG"
-
-
 class PrismActionProvider(ActionProvider[WalletProvider]):
     """Rent and run on real NVIDIA GPUs through Prism Network.
 
     The provider carries its own funded wallet (``PRISM_AGENT_KEY``) and settles
     onchain in USDG. It never touches the agent's primary wallet, so it works with
     any AgentKit wallet provider.
+
+    Spending goes through the same ledger the MCP server and the Python SDK write.
+    ``max_usdg`` is the model's request rather than the limit: ``PRISM_MAX_USDG``
+    bounds every lease, ``PRISM_DAILY_BUDGET_USDG`` bounds the day, and one wallet
+    has one daily ceiling however many clients are holding it. ``budget`` takes a
+    :class:`~prismnetwork.Budget` or :class:`~prismnetwork.SpendLedger` for a caller
+    that wants its own limits.
     """
 
-    def __init__(self, agent: PrismAgent | None = None):
+    def __init__(self, agent: PrismAgent | None = None, budget=UNSET):
         super().__init__("prism", [])
         if agent is None:
             key = os.environ.get("PRISM_AGENT_KEY")
@@ -57,7 +67,19 @@ class PrismActionProvider(ActionProvider[WalletProvider]):
                 raise ValueError("PRISM_AGENT_KEY is required (or pass agent=)")
             agent = PrismAgent(key, os.environ.get("PRISM_ESCROW", DEFAULT_ESCROW))
         self.agent = agent
-        self._leases: dict[int, Lease] = {}
+        self.tools = PrismToolset(agent=agent, budget=budget)
+
+    @create_action(
+        name="budget",
+        description=(
+            "Show the spending limits in force and what this wallet has already spent in the last "
+            "24 hours. Worth checking before a long job; a lease refused for budget reports the "
+            "same numbers."
+        ),
+        schema=NoArgs,
+    )
+    def budget(self, args: dict[str, Any]) -> str:
+        return self.tools.budget_status()
 
     @create_action(
         name="wallet",
@@ -65,8 +87,7 @@ class PrismActionProvider(ActionProvider[WalletProvider]):
         schema=NoArgs,
     )
     def wallet(self, args: dict[str, Any]) -> str:
-        b = self.agent.balances()
-        return f"address: {b['address']}\nusdg: {_usdg(b['usdg'])}\neth: {int(b['eth']) / 1e18:.6f}"
+        return self.tools.wallet()
 
     @create_action(
         name="list_gpus",
@@ -77,40 +98,27 @@ class PrismActionProvider(ActionProvider[WalletProvider]):
         schema=NoArgs,
     )
     def list_gpus(self, args: dict[str, Any]) -> str:
-        offers = self.agent.offers()
-        if not offers:
-            return "No GPUs are online to rent right now."
-        rows = []
-        for o in offers:
-            gpu = o.get("gpu", {})
-            per_hr = int(o.get("rate_per_second", 0)) * 3600 / 1_000_000
-            trust = o.get("trust_class", "open")
-            rows.append(
-                f"{gpu.get('model', 'GPU')} · {gpu.get('vram_mib', '?')} MiB · ${per_hr:.2f}/hr · {trust}"
-            )
-        return "\n".join(rows)
+        return self.tools.list_gpus()
 
     @create_action(
         name="lease_and_run",
         description=(
-            "Rent a GPU, run one command on it, and return the output. Pays onchain in USDG "
-            "up to max_usdg. Blocks while the machine provisions (usually 1-4 minutes)."
+            "Rent a GPU, run one command on it, and return the output. Pays onchain in USDG within "
+            "the operator's per-call and daily spending caps. Blocks while the machine provisions "
+            "(usually 1-4 minutes)."
         ),
         schema=LeaseAndRunArgs,
     )
     def lease_and_run(self, args: dict[str, Any]) -> str:
         p = LeaseAndRunArgs(**args)
-        lease = self.agent.lease(
-            image=p.image,
+        return self.tools.lease_and_run(
+            command=p.command,
             duration_seconds=p.duration_seconds,
             min_vram_mib=p.min_vram_mib,
-            max_deposit=int(p.max_usdg * 1_000_000),
+            image=p.image,
+            max_usdg=p.max_usdg,
             min_trust_class=p.min_trust_class,
         )
-        self._leases[lease.lease_id] = lease
-        res = self.agent.run(lease, p.command)
-        out = res.get("stdout") or res.get("stderr") or ""
-        return f"lease {lease.lease_id} funded onchain (tx {lease.funding_hash}), exit {res.get('code')}:\n{out}"
 
     @create_action(
         name="run",
@@ -119,28 +127,20 @@ class PrismActionProvider(ActionProvider[WalletProvider]):
     )
     def run(self, args: dict[str, Any]) -> str:
         p = RunArgs(**args)
-        lease = self._leases.get(p.lease_id)
-        if lease is None:
-            return f"No active lease {p.lease_id} in this session."
-        res = self.agent.run(lease, p.command)
-        return f"exit {res.get('code')}:\n{res.get('stdout') or res.get('stderr') or ''}"
+        return self.tools.run(p.lease_id, p.command)
 
     @create_action(
         name="end_lease",
-        description="Release a leased GPU's local session. The onchain lease settles when its term ends.",
+        description="Release a leased GPU. Billing stops at the release; settlement charges the seconds it was open and returns the rest of the deposit.",
         schema=LeaseIdArgs,
     )
     def end_lease(self, args: dict[str, Any]) -> str:
         p = LeaseIdArgs(**args)
-        lease = self._leases.pop(p.lease_id, None)
-        if lease is None:
-            return f"No active lease {p.lease_id} in this session."
-        self.agent.end_lease(lease)
-        return f"released lease {p.lease_id}"
+        return self.tools.end_lease(p.lease_id)
 
     def supports_network(self, network: Network) -> bool:
         return True
 
 
-def prism_action_provider(agent: PrismAgent | None = None) -> PrismActionProvider:
-    return PrismActionProvider(agent)
+def prism_action_provider(agent: PrismAgent | None = None, budget=UNSET) -> PrismActionProvider:
+    return PrismActionProvider(agent, budget)

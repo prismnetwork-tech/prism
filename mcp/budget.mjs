@@ -7,10 +7,25 @@
 // Spend is written before the money moves and reverted only when the attempt
 // provably cost nothing, so a crash between funding and reply is counted rather
 // than forgiven. The file is shared across clients on purpose: one wallet gets
-// one daily ceiling whoever is holding it.
-import { mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, unlinkSync, statSync } from "node:fs";
+// one daily ceiling whoever is holding it, and the Python SDK's `_budget.py`
+// reads and writes the same entries this module does.
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeSync,
+} from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const MICROS = 1_000_000;
 const DAY_MS = 86_400_000;
@@ -19,6 +34,24 @@ const DAY_MS = 86_400_000;
 const MEMORY_MS = 2 * DAY_MS;
 const LOCK_STALE_MS = 15_000;
 const LOCK_WAIT_MS = 5_000;
+// Above this a USDG figure is a typo or an attack, and multiplying it out is how
+// the arithmetic stops being arithmetic.
+const MAX_CALL_USDG = 1e12;
+// The last instant both languages can name: Python's datetime stops at year
+// 9999 where this one keeps going, so a stamp past this is one only this client
+// could print, and it would sit in the file forever.
+export const MAX_AT_MS = 253_402_300_799_999;
+// One number grammar for both languages. Node's Number() takes "0x10" and
+// Python's float() takes "1_000", and an operator who typed either meant
+// neither. \d is ASCII here and every decimal digit there is in Python, so the
+// range is spelled out: Python reads "٣" as a 3 and no ledger should.
+const DECIMAL = /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/;
+// The two languages also disagree about what padding is: trim() takes U+FEFF
+// where Python's strip does not, and Python's takes U+001C where trim() does
+// not. Trimming these four leaves one answer on both sides.
+const PADDING = /^[ \t\r\n]+|[ \t\r\n]+$/g;
+
+const trim = (value) => String(value).replace(PADDING, "");
 
 export class BudgetError extends Error {
   constructor(message, detail = {}) {
@@ -30,9 +63,14 @@ export class BudgetError extends Error {
 
 export const usdg = (micros) => `${(Number(micros) / MICROS).toFixed(6)} USDG`;
 
+const isAmount = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+const isStamp = (value) => isAmount(value) && value <= MAX_AT_MS;
+
 function positiveNumber(raw, fallback, name) {
-  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
-  const value = Number(raw);
+  const text = raw === undefined || raw === null ? "" : trim(raw);
+  if (text === "") return fallback;
+  const value = DECIMAL.test(text) ? Number(text) : Number.NaN;
   if (!Number.isFinite(value) || value < 0) {
     throw new BudgetError(`${name} must be a non-negative number of USDG, got ${JSON.stringify(raw)}`);
   }
@@ -45,7 +83,7 @@ function positiveNumber(raw, fallback, name) {
 // "wallet configured and broken", so an unexpanded placeholder is nothing.
 export function stripUnexpanded(env = process.env) {
   for (const [key, value] of Object.entries(env)) {
-    if (key.startsWith("PRISM_") && /^\$\{[^}]*\}$/.test(String(value ?? "").trim())) delete env[key];
+    if (key.startsWith("PRISM_") && /^\$\{[^}]*\}$/.test(trim(value ?? ""))) delete env[key];
   }
   return env;
 }
@@ -86,22 +124,76 @@ export function callCeiling(maxUsdg, ceilingMicros) {
   if (typeof maxUsdg !== "number" || !Number.isFinite(maxUsdg) || maxUsdg <= 0) {
     throw new BudgetError("max_usdg must be a positive number of USDG.");
   }
+  // Checked before the multiplication, because that is where a figure this size
+  // stops being a number.
+  if (maxUsdg > MAX_CALL_USDG) throw new BudgetError(`max_usdg must be at most ${MAX_CALL_USDG} USDG.`);
   return Math.min(Math.round(maxUsdg * MICROS), ceilingMicros);
 }
 
+function lockOwner(lock) {
+  try {
+    return readFileSync(lock, "latin1").slice(0, 128);
+  } catch {
+    return null;
+  }
+}
+
+// A holder whose lock was broken as stale must not delete the lock its breaker
+// now holds, which is how two processes end up inside the ledger at once.
+function release(lock, token) {
+  if (lockOwner(lock) !== token) return;
+  try {
+    unlinkSync(lock);
+  } catch {
+    /* already gone */
+  }
+}
+
+// The lock this process is writing under, so the write itself can keep it alive
+// and refuse to publish under someone else's. A timer would do it in Python,
+// where the heartbeat runs on a thread; here the whole ledger is synchronous,
+// so nothing on this loop could fire between taking the lock and writing.
+let writing = null;
+
+function touch(lock, token) {
+  // Refreshing a lock that was broken and retaken would be this process
+  // vouching for a lock it does not hold.
+  if (lockOwner(lock) !== token) return;
+  const stamp = new Date();
+  try {
+    utimesSync(lock, stamp, stamp);
+  } catch {
+    /* it went while we were looking at it */
+  }
+}
+
+const keepLock = () => writing && touch(writing.lock, writing.token);
+
+const holdingLock = () => writing === null || lockOwner(writing.lock) === writing.token;
+
 // A lock rather than last-write-wins, because two clients sharing one wallet is
-// the case this file exists for. A lock older than LOCK_STALE_MS belonged to a
-// process that died; breaking it is safe and not breaking it wedges the wallet.
-function withLock(path, fn, waitMs = LOCK_WAIT_MS) {
-  const lock = `${path}.lock`;
+// the case this file exists for. A holder refreshes its lock as it writes, so a
+// lock older than LOCK_STALE_MS belonged to a process that died; breaking it is
+// safe and not breaking it wedges the wallet. A break that happens anyway,
+// because a machine slept or a clock stepped, is caught at the write.
+//
+// Exported because the tests that matter here need two real processes inside it.
+export function withLock(path, fn, waitMs = LOCK_WAIT_MS) {
   mkdirSync(dirname(path), { recursive: true });
+  // The lock names the file the write lands on rather than the name the caller
+  // spelled. One client reaching the ledger through a link and another through
+  // its target would otherwise hold two different locks over one file, and each
+  // would publish a state read before the other's charge existed.
+  const lock = `${resolveTarget(path)}.lock`;
   const deadline = Date.now() + waitMs;
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
   for (;;) {
     let fd;
     try {
-      fd = openSync(lock, "wx");
+      fd = openSync(lock, "wx", 0o600);
     } catch (err) {
       if (err?.code !== "EEXIST") throw err;
+      const held = lockOwner(lock);
       let age = 0;
       try {
         age = Date.now() - statSync(lock).mtimeMs;
@@ -109,10 +201,15 @@ function withLock(path, fn, waitMs = LOCK_WAIT_MS) {
         continue; // it vanished between the open and the stat; retry immediately
       }
       if (age > LOCK_STALE_MS) {
-        try {
-          unlinkSync(lock);
-        } catch {
-          /* another process broke it first, which is the outcome we wanted */
+        // Break the lock that was read as stale and no other: re-reading the
+        // token keeps a slow breaker from deleting a lock a third process took
+        // in the meantime.
+        if (lockOwner(lock) === held) {
+          try {
+            unlinkSync(lock);
+          } catch {
+            /* another process broke it first, which is the outcome we wanted */
+          }
         }
         continue;
       }
@@ -127,38 +224,140 @@ function withLock(path, fn, waitMs = LOCK_WAIT_MS) {
       continue;
     }
     try {
+      writeSync(fd, token);
+      fsyncSync(fd);
+    } catch (err) {
       closeSync(fd);
+      release(lock, token);
+      throw err;
+    }
+    closeSync(fd);
+    const outer = writing;
+    writing = { lock, token };
+    try {
       return fn();
     } finally {
-      try {
-        unlinkSync(lock);
-      } catch {
-        /* already gone */
-      }
+      writing = outer;
+      release(lock, token);
     }
   }
 }
 
+const unreadable = (path, reason) =>
+  new BudgetError(`the spend ledger at ${path} is unreadable (${reason}), so spending is refused. Move or repair the file.`);
+
 function readState(path) {
+  let raw;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8"));
-    if (!parsed || !Array.isArray(parsed.entries)) return { entries: [] };
-    return { entries: parsed.entries.filter((e) => e && Number.isFinite(e.at) && Number.isFinite(e.micros)) };
+    raw = readFileSync(path);
   } catch (err) {
     if (err?.code === "ENOENT") return { entries: [] };
+    throw unreadable(path, err?.message ?? err);
+  }
+  let parsed;
+  try {
+    // Invalid UTF-8 is refused rather than patched up with replacement
+    // characters, because the bytes a ledger cannot read are the bytes it must
+    // not spend against.
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+  } catch (err) {
     // A corrupt ledger must not read as an empty one: that would hand the
     // caller a fresh day's budget every time the file got truncated.
-    throw new BudgetError(
-      `the spend ledger at ${path} is unreadable (${err?.message ?? err}), so spending is refused. Move or repair the file.`,
-    );
+    throw unreadable(path, err?.message ?? err);
+  }
+  const entries = parsed && typeof parsed === "object" ? parsed.entries : undefined;
+  if (!Array.isArray(entries)) throw unreadable(path, "it holds no list of entries");
+  // Dropping the entries that fail this check would be the corrupt-reads-as-
+  // empty bug again, one charge at a time.
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || !isStamp(entry.at) || !isAmount(entry.micros)) {
+      throw unreadable(path, "an entry is not a charge with non-negative micros and an at a date can hold");
+    }
+  }
+  return { entries };
+}
+
+// The entry is written before the money moves, so it has to survive the crash
+// that lands between the two.
+function fsyncDir(directory) {
+  let fd;
+  try {
+    fd = openSync(directory, "r");
+  } catch {
+    return; // not every platform lets a directory be opened, and the rename is still ordered
+  }
+  try {
+    fsyncSync(fd);
+  } catch {
+    /* some filesystems refuse it */
+  } finally {
+    closeSync(fd);
   }
 }
 
-function writeState(path, state, now) {
+// A symlinked ledger is written through, not replaced: an operator who pointed
+// the path at a file elsewhere means to keep reading that file. realpathSync
+// gives up when the target does not exist yet, so a link is followed by hand
+// and the last name is resolved against its own directory, which is how the
+// first write creates the file through the link rather than over it.
+function resolveTarget(path) {
+  let current = path;
+  for (let hop = 0; hop < 40; hop += 1) {
+    try {
+      return realpathSync(current);
+    } catch {
+      /* nothing there yet */
+    }
+    let link;
+    try {
+      link = readlinkSync(current);
+    } catch {
+      break; // a plain name that is not there, which is the ordinary first write
+    }
+    current = resolve(dirname(current), link);
+  }
+  try {
+    return join(realpathSync(dirname(current)), basename(current));
+  } catch {
+    return current;
+  }
+}
+
+// Exported alongside withLock, for the same reason: what a write does when the
+// lock under it changed hands can only be tested from a second real process.
+export function writeState(path, state, now) {
   const entries = state.entries.filter((e) => now - e.at < MEMORY_MS);
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify({ version: 1, entries }, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, path);
+  const target = resolveTarget(path);
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    unlinkSync(tmp);
+  } catch {
+    /* nothing to clear */
+  }
+  keepLock();
+  // Exclusive, so a temp file left behind by anyone else cannot lend this one
+  // its permissions.
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    writeSync(fd, `${JSON.stringify({ version: 1, entries }, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  // The last moment this is still a decision. A lock read as stale is broken by
+  // whoever wants it next, and if that happened while these bytes were being
+  // prepared they no longer describe the file: publishing them would erase the
+  // charge the breaker just recorded.
+  if (!holdingLock()) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing to clear */
+    }
+    throw new BudgetError("lost the ledger lock; nothing written");
+  }
+  renameSync(tmp, target);
+  fsyncDir(dirname(target));
 }
 
 export function spentInWindow(entries, now) {
@@ -195,7 +394,7 @@ export class SpendLedger {
         .slice(0, 20)
         .map((e) => ({
           at: new Date(e.at).toISOString(),
-          tool: e.tool,
+          ...("tool" in e ? { tool: e.tool } : {}),
           amount: usdg(e.micros),
           ...(e.reference ? { reference: e.reference } : {}),
         })),
@@ -215,6 +414,11 @@ export class SpendLedger {
         { required: micros, cap: this.maxPerCallMicros },
       );
     }
+    // A caller handing this nanoseconds writes an entry no reader can date and
+    // no write can prune, which wedges the ledger for good.
+    if (!isStamp(now)) {
+      throw new BudgetError("a charge has to be stamped in milliseconds since the epoch, and this one is not");
+    }
     return withLock(
       this.path,
       () => {
@@ -227,7 +431,10 @@ export class SpendLedger {
             { spent, requested: micros, cap: this.dailyMicros },
           );
         }
-        const id = `${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        // The suffix separates two charges stamped in the same millisecond, and
+        // Math.random makes that a guess anyone sharing the file can make:
+        // settle and revert both take an id.
+        const id = `${Math.max(Math.trunc(now), 0).toString(36)}-${randomBytes(8).toString("hex")}`;
         state.entries.push({ id, at: now, tool, micros });
         writeState(this.path, state, now);
         return id;
@@ -252,24 +459,45 @@ export class SpendLedger {
 
   // Replaces the reserved figure with what was actually committed on-chain and
   // pins the receipt to it, so the ledger reads like a statement rather than a
-  // list of intentions.
+  // list of intentions. The reservation is the ceiling the escrow was funded
+  // against, so settling can only lower it.
   //
   // A payment the endpoint never consumed is redeemed by the next attempt at the
   // same request, so one transaction can settle more than one reservation.
   // Booking each would charge the day twice for money that moved once: a
   // reference already on file keeps its entry and this one is released.
+  //
+  // The fold rests on a reference naming exactly one payment, which holds
+  // because recordSpend passes nothing but a transaction this process
+  // broadcast. It is bounded to the same tool inside the same day regardless:
+  // the file remembers two days, and folding today's reservation into a charge
+  // the window no longer counts would take a spend off the day's total rather
+  // than deduplicate one.
   settle(id, { micros, reference } = {}) {
     if (!id) return false;
     return withLock(this.path, () => {
+      const now = Date.now();
       const state = readState(this.path);
       const entry = state.entries.find((e) => e.id === id);
       if (!entry) return false;
-      const booked = reference ? state.entries.find((e) => e.id !== id && e.reference === reference) : undefined;
+      const booked = reference
+        ? state.entries.find(
+            (e) => e.id !== id && e.reference === reference && e.tool === entry.tool && now - e.at < DAY_MS,
+          )
+        : undefined;
       const target = booked ?? entry;
-      if (Number.isFinite(micros) && micros >= 0) target.micros = micros;
+      if (isAmount(micros)) {
+        if (micros > target.micros) {
+          console.error(
+            `prism: a settlement of ${usdg(micros)} is above the ${usdg(target.micros)} reserved for ledger entry ${target.id}; the reservation stands.`,
+          );
+        } else {
+          target.micros = micros;
+        }
+      }
       if (reference) target.reference = reference;
       if (booked) state.entries = state.entries.filter((e) => e.id !== id);
-      writeState(this.path, state, Date.now());
+      writeState(this.path, state, now);
       return true;
     }, this.lockWaitMs);
   }
@@ -293,12 +521,15 @@ export async function recordSpend(book, tool, micros, run) {
       console.error(`prism mcp: could not ${action} the ledger entry for ${tool}: ${err?.message ?? err}`);
     }
   };
+  let outcome;
   try {
-    const { value, settledMicros, reference } = await run();
-    reconcile("settle", { micros: settledMicros, reference });
-    return value;
+    outcome = await run();
   } catch (err) {
-    const paid = err?.body?.funding_hash ?? err?.body?.payment_tx;
+    // Only a transaction this process put on the wire proves money moved. A
+    // failure's body is whatever the control plane sent back, and reading a
+    // hash out of it would let the far side decide which reservations stand and
+    // which later ones are folded into them.
+    const paid = typeof err?.broadcast === "string" && err.broadcast ? err.broadcast : null;
     if (paid) {
       reconcile("settle", { reference: paid });
     } else if (err?.code === "chain_error") {
@@ -313,4 +544,20 @@ export async function recordSpend(book, tool, micros, run) {
     }
     throw err;
   }
+  // The attempt ran, so the money is as gone as the caller's ability to
+  // describe it. The reservation stands and the shape is reported as the
+  // programming error it is.
+  // An array carries no settledMicros and no reference, so reading one as an
+  // outcome would book the reservation as if it had been settled and hand the
+  // caller undefined. Python refuses the same shape.
+  if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) {
+    reconcile("settle");
+    const shape = outcome === null ? "null" : Array.isArray(outcome) ? "array" : typeof outcome;
+    throw new BudgetError(
+      `${tool} reported ${shape} where the ledger needs an object of ` +
+        `value, settledMicros and reference; the reservation stands.`,
+    );
+  }
+  reconcile("settle", { micros: outcome.settledMicros, reference: outcome.reference });
+  return outcome.value;
 }

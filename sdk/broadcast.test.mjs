@@ -30,6 +30,7 @@ test("a funded lease whose receipt never arrived still names its transaction", a
   await assert.rejects(agent().fund(quote), (err) => {
     assert.equal(err.code, "chain_error");
     assert.equal(err.body.funding_hash, HASH);
+    assert.equal(err.broadcast, HASH, "the ledger reads this field and not the body");
     assert.match(err.body.cause, /timed out/);
     return true;
   });
@@ -39,6 +40,7 @@ test("a payment whose receipt never arrived still names its transaction", async 
   await assert.rejects(agent().transferUsdg("0x0000000000000000000000000000000000000003", 30_000n), (err) => {
     assert.equal(err.code, "chain_error");
     assert.equal(err.body.payment_tx, HASH);
+    assert.equal(err.broadcast, HASH, "the ledger reads this field and not the body");
     return true;
   });
 });
@@ -50,6 +52,7 @@ test("a submission the chain never accepted names nothing, because nothing left"
   await assert.rejects(refused.transferUsdg("0x0000000000000000000000000000000000000003", 30_000n), (err) => {
     assert.equal(err.code, "chain_error");
     assert.equal(err.body.payment_tx, undefined);
+    assert.equal(err.broadcast, null);
     return true;
   });
 });

@@ -130,14 +130,17 @@ export class PrismActionProvider extends ActionProvider {
       {
         name: "prism_end_lease",
         description:
-          "Release a lease. The machine is torn down and the lease settles onchain when its window ends.",
+          "Release a lease. Billing stops at the release; settlement charges the seconds it was open and returns the rest of the deposit.",
         schema: endLeaseArgs,
         invoke: async (args) => {
           const lease = this.#leases.get(args.leaseId);
           if (!lease) return `lease ${args.leaseId} is not open in this session`;
-          this.#agent.endLease(lease);
           this.#leases.delete(args.leaseId);
-          return `released lease ${args.leaseId}`;
+          const out = await this.#agent.endLease(lease);
+          if (out?.release === "failed") {
+            return `lease ${args.leaseId} could not be released: ${out.error}. Its access key is gone but the meter may still be running; check receipts for the settled charge.`;
+          }
+          return `released lease ${args.leaseId}; billing stopped here and the unused deposit returns after settlement`;
         },
       },
     ];

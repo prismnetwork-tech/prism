@@ -12,11 +12,12 @@ pip install prism-agentkit
 
 ## Actions
 
+- `budget` - the spending limits in force and what the wallet has spent in the last 24 hours.
 - `wallet` - the Prism agent's address and USDG/ETH balances.
 - `list_gpus` - GPUs available to rent now, with model, VRAM, and price per hour.
-- `lease_and_run` - rent a GPU, run a command, return the output (one shot, pays onchain up to `max_usdg`).
+- `lease_and_run` - rent a GPU, run a command, return the output (one shot, pays onchain).
 - `run` - run another command on a GPU already leased this session.
-- `end_lease` - release a lease's local session.
+- `end_lease` - release a lease; billing stops at the release, and the unused deposit returns after settlement.
 
 ## Use
 
@@ -52,6 +53,21 @@ Set the Prism agent's wallet:
 export PRISM_AGENT_KEY=0x...   # agent wallet private key, funded with USDG + gas on Robinhood Chain
 export PRISM_ESCROW=0xfD4228eEEfC49e4b76A0CD40af9fdd546220B2FD   # optional, this is the default
 ```
+
+Set what it may spend:
+
+```bash
+export PRISM_MAX_USDG=1              # per lease or generation; the default
+export PRISM_DAILY_BUDGET_USDG=5     # rolling 24 hours; the default. 0 removes it
+export PRISM_LEDGER_PATH=~/.prism/spend.json   # optional, this is the default
+```
+
+The real ceiling is the wallet balance, so fund it with what you are willing to
+lose. These limits are the second line, and they exist because a `max_usdg` on
+one call says nothing about the fortieth in a row. A model can pass `max_usdg`
+to lower the per-call cap for a single lease; it cannot raise it. The MCP server
+and the Python SDK write the same ledger, so one wallet has one daily ceiling
+however many clients are holding it.
 
 The wallet needs USDG (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`) and Robinhood-Chain ETH for gas. See the [Prism SDK](https://github.com/prismnetwork-tech/prism) for how to fund a fresh wallet.
 

@@ -70,6 +70,8 @@ jobs:
       - run: python scripts/validate-python-packages.py
       - run: python -m unittest discover -s tests -t .
         working-directory: python-sdk
+      - run: python -m unittest discover -s tests -t .
+        working-directory: agentkit
 
   mcp:
     runs-on: ubuntu-24.04

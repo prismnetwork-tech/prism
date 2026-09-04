@@ -109,7 +109,7 @@ await agent.authenticate();
 const lease = await agent.lease({ image: DEFAULT_IMAGE, durationSeconds: 900, minVramMib: 16000 });
 const out = await agent.run(lease, "nvidia-smi");
 console.log(out.stdout);
-agent.endLease(lease);`;
+await agent.endLease(lease);`;
 
 const vaultExample = `await agent.vault.unlock();
 
@@ -259,6 +259,7 @@ export function DeveloperDocs() {
               <Endpoint method="POST" path="/api/app/leases/confirm" auth="Session" description="Bind a finalized funding event and Ed25519 public key to a quote." />
               <Endpoint method="GET" path="/api/app/leases" auth="Session" description="List leases owned by the authenticated account." />
               <Endpoint method="GET" path="/api/app/leases/{lease_id}/access" auth="Session" description="Return direct SSH or gateway access only after readiness and chain finality." />
+              <Endpoint method="POST" path="/api/app/leases/{lease_id}/release" auth="Session" description="End an active lease early. Access closes and the meter stops; settlement charges the seconds it was open and returns the rest of the deposit." />
               <Endpoint method="GET" path="/api/proof" auth="Public" description="Read the sanitized finalized/refunded public proof feed." />
               <Endpoint method="GET" path="/api/activity" auth="Public" description="Read the renter-anonymous recent network activity feed." />
             </div>

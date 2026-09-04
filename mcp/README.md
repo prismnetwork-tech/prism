@@ -76,7 +76,7 @@ real prices. Leasing spends money, so those tools ask for a wallet and say so.
 - `prism_batch_run`: fund a lease that runs one command with no interactive
   access; the node reports the signed output. Matches only suppliers at trust
   class `isolated` or above, so it can find no supplier when none is online.
-- `prism_end_lease`: release a lease.
+- `prism_end_lease`: release a lease. Billing stops at the release; the unused deposit returns after settlement.
 - `prism_vault_store`: seal private data under the wallet-derived key.
 - `prism_vault_list`: list sealed items; values are never returned.
 - `prism_vault_read`: decrypt one item in this process.

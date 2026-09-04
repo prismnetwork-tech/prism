@@ -24,7 +24,7 @@ await agent.authenticate();
 const lease = await agent.lease({ image: DEFAULT_IMAGE, durationSeconds: 900, minVramMib: 16000 });
 const out = await agent.run(lease, "nvidia-smi");
 console.log(out.stdout);
-agent.endLease(lease);
+await agent.endLease(lease);
 ```
 
 `image` must be an immutable digest-pinned reference (`repo@sha256:...`). `DEFAULT_IMAGE` is one; a plain tag is rejected.
@@ -170,7 +170,9 @@ it is seen and held for the rest of the lease, which catches a machine swapped i
 partway through and cannot catch one that was wrong from the start.
 
 Nothing is written to your own `~/.ssh/known_hosts`. The record sits beside the
-lease's private key and is removed with it by `endLease()`.
+lease's private key and is removed with it by `endLease()`, which also releases
+the lease on the network so billing stops there instead of at the end of the
+window.
 
 To refuse the third case outright:
 

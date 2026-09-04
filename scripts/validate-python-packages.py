@@ -1,5 +1,11 @@
+import os
+import tempfile
 from importlib.metadata import version
 from unittest.mock import patch
+
+# The toolset spends through the shared ledger, and a packaging check has no
+# business writing to the one this machine's agents are using.
+os.environ["PRISM_LEDGER_PATH"] = os.path.join(tempfile.mkdtemp(prefix="prism-validate-"), "spend.json")
 
 import prism_agentkit
 import prismnetwork
@@ -21,7 +27,7 @@ class FakeAgent:
             "eth": 2_000_000_000_000_000_000,
         }
 
-    def offers(self):
+    def offers(self, min_trust="open"):
         return [
             {
                 "gpu": {"model": "Test GPU", "vram_mib": 24_576},
@@ -40,6 +46,8 @@ class FakeAgent:
             public_key="",
             funding_hash="0x01",
             quote={},
+            deposit_micros=kwargs["max_deposit"],
+            deposit_source="receipt",
         )
 
     def run(self, lease, command):
@@ -57,7 +65,7 @@ agent = FakeAgent()
 provider = PrismActionProvider(agent)
 prefix = "PrismActionProvider_"
 actions = {action.name.removeprefix(prefix): action for action in provider.get_actions(None)}
-assert set(actions) == {"wallet", "list_gpus", "lease_and_run", "run", "end_lease"}
+assert set(actions) == {"budget", "wallet", "list_gpus", "lease_and_run", "run", "end_lease"}
 
 with patch("coinbase_agentkit.action_providers.action_decorator.send_analytics_event"):
     assert "1.250000 USDG" in actions["wallet"].invoke({})
@@ -82,6 +90,8 @@ with patch("coinbase_agentkit.action_providers.action_decorator.send_analytics_e
     }
     assert actions["run"].invoke({"lease_id": 7, "command": "echo ready"}).endswith("7:echo ready")
     assert actions["end_lease"].invoke({"lease_id": 7}) == "released lease 7"
+    budget = actions["budget"].invoke({})
+    assert "daily budget: 5.000000 USDG" in budget and "prism_lease_and_run 0.250000 USDG" in budget
 assert agent.ended == [7]
 
 import prism_autogen
@@ -90,11 +100,6 @@ import prism_langchain
 from prismnetwork import BatchLease, PrismToolset  # noqa: F401
 from prismnetwork._agent import MAX_COMMAND_BYTES, _command
 from prismnetwork.toolkit import NO_WALLET
-
-
-class FakeToolsetAgent(FakeAgent):
-    def offers(self, min_trust="open"):
-        return super().offers()
 
 
 assert version("prism-langchain") == prism_langchain.__version__
@@ -109,14 +114,14 @@ for bad in ("", "  ", "x" * (MAX_COMMAND_BYTES + 1)):
     except prismnetwork.PrismError as e:
         assert e.code == "invalid_command"
 
-toolset = PrismToolset(agent=FakeToolsetAgent())
+toolset = PrismToolset(agent=FakeAgent())
 listed = toolset.list_gpus()
 assert "Test GPU" in listed and "isolated" in listed
 assert "lease 7 funded onchain" in toolset.lease_and_run("nvidia-smi", max_usdg=0.25)
 assert toolset.run(7, "echo ready").endswith("7:echo ready")
 assert toolset.end_lease(7) == "released lease 7"
 
-guard = PrismToolset(agent=FakeToolsetAgent())
+guard = PrismToolset(agent=FakeAgent())
 assert "command is required" in guard.lease_and_run("")
 assert "8 KiB" in guard.lease_and_run("x" * (MAX_COMMAND_BYTES + 1))
 assert "must be one of" in guard.lease_and_run("ok", min_trust_class="banana")
@@ -128,19 +133,19 @@ assert keyless.lease_and_run("nvidia-smi") == NO_WALLET
 
 expected = ["prism_wallet", "prism_list_gpus", "prism_lease_and_run", "prism_run", "prism_end_lease"]
 
-lc_tools = prism_langchain.get_prism_tools(PrismToolset(agent=FakeToolsetAgent()))
+lc_tools = prism_langchain.get_prism_tools(PrismToolset(agent=FakeAgent()))
 assert [t.name for t in lc_tools] == expected
 assert "Test GPU" in lc_tools[1].invoke({"min_trust_class": "open"})
 assert "lease 7 funded onchain" in lc_tools[2].invoke({"command": "nvidia-smi", "max_usdg": 0.25})
 
-crew_agent = FakeToolsetAgent()
+crew_agent = FakeAgent()
 crew_tools = prism_crewai.prism_tools(PrismToolset(agent=crew_agent))
 assert [t.name for t in crew_tools] == expected
 assert "Test GPU" in crew_tools[1].run(min_trust_class="open")
 assert "lease 7 funded onchain" in crew_tools[2].run(command="nvidia-smi", max_usdg=0.25)
 assert crew_agent.last_lease["max_deposit"] == 250_000
 
-ag_agent = FakeToolsetAgent()
+ag_agent = FakeAgent()
 ag_tools = prism_autogen.prism_tools(PrismToolset(agent=ag_agent))
 assert [f.__name__ for f in ag_tools] == expected
 assert all(f.__doc__ for f in ag_tools)
