@@ -5,6 +5,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{self, Child, Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -177,6 +178,10 @@ pub struct LaunchConfig<'a> {
     /// so it reaches `HOST_DATA`. A lease with a challenge and no digest does
     /// not launch.
     pub agent_policy_digest: Option<&'a str>,
+    /// Set once the control plane reports the lease has ended early. The
+    /// container is stopped at the next check instead of at its deadline, and
+    /// the launch completes as if the deadline had passed.
+    pub released: Option<&'a AtomicBool>,
 }
 
 pub fn validate_image_reference(image: &str) -> anyhow::Result<()> {
@@ -1106,19 +1111,29 @@ fn run_workspace(
 
     let deadline = Instant::now() + Duration::from_secs(u64::from(config.duration_seconds));
     loop {
+        if lease_is_over(config, deadline) {
+            stop_container(config.lease_id, isolation.workload_noun())?;
+            let _ = child.wait();
+            return Ok(());
+        }
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
                 "{} exited before the lease deadline: {status}",
                 isolation.workload_noun()
             );
         }
-        if Instant::now() >= deadline {
-            stop_container(config.lease_id, isolation.workload_noun())?;
-            let _ = child.wait();
-            return Ok(());
-        }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Whether the workload is done: the renter released the lease early, or it ran
+/// the time it was sold. Checked before the container's own exit, because once
+/// the lease is over a container that has already stopped is not a failure.
+fn lease_is_over(config: &LaunchConfig<'_>, deadline: Instant) -> bool {
+    config
+        .released
+        .is_some_and(|released| released.load(Ordering::Acquire))
+        || Instant::now() >= deadline
 }
 
 fn wait_for_container_ip(
@@ -1865,6 +1880,7 @@ mod tests {
             jupyter_port: 8_888,
             attestation_challenge: None,
             agent_policy_digest: None,
+            released: None,
         }
     }
 
@@ -1885,6 +1901,27 @@ mod tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// A release has to reach the running container, otherwise the GPU is held
+    /// for the rest of an hour the renter has stopped paying for.
+    #[test]
+    fn a_released_lease_ends_before_its_deadline() {
+        let root = temporary_directory("released-lease");
+        let (authorized_key, jupyter_token) = workspace_credentials(&root);
+        let shared = shared_isolation();
+        let mut config = launch_config(&root, &authorized_key, &jupyter_token, &shared);
+        let deadline = Instant::now() + Duration::from_secs(3_600);
+        assert!(!lease_is_over(&config, deadline));
+
+        let released = AtomicBool::new(false);
+        config.released = Some(&released);
+        assert!(!lease_is_over(&config, deadline));
+        released.store(true, Ordering::Release);
+        assert!(lease_is_over(&config, deadline));
+
+        config.released = None;
+        assert!(lease_is_over(&config, Instant::now()));
     }
 
     /// A passthrough node upgrades by replacing the binary, so its argv is a

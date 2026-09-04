@@ -1649,6 +1649,17 @@ pub struct NodeCommandReportPayload {
     pub channel_key: Option<String>,
 }
 
+/// What the control plane answers a node command report with. A daemon built
+/// before this existed reads a 204 with no body, so every field stays optional
+/// and absence means "the control plane did not say".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeCommandReportAck {
+    /// Where the lease this command serves now stands. A renter can end a lease
+    /// early, and the node holds the GPU until it is told to let go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_state: Option<LeaseState>,
+}
+
 impl NodeCommandReport {
     pub fn sign(
         unsigned: NodeCommandReportPayload,

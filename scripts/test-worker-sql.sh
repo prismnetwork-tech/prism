@@ -978,22 +978,42 @@ run -c "DELETE FROM lifecycle_outbox o USING leases l
         UPDATE lease_lifecycle SET access_started_at = NOW()
         WHERE lease_id IN (SELECT lease_id FROM leases WHERE subject = 'escrow-fence-test');" >/dev/null
 
-run -c "INSERT INTO lifecycle_outbox (action_id, lease_id, kind)
-        SELECT md5(l.lease_id::text || ':refresh_grant')::uuid, l.lease_id, 'refresh_grant'
-        FROM leases l JOIN lease_lifecycle lc ON lc.lease_id = l.lease_id
-        WHERE l.state = 'active'
-          AND l.escrow_address = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-          AND lc.grant_expires_at <= NOW() + INTERVAL '10 minutes'
-          AND lc.access_started_at +
-              make_interval(secs => (l.document->>'duration_seconds')::int)
-              > NOW() + INTERVAL '10 minutes'
-        ON CONFLICT (lease_id, kind) DO UPDATE
-          SET status = 'queued', available_at = NOW(), lease_until = NULL,
-              last_error = NULL, document = '{}'::jsonb, updated_at = NOW()
-        WHERE lifecycle_outbox.status = 'completed';" >/dev/null
+refresh_scan() {
+  run -c "INSERT INTO lifecycle_outbox (action_id, lease_id, kind)
+          SELECT md5(l.lease_id::text || ':refresh_grant')::uuid, l.lease_id, 'refresh_grant'
+          FROM leases l JOIN lease_lifecycle lc ON lc.lease_id = l.lease_id
+          WHERE l.state = 'active'
+            AND l.escrow_address = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            AND lc.grant_expires_at <= NOW() + INTERVAL '10 minutes'
+            AND lc.access_started_at +
+                make_interval(secs => (l.document->>'duration_seconds')::int)
+                > NOW() + INTERVAL '10 minutes'
+            AND NOT EXISTS (
+                SELECT 1 FROM lifecycle_outbox c
+                WHERE c.lease_id = l.lease_id AND c.kind = 'close_access')
+          ON CONFLICT (lease_id, kind) DO UPDATE
+            SET status = 'queued', available_at = NOW(), lease_until = NULL,
+                last_error = NULL, document = '{}'::jsonb, updated_at = NOW()
+          WHERE lifecycle_outbox.status = 'completed';" >/dev/null
+}
+
+refresh_scan
 [[ $(run -Atc "SELECT string_agg(l.escrow_address, ',' ORDER BY l.escrow_address)
               FROM lifecycle_outbox o JOIN leases l USING (lease_id)
               WHERE l.subject = 'escrow-fence-test' AND o.kind = 'refresh_grant';") == 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]
+# A released lease keeps state 'active' until its close confirms. The scan has
+# to leave it alone: the meter stops at the close, and an hour of session minted
+# after it is compute nobody pays for.
+run -c "DELETE FROM lifecycle_outbox o USING leases l
+        WHERE o.lease_id = l.lease_id AND l.subject = 'escrow-fence-test';
+        INSERT INTO lifecycle_outbox (action_id, lease_id, kind)
+        SELECT md5(lease_id::text || ':close_access')::uuid, lease_id, 'close_access'
+        FROM leases
+        WHERE subject = 'escrow-fence-test'
+          AND escrow_address = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';" >/dev/null
+refresh_scan
+[[ $(run -Atc "SELECT COUNT(*) FROM lifecycle_outbox o JOIN leases l USING (lease_id)
+              WHERE l.subject = 'escrow-fence-test' AND o.kind = 'refresh_grant';") == 0 ]]
 run -c "DELETE FROM lifecycle_outbox o USING leases l
         WHERE o.lease_id = l.lease_id AND l.subject = 'escrow-fence-test';
         INSERT INTO lifecycle_outbox

@@ -35,12 +35,12 @@ use prism_protocol::{
     MAX_VAULT_LABEL_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_NAME_BYTES,
     MAX_WORKSPACES_PER_ACCOUNT, ManagedCommandReport, ManagedProvider, NodeAttestation,
     NodeCertificateBundle, NodeCertificateRequest, NodeCommand, NodeCommandKind,
-    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeEnrollment, NodeOffer, NodePosture,
-    NodeTelemetry, PublicReceipt, ReceiptOutcome, ReproExecutionReport, ReproExecutor,
-    STANDARD_RATE_PER_SECOND, SettlementEvidence, TdxEventEntry, TdxLeaseAttestation, TrustClass,
-    VaultEnvelope, VaultItem, VaultRelease, VaultWrite, Workspace, WorkspaceSnapshot,
-    attestation_report_nonce, class_for_lease, class_for_verdict, discounted_rate,
-    managed_repro_report_hash, node_id, receipt_hash_matches, repro_command_hash,
+    NodeCommandOutcome, NodeCommandPoll, NodeCommandReport, NodeCommandReportAck, NodeEnrollment,
+    NodeOffer, NodePosture, NodeTelemetry, PublicReceipt, ReceiptOutcome, ReproExecutionReport,
+    ReproExecutor, STANDARD_RATE_PER_SECOND, SettlementEvidence, TdxEventEntry,
+    TdxLeaseAttestation, TrustClass, VaultEnvelope, VaultItem, VaultRelease, VaultWrite, Workspace,
+    WorkspaceSnapshot, attestation_report_nonce, class_for_lease, class_for_verdict,
+    discounted_rate, managed_repro_report_hash, node_id, receipt_hash_matches, repro_command_hash,
     repro_report_hash, repro_result_hash, repro_stream_hash, repro_token_hash, snp_report_data,
     stake_discount_bps, tdx_lease_report_data, tdx_report_data, vault_release_permitted,
     verifying_key,
@@ -1200,6 +1200,29 @@ struct LeaseAccessResponse {
     channel_key_source: Option<ChannelKeySource>,
 }
 
+/// `state` is where the lease stands once the call returns: `closing` on a
+/// release that took, and whatever it had already reached on one that arrived
+/// late. `release` says what this call did rather than what the lease is doing:
+/// `queued` on the first release, `already_closed` afterwards.
+#[derive(Serialize)]
+struct LeaseReleaseResponse {
+    lease_id: u64,
+    state: &'static str,
+    release: &'static str,
+}
+
+/// What a release did to the lease it named.
+enum LeaseRelease {
+    /// Access is shut and the teardown is queued.
+    Queued,
+    /// Access had already ended before the call arrived.
+    AlreadyClosed(LeaseState),
+    /// Access never opened, so there is nothing to close.
+    NotYetOpen,
+    /// The lease carries a command and ends when that command reports.
+    Batch,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReproStatusRequest {
@@ -1704,6 +1727,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/leases/match", post(match_lease))
         .route("/v1/leases", get(list_account_leases))
         .route("/v1/leases/{lease_id}/access", get(get_lease_access))
+        .route("/v1/leases/{lease_id}/release", post(release_lease))
         .route(
             "/v1/leases/{lease_id}/attestation/challenge",
             get(create_lease_attestation_challenge),
@@ -3615,6 +3639,7 @@ impl MarketplaceStore {
         match self {
             Self::Memory(market) => {
                 let market = market.read().await;
+                let busy = nodes_holding_commands(&market);
                 Ok(market
                     .offers
                     .values()
@@ -3623,6 +3648,7 @@ impl MarketplaceStore {
                             && offer.public_image_only
                             && offer.updated_at >= cutoff
                             && !market.suspended_nodes.contains(&offer.node_id)
+                            && !busy.contains(&offer.node_id)
                             && market
                                 .tunnels
                                 .get(&offer.node_id)
@@ -3700,6 +3726,11 @@ impl MarketplaceStore {
                        AND NOT EXISTS ( \
                            SELECT 1 FROM node_controls c \
                            WHERE c.node_id = o.node_id AND c.suspended \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM node_commands nc \
+                           WHERE nc.node_id = o.node_id \
+                             AND nc.status IN ('queued', 'leased', 'ready', 'running') \
                        ) \
                        AND (EXISTS ( \
                            SELECT 1 FROM node_tunnels t \
@@ -5044,6 +5075,7 @@ impl MarketplaceStore {
                         .filter(|(_, lease)| occupies_node_for_escrow(lease, escrow_address))
                         .map(|(_, lease)| lease.node_id.clone()),
                 );
+                reserved.extend(nodes_holding_commands(&market));
                 let now = Utc::now();
                 let cutoff = now - Duration::seconds(OFFER_MAX_AGE_SECONDS);
                 let offers = market
@@ -5171,7 +5203,9 @@ impl MarketplaceStore {
                        AND state NOT IN ('finalized', 'refunded') \
                      UNION SELECT l.document->>'node_id' FROM leases l \
                      JOIN cloud_instances ci ON ci.lease_id = l.lease_id \
-                     WHERE ci.status <> 'destroyed'",
+                     WHERE ci.status <> 'destroyed' \
+                     UNION SELECT c.node_id FROM node_commands c \
+                     WHERE c.status IN ('queued', 'leased', 'ready', 'running')",
                 )
                 .bind(QUOTE_HOLD_SECONDS as f64)
                 .bind(escrow_address)
@@ -6487,6 +6521,10 @@ impl MarketplaceStore {
         }
     }
 
+    /// Hands the node the next command it owes work on, after closing out the
+    /// ones whose lease has ended. A poll is the node saying it is running
+    /// nothing, so a command left open on a released lease is finished here
+    /// rather than handed back.
     async fn claim_command(
         &self,
         node_id: &str,
@@ -6497,6 +6535,7 @@ impl MarketplaceStore {
             Self::Memory(market) => {
                 let mut market = market.write().await;
                 remember_node_request(&mut market, node_id, request_id, now)?;
+                close_ended_commands(&mut market, node_id, now);
                 let command = market
                     .commands
                     .values_mut()
@@ -6534,14 +6573,30 @@ impl MarketplaceStore {
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
                 record_node_request(&mut transaction, node_id, request_id).await?;
+                query(
+                    "UPDATE node_commands c \
+                     SET status = 'failed', lease_until = NULL, \
+                         last_error = COALESCE(c.last_error, $2), updated_at = NOW() \
+                     FROM leases l \
+                     WHERE l.lease_id = c.lease_id AND c.node_id = $1 \
+                       AND c.status IN ('queued', 'leased', 'ready', 'running') \
+                       AND l.state NOT IN ('funded', 'provisioning', 'ready', 'active')",
+                )
+                .bind(node_id)
+                .bind(ENDED_LEASE_COMMAND_ERROR)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
                 let command = query_scalar::<_, SqlJson<NodeCommand>>(
-                    "SELECT document FROM node_commands \
-                     WHERE node_id = $1 AND attempts < 10 \
-                       AND (status = 'queued' \
-                            OR (status = 'leased' AND lease_until <= NOW()) \
-                            OR (status = 'ready' AND COALESCE(lease_until, \
-                                updated_at + INTERVAL '2 minutes') <= NOW())) \
-                     ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+                    "SELECT c.document FROM node_commands c \
+                     JOIN leases l ON l.lease_id = c.lease_id \
+                     WHERE c.node_id = $1 AND c.attempts < 10 \
+                       AND l.state IN ('funded', 'provisioning', 'ready', 'active') \
+                       AND (c.status = 'queued' \
+                            OR (c.status = 'leased' AND c.lease_until <= NOW()) \
+                            OR (c.status = 'ready' AND COALESCE(c.lease_until, \
+                                c.updated_at + INTERVAL '2 minutes') <= NOW())) \
+                     ORDER BY c.created_at ASC LIMIT 1 FOR UPDATE OF c SKIP LOCKED",
                 )
                 .bind(node_id)
                 .fetch_optional(&mut *transaction)
@@ -6573,12 +6628,13 @@ impl MarketplaceStore {
 
     /// `channel_key_fingerprint` is derived from the key line the node signed
     /// rather than taken from it, so what a renter is later told to pin is a
-    /// value this side computed.
+    /// value this side computed. Answers with where the lease stands afterwards,
+    /// which is how a node learns its renter released the lease under it.
     async fn report_command(
         &self,
         report: &NodeCommandReport,
         channel_key_fingerprint: Option<&str>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<LeaseState, StoreError> {
         let now = Utc::now();
         match self {
             Self::Memory(market) => {
@@ -6598,6 +6654,10 @@ impl MarketplaceStore {
                 let transition =
                     command_report_transition(&entry.command, entry.status, &lease.state, report)
                         .ok_or(StoreError::CommandNotFound)?;
+                let reached = transition
+                    .lease_state
+                    .clone()
+                    .unwrap_or_else(|| lease.state.clone());
                 let entry = market
                     .commands
                     .get_mut(&report.command_id)
@@ -6625,7 +6685,7 @@ impl MarketplaceStore {
                 if let Some(action) = transition.action {
                     market.lifecycle_actions.insert((lease_id, action));
                 }
-                Ok(())
+                Ok(reached)
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
@@ -6647,6 +6707,10 @@ impl MarketplaceStore {
                 let transition =
                     command_report_transition(&command, &current, &lease.state, report)
                         .ok_or(StoreError::CommandNotFound)?;
+                let reached = transition
+                    .lease_state
+                    .clone()
+                    .unwrap_or_else(|| lease.state.clone());
                 query(
                     "UPDATE node_commands \
                      SET status = $2, last_error = $3, \
@@ -6711,7 +6775,8 @@ impl MarketplaceStore {
                     .await
                     .map_err(StoreError::Storage)?;
                 }
-                transaction.commit().await.map_err(StoreError::Storage)
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(reached)
             }
         }
     }
@@ -7116,6 +7181,102 @@ impl MarketplaceStore {
                         .await
                         .map_err(StoreError::Storage)?;
                 stored.map(|state| parse_lease_state(&state)).transpose()
+            }
+        }
+    }
+
+    /// Shuts an active lease and queues the teardown the lifecycle worker
+    /// performs, or answers `None` where the account owns no such lease. The
+    /// lease moves to `closing` here rather than when that teardown confirms:
+    /// the access path keys on `active`, so a lease left there would mint a
+    /// fresh gateway grant after the worker had already revoked the last one
+    /// and stopped the meter.
+    async fn release_lease(
+        &self,
+        subject: &str,
+        lease_id: u64,
+    ) -> Result<Option<LeaseRelease>, StoreError> {
+        match self {
+            Self::Memory(market) => {
+                let mut market = market.write().await;
+                let Some((owner, lease)) = market.leases.get_mut(&lease_id) else {
+                    return Ok(None);
+                };
+                if owner != subject {
+                    return Ok(None);
+                }
+                if lease.command.is_some() {
+                    return Ok(Some(LeaseRelease::Batch));
+                }
+                let observed = lease.state.clone();
+                if observed != LeaseState::Active {
+                    return Ok(Some(if observed.can_still_open_access() {
+                        LeaseRelease::NotYetOpen
+                    } else {
+                        LeaseRelease::AlreadyClosed(observed)
+                    }));
+                }
+                lease.state = LeaseState::Closing;
+                lease.updated_at = Utc::now();
+                market.lifecycle_actions.insert((lease_id, "close_access"));
+                Ok(Some(LeaseRelease::Queued))
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(StoreError::Storage)?;
+                // The row lock is what makes two releases of the same lease, or
+                // a release racing the periodic teardown scan, settle into one
+                // queued close instead of two.
+                let stored = query_as::<_, (String, bool)>(
+                    "SELECT l.state, \
+                            l.document->>'command' IS NOT NULL \
+                            OR EXISTS (SELECT 1 FROM managed_repro_jobs m \
+                                       WHERE m.lease_id = l.lease_id) \
+                     FROM leases l \
+                     WHERE l.lease_id = $1 AND l.subject = $2 FOR UPDATE OF l",
+                )
+                .bind(lease_id as i64)
+                .bind(subject)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                let Some((stored, batch)) = stored else {
+                    return Ok(None);
+                };
+                if batch {
+                    return Ok(Some(LeaseRelease::Batch));
+                }
+                let state = parse_lease_state(&stored)?;
+                if state != LeaseState::Active {
+                    return Ok(Some(if state.can_still_open_access() {
+                        LeaseRelease::NotYetOpen
+                    } else {
+                        LeaseRelease::AlreadyClosed(state)
+                    }));
+                }
+                query(
+                    "INSERT INTO lifecycle_outbox \
+                         (action_id, lease_id, kind, available_at) \
+                     VALUES ($1, $2, 'close_access', NOW()) \
+                     ON CONFLICT (lease_id, kind) DO NOTHING",
+                )
+                .bind(Uuid::now_v7())
+                .bind(lease_id as i64)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                query(
+                    "UPDATE leases \
+                     SET state = 'closing', \
+                         document = jsonb_set(document, '{state}', '\"closing\"'), \
+                         updated_at = NOW() \
+                     WHERE lease_id = $1 AND state = 'active'",
+                )
+                .bind(lease_id as i64)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Storage)?;
+                transaction.commit().await.map_err(StoreError::Storage)?;
+                Ok(Some(LeaseRelease::Queued))
             }
         }
     }
@@ -7653,6 +7814,24 @@ fn command_report_transition(
                 renew_claim: false,
             })
         }
+        // A lease past active has already closed and queued its own teardown,
+        // so whatever the node says about the command now is bookkeeping:
+        // recording it frees the machine for the next lease without touching
+        // the money. Refusing it would leave the daemon retrying a report it
+        // can never place, and the command row holding a healthy node out of
+        // every offer.
+        _ if !lease_state.can_still_open_access() => {
+            let status = match finished_status(current) {
+                Some(finished) if report.outcome == NodeCommandOutcome::Ready => finished,
+                _ => status,
+            };
+            Some(CommandReportTransition {
+                status,
+                lease_state: None,
+                action: None,
+                renew_claim: status == "ready",
+            })
+        }
         _ => None,
     }
 }
@@ -7703,6 +7882,62 @@ fn occupies_node(lease: &LeaseRecord) -> bool {
 
 fn occupies_node_for_escrow(lease: &LeaseRecord, escrow_address: &str) -> bool {
     lease.escrow_address.eq_ignore_ascii_case(escrow_address) && occupies_node(lease)
+}
+
+/// Nodes still holding a launch command. The daemon runs the container to the
+/// deadline it was handed and reports only when it is done, so the machine
+/// stays occupied after an early release has already freed the lease. Quoting
+/// it inside that window strands the next renter in provisioning.
+fn nodes_holding_commands(market: &MemoryMarketplace) -> BTreeSet<String> {
+    market
+        .commands
+        .values()
+        .filter(|entry| command_holds_node(entry.status))
+        .map(|entry| entry.command.node_id.clone())
+        .collect()
+}
+
+fn command_holds_node(status: &str) -> bool {
+    matches!(status, "queued" | "leased" | "ready" | "running")
+}
+
+/// Where a report leaves a command that has already finished: exactly where it
+/// was. A node repeating an old ready report cannot pull one back open.
+fn finished_status(current: &str) -> Option<&'static str> {
+    match current {
+        "completed" => Some("completed"),
+        "failed" => Some("failed"),
+        _ => None,
+    }
+}
+
+const ENDED_LEASE_COMMAND_ERROR: &str = "the lease ended before the command finished";
+
+/// Closes out what a node still holds for leases that have ended. Handing a
+/// released lease's launch back would start the renter's workspace again on
+/// compute nobody is billed for, and leaving the row open would keep the node
+/// out of every offer with no report left that could ever close it.
+fn close_ended_commands(market: &mut MemoryMarketplace, node_id: &str, now: DateTime<Utc>) {
+    let ended: Vec<Uuid> = market
+        .commands
+        .values()
+        .filter(|entry| {
+            entry.command.node_id == node_id
+                && command_holds_node(entry.status)
+                && market
+                    .leases
+                    .get(&entry.command.lease_id)
+                    .is_none_or(|(_, lease)| !lease.state.can_still_open_access())
+        })
+        .map(|entry| entry.command.command_id)
+        .collect();
+    for command_id in ended {
+        if let Some(entry) = market.commands.get_mut(&command_id) {
+            entry.status = "failed";
+            entry.lease_until = None;
+            entry.updated_at = now;
+        }
+    }
 }
 
 fn lease_state_name(state: &LeaseState) -> &'static str {
@@ -8840,11 +9075,13 @@ async fn authorize_node_command(
         .map_err(store_error)
 }
 
+/// The answer carries where the lease stands so the node can stop a container
+/// whose lease ended early. A daemon that predates the field ignores it.
 async fn report_node_command(
     State(state): State<AppState>,
     Path((node_id, command_id)): Path<(String, Uuid)>,
     Json(report): Json<NodeCommandReport>,
-) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<NodeCommandReportAck>, (StatusCode, Json<ApiError>)> {
     if report.node_id != node_id
         || report.command_id != command_id
         || report
@@ -8901,12 +9138,14 @@ async fn report_node_command(
                 "workspace host key must be an OpenSSH public key line",
             )
         })?;
-    state
+    let lease_state = state
         .store
         .report_command(&report, channel_key_fingerprint.as_deref())
         .await
         .map_err(store_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(NodeCommandReportAck {
+        lease_state: Some(lease_state),
+    }))
 }
 
 async fn verify_command_poll(
@@ -9158,6 +9397,62 @@ async fn get_lease_access(
             .map(|key| key.fingerprint.clone()),
         channel_key_source: grant.channel_key.map(|key| key.source),
     }))
+}
+
+/// Releasing a lease ends access and stops the meter. Settlement charges only
+/// the seconds between access opening and this close, and the rest of the
+/// deposit goes back to the renter once the escrow's dispute window, currently
+/// 300 seconds, has run. The lease reads `closing` from here on and serves no
+/// further credentials.
+async fn release_lease(
+    State(state): State<AppState>,
+    Path(lease_id): Path<u64>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<LeaseReleaseResponse>), (StatusCode, Json<ApiError>)> {
+    let path = format!("/v1/leases/{lease_id}/release");
+    let account = require_account(&state, &headers, "POST", &path, &body).await?;
+    let Some(release) = state
+        .store
+        .release_lease(&account.subject, lease_id)
+        .await
+        .map_err(store_error)?
+    else {
+        return Err(not_found("lease_not_found", "no such lease"));
+    };
+    lease_release_response(lease_id, &release)
+}
+
+fn lease_release_response(
+    lease_id: u64,
+    release: &LeaseRelease,
+) -> Result<(StatusCode, Json<LeaseReleaseResponse>), (StatusCode, Json<ApiError>)> {
+    let (status, state, release) = match release {
+        LeaseRelease::Queued => (StatusCode::ACCEPTED, &LeaseState::Closing, "queued"),
+        LeaseRelease::AlreadyClosed(state) => (StatusCode::OK, state, "already_closed"),
+        LeaseRelease::NotYetOpen => {
+            return Err(conflict(
+                "lease_not_active",
+                "this lease has not opened access yet; the escrow refunds a lease \
+                 that never provisions on its own schedule",
+            ));
+        }
+        LeaseRelease::Batch => {
+            return Err(conflict(
+                "lease_not_releasable",
+                "a batch lease ends when its command reports; there is nothing to \
+                 release early",
+            ));
+        }
+    };
+    Ok((
+        status,
+        Json(LeaseReleaseResponse {
+            lease_id,
+            state: lease_state_name(state),
+            release,
+        }),
+    ))
 }
 
 /// The nonce the guest serving this lease has to answer. Handed out without an
@@ -12103,6 +12398,269 @@ mod tests {
         );
     }
 
+    /// Releasing is the only renter-side way to stop the meter, so it answers a
+    /// stranger the way every other lease read does: absent, whether or not the
+    /// lease exists, and with nothing queued against it.
+    #[tokio::test]
+    async fn a_stranger_cannot_release_a_lease() {
+        let market = Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Open,
+            LeaseState::Active,
+        )));
+        let store = MarketplaceStore::Memory(market.clone());
+
+        assert!(
+            store
+                .release_lease("somebody-else", GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .release_lease(GUEST_RENTER, GUEST_LEASE_ID + 999)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let market = market.read().await;
+        assert_eq!(
+            market.leases.get(&GUEST_LEASE_ID).unwrap().1.state,
+            LeaseState::Active
+        );
+        assert!(market.lifecycle_actions.is_empty());
+    }
+
+    /// Before access opens there is nothing to close, and the escrow already
+    /// refunds a lease that never provisions. Queueing a teardown here would
+    /// meter a window that never started.
+    #[tokio::test]
+    async fn releasing_a_lease_before_access_opens_is_refused() {
+        let market = Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Open,
+            LeaseState::Funded,
+        )));
+        let store = MarketplaceStore::Memory(market.clone());
+
+        let release = store
+            .release_lease(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .expect("the owner sees where their lease stands");
+        match lease_release_response(GUEST_LEASE_ID, &release) {
+            Err((status, Json(error))) => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert_eq!(error.code, "lease_not_active");
+            }
+            Ok(_) => panic!("a lease that never opened access cannot be released"),
+        }
+
+        let market = market.read().await;
+        assert_eq!(
+            market.leases.get(&GUEST_LEASE_ID).unwrap().1.state,
+            LeaseState::Funded
+        );
+        assert!(market.lifecycle_actions.is_empty());
+    }
+
+    /// The release itself only queues the teardown the lifecycle worker
+    /// performs: revoking the grant, closing the escrow's access window and
+    /// handing settlement the seconds actually used.
+    #[tokio::test]
+    async fn releasing_an_active_lease_queues_the_close() {
+        let market = Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Open,
+            LeaseState::Active,
+        )));
+        let store = MarketplaceStore::Memory(market.clone());
+
+        let state = store
+            .release_lease(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .expect("the owner can release their own lease");
+        let Ok((status, Json(response))) = lease_release_response(GUEST_LEASE_ID, &state) else {
+            panic!("an active lease can be released")
+        };
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response.lease_id, GUEST_LEASE_ID);
+        assert_eq!(response.state, "closing");
+        assert_eq!(response.release, "queued");
+
+        let held = market.read().await;
+        assert_eq!(
+            held.leases.get(&GUEST_LEASE_ID).unwrap().1.state,
+            LeaseState::Closing
+        );
+        assert!(
+            held.lifecycle_actions
+                .contains(&(GUEST_LEASE_ID, "close_access"))
+        );
+        drop(held);
+
+        let state = store
+            .release_lease(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .expect("a released lease is still the renter's to ask about");
+        let Ok((status, Json(response))) = lease_release_response(GUEST_LEASE_ID, &state) else {
+            panic!("releasing twice is not an error")
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.state, "closing");
+        assert_eq!(response.release, "already_closed");
+        assert_eq!(market.read().await.lifecycle_actions.len(), 1);
+    }
+
+    /// A batch lease has no session to end: its command is what closes it, and
+    /// closing access under a command still running would leave the escrow
+    /// waiting on a report that settlement can no longer accept.
+    #[tokio::test]
+    async fn a_batch_lease_cannot_be_released_early() {
+        let mut market = guest_lease_market(TrustClass::Open, LeaseState::Active);
+        market.leases.get_mut(&GUEST_LEASE_ID).unwrap().1.command = Some("nvidia-smi".to_owned());
+        let market = Arc::new(RwLock::new(market));
+        let store = MarketplaceStore::Memory(market.clone());
+
+        let state = store
+            .release_lease(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .expect("the owner can ask");
+        let Err((status, Json(error))) = lease_release_response(GUEST_LEASE_ID, &state) else {
+            panic!("a batch lease is refused")
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "lease_not_releasable");
+        let held = market.read().await;
+        assert_eq!(
+            held.leases.get(&GUEST_LEASE_ID).unwrap().1.state,
+            LeaseState::Active
+        );
+        assert!(held.lifecycle_actions.is_empty());
+    }
+
+    /// The daemon runs a container to the deadline it was handed. After an
+    /// early release the lease settles and frees the node on chain while the
+    /// machine is still busy, so the command, not the lease, is what says the
+    /// node can take the next renter.
+    #[tokio::test]
+    async fn a_node_still_running_a_released_command_is_not_offered() {
+        let now = Utc::now();
+        let mut market = MemoryMarketplace::default();
+        market
+            .offers
+            .insert("only".to_owned(), offer("only", 100, 10_000));
+        market.tunnels.insert("only".to_owned(), now);
+        let lease = LeaseRecord {
+            lease_id: 27,
+            chain_lease_id: 27,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+            quote_id: Uuid::now_v7(),
+            node_id: "only".to_owned(),
+            renter_wallet: format!("0x{}", "11".repeat(20)),
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            rate_per_second: 100,
+            maximum_escrow: 6_000,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: format!("0x{:064x}", 27),
+            state: LeaseState::Finalized,
+            command: None,
+            repro: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let command = launch_command(&lease, Some("ssh-ed25519 AAAA"), &"a".repeat(64)).unwrap();
+        let command_id = command.command_id;
+        market
+            .leases
+            .insert(lease.lease_id, ("previous-renter".to_owned(), lease));
+        market.commands.insert(
+            command_id,
+            MemoryCommand {
+                command,
+                result: None,
+                status: "ready",
+                lease_until: None,
+                authorization_request_id: None,
+                verified_report: None,
+                updated_at: now,
+            },
+        );
+        let store = MarketplaceStore::Memory(Arc::new(RwLock::new(market)));
+        let request = LeaseRequest {
+            image: format!("registry.example/runtime@sha256:{}", "ab".repeat(32)),
+            duration_seconds: 60,
+            min_vram_mib: 1,
+            preferred_node_id: None,
+            min_trust_class: TrustClass::Open,
+            command: None,
+            repro: None,
+        };
+
+        assert!(matches!(
+            store.quote("renter", &request, 0).await,
+            Err(StoreError::CapacityReserved)
+        ));
+
+        let MarketplaceStore::Memory(market) = &store else {
+            unreachable!()
+        };
+        market
+            .write()
+            .await
+            .commands
+            .get_mut(&command_id)
+            .unwrap()
+            .status = "completed";
+
+        assert_eq!(
+            store.quote("renter", &request, 0).await.unwrap().node_id,
+            "only"
+        );
+    }
+
+    /// A released lease stops serving the session it was serving, and says so
+    /// rather than leaving the renter polling for credentials that are gone.
+    #[tokio::test]
+    async fn a_released_lease_serves_no_more_access() {
+        let market = Arc::new(RwLock::new(guest_lease_market(
+            TrustClass::Open,
+            LeaseState::Active,
+        )));
+        let store = MarketplaceStore::Memory(market);
+
+        assert!(
+            store
+                .lease_access(GUEST_RENTER, GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .is_some(),
+            "an active lease serves its renter"
+        );
+        store
+            .release_lease(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .expect("the owner can release their own lease");
+
+        assert!(
+            store
+                .lease_access(GUEST_RENTER, GUEST_LEASE_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let state = store
+            .lease_state(GUEST_RENTER, GUEST_LEASE_ID)
+            .await
+            .unwrap()
+            .expect("the owner can see where their lease stands");
+        assert!(!state.can_still_open_access());
+    }
+
     /// The renter can only pin the host key if it reaches them, and it is the
     /// key inside the report rather than whatever the relay presents.
     #[tokio::test]
@@ -14441,6 +14999,172 @@ mod tests {
         assert_eq!(market.leases.get(&17).unwrap().1.state, LeaseState::Closing);
         assert!(market.lifecycle_actions.contains(&(17, "start_access")));
         assert!(market.lifecycle_actions.contains(&(17, "close_access")));
+    }
+
+    /// Once a renter has released, the node reporting that it stopped the
+    /// container is bookkeeping: the command completes, and neither the lease
+    /// nor the money moves again.
+    #[test]
+    fn a_node_letting_go_of_a_released_lease_completes_its_command_quietly() {
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            lease_id: 23,
+            chain_lease_id: 23,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+            quote_id: Uuid::now_v7(),
+            node_id: "node".to_owned(),
+            renter_wallet: "renter".to_owned(),
+            image: "registry.example/runtime@sha256:abc".to_owned(),
+            duration_seconds: 60,
+            rate_per_second: 100,
+            maximum_escrow: 6_000,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: "0xabc".to_owned(),
+            state: LeaseState::Closing,
+            command: None,
+            repro: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let command = launch_command(&lease, Some("ssh-ed25519 AAAA"), "unused").unwrap();
+        let report = NodeCommandReport {
+            node_id: "node".to_owned(),
+            device_public_key: "device-key".to_owned(),
+            request_id: Uuid::now_v7(),
+            command_id: command.command_id,
+            outcome: NodeCommandOutcome::Completed,
+            observed_at: now,
+            error: None,
+            result: None,
+            channel_key: None,
+            signature: "signature".to_owned(),
+        };
+        for state in [
+            LeaseState::Closing,
+            LeaseState::SettlementPending,
+            LeaseState::Finalized,
+        ] {
+            let transition = command_report_transition(&command, "ready", &state, &report)
+                .expect("a stopped container is always worth recording");
+            assert_eq!(transition.status, "completed");
+            assert_eq!(transition.lease_state, None);
+            assert_eq!(transition.action, None);
+            assert!(!transition.renew_claim);
+        }
+        // Before access opened there is no container to have stopped, so the
+        // report is rejected as it always was.
+        assert!(
+            command_report_transition(&command, "ready", &LeaseState::Ready, &report).is_none()
+        );
+
+        // Letting go can fail: the container may have exited on its own, or the
+        // runtime may refuse to stop it. Refusing that report leaves the daemon
+        // retrying it forever against a lease that will never take it back, and
+        // the command row holding the node out of every offer.
+        for outcome in [NodeCommandOutcome::Failed, NodeCommandOutcome::Completed] {
+            for current in ["queued", "leased", "ready", "running"] {
+                for state in [
+                    LeaseState::Closing,
+                    LeaseState::SettlementPending,
+                    LeaseState::Disputed,
+                    LeaseState::Finalized,
+                    LeaseState::Refunded,
+                    LeaseState::Failed,
+                ] {
+                    let report = NodeCommandReport {
+                        outcome: outcome.clone(),
+                        ..report.clone()
+                    };
+                    let transition = command_report_transition(&command, current, &state, &report)
+                        .expect("a node that cannot place its report stops polling");
+                    assert_eq!(transition.lease_state, None, "{current} {state:?}");
+                    assert_eq!(transition.action, None, "{current} {state:?}");
+                    assert!(!transition.renew_claim, "{current} {state:?}");
+                }
+            }
+        }
+
+        // A ready report during the wind-down keeps the claim: the node is told
+        // where the lease stands and stops the container itself.
+        let ready = NodeCommandReport {
+            outcome: NodeCommandOutcome::Ready,
+            ..report.clone()
+        };
+        let transition =
+            command_report_transition(&command, "leased", &LeaseState::Closing, &ready).unwrap();
+        assert_eq!(transition.status, "ready");
+        assert_eq!(transition.lease_state, None);
+        assert_eq!(transition.action, None);
+        assert!(transition.renew_claim);
+
+        // A ready report the node kept retrying arrives after the command was
+        // closed out. It is accepted and changes nothing: reopening the row
+        // would hold the machine out of the market all over again.
+        for current in ["completed", "failed"] {
+            let transition =
+                command_report_transition(&command, current, &LeaseState::Finalized, &ready)
+                    .unwrap();
+            assert_eq!(transition.status, current);
+            assert!(!transition.renew_claim);
+        }
+    }
+
+    /// A node that polls while holding a command for a lease that has ended is
+    /// not handed that lease back: the workspace would run on compute nobody
+    /// pays for. The row is closed instead, which is what frees the node for
+    /// the next renter.
+    #[tokio::test]
+    async fn a_poll_closes_out_a_released_lease_instead_of_relaunching_it() {
+        let node = format!("0x{}", "ad".repeat(32));
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            lease_id: 29,
+            chain_lease_id: 29,
+            escrow_address: DEVELOPMENT_ESCROW_ADDRESS.to_owned(),
+            quote_id: Uuid::now_v7(),
+            node_id: node.clone(),
+            renter_wallet: format!("0x{}", "13".repeat(20)),
+            image: format!("registry.example/runtime@sha256:{}", "de".repeat(32)),
+            duration_seconds: 3_600,
+            rate_per_second: 100,
+            maximum_escrow: 360_000,
+            trust_class: TrustClass::Open,
+            funding_transaction_hash: format!("0x{}", "fa".repeat(32)),
+            state: LeaseState::Closing,
+            command: None,
+            repro: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let command = launch_command(&lease, Some("ssh-ed25519 AAAA"), "unused").unwrap();
+        let command_id = command.command_id;
+        let market = Arc::new(RwLock::new(MemoryMarketplace {
+            leases: BTreeMap::from([(lease.lease_id, ("subject".to_owned(), lease))]),
+            commands: BTreeMap::from([(
+                command_id,
+                MemoryCommand {
+                    command,
+                    status: "ready",
+                    lease_until: Some(now - Duration::minutes(5)),
+                    authorization_request_id: None,
+                    result: None,
+                    verified_report: None,
+                    updated_at: now - Duration::minutes(5),
+                },
+            )]),
+            ..MemoryMarketplace::default()
+        }));
+        let store = MarketplaceStore::Memory(market.clone());
+        assert!(
+            store
+                .claim_command(&node, Uuid::now_v7())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let market = market.read().await;
+        assert_eq!(market.commands.get(&command_id).unwrap().status, "failed");
+        assert!(!nodes_holding_commands(&market).contains(&node));
     }
 
     #[test]

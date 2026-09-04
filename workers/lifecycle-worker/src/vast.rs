@@ -191,10 +191,6 @@ struct RawInstance {
     #[serde(default)]
     dph_total: Option<f64>,
     #[serde(default)]
-    ssh_host: Option<String>,
-    #[serde(default)]
-    ssh_port: Option<u16>,
-    #[serde(default)]
     public_ipaddr: Option<String>,
     /// Vast reports -1 when the host could not reserve a forwarded port range,
     /// and nothing at all until it has tried.
@@ -669,10 +665,11 @@ fn instance_from_response(body: &str) -> anyhow::Result<Instance> {
     let raw = serde_json::from_str::<InstanceResponse>(body)
         .with_context(|| format!("decode Vast instance: {}", truncate(body, 300)))?
         .instances;
-    // These instances are created `ssh_direct`. `ssh_host`/`ssh_port` describe
-    // Vast's relay, which accepts the connection and then never speaks SSH for
-    // a direct instance, so a renter waiting on it only ever sees a timeout.
-    // The machine itself answers on its own address and forwarded port.
+    // These instances are created `ssh_direct`, so Vast's own `ssh_host` and
+    // `ssh_port` are dropped rather than read: they name a relay that accepts
+    // the connection and then never speaks SSH for a direct instance, and a
+    // renter waiting on it only ever sees a timeout. The machine itself answers
+    // on its own address and forwarded port.
     let (ssh_host, ssh_port) = direct_ssh_target(&raw);
     if ssh_host
         .as_deref()
