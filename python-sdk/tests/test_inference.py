@@ -933,10 +933,11 @@ class CapturedReportTest(unittest.TestCase):
     """One live report from the public attestation endpoint, as the offline
     vector for the replay and binding checks.
 
-    The endpoint returned ``app_compose`` base64-encoded until 2026-09, because
-    the measured compose is a shell script whose paths a secret scanner reads as
-    leaked local ones. Captures from either era are restored byte for byte here:
-    the whole point of the check is that those bytes hash to the measurement.
+    The measured compose is a shell script whose paths a secret scanner reads as
+    leaked local ones, so the fixture stores it base64 and restores it byte for
+    byte here. The endpoint used to return it encoded and now returns it plain,
+    so a recapture has to be re-encoded before it lands in the repo. The whole
+    point of the check is that those bytes hash to the measurement.
     """
 
     @classmethod
