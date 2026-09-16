@@ -42,6 +42,7 @@ from prismnetwork._e2ee import (
     seal_field,
 )
 from prismnetwork._inference import (
+    _accepted_commits,
     DSTACK_RUNTIME_EVENT,
     EXPECTED_WORKLOAD,
     ConfidentialError,
@@ -932,17 +933,21 @@ class CapturedReportTest(unittest.TestCase):
     """One live report from the public attestation endpoint, as the offline
     vector for the replay and binding checks.
 
-    Its ``app_compose`` travels base64 in the fixture, because the measured
-    compose is a shell script whose paths a secret scanner reads as leaked local
-    ones, and is restored here byte for byte: the whole point of the check is
-    that those bytes hash to the measurement.
+    The measured compose is a shell script whose paths a secret scanner reads as
+    leaked local ones, so the fixture stores it base64 and restores it byte for
+    byte here. The endpoint used to return it encoded and now returns it plain,
+    so a recapture has to be re-encoded before it lands in the repo. The whole
+    point of the check is that those bytes hash to the measurement.
     """
 
     @classmethod
     def setUpClass(cls):
         capture = json.loads(FIXTURE.read_text())
         evidence = capture["report"]["attestation"]["evidence"]
-        evidence["app_compose"] = base64.b64decode(evidence["app_compose_b64"]).decode("utf-8")
+        # Captures taken before 2026-09 carry the compose base64-encoded; the
+        # endpoint returns it as text now.
+        if "app_compose" not in evidence:
+            evidence["app_compose"] = base64.b64decode(evidence["app_compose_b64"]).decode("utf-8")
         cls.report = capture["report"]
         cls.nonce = capture["nonce"]
         # Before the key set's not_after, which is what the capture is a
@@ -1728,5 +1733,36 @@ class LeasePhaseTest(unittest.TestCase):
         self.assertEqual(caught.exception.broadcast, TX)
 
 
+class RefreshableCommitTest(unittest.TestCase):
+    """The commit moves on the upstream's schedule, so it can be refreshed
+    without a release. Nothing else in the pin can."""
+
+    def test_a_refreshed_commit_is_accepted_alongside_the_baked_in_one(self):
+        expected = dict(EXPECTED_WORKLOAD)
+        expected["repo_commits"] = ["a" * 40]
+        accepted = _accepted_commits(expected)
+        self.assertIn(EXPECTED_WORKLOAD["repo_commit"], accepted)
+        self.assertIn("a" * 40, accepted)
+
+    def test_the_baked_in_commit_survives_an_empty_or_junk_refresh(self):
+        for junk in (None, [], "not-a-list", 7, {}):
+            expected = dict(EXPECTED_WORKLOAD, repo_commits=junk)
+            self.assertEqual(
+                _accepted_commits(expected),
+                {EXPECTED_WORKLOAD["repo_commit"]},
+                f"a {type(junk).__name__} refresh must not widen or empty the pin",
+            )
+
+    def test_the_image_and_os_hash_are_not_refreshable(self):
+        expected = dict(EXPECTED_WORKLOAD)
+        expected["repo_commits"] = ["b" * 40]
+        # Only the commit is drawn from the refreshable set; a served list has no
+        # way to name a different launcher image or OS image.
+        self.assertNotIn(expected["launcher_image"], _accepted_commits(expected))
+        self.assertNotIn(expected["os_image_hash"], _accepted_commits(expected))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

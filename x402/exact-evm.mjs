@@ -52,6 +52,10 @@ const REASON = {
   recipient: "invalid_exact_evm_payload_recipient_mismatch",
   funds: "insufficient_funds",
   state: "invalid_transaction_state",
+  // The protocol folds a spent nonce into invalid_transaction_state, alongside
+  // every other reason a transfer will not simulate. They need different
+  // answers: a replay is fixed by signing a new authorization, a revert is not.
+  spent: "payment_already_redeemed",
   // Not in the protocol's list, because the protocol assumes a facilitator can
   // read what it broadcast. Ours must survive an rpc that cannot.
   unconfirmed: "settlement_unconfirmed",
@@ -208,7 +212,7 @@ export function createExactEvm(networks) {
     ]);
     // A spent nonce is the contract reporting this exact authorization already
     // settled, which is a replay rather than a malformed payload.
-    if (used) return { isValid: false, invalidReason: REASON.state, payer };
+    if (used) return { isValid: false, invalidReason: REASON.spent, payer };
     if (balance < value) return { isValid: false, invalidReason: REASON.funds, payer };
 
     try {

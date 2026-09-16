@@ -111,7 +111,7 @@ const TX_HASH = /^0x[0-9a-f]{64}$/i;
 // pays first, so its key is the transaction hash. The exact scheme authorizes
 // first, so its key is the payer and the authorization nonce, which is also
 // what the token contract itself refuses to reuse.
-const PAYMENT_KEY = /^(0x[0-9a-f]{64}|0x[0-9a-f]{40}:0x[0-9a-f]{64})$/i;
+const PAYMENT_KEY = /^([a-z0-9:-]+\|)?(0x[0-9a-f]{64}|0x[0-9a-f]{40}:0x[0-9a-f]{64})$/i;
 
 const ROUTES = {
   single: {
@@ -285,6 +285,15 @@ export const USDC_BASE_DOMAIN = { name: "USD Coin", version: "2" };
 /// on-chain DOMAIN_SEPARATOR. A client that signs against the wrong domain
 /// produces a well-formed signature the token rejects.
 export const USDG_ROBINHOOD_DOMAIN = { name: "Global Dollar", version: "1" };
+/// USDC is Arc's gas token, exposed both as an 18-decimal native balance and as
+/// a 6-decimal ERC-20 at this predeploy. x402 amounts are ERC-20 units, so the
+/// payload is unchanged; anything reading a native balance for the same money is
+/// off by 10^12.
+export const USDC_ARC = "0x3600000000000000000000000000000000000000";
+/// Read off the testnet predeploy on 2026-09-14, and it is not Base's domain: Arc's
+/// `name()` is "USDC" where Base returns "USD Coin". Signing Base's domain here
+/// produces a well-formed signature that recovers to nobody.
+export const USDC_ARC_DOMAIN = { name: "USDC", version: "2" };
 
 export function loadConsumed(file) {
   const set = new Set();
@@ -302,6 +311,9 @@ export function createGateway({
   models,
   payTo,
   basePayTo = null,
+  arcPayTo = null,
+  arcNetwork = "eip155:5042",
+  arcTestnet = false,
   exact = null,
   originUrl = "https://api.prismnetwork.tech/inference",
   // Carried in every 402 so an agent that arrives cold learns the price and how
@@ -661,7 +673,8 @@ export function createGateway({
         detail,
         state: phase(),
         retry_after_seconds: seconds,
-        retry: "nothing was charged; send the same payment header again.",
+        retry: "nothing was charged; send the same payment header again, or sign a "
+          + "fresh one if its validBefore has passed while you waited.",
       },
     };
   }
@@ -678,7 +691,8 @@ export function createGateway({
         error,
         detail,
         state: phase(),
-        retry: "nothing was charged; retry with the same payment header",
+        retry: "nothing was charged; retry with the same payment header, or sign a "
+          + "fresh one if its validBefore has passed while you waited",
       },
     };
   }
@@ -740,6 +754,36 @@ export function createGateway({
         maxTimeoutSeconds: 60,
         ...(shape ? { outputSchema: shape } : {}),
         extra: { ...USDC_BASE_DOMAIN, assetTransferMethod: "eip3009" },
+      });
+    }
+    if (arcPayTo) {
+      list.push({
+        scheme: "exact",
+        network: arcNetwork,
+        asset: USDC_ARC,
+        payTo: arcPayTo,
+        amount: amount.toString(),
+        resource: `${originUrl}${route.path}`,
+        description:
+          `${route.unit} ${route.where}, paid in USDC on Arc${arcTestnet ? " testnet" : ""}. ` +
+          "Sign an EIP-3009 transferWithAuthorization for the quoted amount and send it as the " +
+          "payment header. You need no gas: the authorization is broadcast for you." +
+          // The other rails in this array settle on mainnets. A quote that lists
+          // a test chain beside them, priced the same and labelled only by its
+          // id, invites a caller to pick the wrong one and spend real money.
+          (arcTestnet ? " TEST NETWORK: this rail settles in play money and buys nothing." : ""),
+        mimeType: "application/json",
+        maxTimeoutSeconds: 60,
+        ...(shape ? { outputSchema: shape } : {}),
+        // v2 strips `description` from an accepts entry and keeps `extra`, so a
+        // warning that only lives in the prose never reaches a v2 client. This
+        // rail sits beside mainnet rails priced identically, and its chain id is
+        // the only other thing telling them apart.
+        extra: {
+          ...USDC_ARC_DOMAIN,
+          assetTransferMethod: "eip3009",
+          ...(arcTestnet ? { testnet: true } : {}),
+        },
       });
     }
     list.push({
@@ -810,9 +854,6 @@ export function createGateway({
     if (typeof from !== "string" || typeof nonce !== "string") {
       return { ok: false, reason: "invalid_payload" };
     }
-    const key = `${from}:${nonce}`.toLowerCase();
-    if (!PAYMENT_KEY.test(key)) return { ok: false, reason: "invalid_payload" };
-
     // The requirement we quoted, not the one the client echoed back: a payer
     // who rewrites the amount or the recipient must fail, and comparing their
     // copy against itself would always pass.
@@ -823,10 +864,26 @@ export function createGateway({
     );
     if (!want) return { ok: false, reason: "invalid_network" };
 
+    // Namespaced by chain: a payer whose client derives nonces deterministically
+    // pays the same nonce on two rails, and an un-namespaced key refuses the
+    // second as a replay. The token's own authorizationState is per chain
+    // already, so this only guards the local set.
+    const key = `${want.network}|${from}:${nonce}`.toLowerCase();
+    if (!PAYMENT_KEY.test(key)) return { ok: false, reason: "invalid_payload" };
+
     // Checked before the spent-payment cache is consulted. The authorization
     // and its signature are broadcast on chain to settle, so a payer and nonce
     // read off a block would otherwise redeem the answer they bought.
-    const verdict = await exact.verify(parsed, want);
+    // An unreachable chain is our fault, not the payer's, but 402 is the only
+    // answer that lets them retry or pick another rail. Letting it throw would
+    // take the process down and every warm lease with it.
+    let verdict;
+    try {
+      verdict = await exact.verify(parsed, want);
+    } catch (error) {
+      log(`verify failed on ${want.network}: ${describe(error)}`);
+      return { ok: false, reason: "facilitator_unavailable" };
+    }
     if (!verdict.isValid) return { ok: false, reason: verdict.invalidReason };
 
     if (!reservePayment(key)) {

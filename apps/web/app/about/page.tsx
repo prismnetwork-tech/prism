@@ -26,9 +26,9 @@ export default function AboutPage() {
           open SDK, an MCP server, and pay-per-job settlement over x402.
         </p>
         <p>
-          The current service provides live, managed NVIDIA L40S capacity. A provider
-          program for operator-owned infrastructure is in technical onboarding and is not yet
-          available for production leases.
+          The current service provides live NVIDIA capacity across several card classes, sourced
+          from vetted providers. Operator-owned hardware is not part of the service today, so every
+          machine a customer rents is brokered, and the trust class on each offer says so.
         </p>
       </InformationSection>
 
@@ -45,7 +45,38 @@ export default function AboutPage() {
         <p>Workspaces are fresh containers, not confidential computing, so the infrastructure provider remains inside their trust boundary. Each vault item names the weakest workspace class it may be released into, and the default is above what the network can currently serve.</p>
       </InformationSection>
 
-      <InformationSection index="03" title="Open-source infrastructure">
+      <InformationSection index="03" title="What PRISM does on the network">
+        <p>
+          PRISM is the network&apos;s access token, not its currency. Compute is quoted and paid
+          in USDG or USDC, so a renter never has to hold PRISM to buy a GPU. What PRISM buys is a
+          cheaper rate on part of the fleet.
+        </p>
+        <h3>Staking unlocks discounted capacity</h3>
+        <p>
+          Operators can reserve a machine for stakers. Those offers are marked{" "}
+          <code>staker_only</code> and priced below open capacity: today they run at 177 base
+          units per second against 222 elsewhere, about 20 percent lower, and a wallet that has
+          not staked is refused rather than charged the higher rate. Stake matures before it
+          counts and unwinds through a cooldown, both enforced by the contract.
+        </p>
+        <h3>Where to check it</h3>
+        <p>
+          The token is{" "}
+          <a href="https://robinhoodchain.blockscout.com/token/0x0A1e0Cc751f77C2C93760FC957CC8E4E779b2bC8">
+            0x0A1e0Cc7
+          </a>{" "}
+          and the staking contract is{" "}
+          <a href="https://robinhoodchain.blockscout.com/address/0x7c4060e0b1f6954a90ea92Ee81C14b3b70D1be7c">
+            0x7c4060e0
+          </a>
+          , both on Robinhood Chain. The staking contract is source-verified and has no owner, no
+          pause and no upgrade path, so the terms it was deployed with are the terms it keeps.
+          Live capacity and which offers are staker-only are published on the{" "}
+          <a href="https://api.prismnetwork.tech/v1/offers">offers endpoint</a>.
+        </p>
+      </InformationSection>
+
+      <InformationSection index="04" title="Open-source infrastructure">
         <p>
           Prism&apos;s protocol, smart contracts, service architecture, and application code are
           developed in the open. Architecture and operational contracts are

@@ -60,10 +60,14 @@ const specReceipt = { ...JSON.parse(RECEIPT_JCS), signature: RECEIPT_SIGNATURE }
 // because the whole point of the check is that those bytes hash to the
 // measurement.
 const capture = JSON.parse(readFileSync(new URL("./fixtures/aci-attestation.json", import.meta.url), "utf8"));
-capture.report.attestation.evidence.app_compose = Buffer.from(
-  capture.report.attestation.evidence.app_compose_b64,
-  "base64",
-).toString("utf8");
+// Captures taken before 2026-09 carry the compose base64-encoded; the endpoint
+// returns it as text now.
+if (capture.report.attestation.evidence.app_compose === undefined) {
+  capture.report.attestation.evidence.app_compose = Buffer.from(
+    capture.report.attestation.evidence.app_compose_b64,
+    "base64",
+  ).toString("utf8");
+}
 const binding = JSON.parse(readFileSync(new URL("./fixtures/gpu-evidence-binding.json", import.meta.url), "utf8"));
 
 test("canonicalization is member order independent and reproduces the vector digest", async () => {
