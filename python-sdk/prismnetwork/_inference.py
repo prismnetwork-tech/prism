@@ -82,7 +82,7 @@ EXPECTED_WORKLOAD = {
         "c083ff9e6a5ddf10f6c9e9bb1f74cc618deebecfea5208b563c574399db4637c",
     "repo_url": "https://github.com/Dstack-TEE/private-ai-gateway.git",
     "os_image_hash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
-    "repo_commit": "b6b5c1b82f6fc59490db5a5255bf4493805e66c6",
+    "repo_commit": "3e56bd30dd459d0df90afeb6d63eca7a919bc22f",
 }
 
 _ERC20_TRANSFER = [
@@ -414,6 +414,28 @@ class Gate:
     skipped: bool = False
 
 
+def _accepted_commits(expected) -> set:
+    """Every commit this check will accept.
+
+    The pin exists because a TDX quote alone says nothing about which code was
+    measured. The commit inside it moves whenever the upstream redeploys, which
+    is not our schedule and has happened twice in four days, and a pin that
+    lives only in a published package leaves every installed client refusing to
+    serve until it upgrades.
+
+    So the commit, and only the commit, can also come from ``repo_commits`` in
+    the expected workload, which a caller may refresh from
+    ``/v1/confidential/workload``. The launcher image digest and the OS image
+    hash stay where they are, compiled in. Those identify the binary, so the
+    worst a wrong list can do here is refuse a workload that was fine.
+    """
+    commits = {expected.get("repo_commit")} if expected.get("repo_commit") else set()
+    extra = expected.get("repo_commits")
+    if isinstance(extra, (list, tuple, set)):
+        commits |= {c for c in extra if isinstance(c, str)}
+    return commits
+
+
 def _measured_workload(app_compose) -> dict:
     """What the measured compose says it runs. Every value here is inside the
     bytes that hash to the measured compose-hash, so none of it is the report's
@@ -459,9 +481,11 @@ def gate_workload_identity(app_compose, os_image_hash, provenance, expected) -> 
                         f"this SDK pins {expected.get('repo_url')}")
     if measured["repo_commit"] is None:
         problems.append("the measured compose pins no single source commit")
-    elif expected.get("repo_commit") and measured["repo_commit"] != str(expected["repo_commit"]).lower():
-        problems.append(f"the measured commit is {measured['repo_commit']}, "
-                        f"this SDK pins {expected['repo_commit']}")
+    else:
+        accepted = {str(c).lower() for c in _accepted_commits(expected) if c}
+        if accepted and measured["repo_commit"] not in accepted:
+            problems.append(f"the measured commit is {measured['repo_commit']}, "
+                            f"this SDK accepts {', '.join(sorted(accepted))}")
 
     # A declaration that is not an object declares nothing to contradict the
     # measured compose with, and the measured compose is the authority anyway.

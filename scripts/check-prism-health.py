@@ -26,6 +26,9 @@ import time
 import urllib.error
 import urllib.request
 
+# Kept in step with EXPECTED_WORKLOAD in sdk/attest.mjs and _inference.py.
+PINNED_WORKLOAD_COMMIT = "3e56bd30dd459d0df90afeb6d63eca7a919bc22f"
+
 DEFAULT_STATE = "/var/lib/prism/health-state.json"
 REPEAT_SECONDS = 6 * 60 * 60
 # The RPC sits behind a CDN that answers urllib's default agent with a 403.
@@ -310,14 +313,51 @@ def check_canary(alarms, path, stale_seconds):
         )
 
 
+def check_workload_pin(alarms, attestation_url, pinned_commit):
+    """The SDK pins the exact commit the enclave must be running, and refuses
+    every end-to-end encrypted call when the measurement disagrees. Upstream
+    redeploys on their own schedule, so the pin goes stale without anything on
+    our side changing, and the paid upstream probe above will not notice:
+    it talks to the provider directly and never exercises the sealed path our
+    customers use. Reading the live provenance costs nothing and catches the
+    drift the moment it happens."""
+    if not pinned_commit:
+        alarms.append(Alarm("workload_pin_config", "no pinned commit to compare against"))
+        return
+    report = json.loads(get(attestation_url, timeout=30))
+    measured = (((report.get("attestation") or {}).get("source_provenance") or {})
+                .get("repo_commit"))
+    if not measured:
+        alarms.append(Alarm("workload_pin", "the attestation published no repo_commit"))
+        return
+    if measured != pinned_commit:
+        alarms.append(
+            Alarm(
+                "workload_pin",
+                f"the enclave now measures {measured}, the SDK pins {pinned_commit}; "
+                "every end-to-end encrypted call fails closed until the accepted "
+                "commits are updated",
+            )
+        )
+
+
 def check_reconciliation(alarms, url):
     """The monitor already reconciles leases against the escrow. Read its
     answers rather than asking the same questions a second way."""
-    try:
-        body = get(url, timeout=10)
-    except (urllib.error.URLError, OSError) as error:
-        alarms.append(Alarm("reconcile", f"reconciliation monitor is unreachable: {error}"))
-        return
+    # A local scrape that sometimes runs past its budget under load. One slow
+    # read is not an outage, and paging on it produced an unreachable/recovered
+    # pair every few minutes carrying no news about the leases it watches.
+    for attempt in range(2):
+        try:
+            body = get(url, timeout=20)
+            break
+        except (urllib.error.URLError, OSError) as error:
+            if attempt:
+                alarms.append(
+                    Alarm("reconcile", f"reconciliation monitor is unreachable on two tries: {error}")
+                )
+                return
+            time.sleep(3)
 
     readings = {}
     for line in body.splitlines():
@@ -429,6 +469,17 @@ def main():
                 os.environ.get("PHALA_API_KEY"),
                 os.environ.get("PRISM_CONFIDENTIAL_UPSTREAM", "https://tee.redpill.ai/v1"),
                 os.environ.get("PRISM_CONFIDENTIAL_PROBE_MODEL", "openai/gpt-oss-20b"),
+            ),
+        ),
+        (
+            "workload_pin",
+            lambda: check_workload_pin(
+                alarms,
+                os.environ.get(
+                    "PRISM_CONFIDENTIAL_ATTESTATION_URL",
+                    "https://tee.redpill.ai/v1/aci/attestation",
+                ),
+                os.environ.get("PRISM_CONFIDENTIAL_PINNED_COMMIT", PINNED_WORKLOAD_COMMIT),
             ),
         ),
         ("reconcile", lambda: check_reconciliation(alarms, metrics_url)),

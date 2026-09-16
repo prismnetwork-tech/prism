@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { recoverMessageAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { boundMessage, hashRequest } from "@prismnetwork/x402/codec";
-import { createGateway, DEFAULT_PRICING, priceFor, SERVED_TTL_MS } from "./gateway.mjs";
+import { createGateway, DEFAULT_PRICING, priceFor, SERVED_TTL_MS, USDC_ARC } from "./gateway.mjs";
 
 // What a lease costs and what it produces. The rate is the network's, read off
 // /v1/offers and confirmed by settled receipts (900s billed 199,800 micros).
@@ -811,4 +811,103 @@ test("a spent payment answers the request it bought and no other", async () => {
   assert.equal(resigned.status, 402);
   assert.equal(resigned.body.error, "payment_reused");
   assert.equal(deps.calls.generations.length, 2, "the second request must not be served from the first");
+});
+
+const ARC_PAY_TO = "0xe67a61f8e2aC4057aa22e64306107E7120078447";
+
+test("Arc is offered only when it is configured, and never displaces the other rails", async () => {
+  const without = build(fakeDeps(), { basePayTo: BASE_PAY_TO, exact: fakeExact() });
+  const bare = (await without.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts;
+  assert.deepEqual(bare.map((a) => a.network), ["eip155:8453", "eip155:4663"]);
+
+  const withArc = build(fakeDeps(), {
+    basePayTo: BASE_PAY_TO,
+    arcPayTo: ARC_PAY_TO,
+    arcNetwork: "eip155:5042",
+    exact: fakeExact(),
+  });
+  const offered = (await withArc.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts;
+  // Base stays the headline: validators read accepts[0], and leading with a
+  // chain they do not index makes a payable endpoint look unsupported.
+  assert.deepEqual(offered.map((a) => a.network), ["eip155:8453", "eip155:5042", "eip155:4663"]);
+  assert.equal(offered[0].amount, offered[1].amount, "the same work costs the same on either chain");
+});
+
+test("the Arc quote carries Arc's own EIP-712 domain, not Base's", async () => {
+  const gateway = build(fakeDeps(), {
+    arcPayTo: ARC_PAY_TO,
+    arcNetwork: "eip155:5042",
+    exact: fakeExact(),
+  });
+  const arc = (await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts.find((a) => a.network.startsWith("eip155:5042"));
+  assert.equal(arc.extra.name, "USDC");
+  assert.equal(arc.extra.version, "2");
+  assert.equal(arc.extra.assetTransferMethod, "eip3009");
+  assert.equal(arc.asset, USDC_ARC);
+  assert.equal(arc.payTo, ARC_PAY_TO);
+});
+
+test("the quoted Arc network is the one configured, so a testnet quote cannot read as mainnet", async () => {
+  const gateway = build(fakeDeps(), {
+    arcPayTo: ARC_PAY_TO,
+    arcNetwork: "eip155:5042002",
+    exact: fakeExact(),
+  });
+  const arc = (await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts.find((a) => a.network.startsWith("eip155:5042"));
+  assert.equal(arc.network, "eip155:5042002");
+});
+
+test("a chain that cannot be reached answers 402 rather than taking the process down", async () => {
+  const unreachable = {
+    handles: () => true,
+    verify: async () => { throw new Error("HTTP request failed: 403"); },
+    settle: async () => { throw new Error("unreachable"); },
+  };
+  const gateway = build(fakeDeps(), {
+    arcPayTo: ARC_PAY_TO,
+    arcNetwork: "eip155:5042",
+    exact: unreachable,
+  });
+  const quote = (await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body;
+  const arc = quote.accepts.find((a) => a.network === "eip155:5042");
+  const header = Buffer.from(JSON.stringify({
+    x402Version: 2,
+    accepted: { scheme: "exact", network: arc.network, asset: arc.asset, payTo: arc.payTo },
+    payload: { authorization: { from: PAYER, to: arc.payTo, value: arc.amount,
+      validAfter: "0", validBefore: String(Math.floor(Date.now() / 1000) + 3600), nonce: `0x${"11".repeat(32)}` },
+      signature: `0x${"22".repeat(65)}` },
+  }), "utf8").toString("base64");
+
+  const answer = await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, header, 2);
+  assert.equal(answer.status, 402, "an unreachable rail is a 402, not a crash");
+  assert.equal(answer.body.error, "facilitator_unavailable");
+});
+
+
+test("a test network says so in the quote, because it sits beside rails that spend real money", async () => {
+  const gateway = build(fakeDeps(), {
+    basePayTo: BASE_PAY_TO,
+    arcPayTo: ARC_PAY_TO,
+    arcNetwork: "eip155:5042002",
+    arcTestnet: true,
+    exact: fakeExact(),
+  });
+  const offered = (await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2)).body.accepts;
+  const arc = offered.find((a) => a.network === "eip155:5042002");
+  // v2 drops `description`, so the marker has to survive in `extra`.
+  assert.equal(arc.extra.testnet, true);
+  // The mainnet rails beside it must stay unmarked, or the warning means nothing.
+  for (const other of offered.filter((a) => a !== arc)) {
+    assert.equal(other.extra?.testnet, undefined, `${other.network} is not a test network`);
+  }
+});
+
+test("the mainnet Arc rail carries no test warning", async () => {
+  const gateway = build(fakeDeps(), {
+    arcPayTo: ARC_PAY_TO, arcNetwork: "eip155:5042", exact: fakeExact(),
+  });
+  const arc = (await gateway.handleInference({ model: "llama3.2:3b", prompt: "hi" }, undefined, 2))
+    .body.accepts.find((a) => a.network === "eip155:5042");
+  assert.equal(arc.extra.testnet, undefined);
+  assert.equal(arc.extra.name, "USDC");
 });

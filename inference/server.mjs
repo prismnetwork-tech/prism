@@ -11,16 +11,18 @@
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { createPublicClient, getAddress, http, recoverMessageAddress } from "viem";
+import { createPublicClient, fallback, getAddress, http, recoverMessageAddress } from "viem";
 import { DEFAULT_IMAGE, PrismAgent, robinhoodChain, USDG } from "@prismnetwork/agent-sdk";
 import { createExactEvm } from "@prismnetwork/x402/exact-evm";
 import { createCdpFacilitator, routeByNetwork } from "@prismnetwork/x402/cdp-facilitator";
 import { bazaar, boundMessage, detect, hashRequest } from "@prismnetwork/x402/codec";
 import { authorized, listener } from "@prismnetwork/x402/listen";
-import { base as baseChain } from "viem/chains";
+import { arc as arcChain, arcTestnet as arcTestnetChain, base as baseChain } from "viem/chains";
 import {
   createGateway,
   MAX_CONFIDENTIAL_BODY_BYTES,
+  USDC_ARC,
+  USDC_ARC_DOMAIN,
   USDC_BASE,
   USDC_BASE_DOMAIN,
   USDG_ROBINHOOD_DOMAIN,
@@ -113,7 +115,25 @@ try {
     // read the receipt back.
     baseRpcUrl: (process.env.X402_BASE_RPC_URL ?? "https://base.drpc.org,https://1rpc.io/base")
       .split(",").map((u) => u.trim()).filter(Boolean),
+    arcPayTo: process.env.X402_ARC_PAY_TO ? getAddress(process.env.X402_ARC_PAY_TO) : null,
+    arcChain: /^testnet$/i.test((process.env.PRISM_ARC_CHAIN ?? "").trim()) ? arcTestnetChain : arcChain,
+    arcRpcUrl: (process.env.X402_ARC_RPC_URL ?? "").split(",").map((u) => u.trim()).filter(Boolean),
   };
+  // Arc mainnet publishes no publicly resolvable RPC, so viem ships that chain
+  // without one. Guessing a hostname here would advertise a rail that cannot
+  // settle, which costs a payer a signature and a wait for nothing.
+  if (config.arcPayTo && !config.arcRpcUrl.length) {
+    if (!config.arcChain.rpcUrls?.default?.http?.length) {
+      throw new Error(
+        `X402_ARC_PAY_TO is set for chain ${config.arcChain.id}, which publishes no default RPC. ` +
+          "Set X402_ARC_RPC_URL, or leave X402_ARC_PAY_TO unset to stop offering Arc.",
+      );
+    }
+    config.arcRpcUrl = [...config.arcChain.rpcUrls.default.http];
+  }
+  if (config.arcPayTo && !process.env.PRISM_X402_COLLECTOR_KEY) {
+    throw new Error("X402_ARC_PAY_TO is set but PRISM_X402_COLLECTOR_KEY is not, so nothing can broadcast an authorization");
+  }
   if (config.basePayTo && !process.env.PRISM_X402_COLLECTOR_KEY) {
     throw new Error("X402_BASE_PAY_TO is set but PRISM_X402_COLLECTOR_KEY is not, so nothing can broadcast an authorization");
   }
@@ -195,6 +215,22 @@ const fetchOllama = (slot, path, init) => fetch(`http://127.0.0.1:${config.tunne
 // Robinhood Chain is always verifiable: the agent key that leases GPUs also
 // holds the gas to broadcast an authorization there. Base is offered only when
 // there is somewhere to collect it.
+const TOKEN_DOMAIN_ABI = [
+  { name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+  { name: "version", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+];
+
+// Checked before the network table is built, so a rail that cannot settle is
+// never quoted. Arc alone is dropped: Base and Robinhood do not care that
+// Circle's chain is unreachable, and taking them down with it would turn a
+// misconfigured extra into an outage.
+try {
+  await confirmArcRail();
+} catch (error) {
+  console.error(`arc not offered: ${error.message}`);
+  config.arcPayTo = null;
+}
+
 const exactNetworks = {
   "eip155:4663": {
     chain: robinhoodChain,
@@ -202,6 +238,18 @@ const exactNetworks = {
     privateKey: process.env.PRISM_AGENT_KEY,
     assets: { [USDG]: USDG_ROBINHOOD_DOMAIN },
   },
+  // Gas and takings are the same asset here, so the collector only refills
+  // itself when it is also arcPayTo.
+  ...(config.arcPayTo
+    ? {
+        [`eip155:${config.arcChain.id}`]: {
+          chain: config.arcChain,
+          rpcUrl: config.arcRpcUrl,
+          privateKey: process.env.PRISM_X402_COLLECTOR_KEY,
+          assets: { [USDC_ARC]: USDC_ARC_DOMAIN },
+        },
+      }
+    : {}),
   ...(config.basePayTo
     ? {
         "eip155:8453": {
@@ -221,6 +269,40 @@ const exactNetworks = {
 };
 
 const localExact = createExactEvm(exactNetworks);
+
+/// Confirm the Arc rail points where it claims before a payer signs anything.
+///
+/// Two things can be quietly wrong. PRISM_ARC_CHAIN picks the chain while
+/// X402_ARC_RPC_URL picks the endpoint, and nothing ties them together, so a
+/// leftover testnet URL under a mainnet chain id quotes a rail that can never
+/// settle. And the EIP-712 domain is a constant read off testnet; if mainnet's
+/// USDC reports anything else, every signature verifies against nobody.
+
+async function confirmArcRail() {
+  if (!config.arcPayTo) return;
+  const client = createPublicClient({
+    chain: config.arcChain,
+    transport: fallback(config.arcRpcUrl.map((url) => http(url))),
+  });
+  const [id, name, version] = await Promise.all([
+    client.getChainId(),
+    client.readContract({ address: USDC_ARC, abi: TOKEN_DOMAIN_ABI, functionName: "name" }),
+    client.readContract({ address: USDC_ARC, abi: TOKEN_DOMAIN_ABI, functionName: "version" }),
+  ]);
+  if (id !== config.arcChain.id) {
+    throw new Error(
+      `X402_ARC_RPC_URL answers chain ${id} but Arc is configured as ${config.arcChain.id}. ` +
+        "Set PRISM_ARC_CHAIN=testnet for the test network, or point the RPC at mainnet.",
+    );
+  }
+  if (name !== USDC_ARC_DOMAIN.name || version !== USDC_ARC_DOMAIN.version) {
+    throw new Error(
+      `Arc USDC at ${USDC_ARC} reports domain ${JSON.stringify({ name, version })}, ` +
+        `not ${JSON.stringify(USDC_ARC_DOMAIN)}. Every payment would be refused, so Arc is not offered.`,
+    );
+  }
+}
+
 
 // Base settles at Coinbase when a key is configured, because the Bazaar only
 // indexes endpoints its own facilitator has settled for. Everything else, and
@@ -352,6 +434,9 @@ const gateway = createGateway({
   models: config.models,
   payTo: config.payTo,
   basePayTo: config.basePayTo,
+  arcPayTo: config.arcPayTo,
+  arcNetwork: `eip155:${config.arcChain.id}`,
+  arcTestnet: Boolean(config.arcChain.testnet),
   exact,
   schemas: inferenceSchemas,
   batchSchemas,
@@ -404,6 +489,17 @@ const server = createServer(async (req, res) => {
   // The confidential tier as an aggregator's provider monitor reads a
   // catalogue. Free, and assembled from live pricing and the live spend cap so
   // it says the same thing the 402 does.
+  // The commit the enclave runs moves whenever the upstream redeploys, twice in
+  // four days so far, and a pin that only lives in a published package refuses
+  // every call until each client upgrades. A client may read the accepted
+  // commits here instead; none does yet, so this is the server half.
+  if (req.method === "GET" && url.pathname === "/v1/confidential/workload") {
+    return json(res, 200, {
+      repo_url: "https://github.com/Dstack-TEE/private-ai-gateway.git",
+      repo_commits: (process.env.PRISM_CONFIDENTIAL_COMMITS ?? "")
+        .split(",").map((c) => c.trim().toLowerCase()).filter((c) => /^[0-9a-f]{40}$/.test(c)),
+    }, { "cache-control": "public, max-age=60" });
+  }
   if (req.method === "GET" && url.pathname === "/v1/provider/models") {
     const catalogue = providerModels({
       confidential: gateway.confidential(),
@@ -435,7 +531,7 @@ const server = createServer(async (req, res) => {
       x402Version: 1,
       name: "Prism Network managed inference",
       description:
-        "Pay-per-generation LLM inference on rented GPUs. Pay in USDC on Base or USDG on Robinhood " +
+        "Pay-per-generation LLM inference on rented GPUs. Pay in USDC on Base or Arc, or USDG on Robinhood " +
         "Chain; an unpaid request answers 402 with the exact price on each. The serving lease " +
         "settles onchain with a public receipt." +
         (confidential

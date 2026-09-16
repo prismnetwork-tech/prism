@@ -56,7 +56,7 @@ export const EXPECTED_WORKLOAD = {
     "ghcr.io/redpill-ai/private-ai-launcher@sha256:c083ff9e6a5ddf10f6c9e9bb1f74cc618deebecfea5208b563c574399db4637c",
   repoUrl: "https://github.com/Dstack-TEE/private-ai-gateway.git",
   osImageHash: "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
-  repoCommit: "b6b5c1b82f6fc59490db5a5255bf4493805e66c6",
+  repoCommit: "3e56bd30dd459d0df90afeb6d63eca7a919bc22f",
 };
 
 const NRAS_ATTEST_URL = "https://nras.attestation.nvidia.com/v3/attest/gpu";
