@@ -177,11 +177,11 @@ test("a hugging face id is published only where the weights are named upstream",
   const vendor = providerModels({
     confidential: {
       ...confidential(),
-      models: { "openai/gpt-oss-20b": { base_micros: 1, per_token_micros: 1, full_cap_micros: "2" } },
+      models: { "openai/gpt-oss-120b": { base_micros: 1, per_token_micros: 1, full_cap_micros: "2" } },
     },
     dailyUsd: 2,
   }).data[0];
-  assert.equal(vendor.hugging_face_id, "openai/gpt-oss-20b");
+  assert.equal(vendor.hugging_face_id, "openai/gpt-oss-120b");
 });
 
 test("nothing is invented where the upstream publishes nothing", () => {
@@ -210,4 +210,26 @@ test("the open tier never reaches the catalogue", () => {
 
   assert.deepEqual(ids, [GEMMA]);
   for (const open of gateway.models().models) assert.ok(!ids.includes(open), `${open} leases per request`);
+});
+
+test("a model that takes images says so, and one that does not stays text only", () => {
+  const seeing = providerModels({
+    confidential: {
+      ...confidential(),
+      models: { "qwen/qwen3-vl-30b-a3b-instruct": { base_micros: 1, per_token_micros: 1, full_cap_micros: "2" } },
+    },
+    dailyUsd: 2,
+  }).data[0];
+  assert.deepEqual(seeing.input_modalities.map((m) => m.type), ["image", "text"]);
+
+  const blind = providerModels({
+    confidential: {
+      ...confidential(),
+      models: { "openai/gpt-oss-120b": { base_micros: 1, per_token_micros: 1, full_cap_micros: "2" } },
+    },
+    dailyUsd: 2,
+  }).data[0];
+  // Declaring vision on a model that cannot see one would invite a request the
+  // enclave refuses after the caller has already paid.
+  assert.deepEqual(blind.input_modalities.map((m) => m.type), ["text"]);
 });

@@ -414,6 +414,41 @@ class Gate:
     skipped: bool = False
 
 
+_FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
+_SERVED_COMMITS: dict = {}
+
+
+def served_commits(base: str, timeout: float = 5.0) -> list:
+    """Commits the network currently accepts, on top of the one compiled in.
+
+    The enclave's commit moves whenever the upstream redeploys, three times in
+    ten days so far, and a pin that lives only in a published package refuses
+    every call until each client upgrades. This reads the current set instead.
+
+    Fails open to the empty list. A client that cannot reach the endpoint keeps
+    the pin it shipped with, which refuses a workload it does not recognise, so
+    the failure mode is the old one rather than a wider one. Nothing here can
+    widen anything but the commit: the launcher image and the OS image hash are
+    compared against the compiled-in values no matter what this returns.
+    """
+    if base in _SERVED_COMMITS:
+        return _SERVED_COMMITS[base]
+    commits: list = []
+    try:
+        response = requests.request(
+            "GET", f"{base.rstrip('/')}/v1/confidential/workload",
+            headers={"accept": "application/json"}, timeout=timeout,
+        )
+        body = response.json() if response.status_code == 200 else {}
+        if body.get("repo_url") == EXPECTED_WORKLOAD["repo_url"]:
+            commits = [c for c in body.get("repo_commits", [])
+                       if isinstance(c, str) and _FULL_COMMIT.fullmatch(c)]
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        commits = []
+    _SERVED_COMMITS[base] = commits
+    return commits
+
+
 def _accepted_commits(expected) -> set:
     """Every commit this check will accept.
 
@@ -1034,6 +1069,11 @@ def verify_confidential(*, base: str = DEFAULT_CONFIDENTIAL_BASE, model: str | N
     if measurement is None:
         t.broke(WORKLOAD, "no measured compose to read the workload identity out of")
     else:
+        # None means the caller deliberately pinned nothing and wants the
+        # explicit incomplete, so the refresh must not turn that into a check.
+        if expected_workload:
+            expected_workload = dict(expected_workload)
+            expected_workload.setdefault("repo_commits", served_commits(base))
         identity = appraise_workload(report, measurement, expected_workload)
         provenance = identity.provenance
         t.add(WORKLOAD, "skip" if identity.skipped else "pass" if identity.ok else "fail",
@@ -1776,6 +1816,11 @@ class InferenceMixin:
         compose = measurement.check("compose_hash")
         if not compose.ok:
             raise ConfidentialError(502, "attestation_unverified", {"cause": compose.detail})
+        # None means the caller deliberately pinned nothing and wants the
+        # explicit incomplete, so the refresh must not turn that into a check.
+        if expected_workload:
+            expected_workload = dict(expected_workload)
+            expected_workload.setdefault("repo_commits", served_commits(base))
         identity = appraise_workload(report, measurement, expected_workload)
         if not identity.ok:
             raise ConfidentialError(502, "attestation_unverified", {

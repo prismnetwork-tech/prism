@@ -156,7 +156,12 @@ export function encryptChatRequest(body, keyset, { now = Math.floor(Date.now() /
     if (typeof message?.content !== "string") {
       // Any plaintext string at a protected path fails the request upstream, so
       // a body this client cannot fully protect is refused here instead.
-      throw new E2eeError(`messages.${index}.content must be a string to be encrypted`);
+      throw new E2eeError(
+        `messages.${index}.content is not a string, and the sealed envelope covers string ` +
+          "content only: the protocol binds each ciphertext to the field path " +
+          "messages.N.content, which a content-parts array has no equivalent of. An image " +
+          "message can still be served in the enclave with e2ee off, where the relay sees it.",
+      );
     }
     const field = `messages.${index}.content`;
     const aad = requestAad({ algo: serviceKey.algo, model: body.model, field, nonce, ts });

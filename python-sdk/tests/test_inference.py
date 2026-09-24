@@ -247,6 +247,11 @@ class Gateway:
             raise AssertionError(f"unexpected request {method} {url}")
         return route(data=data, body=json, headers=headers or {}, query=query)
 
+    def _v1_confidential_workload(self, **_):
+        # The network's accepted commits. Empty here so every existing case
+        # keeps appraising against the pin compiled into the SDK.
+        return Answer(200, {"repo_url": EXPECTED_WORKLOAD["repo_url"], "repo_commits": []})
+
     def _v1_models(self, **_):
         card = {
             "endpoint": "/inference/v1/chat/completions",
@@ -1660,7 +1665,7 @@ class LeasePhaseTest(unittest.TestCase):
 
     def test_a_funded_lease_carries_the_deposit_this_wallet_signed_for(self):
         agent = self.agent()
-        agent._fund = lambda quote: (TX, 200_000, "receipt")
+        agent._fund = lambda quote, decision=None: (TX, 200_000, "receipt")
         lease = agent.lease(DEFAULT_IMAGE, 900)
         self.assertEqual(lease.deposit_micros, 200_000)
         self.assertEqual(lease.funding_hash, TX)
@@ -1704,7 +1709,7 @@ class LeasePhaseTest(unittest.TestCase):
 
     def test_a_deposit_whose_receipt_never_arrived_keeps_the_key_and_names_the_transaction(self):
         agent = self.agent()
-        agent._fund = lambda quote: (_ for _ in ()).throw(
+        agent._fund = lambda quote, decision=None: (_ for _ in ()).throw(
             PrismError(504, "confirmation_timeout", {"hash": TX}, TX))
         with self.assertRaises(PrismError) as caught:
             agent.lease(DEFAULT_IMAGE, 900)
@@ -1715,7 +1720,7 @@ class LeasePhaseTest(unittest.TestCase):
 
     def test_a_confirmation_that_failed_after_funding_names_the_deposit(self):
         agent = self.agent()
-        agent._fund = lambda quote: (TX, 200_000, "receipt")
+        agent._fund = lambda quote, decision=None: (TX, 200_000, "receipt")
         agent.confirm = lambda *a: (_ for _ in ()).throw(PrismError(502, "control_plane_error", {}))
         with self.assertRaises(PrismError) as caught:
             agent.lease(DEFAULT_IMAGE, 900)
@@ -1725,7 +1730,7 @@ class LeasePhaseTest(unittest.TestCase):
 
     def test_a_failure_after_funding_that_is_not_ours_is_still_a_funded_lease(self):
         agent = self.agent()
-        agent._fund = lambda quote: (TX, 200_000, "receipt")
+        agent._fund = lambda quote, decision=None: (TX, 200_000, "receipt")
         agent.confirm = lambda *a: (_ for _ in ()).throw(RuntimeError("json decode failed"))
         with self.assertRaises(PrismError) as caught:
             agent.lease(DEFAULT_IMAGE, 900)
