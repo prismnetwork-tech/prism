@@ -198,7 +198,13 @@ def encrypt_chat_request(body: dict, keyset: dict, now: int | None = None,
             # Any plaintext string at a protected path fails the request
             # upstream, so a body this client cannot fully protect is refused
             # here instead.
-            raise E2eeError(f"messages.{index}.content must be a string to be encrypted")
+            raise E2eeError(
+                f"messages.{index}.content is a {type(content).__name__}, and the sealed "
+                "envelope covers string content only: the protocol binds each ciphertext to "
+                "the field path messages.N.content, which a content-parts array has no "
+                "equivalent of. An image message can still be served in the enclave with "
+                "e2ee off, where the relay sees it."
+            )
         field = f"messages.{index}.content"
         aad = request_aad(algo=service_key["algo"], model=body["model"], field=field, nonce=nonce, ts=ts)
         restored["messages"].append({**message, "content": restore_content(content)})

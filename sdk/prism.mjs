@@ -1,6 +1,7 @@
 // Prism Network agent SDK: headless GPU leasing for wallet-holding agents.
 // No browser, no Privy. Authenticate with a wallet signature, pay on-chain, run.
 import { execFileSync, spawn } from "node:child_process";
+import { authorise, decisionDigest, leaseReference } from "./decision.mjs";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -274,13 +275,13 @@ export class PrismAgent {
     return this.#submit(() => this.#fundNow(quote));
   }
 
-  async #fundNow(quote) {
+  async #fundNow(quote, decision = null) {
     if (typeof quote?.quote_id !== "string" || typeof quote?.node_id !== "string") {
       throw new PrismError(400, "invalid_quote");
     }
     const deposit = parseBaseUnits(quote.maximum_escrow, "maximum_escrow");
     const duration = parseDuration(quote.duration_seconds);
-    const clientReference = keccak256(stringToBytes(quote.quote_id));
+    const clientReference = leaseReference(quote.quote_id, decision);
     let broadcast = null;
     try {
       // Approving and spending are one indivisible step. The approval covers
@@ -333,12 +334,17 @@ export class PrismAgent {
     }
   }
 
-  async confirm({ quoteId, transactionHash, sshAuthorizedKey }) {
+  /// `decisionHash` travels when the lease was authorised: the client
+  /// reference on chain is derived from it, and the control plane cannot check
+  /// the funding log without knowing which derivation to expect. The digest is
+  /// all it gets; the decision stays here.
+  async confirm({ quoteId, transactionHash, sshAuthorizedKey, decisionHash = null }) {
     return this.#proxy("POST", ["leases", "confirm"], {
       body: {
         quote_id: quoteId,
         transaction_hash: transactionHash,
         ssh_authorized_key: sshAuthorizedKey,
+        ...(decisionHash ? { decision_hash: decisionHash } : {}),
       },
     });
   }
@@ -425,7 +431,12 @@ export class PrismAgent {
     maxDeposit = null,
     minTrustClass = "open",
     command = null,
+    decision = null,
+    policy = null,
   } = {}) {
+    // Checked before a quote is taken, so a refusal costs nothing and does not
+    // hold capacity against other renters while it expires.
+    if (policy) authorise(policy, decision ?? { action: "unstated", source: "none", answers: [] });
     if (!this.session) await this.authenticate();
     // A wallet with no balance at all cannot fund anything, and a doomed quote
     // still holds capacity against other renters until it expires. Refuse
@@ -462,11 +473,12 @@ export class PrismAgent {
         if (maxDeposit != null && parseBaseUnits(quote.maximum_escrow, "maximum_escrow") > BigInt(maxDeposit)) {
           throw new PrismError(402, "cost_exceeds_max", { required: quote.maximum_escrow, max: String(maxDeposit) });
         }
-        funded = await this.#fundNow(quote);
+        funded = await this.#fundNow(quote, decision);
         return this.confirm({
           quoteId: quote.quote_id,
           transactionHash: funded.hash,
           sshAuthorizedKey: key.publicKey,
+          decisionHash: decisionDigest(decision),
         });
       });
       if (!Number.isInteger(record?.lease_id)) {

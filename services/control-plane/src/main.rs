@@ -1324,6 +1324,11 @@ struct ConfirmLeaseRequest {
     quote_id: Uuid,
     transaction_hash: String,
     ssh_authorized_key: Option<String>,
+    /// The digest of the decision that authorised this spend, when the caller
+    /// bound one. Only the digest: the decision stays with the caller and
+    /// nothing here can reconstruct it. Its presence changes which client
+    /// reference the funding log must carry.
+    decision_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2087,6 +2092,7 @@ impl ChainVerifier {
         &self,
         transaction_hash: &str,
         quote: &LeaseQuote,
+        decision_hash: Option<[u8; 32]>,
     ) -> Result<ConfirmedFunding, ChainError> {
         if !is_hash(transaction_hash) {
             return Err(ChainError::InvalidTransactionHash);
@@ -2139,7 +2145,7 @@ impl ChainVerifier {
                 {
                     return Err(ChainError::NotFinal);
                 }
-                decode_funding_event(&receipt.logs, escrow_address, quote)
+                decode_funding_event_with(&receipt.logs, escrow_address, quote, decision_hash)
             }
         }
     }
@@ -2308,10 +2314,11 @@ async fn rpc_call<T: for<'de> Deserialize<'de>>(
     response.result.ok_or(ChainError::InvalidResponse)
 }
 
-fn decode_funding_event(
+fn decode_funding_event_with(
     logs: &[ChainLog],
     escrow_address: &str,
     quote: &LeaseQuote,
+    decision_hash: Option<[u8; 32]>,
 ) -> Result<ConfirmedFunding, ChainError> {
     let signature = format!(
         "0x{}",
@@ -2320,7 +2327,7 @@ fn decode_funding_event(
         ))
     );
     let expected_node = quote.node_id.trim_start_matches("0x");
-    let expected_reference = quote_reference(quote.quote_id);
+    let expected_reference = quote_reference_with(quote.quote_id, decision_hash);
     for log in logs {
         if !log.address.eq_ignore_ascii_case(escrow_address)
             || log.topics.len() != 4
@@ -2362,8 +2369,30 @@ fn decode_funding_event(
     Err(ChainError::FundingMismatch)
 }
 
-fn quote_reference(quote_id: Uuid) -> [u8; 32] {
-    Keccak256::digest(quote_id.to_string().as_bytes()).into()
+/// What the escrow's client reference must be for this quote.
+///
+/// Without a decision it is the quote id's digest, which is what every lease
+/// funded before this carried. With one, the decision's digest is hashed in
+/// alongside it, so the reference commits to why the spend was authorised as
+/// well as to what it bought.
+///
+/// The quote id stays in the preimage because the escrow refuses a reference it
+/// has already seen: two leases funded on the same decision would otherwise
+/// collide and the second would revert.
+///
+/// Only the digest reaches this service. The decision itself stays with the
+/// caller, and nothing here can reconstruct it.
+fn quote_reference_with(quote_id: Uuid, decision_hash: Option<[u8; 32]>) -> [u8; 32] {
+    let quote_digest: [u8; 32] = Keccak256::digest(quote_id.to_string().as_bytes()).into();
+    match decision_hash {
+        None => quote_digest,
+        Some(decision) => {
+            let mut hasher = Keccak256::new();
+            hasher.update(quote_digest);
+            hasher.update(decision);
+            hasher.finalize().into()
+        }
+    }
 }
 
 fn decode_word(value: &str) -> Result<[u8; 32], ChainError> {
@@ -9842,6 +9871,17 @@ async fn confirm_lease(
         .quote_for_subject(&account.subject, request.quote_id)
         .await
         .map_err(store_error)?;
+    // Parsed before anything is read off chain: a malformed digest is the
+    // caller's mistake and should not look like a funding mismatch.
+    let decision_hash = match request.decision_hash.as_deref() {
+        None => None,
+        Some(value) => Some(decode_word(value).map_err(|_| {
+            bad_request(
+                "invalid_decision_hash",
+                "decision_hash must be a 32-byte hex digest",
+            )
+        })?),
+    };
     let ssh_authorized_key = request.ssh_authorized_key.as_deref();
     if quote.command.is_none() && !ssh_authorized_key.is_some_and(is_ssh_authorized_key) {
         return Err(bad_request(
@@ -9851,7 +9891,7 @@ async fn confirm_lease(
     }
     let funding = state
         .chain
-        .verify_funding(&request.transaction_hash, &quote)
+        .verify_funding(&request.transaction_hash, &quote, decision_hash)
         .await
         .map_err(chain_error)?;
     let jupyter_token = generate_jupyter_token();
@@ -14157,7 +14197,7 @@ mod tests {
         )
         .unwrap();
         let funding = chain
-            .verify_funding(&format!("0x{}", "01".repeat(32)), &quote)
+            .verify_funding(&format!("0x{}", "01".repeat(32)), &quote, None)
             .await
             .unwrap();
 
@@ -14582,7 +14622,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend(abi_word(quote.maximum_escrow));
         data.extend(abi_word(u64::from(quote.duration_seconds)));
-        data.extend(quote_reference(quote_id));
+        data.extend(quote_reference_with(quote_id, None));
         let event = ChainLog {
             address: "0x2222222222222222222222222222222222222222".to_owned(),
             topics: vec![
@@ -14599,10 +14639,11 @@ mod tests {
             data: format!("0x{}", hex::encode(&data)),
         };
 
-        let funding = decode_funding_event(
+        let funding = decode_funding_event_with(
             &[event],
             "0x2222222222222222222222222222222222222222",
             &quote,
+            None,
         )
         .unwrap();
         assert_eq!(funding.lease_id, lease_id);
@@ -14611,7 +14652,7 @@ mod tests {
         let mut wrong_quote = quote;
         wrong_quote.quote_id = Uuid::now_v7();
         assert!(matches!(
-            decode_funding_event(
+            decode_funding_event_with(
                 &[ChainLog {
                     address: "0x2222222222222222222222222222222222222222".to_owned(),
                     topics: vec![
@@ -14629,7 +14670,94 @@ mod tests {
                 }],
                 "0x2222222222222222222222222222222222222222",
                 &wrong_quote,
+                None,
             ),
+            Err(ChainError::FundingMismatch)
+        ));
+    }
+
+    /// The three implementations of this derivation have to agree exactly, or a
+    /// lease funded by an SDK never confirms. These vectors are produced by the
+    /// Python and JavaScript SDKs; changing the derivation on one side without
+    /// the others breaks funding rather than failing a build.
+    #[test]
+    fn the_reference_derivation_matches_the_sdks() {
+        let quote_id = Uuid::parse_str("3f2b1a44-9c7e-4d21-8b55-0a1c2d3e4f56").unwrap();
+        let digest =
+            hex::decode("ce88911b61ece9a93eb84b1a31eb295f7b85dbf713bc084db375575cabb14165")
+                .unwrap();
+        let mut decision = [0u8; 32];
+        decision.copy_from_slice(&digest);
+
+        assert_eq!(
+            hex::encode(quote_reference_with(quote_id, Some(decision))),
+            "aa58b79f6f9ca7fb0b6da8c6df68187f13fb126b95b16bd8078f6b1a28531889",
+        );
+        // And the unauthorised derivation is still the bare quote digest, so
+        // every lease funded before this keeps confirming.
+        assert_eq!(
+            quote_reference_with(quote_id, None),
+            <[u8; 32]>::from(Keccak256::digest(quote_id.to_string().as_bytes())),
+        );
+    }
+
+    /// A lease can commit to why it was funded, and the commitment has to be
+    /// checked here: a reference the caller computed and nobody verified proves
+    /// nothing. The decision itself never reaches this service, only its digest.
+    #[test]
+    fn a_decision_bound_lease_confirms_only_against_the_decision_that_funded_it() {
+        let quote_id = Uuid::new_v4();
+        let quote = LeaseQuote {
+            quote_id,
+            node_id: format!("0x{}", "33".repeat(32)),
+            image: "img".to_owned(),
+            command: None,
+            duration_seconds: 600,
+            rate_per_second: 100,
+            maximum_escrow: 60_000,
+            trust_class: TrustClass::Open,
+            min_vram_mib: 16_000,
+            repro: None,
+            expires_at: Utc::now() + Duration::minutes(QUOTE_TTL_MINUTES),
+        };
+        let decision: [u8; 32] = Keccak256::digest(b"the decision that authorised this").into();
+        let other: [u8; 32] = Keccak256::digest(b"a decision that did not").into();
+
+        let mut data = Vec::new();
+        data.extend(abi_word(quote.maximum_escrow));
+        data.extend(abi_word(u64::from(quote.duration_seconds)));
+        data.extend(quote_reference_with(quote_id, Some(decision)));
+        let funded = || ChainLog {
+            address: "0x2222222222222222222222222222222222222222".to_owned(),
+            topics: vec![
+                format!(
+                    "0x{}",
+                    hex::encode(Keccak256::digest(
+                        b"LeaseFunded(uint256,bytes32,address,uint256,uint32,bytes32)"
+                    ))
+                ),
+                format!("0x{}", hex::encode(abi_word(7_u64))),
+                quote.node_id.clone(),
+                format!("0x{}{}", "00".repeat(12), "11".repeat(20)),
+            ],
+            data: format!("0x{}", hex::encode(data.clone())),
+        };
+        let escrow = "0x2222222222222222222222222222222222222222";
+
+        assert_eq!(
+            decode_funding_event_with(&[funded()], escrow, &quote, Some(decision))
+                .unwrap()
+                .lease_id,
+            7
+        );
+        // The same funded lease, appraised against a decision it was not funded
+        // under, and against no decision at all.
+        assert!(matches!(
+            decode_funding_event_with(&[funded()], escrow, &quote, Some(other)),
+            Err(ChainError::FundingMismatch)
+        ));
+        assert!(matches!(
+            decode_funding_event_with(&[funded()], escrow, &quote, None),
             Err(ChainError::FundingMismatch)
         ));
     }

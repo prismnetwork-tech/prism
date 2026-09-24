@@ -25,14 +25,26 @@ const usd = (micros) => (Number(micros) / 1e6).toFixed(6);
 /// several repos carry each name, and picking one would be a claim about which
 /// weights are loaded that nothing here can check.
 const HUGGING_FACE = {
-  "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+  "deepseek/deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash",
   "openai/gpt-oss-120b": "openai/gpt-oss-120b",
-  "openai/gpt-oss-20b": "openai/gpt-oss-20b",
+  "nvidia/nemotron-3.5-lightning": "nvidia/Nemotron-3.5-Lightning",
+  "moonshotai/kimi-k3": "moonshotai/Kimi-K3",
+  "qwen/qwen3-vl-30b-a3b-instruct": "Qwen/Qwen3-VL-30B-A3B-Instruct",
   "meta-llama/llama-3.3-70b-instruct": "meta-llama/Llama-3.3-70B-Instruct",
   "qwen/qwen3.8-27b": "Qwen/Qwen3.8-27B",
   "z-ai/glm-5.2": "zai-org/GLM-5.2",
+  "z-ai/glm-5.3": "zai-org/GLM-5.3",
   "z-ai/glm-5.3-flash": "zai-org/GLM-5.3-Flash",
 };
+
+/// Upstream ids whose model accepts images alongside text. Read off the
+/// upstream catalogue rather than assumed: a model that cannot see one answers
+/// a picture with an error the caller already paid for.
+const SEES_IMAGES = new Set([
+  "qwen/qwen3-vl-30b-a3b-instruct",
+  "moonshotai/kimi-k3",
+  "phala/qwen3.8-27b-uncensored",
+]);
 
 const DESCRIPTION =
   "Served inside an Intel TDX enclave in front of a GPU that NVIDIA attests directly. Every " +
@@ -72,6 +84,12 @@ function modelDocument(id, card, { maxTokens, maxBodyBytes, dailyUsd, priciestUs
     ...(HUGGING_FACE[id] ? { hugging_face_id: HUGGING_FACE[id] } : {}),
     description: DESCRIPTION,
     input_modalities: [
+      ...(SEES_IMAGES.has(id)
+        ? [{
+            type: "image",
+            supported_inputs: { max_prompt_length: { value: maxBodyBytes, unit: "byte" } },
+          }]
+        : []),
       {
         type: "text",
         // What the route enforces is a byte limit over the whole request, so

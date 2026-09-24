@@ -154,6 +154,15 @@ class BatchLease:
 
 # Imported here rather than at the top because the inference half raises errors
 # that derive from PrismError above.
+from ._decision import (
+    Answer,
+    Decision,
+    DecisionRefused,
+    Policy,
+    decision_digest,
+    lease_reference,
+    reference_matches,
+)
 from ._inference import InferenceMixin  # noqa: E402
 
 
@@ -229,11 +238,20 @@ class PrismAgent(InferenceMixin):
             request["command"] = _command(command)
         return self._proxy("POST", ["leases", "match"], {"request": request})
 
-    def confirm(self, quote_id: str, transaction_hash: str, ssh_authorized_key: str) -> dict:
+    def confirm(self, quote_id: str, transaction_hash: str, ssh_authorized_key: str,
+                decision_hash: str | None = None) -> dict:
+        """Tell the control plane which funding transaction bought this quote.
+
+        ``decision_hash`` is sent when the lease was authorised, because the
+        client reference on chain is derived from it and the control plane
+        cannot check the funding log without knowing which derivation to expect.
+        The digest is all it gets: the decision stays here.
+        """
         return self._proxy("POST", ["leases", "confirm"], {
             "quote_id": quote_id,
             "transaction_hash": transaction_hash,
             "ssh_authorized_key": ssh_authorized_key,
+            **({"decision_hash": decision_hash} if decision_hash else {}),
         })
 
     def leases(self) -> list:
@@ -296,6 +314,7 @@ class PrismAgent(InferenceMixin):
         raise PrismError(408, "access_timeout", {"lease_id": lease_id})
 
     def lease(self, image: str, duration_seconds: int, min_vram_mib: int = 16000,
+              decision: Decision | None = None, policy: Policy | None = None,
               preferred_node_id: str | None = None, max_deposit: int | None = None,
               min_trust_class: str = "open", command: str | None = None) -> Lease | BatchLease:
         # Everything up to the deposit is preparation, and a failure in it costs
@@ -326,9 +345,10 @@ class PrismAgent(InferenceMixin):
             raise
         except Exception as e:
             raise PrismError(502, "pre_broadcast_failure", {"cause": str(e)}, broadcast=False) from e
-        return self.fund_quote(quote)
+        return self.fund_quote(quote, decision=decision, policy=policy)
 
-    def fund_quote(self, quote: dict) -> Lease | BatchLease:
+    def fund_quote(self, quote: dict, decision: Decision | None = None,
+                   policy: Policy | None = None) -> Lease | BatchLease:
         """Fund a quote from ``quote()`` and wait for what it bought.
 
         This is the second half of ``lease()``, split out for callers that show
@@ -343,6 +363,12 @@ class PrismAgent(InferenceMixin):
         transaction, the lease id when one was assigned, and the key that opens
         the machine, which stays on disk because it is the only way in.
         """
+        # Checked before a key is generated and long before anything is
+        # broadcast, so a refusal costs nothing and leaves no lease behind.
+        if policy is not None:
+            policy.authorise(decision) if decision is not None else policy.authorise(
+                Decision(action="unstated", source="none")
+            )
         try:
             key = self._generate_ssh_key()
         except PrismError as e:
@@ -354,8 +380,9 @@ class PrismAgent(InferenceMixin):
         source = None
         lease_id = None
         try:
-            funding, deposited, source = self._fund(quote)
-            record = self.confirm(quote["quote_id"], funding, key["public_key"])
+            funding, deposited, source = self._fund(quote, decision)
+            record = self.confirm(quote["quote_id"], funding, key["public_key"],
+                                  decision_digest(decision))
             lease_id = record.get("lease_id")
             if not isinstance(lease_id, int):
                 raise PrismError(502, "malformed_lease_record", {"funding_hash": funding})
@@ -449,12 +476,12 @@ class PrismAgent(InferenceMixin):
             if lease.key_dir:
                 shutil.rmtree(lease.key_dir, ignore_errors=True)
 
-    def _fund(self, quote: dict) -> tuple[str, int, str]:
+    def _fund(self, quote: dict, decision: Decision | None = None) -> tuple[str, int, str]:
         """Deposit against the quote and return the transaction that did it,
         what the escrow pulled, and where that figure was read from."""
         quoted = int(quote["maximum_escrow"])
         duration = int(quote["duration_seconds"])
-        client_ref = Web3.keccak(text=quote["quote_id"])
+        client_ref = lease_reference(quote["quote_id"], decision, Web3.keccak)
         node_id = bytes.fromhex(quote["node_id"].removeprefix("0x"))
         allowance = self._usdg.functions.allowance(self.address, self.escrow).call()
         if allowance < quoted:

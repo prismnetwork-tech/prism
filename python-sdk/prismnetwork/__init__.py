@@ -1,3 +1,12 @@
+from ._decision import (
+    Answer,
+    Decision,
+    DecisionRefused,
+    Policy,
+    decision_digest,
+    lease_reference,
+    reference_matches,
+)
 from ._agent import (
     DEFAULT_IMAGE,
     TRUST_CLASSES,
@@ -48,6 +57,13 @@ from ._x402 import bound_message, hash_request, payment_header
 from .toolkit import DEFAULT_ESCROW, PrismToolset, agent_from_env
 
 __all__ = [
+    "Answer",
+    "Decision",
+    "DecisionRefused",
+    "Policy",
+    "decision_digest",
+    "lease_reference",
+    "reference_matches",
     "PrismAgent",
     "PrismError",
     "Lease",
@@ -92,4 +108,4 @@ __all__ = [
     "keyset_digest",
     "report_data",
 ]
-__version__ = "0.4.2"
+__version__ = "0.4.3"
