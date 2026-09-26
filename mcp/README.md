@@ -106,6 +106,32 @@ share the ledger file.
 None of this is the real limit. Fund a dedicated wallet with what you are
 willing to lose: that balance is what survives a bug in everything above.
 
+## Spend policy
+
+The limits above cap how much an agent spends. A spend policy decides whether a
+given lease has a reason you accept. Set `PRISM_SPEND_POLICY` to the policy as
+JSON, or to the path of a JSON file:
+
+```json
+{
+  "policy_id": "gpu-v1",
+  "allow": ["fine_tune", "benchmark"],
+  "require": ["needs_gpu"],
+  "minimums": { "needs_gpu": 0.8 }
+}
+```
+
+Every lease tool then takes a `decision`: the action, what made the call, and
+typed answers with a confidence from 0 to 1. A decision that misses the policy
+is refused with every reason before anything is quoted, funded or counted
+against the budget. One that passes is hashed into the escrow deposit, so the
+lease on chain carries a reference only that decision reproduces. `prism_budget`
+shows the policy in force. Without `PRISM_SPEND_POLICY` a decision is optional
+and still binds when given.
+
+The binding shows a decision existed before the money moved and met your rules.
+It does not show the decision was sound.
+
 Tools that spend are annotated `destructiveHint` and carry
 `anthropic/requiresUserInteraction`, so Claude Code asks before every one of
 them even in modes that otherwise approve tools automatically.
