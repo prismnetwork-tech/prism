@@ -15,6 +15,7 @@ import {
   stringToBytes,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+export { PRISM_CHAIN_BRIDGE_URL, prismChain, prismChainContracts } from "./chain.mjs";
 import { appraiseWorkload, DEFAULT_CONFIDENTIAL_BASE, EXPECTED_WORKLOAD, verifyConfidential } from "./attest.mjs";
 import { decryptResponse, encryptChatRequest } from "./e2ee.mjs";
 import { hostKeyArgs, HostKeyError } from "./hostkey.mjs";

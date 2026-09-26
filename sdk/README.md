@@ -191,9 +191,26 @@ with `host_key_unpublished`.
 
 `lease()` (and the lower-level `fund()`) reproduce the escrow's quote binding: `clientReference = keccak256(quote_id)`, `approve(escrow, maximum_escrow)`, then `createLease(...)`, waiting 12 confirmations.
 
+Pass `decision` and `policy` to `lease()` to authorise the spend first. The decision is checked against the policy before a quote is taken, and its hash is bound into the deposit: `clientReference = keccak256(keccak256(quote_id) ‖ decision_hash)`. Anyone holding the decision can recompute the reference and see it existed before the money moved. It does not show the decision was right. The helpers live in `@prismnetwork/agent-sdk/decision`.
+
 ## Funding
 
 The wallet needs two balances on Robinhood Chain (id 4663): USDG (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`, 6 decimals) for the lease deposit, and native ETH for gas. Bridge from L1 to fund a fresh wallet. `authenticate()`, `offers()`, and `quote()` need neither, so the read paths work before you fund anything.
+
+## Prism Chain
+
+Prism Chain (id 77476) is the Layer 3 for GPU compute, settled on Robinhood Chain. `@prismnetwork/agent-sdk/chain` exports the chain for viem and the bridge helpers:
+
+```js
+import { depositToken, prismChain, withdraw } from "@prismnetwork/agent-sdk/chain";
+
+// Robinhood Chain → Prism Chain, arrives in about a minute.
+await depositToken(robinhoodWallet, USDG, 5_000_000n);
+// Prism Chain → Robinhood Chain, claimable there after about a day.
+await withdraw(prismWallet, 1_000_000n, { token: USDG });
+```
+
+`depositEth` moves ETH the same way. Claim a finished withdrawal at [bridge.prismnetwork.tech](https://bridge.prismnetwork.tech). Leases still fund and settle on Robinhood Chain.
 
 ## Requirements
 

@@ -1,6 +1,7 @@
 import type { AttestationResult, VerifyConfidentialOptions, WorkloadPin } from "./attest.d.mts";
 
 export declare const robinhoodChain: unknown;
+export { PRISM_CHAIN_BRIDGE_URL, prismChain, prismChainContracts } from "./chain.d.mts";
 export declare const USDG: string;
 export declare const DEFAULT_IMAGE: string;
 export declare const TRUST_CLASSES: readonly ["open", "isolated", "attested", "confidential"];
