@@ -37,9 +37,10 @@ assert.equal(packed[0].version, packageJson.version);
 // Every file the server imports has to be in the archive. `budget.mjs` carries
 // the spend ledger, so shipping without it leaves a package that installs and
 // then throws on first import, which is the failure this check exists to catch.
+// `policy.mjs` is imported the same way, so it is pinned for the same reason.
 assert.deepEqual(
   packed[0].files.map(({ path }) => path).sort(),
-  ["README.md", "budget.mjs", "package.json", "server.mjs"],
+  ["README.md", "budget.mjs", "package.json", "policy.mjs", "server.mjs"],
   "npm archive contents changed",
 );
 
