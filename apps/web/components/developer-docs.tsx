@@ -361,6 +361,27 @@ export function DeveloperDocs() {
               independent production audit. Verify contract addresses, bytecode, constructor
               inputs, and current pause state directly before building a financial dependency.
             </Callout>
+            <Subheading id="prism-chain">Prism Chain</Subheading>
+            <p>
+              Prism Chain is the Layer 3 for GPU compute, settled on Robinhood Chain. ETH, USDG and
+              PRISM reach it through the canonical Arbitrum token bridge at{" "}
+              <a href="https://bridge.prismnetwork.tech">bridge.prismnetwork.tech</a>. A deposit
+              lands in about a minute. A withdrawal finalizes on Robinhood Chain after about a day
+              and is then claimed there. Leases are funded and settled on Robinhood Chain today.
+            </p>
+            <dl className="parameter-grid">
+              <div><dt>Chain ID</dt><dd>77476</dd></div>
+              <div><dt>RPC</dt><dd><code>rpc.prismnetwork.tech</code></dd></div>
+              <div><dt>WebSocket</dt><dd><code>ws.prismnetwork.tech</code></dd></div>
+              <div><dt>Explorer</dt><dd><a href="https://explorer.prismnetwork.tech">explorer.prismnetwork.tech</a></dd></div>
+              <div><dt>Gas token</dt><dd>ETH</dd></div>
+              <div><dt>Settles on</dt><dd>Robinhood Chain (4663)</dd></div>
+            </dl>
+            <p>
+              The TypeScript SDK exports the chain for viem and the bridge calls from{" "}
+              <code>@prismnetwork/agent-sdk/chain</code>: <code>depositEth</code>,{" "}
+              <code>depositToken</code> and <code>withdraw</code>.
+            </p>
           </DocsSection>
 
           <DocsSection id="settlement" index="09" eyebrow="Usage accounting" title="Settlement and proof">

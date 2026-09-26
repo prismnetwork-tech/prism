@@ -39,6 +39,11 @@ export const faq = [
       "Items are sealed on your machine with a key derived from a wallet signature that is never transmitted, so Prism stores ciphertext and holds no means of reading it. Each item names the weakest class of workspace it may be released into, and a release into anything below that floor is refused.",
   },
   {
+    question: "What is Prism Chain?",
+    answer:
+      "A Layer 3 built for GPU compute and settled on Robinhood Chain, chain id 77476. ETH, USDG and PRISM move to it and back at bridge.prismnetwork.tech, and its activity is public at explorer.prismnetwork.tech. Leases are funded and settled on Robinhood Chain today; moving them to Prism Chain is on the roadmap.",
+  },
+  {
     question: "Do I need an account to rent a GPU?",
     answer:
       "A wallet is the identity. Agents authenticate by signing a challenge and never touch a browser, using the SDK, the MCP server, or pay-per-job over x402. There is a console for people who prefer one.",

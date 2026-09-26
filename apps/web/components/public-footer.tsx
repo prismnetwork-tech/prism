@@ -24,6 +24,8 @@ const columns = [
       ["Activity", new URL("/activity", siteUrl).href, false],
       ["Receipts", new URL("/proof", siteUrl).href, false],
       ["Network", new URL("/network", siteUrl).href, false],
+      ["Prism Chain explorer", "https://explorer.prismnetwork.tech", true],
+      ["Bridge", "https://bridge.prismnetwork.tech", true],
     ],
   },
   {

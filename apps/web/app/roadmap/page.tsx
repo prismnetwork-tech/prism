@@ -52,6 +52,23 @@ export default function RoadmapPage() {
           running ledger against a session budget. An agent left to run unattended has a ceiling,
           and the receipt afterwards separates what was charged from what came back.
         </p>
+        <h3>Prism Chain</h3>
+        <p>
+          A Layer 3 built for GPU compute and settled on Robinhood Chain, with its own{" "}
+          <a href="https://explorer.prismnetwork.tech">explorer</a> and{" "}
+          <a href="https://bridge.prismnetwork.tech">bridge</a>. ETH, USDG and PRISM move between
+          the two chains through the canonical Arbitrum token bridge. Deposits arrive in about a
+          minute; withdrawals finalize in about a day. The TypeScript SDK exports the chain and the
+          bridge calls. Leases still settle on Robinhood Chain, and moving them is the next step
+          below.
+        </p>
+        <h3>A stated reason behind every spend</h3>
+        <p>
+          An operator writes a policy: which actions an agent may fund and how sure it has to be.
+          The agent's decision is checked before anything is quoted, and its hash is recorded with
+          the escrow deposit, so the lease onchain points back to the reason it was funded. Both
+          SDKs and the MCP server support it.
+        </p>
         <h3>Onchain lease escrow and settlement</h3>
         <p>
           Funding, metered billing, and refunds execute through deployed contracts, bounded by a
@@ -166,14 +183,14 @@ export default function RoadmapPage() {
           fourteen days, with at least 95% of advertised capacity provisioning successfully when
           leased. Advertised capacity counts only if it is there when a lease arrives for it.
         </p>
-        <h3>Cheaper settlement per lease</h3>
+        <h3>Leases settle on Prism Chain</h3>
         <p>
           Robinhood Chain fees rose ninefold in eleven days while the lease price stayed fixed,
-          which makes short leases expensive to settle. Two options are on the table: settle on
-          Base, or batch the writes on Robinhood Chain. The choice and its date go in the
-          documentation, and the target is under five cents of chain cost per settled lease, held
-          for thirty days. Receipts stay on Robinhood Chain either way, so the public trail does
-          not move.
+          which makes short leases expensive to settle. The escrow and settlement contracts move to
+          Prism Chain, funded with USDG bridged from Robinhood Chain, where a transaction costs a
+          fraction of a cent. The target is under one cent of chain cost per settled lease, held
+          for thirty days. Prism Chain posts its data to Robinhood Chain, so the public trail stays
+          there.
         </p>
         <h3>Spend controls, written down</h3>
         <p>
