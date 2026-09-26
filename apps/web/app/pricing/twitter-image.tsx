@@ -7,7 +7,7 @@ export const alt = "Prism pricing";
 export default function Image() {
   return renderOgImage({
     eyebrow: "Pricing",
-    title: "L40S compute at \$0.80 per GPU hour.",
+    title: "GPU compute at \$0.80 per GPU hour.",
     tag: "Per-second billing · USDG",
   });
 }

@@ -30,7 +30,7 @@ export function publicPageRewrite(hostname: string, pathname: string) {
 /// if they drift, because a stale hash silently drops the markup.
 export const STRUCTURED_DATA_HASHES = [
   "sha256-X0tJmqBWy2c3p35NmEyLzHOmoQf1DZ1oE1C+rD0rFSs=",
-  "sha256-dHbYlUj0AgSutpV8NARzDW7bvn32OViL3zzave8JVco=",
+  "sha256-zD2vBJoxa/5Og6XXxH1m+Pgfx9IuJy4icR1mZvw01RM=",
 ] as const;
 
 export function contentSecurityPolicy(nonce: string, development: boolean) {

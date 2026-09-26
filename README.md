@@ -17,33 +17,37 @@ Prism has two execution paths:
 - **Independent nodes:** Ubuntu 24.04 x86-64 hosts run public OCI images in Kata
   VM-backed containers with exclusive NVIDIA VFIO passthrough. Access uses
   short-lived SSH or Jupyter credentials through an outbound-only mTLS tunnel.
-- **Vast broker:** a bonded broker provisions disposable L40S instances and
-  exposes direct SSH. This path relies on provider-reported readiness and
-  evidence; it does not provide Kata/VFIO isolation, the Prism gateway, or
-  Jupyter access.
+- **Vast broker:** a bonded broker provisions disposable instances across several
+  NVIDIA classes and exposes direct SSH. This path relies on provider-reported
+  readiness and evidence; it does not provide Kata/VFIO isolation, the Prism
+  gateway, or Jupyter access.
 
-Interactive raw GPU leases are what the network serves today. A lease can also
-carry a single command instead of a session, which runs on an independent node
-and reports back what it printed, but no independent node has completed the
-hardware canary yet, so nothing has run that path in production. Managed
-inference is not implemented.
+All capacity served today comes from the broker path. `prismd` is not running on
+any host and no independent node is enrolled, so the isolation the independent
+path describes is written and tested but never reaches a customer.
+
+Interactive raw GPU leases are what the network serves today, and a renter can
+end one early to stop the meter. A lease can also carry commands instead of a
+session, which the broker path runs and reports back. Managed inference runs as
+a separate pay-per-call endpoint.
 
 ## Current state
 
-Verified on 2026-07-20:
+Verified on 2026-09-07:
 
 | Area | Status |
 | --- | --- |
-| Public web and API | Live at [prismnetwork.tech](https://prismnetwork.tech), with one Vast-backed L40S offer visible |
-| Robinhood Chain contracts | Deployed on mainnet; the lease escrow is live |
-| Vast execution | Implemented and locally lifecycle-tested; a funded mainnet canary has not been completed |
-| Independent Kata nodes | Daemon, gateway, certificates, commands, tunnel and workspace lifecycle are implemented and integration-tested without physical GPU hardware |
-| Settlement and proof | Workers and local end-to-end flows are implemented; no public mainnet settlement receipt exists yet |
-| Batch commands | Implemented on the independent-node path; never executed on physical hardware |
-| Managed inference | Planned, not implemented |
+| Public web and API | Live at [prismnetwork.tech](https://prismnetwork.tech); online offers fluctuate between one and three |
+| Robinhood Chain contracts | Deployed on mainnet; the lease escrow is live and settling |
+| Vast execution | Live on mainnet, funded, with settled leases and published receipts |
+| Independent Kata nodes | Daemon, gateway, certificates, commands, tunnel and workspace lifecycle are implemented and integration-tested without physical GPU hardware; no node is enrolled |
+| Settlement and proof | Live; settlement receipts are published at [prismnetwork.tech/proof](https://prismnetwork.tech/proof) |
+| Early lease release | Live; `POST /v1/leases/{id}/release` stops the meter and returns unused escrow |
+| Batch commands | Live on brokered capacity through the reproducible-run path; the independent-node command channel has never run on physical hardware |
+| Managed inference | Live; two models on the open tier and nine on the confidential tier, paid per call over x402 |
 
-This is an unaudited pre-production system, so do not put production traffic or
-serious money on it yet.
+The contracts have not received an independent audit and the escrow caps are set
+low deliberately. Size any deposit accordingly.
 
 What a supplier protects is stated per offer rather than as one blanket
 warning. Every offer, quote, lease and receipt carries a trust class (`open`,
@@ -222,16 +226,17 @@ Docker with Compose and ripgrep.
 
 ## Remaining release gates
 
-- Keep the escrow paused until a capped, funded mainnet canary completes from
-  deposit through refund or settlement.
+Funded mainnet leases now settle end to end and their receipts are public, so
+the deposit-through-settlement gate and the first-receipt gate are closed. What
+is still open:
+
 - Validate CUDA readiness, Kata isolation, VFIO assignment, egress controls and
-  teardown on physical NVIDIA hardware.
+  teardown on physical NVIDIA hardware, which no enrolled node has done.
 - Complete live KMS signing and failure-recovery evidence for lifecycle and
   settlement workers.
 - Exercise real Privy signup, external and embedded wallets, SSH access and
   Jupyter access against the release deployment.
-- Publish the first confirmed proof receipt and test the independent daily X
-  digest outbox.
+- Test the independent daily digest outbox.
 - Run applied-host backup/restore, load, failover and incident-response drills.
 - Obtain independent smart-contract and infrastructure security review before
   raising contract caps.

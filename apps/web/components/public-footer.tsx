@@ -24,6 +24,8 @@ const columns = [
       ["Activity", new URL("/activity", siteUrl).href, false],
       ["Receipts", new URL("/proof", siteUrl).href, false],
       ["Network", new URL("/network", siteUrl).href, false],
+      ["Prism Chain explorer", "https://explorer.prismnetwork.tech", true],
+      ["Bridge", "https://bridge.prismnetwork.tech", true],
     ],
   },
   {
@@ -78,7 +80,7 @@ export function PublicFooter() {
             <span>prism.</span>
           </Link>
           <p>Metered GPU compute for autonomous agents, rented with a wallet.</p>
-          <span>Live · Robinhood Chain · L40S</span>
+          <span>Live · Robinhood Chain · NVIDIA capacity</span>
         </div>
 
         {columns.map((column) => (

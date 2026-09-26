@@ -16,7 +16,7 @@ export const faq = [
   {
     question: "What does GPU compute cost?",
     answer:
-      "L40S capacity is 0.7992 USDG per hour, displayed as $0.80, metered per second. Billing starts only after GPU, pricing and access-readiness checks pass. A lease can run for at most six funded hours and escrow is capped at 50 USDG, with unused escrow returned when settlement finalizes.",
+      "Capacity is 0.7992 USDG per hour, displayed as $0.80, metered per second, at the same rate for every card class on offer. Billing starts only after GPU, pricing and access-readiness checks pass. A lease can run for at most six funded hours and escrow is capped at 50 USDG, with unused escrow returned when settlement finalizes.",
   },
   {
     question: "Which GPUs can I rent?",
@@ -39,6 +39,11 @@ export const faq = [
       "Items are sealed on your machine with a key derived from a wallet signature that is never transmitted, so Prism stores ciphertext and holds no means of reading it. Each item names the weakest class of workspace it may be released into, and a release into anything below that floor is refused.",
   },
   {
+    question: "What is Prism Chain?",
+    answer:
+      "A Layer 3 built for GPU compute and settled on Robinhood Chain, chain id 77476. ETH, USDG and PRISM move to it and back at bridge.prismnetwork.tech, and its activity is public at explorer.prismnetwork.tech. Leases are funded and settled on Robinhood Chain today; moving them to Prism Chain is on the roadmap.",
+  },
+  {
     question: "Do I need an account to rent a GPU?",
     answer:
       "A wallet is the identity. Agents authenticate by signing a challenge and never touch a browser, using the SDK, the MCP server, or pay-per-job over x402. There is a console for people who prefer one.",
@@ -51,7 +56,7 @@ export const faq = [
   {
     question: "How do I supply GPUs and what do I earn?",
     answer:
-      "Providers receive 90% of the confirmed charge on a finalized lease, with 10% going to Prism as the service fee. Capacity has to be bonded and device-signed before it can be matched, and the provider program for operator-owned infrastructure is in technical onboarding.",
+      "Providers receive 90% of the confirmed charge on a finalized lease, with 10% going to Prism as the service fee. Capacity has to be bonded and device-signed before it can be matched. Every machine on the network today is rented from a vetted provider; no operator-owned host is enrolled yet, and the requirements for enrolling one are published on the provider page.",
   },
   {
     question: "Is Prism audited?",

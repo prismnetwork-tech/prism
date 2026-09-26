@@ -166,7 +166,7 @@ export function DeveloperDocs() {
               <a className="landing-button secondary" href="#architecture">Read the architecture <span>↓</span></a>
             </div>
             <dl className="docs-facts">
-              <div><dt>Execution</dt><dd>L40S cloud</dd></div>
+              <div><dt>Execution</dt><dd>Brokered NVIDIA cloud</dd></div>
               <div><dt>Settlement</dt><dd>Robinhood Chain + USDG</dd></div>
               <div><dt>Access</dt><dd>Temporary, key-only SSH</dd></div>
               <div><dt>Billing unit</dt><dd>Confirmed runtime second</dd></div>
@@ -191,7 +191,7 @@ export function DeveloperDocs() {
             </div>
             <div className="docs-grid two">
               <InfoCard title="Data plane">
-                <p>Managed cloud leases receive a temporary direct SSH endpoint. Operator-owned infrastructure uses revocable gateway grants over outbound mTLS tunnels.</p>
+                <p>Managed cloud leases receive a temporary direct SSH endpoint. Operator-owned infrastructure would use revocable gateway grants over outbound mTLS tunnels, and no host is enrolled on that path today.</p>
               </InfoCard>
               <InfoCard title="Control plane">
                 <p>PostgreSQL is the system of record for accounts, quotes, provider instances, lease transitions, settlement transactions, and proof publication.</p>
@@ -318,7 +318,7 @@ export function DeveloperDocs() {
               <RuntimeRow label="Access" cloud="Temporary direct root SSH" physical="Revocable SSH/Jupyter grant via mTLS gateway" />
               <RuntimeRow label="Readiness" cloud="Provider state, GPU, VRAM, cost, SSH endpoint" physical="Signed telemetry plus independent active gateway probes" />
               <RuntimeRow label="Evidence" cloud="Provider instance and hourly cost" physical="Device-signed telemetry and gateway timing" />
-              <RuntimeRow label="Availability" cloud="Live" physical="Planned; not available for production leases" />
+              <RuntimeRow label="Availability" cloud="Live; every offer today comes from this path" physical="Built and tested; not yet serving leases" />
             </div>
             <p>
               Operators can also serve open-class leases from machines they already own, with the
@@ -361,6 +361,27 @@ export function DeveloperDocs() {
               independent production audit. Verify contract addresses, bytecode, constructor
               inputs, and current pause state directly before building a financial dependency.
             </Callout>
+            <Subheading id="prism-chain">Prism Chain</Subheading>
+            <p>
+              Prism Chain is the Layer 3 for GPU compute, settled on Robinhood Chain. ETH, USDG and
+              PRISM reach it through the canonical Arbitrum token bridge at{" "}
+              <a href="https://bridge.prismnetwork.tech">bridge.prismnetwork.tech</a>. A deposit
+              lands in about a minute. A withdrawal finalizes on Robinhood Chain after about a day
+              and is then claimed there. Leases are funded and settled on Robinhood Chain today.
+            </p>
+            <dl className="parameter-grid">
+              <div><dt>Chain ID</dt><dd>77476</dd></div>
+              <div><dt>RPC</dt><dd><code>rpc.prismnetwork.tech</code></dd></div>
+              <div><dt>WebSocket</dt><dd><code>ws.prismnetwork.tech</code></dd></div>
+              <div><dt>Explorer</dt><dd><a href="https://explorer.prismnetwork.tech">explorer.prismnetwork.tech</a></dd></div>
+              <div><dt>Gas token</dt><dd>ETH</dd></div>
+              <div><dt>Settles on</dt><dd>Robinhood Chain (4663)</dd></div>
+            </dl>
+            <p>
+              The TypeScript SDK exports the chain for viem and the bridge calls from{" "}
+              <code>@prismnetwork/agent-sdk/chain</code>: <code>depositEth</code>,{" "}
+              <code>depositToken</code> and <code>withdraw</code>.
+            </p>
           </DocsSection>
 
           <DocsSection id="settlement" index="09" eyebrow="Usage accounting" title="Settlement and proof">
@@ -424,7 +445,7 @@ export function DeveloperDocs() {
                 <p>Provider launches reconcile by a unique lease label. Chain submissions persist signed bytes before broadcast. Workers retry from persisted state and reject conflicting final-state transitions.</p>
               </InfoCard>
               <InfoCard title="Capacity admission">
-                <p>Prism publishes an L40S offer only when available capacity satisfies model, VRAM, reliability, and pricing requirements.</p>
+                <p>Prism publishes an offer only when available capacity satisfies the model, VRAM, reliability and pricing requirements.</p>
               </InfoCard>
               <InfoCard title="Failure containment">
                 <p>Provision failures close or refund rather than starting billing. Destruction is retried before final settlement. Emergency pause blocks new leases without blocking existing refunds.</p>

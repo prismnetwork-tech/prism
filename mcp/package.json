@@ -1,6 +1,6 @@
 {
   "name": "@prismnetwork/mcp",
-  "version": "0.9.4",
+  "version": "0.10.0",
   "description": "MCP server for leasing and running on Prism Network GPUs.",
   "mcpName": "io.github.prismnetwork-tech/mcp",
   "type": "module",
@@ -9,6 +9,7 @@
   },
   "files": [
     "budget.mjs",
+    "policy.mjs",
     "server.mjs",
     "README.md"
   ],
@@ -18,7 +19,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@phala/dcap-qvl": "^0.6.1",
-    "@prismnetwork/agent-sdk": "^0.7.8",
+    "@prismnetwork/agent-sdk": "^0.7.12",
     "jose": "^6",
     "viem": "^2"
   },

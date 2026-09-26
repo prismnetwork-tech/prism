@@ -15,6 +15,7 @@ import {
   verifyConfidential,
 } from "@prismnetwork/agent-sdk";
 import { BudgetError, SpendLedger, callCeiling, readBudget, recordSpend, stripUnexpanded } from "./budget.mjs";
+import { authorised, decisionDigest, decisionFrom, describePolicy, readPolicy } from "./policy.mjs";
 
 stripUnexpanded(process.env);
 
@@ -62,6 +63,26 @@ try {
 } catch (err) {
   budgetProblem = err?.message ?? String(err);
   console.error(`prism mcp: ${budgetProblem}`);
+}
+
+// Same rule as the budget: a policy the operator got wrong stops leasing rather
+// than letting every lease through unchecked.
+let policy = null;
+let policyProblem = null;
+try {
+  policy = readPolicy();
+} catch (err) {
+  policyProblem = err?.message ?? String(err);
+  console.error(`prism mcp: ${policyProblem}`);
+}
+
+/// The decision this lease carries, checked against the operator's policy
+/// before anything is booked, quoted or funded.
+function leaseDecision(tool, args) {
+  if (policyProblem) throw new Error(`${tool} is disabled until the spend policy is fixed: ${policyProblem}`);
+  const d = decisionFrom(args.decision, policy);
+  if (d) authorised(policy, d);
+  return d;
 }
 
 function requireWallet(tool, reason = "spends money") {
@@ -211,6 +232,33 @@ const spends = {
   _meta: { "anthropic/requiresUserInteraction": true },
 };
 
+// Why a lease is being funded. Only its hash leaves the machine, bound into the
+// escrow deposit, so whoever holds the decision can prove it came first.
+const DECISION_SCHEMA = {
+  type: "object",
+  description:
+    "Why this lease is being funded. Required when the operator set a spend policy (see prism_budget), and the lease is refused before anything is quoted if the decision does not meet it. Only a hash of it leaves this machine, recorded with the escrow deposit.",
+  properties: {
+    action: { type: "string", description: "What the spend is for, e.g. 'fine_tune' or 'benchmark'." },
+    source: { type: "string", description: "What made the call: a model name, a rule, or 'operator'." },
+    answers: {
+      type: "array",
+      description: "Typed answers behind the decision. confidence (0 to 1) is what a policy floor reads.",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Lowercase identifier, e.g. 'needs_gpu'." },
+          value: { description: "The answer: an option, a score, or a probability." },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+        },
+        required: ["name", "value"],
+      },
+    },
+    policy_id: { type: "string", description: "The policy this decision was made under; defaults to the operator's." },
+  },
+  required: ["action", "source"],
+};
+
 const TOOLS = [
   {
     name: "prism_budget",
@@ -272,6 +320,7 @@ const TOOLS = [
         duration_seconds: { type: "integer", description: "Paid window in seconds (default 900, max 21600). A command still running at the end is killed and reported exit 124." },
         min_vram_mib: { type: "integer", description: "Minimum GPU memory in MiB (default 16000)." },
         max_usdg: { type: "number", description: "Cost ceiling for this lease in USDG. It lowers the operator's PRISM_MAX_USDG and cannot raise it; omitted, that ceiling applies. See prism_budget." },
+        decision: DECISION_SCHEMA,
       },
       required: ["command"],
     },
@@ -371,6 +420,7 @@ const TOOLS = [
           description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
         },
         max_usdg: { type: "number", description: "Cost ceiling for this lease in USDG. It lowers the operator's PRISM_MAX_USDG and cannot raise it; omitted, that ceiling applies. See prism_budget." },
+        decision: DECISION_SCHEMA,
       },
       required: ["command"],
     },
@@ -391,6 +441,7 @@ const TOOLS = [
           description: "Refuse suppliers below this trust class (default 'open'). Raise it for anything the host operator must not read.",
         },
         max_usdg: { type: "number", description: "Cost ceiling for this lease in USDG. It lowers the operator's PRISM_MAX_USDG and cannot raise it; omitted, that ceiling applies. See prism_budget." },
+        decision: DECISION_SCHEMA,
       },
     },
     ...spends,
@@ -483,7 +534,9 @@ const TOOLS = [
 ];
 
 async function handle(name, args) {
-  if (name === "prism_budget") return requireLedger(name).status();
+  if (name === "prism_budget") {
+    return { ...requireLedger(name).status(), ...(policyProblem ? { spend_policy_error: policyProblem } : describePolicy(policy)) };
+  }
   if (name === "prism_wallet") {
     const b = await requireWallet("prism_wallet").balances();
     return { address: b.address, usdg: usdg(b.usdg), eth_wei: b.eth };
@@ -574,6 +627,7 @@ async function handle(name, args) {
   if (name === "prism_batch_run") {
     requireCommand(args.command);
     requireWallet(name);
+    const decision = leaseDecision(name, args);
     const cap = maxDeposit(name, args);
     return spending(name, cap, async () => {
       const batch = await agent.lease({
@@ -582,6 +636,8 @@ async function handle(name, args) {
         minVramMib: args.min_vram_mib ?? 16000,
         maxDeposit: cap,
         command: args.command,
+        decision,
+        policy,
       });
       return {
         reference: batch.fundingHash,
@@ -589,6 +645,7 @@ async function handle(name, args) {
         value: {
           lease_id: batch.leaseId,
           funding_tx: batch.fundingHash,
+          ...(decision ? { decision_hash: decisionDigest(decision) } : {}),
           exit_code: batch.result?.exit_code,
           stdout: batch.result?.stdout,
           stderr: batch.result?.stderr,
@@ -731,6 +788,7 @@ async function handle(name, args) {
   if (name === "prism_lease_and_run" || name === "prism_lease") {
     if (name === "prism_lease_and_run") requireCommand(args.command);
     requireWallet(name);
+    const decision = leaseDecision(name, args);
     const cap = maxDeposit(name, args);
     sweepExpiredLeases();
     const lease = await spending(name, cap, async () => {
@@ -740,6 +798,8 @@ async function handle(name, args) {
         minVramMib: args.min_vram_mib ?? 16000,
         maxDeposit: cap,
         minTrustClass: args.min_trust_class ?? "open",
+        decision,
+        policy,
       });
       return { value: funded, reference: funded.fundingHash, settledMicros: escrowed(funded.quote) };
     });
@@ -747,6 +807,7 @@ async function handle(name, args) {
     const summary = {
       lease_id: lease.leaseId,
       funding_tx: lease.fundingHash,
+      ...(decision ? { decision_hash: decisionDigest(decision) } : {}),
       // `prism_run` checks this itself. It is in the summary because the
       // caller is being handed an address they may connect to by hand, and an
       // address with no key to check is an invitation to accept whatever
@@ -850,7 +911,7 @@ async function handleVault(name, args) {
   throw new Error(`unknown tool ${name}`);
 }
 
-const server = new Server({ name: "prism", version: "0.9.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "prism", version: "0.10.0" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {

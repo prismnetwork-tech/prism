@@ -27,6 +27,10 @@ deploy/lightsail/secrets/
 deploy/ec2/.env
 deploy/ec2/secrets/
 
+# Internal planning. Carries supplier cost prices and margins, so it never
+# ships with the public tree.
+docs/ROADMAP.md
+
 mcp/package-lock.json
 x402/package-lock.json
 sdk/package-lock.json
