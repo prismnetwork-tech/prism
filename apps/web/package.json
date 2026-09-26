@@ -34,7 +34,7 @@
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "typescript": "5.9.3",
-    "vitest": "4.1.10"
+    "vitest": "4.1.11"
   },
   "overrides": {
     "viem": "2.55.2",
