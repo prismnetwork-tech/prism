@@ -16,7 +16,7 @@ export const faq = [
   {
     question: "What does GPU compute cost?",
     answer:
-      "L40S capacity is 0.7992 USDG per hour, displayed as $0.80, metered per second. Billing starts only after GPU, pricing and access-readiness checks pass. A lease can run for at most six funded hours and escrow is capped at 50 USDG, with unused escrow returned when settlement finalizes.",
+      "Capacity is 0.7992 USDG per hour, displayed as $0.80, metered per second, at the same rate for every card class on offer. Billing starts only after GPU, pricing and access-readiness checks pass. A lease can run for at most six funded hours and escrow is capped at 50 USDG, with unused escrow returned when settlement finalizes.",
   },
   {
     question: "Which GPUs can I rent?",
@@ -51,7 +51,7 @@ export const faq = [
   {
     question: "How do I supply GPUs and what do I earn?",
     answer:
-      "Providers receive 90% of the confirmed charge on a finalized lease, with 10% going to Prism as the service fee. Capacity has to be bonded and device-signed before it can be matched, and the provider program for operator-owned infrastructure is in technical onboarding.",
+      "Providers receive 90% of the confirmed charge on a finalized lease, with 10% going to Prism as the service fee. Capacity has to be bonded and device-signed before it can be matched. Every machine on the network today is rented from a vetted provider; no operator-owned host is enrolled yet, and the requirements for enrolling one are published on the provider page.",
   },
   {
     question: "Is Prism audited?",

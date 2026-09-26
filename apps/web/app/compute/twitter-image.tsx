@@ -8,6 +8,6 @@ export default function Image() {
   return renderOgImage({
     eyebrow: "GPU compute",
     title: "Launch a workspace in minutes.",
-    tag: "NVIDIA L40S · Temporary SSH",
+    tag: "NVIDIA GPU · Temporary SSH",
   });
 }

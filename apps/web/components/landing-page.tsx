@@ -12,7 +12,7 @@ const agentSteps = [
 const executionSteps = [
   ["01", "Quote", "Review the per-second rate, funded duration, and maximum USDG commitment."],
   ["02", "Fund", "Approve the quoted amount and deposit it into the lease escrow contract."],
-  ["03", "Provision", "Prism assigns available L40S capacity and prepares an ephemeral workspace."],
+  ["03", "Provision", "Prism assigns an available NVIDIA card and prepares an ephemeral workspace."],
   ["04", "Meter", "Charges begin after GPU and access-readiness checks complete."],
   ["05", "Settle", "Confirmed usage is settled onchain and unused escrow is returned."],
 ] as const;
@@ -50,7 +50,7 @@ export function LandingPage() {
               <p className="landing-kicker"><span /> Agent-native GPU compute</p>
               <h1>GPU compute your agents<br />can rent themselves.</h1>
               <p>
-                An agent authenticates with its wallet, leases an NVIDIA L40S, and pays per
+                An agent authenticates with its wallet, leases an NVIDIA GPU, and pays per
                 second in USDG. No console, no API keys. Every lease is metered and settled
                 onchain.
               </p>
@@ -73,17 +73,18 @@ export function LandingPage() {
             <p className="section-index">01 / Network</p>
             <h2>Compute and settlement<br />in one service.</h2>
             <p>
-              Managed L40S capacity is live. Operator-owned infrastructure is in technical
-              onboarding and is not yet available for production leases.
+              Every machine on the network today is rented from a vetted provider and matched to a
+              lease on demand. Operator-owned hardware is not part of the service, and the trust
+              class on each offer says what the host can and cannot see.
             </p>
           </div>
           <div className="network-panels">
             <article className="network-panel renter-panel">
               <span className="panel-number">R / 01</span>
               <div>
-                <p className="panel-label">L40S compute</p>
-                <h3>46 GB of GPU memory from $0.80 per hour.</h3>
-                <p>Run digest-pinned OCI images in ephemeral workspaces with temporary SSH access. Offers reflect real-time capacity.</p>
+                <p className="panel-label">Rent a GPU</p>
+                <h3>48 GB NVIDIA cards at $0.80 per hour.</h3>
+                <p>Run digest-pinned OCI images in ephemeral workspaces with temporary SSH access. Offers reflect real-time capacity, and a quote names the exact card before you fund anything.</p>
               </div>
               <Link href="/compute">Explore compute <span>↗</span></Link>
             </article>
@@ -92,7 +93,7 @@ export function LandingPage() {
               <div>
                 <p className="panel-label">Provider program</p>
                 <h3>Operate GPU capacity and earn from settled usage.</h3>
-                <p>Review the requirements for operator-owned NVIDIA infrastructure. Approved providers receive 90% of confirmed usage charges.</p>
+                <p>The hardware, bonding and isolation requirements for operator-owned NVIDIA hosts are published. No independent host is enrolled today. The settlement terms pay a provider 90% of the confirmed charge on a finalized lease.</p>
               </div>
               <Link href="/nodes">Review requirements <span>↗</span></Link>
             </article>
@@ -144,7 +145,7 @@ export function LandingPage() {
                 <span>CONTAINER</span>
                 <div className="security-frame inner-frame">
                   <span>GPU</span>
-                  <strong>L40S</strong>
+                  <strong>NVIDIA</strong>
                 </div>
               </div>
             </div>
@@ -185,7 +186,7 @@ export function LandingPage() {
             </div>
             <dl>
               <div><dt>STATUS</dt><dd>SETTLED ONCHAIN</dd></div>
-              <div><dt>GPU MODEL</dt><dd>NVIDIA L40S</dd></div>
+              <div><dt>GPU MODEL</dt><dd>NVIDIA RTX 6000 ADA</dd></div>
               <div><dt>BILLING</dt><dd>PER SECOND, USDG</dd></div>
               <div><dt>NETWORK</dt><dd>ROBINHOOD CHAIN</dd></div>
               <div><dt>FEED</dt><dd>/PROOF</dd></div>

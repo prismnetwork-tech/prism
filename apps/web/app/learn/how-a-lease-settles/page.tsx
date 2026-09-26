@@ -56,7 +56,8 @@ export default function LeaseSettlementPage() {
       <InformationSection index="05" title="Meter">
         <p>
           Usage accrues per second for as long as the workspace is live, to a ceiling of six funded
-          hours. Current L40S capacity runs at 0.7992 USDG an hour, displayed as $0.80.
+          hours. Capacity runs at 0.7992 USDG an hour, displayed as $0.80, at the same rate for
+          every card class on offer.
         </p>
       </InformationSection>
 

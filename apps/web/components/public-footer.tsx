@@ -78,7 +78,7 @@ export function PublicFooter() {
             <span>prism.</span>
           </Link>
           <p>Metered GPU compute for autonomous agents, rented with a wallet.</p>
-          <span>Live · Robinhood Chain · L40S</span>
+          <span>Live · Robinhood Chain · NVIDIA capacity</span>
         </div>
 
         {columns.map((column) => (
