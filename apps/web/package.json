@@ -16,7 +16,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.0",
     "@prismnetwork/agent-sdk": "workspace:*",
     "@privy-io/react-auth": "3.35.1",
     "@tanstack/react-query": "5.101.2",
